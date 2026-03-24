@@ -31,6 +31,8 @@ pub struct GameMap {
     pub size_y: usize,
     pub tex_union_dim: usize,
     pub water_color: u32,
+    pub water_name: String,
+    pub water_normal_len: f32,
     pub light_main_color: u32,
     pub light_main_dir: [f32; 3],
     pub macro_texture_path: Option<String>,
@@ -61,6 +63,13 @@ impl GameMap {
             .unwrap_or(16) as usize;
         let water_color = find_property_int(prop_names, prop_values, "WaterColor")
             .unwrap_or(0x003060) as u32;
+        let water_name = prop_names
+            .find_as_wstr("WaterName")
+            .map(|idx| prop_values.get_as_wstr(idx))
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "water_blue".to_string());
+        let water_normal_len = find_property_float(prop_names, prop_values, "WaterNormLen")
+            .unwrap_or(1.0);
         let light_main_color = find_property_int(prop_names, prop_values, "LightMainColor")
             .unwrap_or(0x989898) as u32;
 
@@ -162,6 +171,8 @@ impl GameMap {
             size_y,
             tex_union_dim,
             water_color,
+            water_name,
+            water_normal_len,
             light_main_color,
             light_main_dir,
             macro_texture_path,
