@@ -6,19 +6,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 MatrixGame is the Space Rangers 2 Planetary Battles Engine — a DirectX 9.0 based 3D game engine written in C++ targeting Windows (x86). Licensed under GPLv2+.
 
-## Build System
+## Build System (Original C++)
 
 CMake 3.13+, requires MSVC (Visual Studio 2010/2012+) and DirectX 9 SDK.
 
 ```bash
-# Configure (from repo root)
 cmake -B build -G "Visual Studio 16 2019" -A Win32
-
-# Build
 cmake --build build --config Release
-cmake --build build --config Debug
-
-# Install binaries to bin/
 cmake --install build --config Release
 ```
 
@@ -28,48 +22,113 @@ cmake --install build --config Release
 - `MATRIXGAME_BUILD_DLL=OFF`: Builds standalone EXE (`EXE_VERSION` defined)
 - `MATRIXGAME_CHEATS=ON`: Enables cheat mode (`CHEATS_ON` defined)
 
-### Output
-
-- Release: `bin/MatrixGame.dll` or `.exe`
-- Debug: `bin/Debug/MatrixGame.dll` + `.pdb`
-
-## Architecture
-
-### Module Layout
-
-- **MatrixGame/src/** — Main game engine (~50K LOC)
-  - Root: Core classes (CMatrixMapLogic, CRenderPipeline, CMatrixSide, CMatrixRobot, CMatrixBuilding, CMatrixCannon)
-  - `Effects/` — Particle system (explosions, flames, plasma, billboards)
-  - `Interface/` — UI system (CIFaceElement hierarchy, menus, HUD, CConstructor)
-  - `Logic/` — AI (CMatrixAIGroup, CMatrixTactics), pathfinding, environment, game rules
-- **MatrixLib/** — Engine utility library
-  - `Base/` — Memory management (CHeap), file I/O, strings (CStr/CWStr), config parser (CBlockPar), CRC32
-  - `3G/` — DirectX 9 abstraction: rendering, camera, shadows, stencils, vertex/index buffers (BigVB/BigIB)
-  - `Bitmap/` — Image operations (includes x86 ASM-optimized sharpening from VirtualDub)
-  - `DebugMsg/` — Debug output utilities
-  - `FilePNG/` — PNG loading via LibPNG
-- **ThirdParty/** — ZLib, LibPNG, LibJPEG
-- **Extras/MaxExp/** — 3ds Max exporter plugin (.dle), separate CMake target
-
-### Key Patterns
-
-- **Global singletons**: `g_MatrixHeap`, `g_MatrixData`, `g_MatrixMap`, `g_IFaceList`, `g_Render`
-- **Entry point**: `MatrixGameInit()` in `MatrixGame.cpp`
-- **Config**: Text-based key=value files parsed by `CBlockPar`
-- **String constants**: Centralized in `StringConstants.hpp`
-- **Unicode**: Wide-character strings (CWStr) used throughout
-- **x86-specific**: 32-bit target with MASM assembly in bitmap processing
-
-### Library Dependencies (linked in CMakeLists.txt)
-
-MatrixGame links: MatrixLib, DebugMsg, FilePNG, ZLIB, winmm, DirectX 9 libs
-
 ### Compiler Settings
 
-- Release: `/O2 /Ob2 /Oi /Ot /Oy /MT /Zp1` (1-byte struct packing, static CRT, full optimization)
-- Debug: `/Od /RTCc /RTC1 /MTd /Zp1` (runtime checks, static debug CRT)
-- Both configs use `/Zp1` (1-byte packing) and `/Gr` (__fastcall convention)
+- Both configs use `/Zp1` (1-byte struct packing) and `/Gr` (__fastcall convention)
+- Release: `/O2 /Ob2 /Oi /Ot /Oy /MT /Zp1`
+- Debug: `/Od /RTCc /RTC1 /MTd /Zp1`
+
+## Build System (Rust Port)
+
+```bash
+cd rust_port
+
+# Native
+cargo build
+cargo run  # needs display + Data/robots.pkg
+
+# WASM
+rustup target add wasm32-unknown-unknown
+cargo install wasm-pack
+wasm-pack build --target web --out-dir pkg
+
+# Pack assets for WASM (extracts textures from robots.pkg)
+cargo run --example pack_bundle
+
+# Serve locally
+python3 -m http.server 8099
+# open http://localhost:8099
+```
+
+Bump `?v=N` in `index.html` import to bust browser cache after WASM rebuilds.
+
+## Rust Port File Structure (mirrors original C++)
+
+```
+rust_port/src/
+├── app.rs                    ← MatrixFormGame.cpp (input, game loop)
+├── lib.rs                    ← WASM entry point
+├── main.rs                   ← native entry point
+├── assets/
+│   ├── bundle.rs             ← asset bundle for WASM delivery
+│   ├── loader.rs             ← platform-split file loading
+│   ├── pkg_reader.rs         ← Pack.cpp (.pkg archive reader)
+│   └── storage.rs            ← CStorage.cpp (STRG/CMAP parser)
+├── game/
+│   ├── bitmap.rs             ← CBitmap.cpp (MergeByMask, MergeWithAlpha)
+│   ├── common.rs             ← Common.hpp (constants, CELLFLAG_*, binary helpers)
+│   ├── map.rs                ← MatrixMapPrepare.cpp (map loading, PointCalcNormals)
+│   ├── map_prepare.rs        ← MatrixMapPrepare.cpp (BuildTexUnions)
+│   └── world.rs              ← game state stub
+├── platform/
+│   └── mod.rs                ← platform time abstraction
+└── renderer/
+    ├── camera.rs             ← MatrixCamera.cpp (view matrix, input)
+    ├── context.rs            ← wgpu device/surface init
+    ├── ter_surface.rs        ← MatrixTerSurface.cpp (overlay surfaces LoadM)
+    ├── terrain.rs            ← MatrixMapGroup.cpp (BuildBottom) + MatrixMap.cpp (Draw)
+    ├── texture.rs            ← DDS decode, mipmap gen, GPU texture creation
+    └── water.rs              ← MatrixWater.cpp (wave animation, alpha, rendering)
+```
+
+## Original C++ Architecture
+
+### Key Data Formats
+
+- **`.pkg`**: Archive format with ZL02/ZL03 compressed files. Header: 4-byte root offset → SFolderRec → SFileRec[]. Record size = 158 bytes under /Zp1.
+- **`.CMAP`**: Map files using CStorage (STRG) binary format. Contains heightmap points, texture unions, groups, surfaces, properties.
+- **STRG format**: Magic `0x47525453`, version (0=raw, 1=ZL03 compressed), record count, then records. Each record: WStr name, item count, items. Each item: WStr name, u32 type, u32 size, data (CDataBuf).
+- **ZL03 format**: `ZL03` magic, i32 block_count, then blocks of (u32 compressed_size, zlib data). NOT a single zlib stream.
+- **CDataBuf**: Header (alloc_table_disp, arrays_count, element_type_size), data, then allocation table entries (disp, count, allocated_count).
+- **SCompilePoint**: 12 bytes under /Zp1: i32 move, f32 z, u8 b, u8 g, u8 r, u8 flags.
+- **SCompileBottomVert**: 8 bytes: u16 x, u16 y, u16 tx, u16 ty.
+
+### Coordinate System
+
+The original uses **X right, Y forward, Z up** (D3D left-handed). The Rust port stores all vertex data in original Z-up coords. A single `z_to_y` conversion matrix in `camera.view_proj()` converts to wgpu's Y-up clip space. **Never scatter Y↔Z swaps throughout the code.**
+
+### Terrain Rendering Pipeline
+
+1. **BuildTexUnions** (MatrixMapPrepare.cpp:108): Builds 1024×1024 texture atlas from 64×64 tiles. Each tile: base PNG + alpha-masked overlays from `bottom/Data` + `bitmaps/Bitmap`. Edge extension for empty slots. Uploaded with 6 mip levels.
+2. **BuildBottom** (MatrixMapGroup.cpp:231): Per-group geometry from `groups/Data`. SCompileBottomVert vertices → world positions with atlas UVs and macrotexture UVs. Down-cell vertices offset by `-normal * 0.5`.
+3. **TerBotM** (MatrixRenderPipeline.cpp:1198): 3-stage fixed-function: SELECT(atlas) → BLENDTEXTUREALPHA(macrotexture) → MODULATE(vertex_color).
+4. **Surface overlays** (MatrixTerSurface.cpp): Triangle strip geometry with per-surface textures. Alpha blended, Z-write off, sorted by draw index.
+
+### Water Rendering Pipeline
+
+1. **BuildWater** (MatrixMapGroup.cpp:366): Per-group 64×64 alpha texture from terrain depth. `up_level=-1.0`, `down_level=-20.1`.
+2. **CMatrixWater** (MatrixWater.cpp): Shared 17×17 mesh, sine wave animation per cell (`h[i] = r * sin(angle + phase)`), normal computation from height gradients.
+3. **DrawWater** (MatrixMap.cpp:1706): Two passes — alpha pass (per-group with depth alpha texture) + solid pass (opaque water for tiles outside map, computed from camera frustum footprint).
+4. **WaterAlpha_t3** (MatrixRenderPipeline.cpp:98): Stage 0 alpha from depth texture, stage 1 MODULATE2X(water_tex, WaterColor), stage 2 BLENDTEXTUREALPHA(mirror_tex using camera-space normal UVs). Lighting: `D3DRS_AMBIENT=WaterColor` + directional light.
+
+### Camera (MatrixCamera.cpp)
+
+- Strategy mode: spherical orbit around link point. `angle_z` (yaw), `angle_x` (pitch), `dist` (distance).
+- View matrix: `translate(-lp) * rotZ(-angle_z) * rotX(angle_x)` with distance in rotX, then negate Y/Z columns.
+- Mouse: right-drag rotates (yaw speed 0.01 rad/px, pitch 0.0025 rad/px). Wheel zooms (±0.225 per step).
+- Smooth interpolation: `mul = 1 - 0.995^ms`.
+- FOV: 60° horizontal.
+
+### Critical Implementation Details
+
+- **D3D uses row-major matrices**, glam uses column-major. Multiplication order reverses: D3D `A * B * C` (row-major, v on left) = glam `C * B * A` (column-major, v on right).
+- **MergeByMask** (CBitmap.cpp:1280): mask=0 shows overlay, mask=255 shows background. This is **inverted** from typical alpha blending.
+- **DXT3 alpha**: Stored in first 8 bytes of each 16-byte block as 4-bit-per-pixel explicit alpha. Must be decoded separately from the color block.
+- **Texture atlas seams**: Original hides them via DXT1 compression (4×4 block blending) + 6 mip levels. Without DXT1, need macrotexture overlay and proper mipmaps.
+- **Water normal transform**: D3D `TCI_CAMERASPACENORMAL` uses `inverse_transpose(world * view)`. The original world matrix scales by `water_scale=12.5`, which flattens normals. Must replicate this scaling.
+- **`queue.write_buffer` on WebGL**: May not reliably update vertex buffers for the current frame. Shader-based animation (via time uniform) is more reliable than CPU buffer updates.
+- **WebGL texture limits**: Max dimension 2048px. Canvas and surface config must be clamped. Mipmap uploads via `create_texture_with_data` with `MipMajor` ordering.
 
 ## No Test Suite
 
-There is no automated test infrastructure. Validation is done through in-game integration testing.
+No automated tests. Validation through visual comparison with original game screenshots.
