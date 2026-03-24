@@ -2,6 +2,8 @@ pub mod camera;
 pub mod context;
 pub mod particles;
 pub mod pipeline;
+pub mod ter_surface;
 pub mod terrain;
+pub mod texture;
 pub mod units;
 pub mod water;

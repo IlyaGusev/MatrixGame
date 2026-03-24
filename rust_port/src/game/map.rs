@@ -17,6 +17,14 @@ pub struct CompilePoint {
     pub flags: u8,
 }
 
+/// Per-point surface normal (computed from surrounding heights).
+#[derive(Debug, Clone, Copy)]
+pub struct PointNormal {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+}
+
 /// Loaded map data.
 pub struct GameMap {
     pub size_x: usize,
@@ -28,6 +36,7 @@ pub struct GameMap {
     pub macro_texture_path: Option<String>,
     pub macro_texture_size: i32,  // m_MacrotextureSize from "SIM" param
     pub points: Vec<CompilePoint>, // (size_x+1) * (size_y+1) points
+    pub normals: Vec<PointNormal>,  // same size, computed from heights
 }
 
 impl GameMap {
@@ -144,6 +153,10 @@ impl GameMap {
             points.iter().map(|p| p.z).fold(f32::NEG_INFINITY, f32::max),
         );
 
+        // Compute surface normals — ports PointCalcNormals (MatrixMapPrepare.cpp:20-105)
+        let _w = size_x + 1;
+        let normals = compute_normals(&points, size_x, size_y);
+
         Ok(Self {
             size_x,
             size_y,
@@ -154,6 +167,7 @@ impl GameMap {
             macro_texture_path,
             macro_texture_size,
             points,
+            normals,
         })
     }
 
@@ -162,15 +176,112 @@ impl GameMap {
         &self.points[y * (self.size_x + 1) + x]
     }
 
-    /// Map width in world units.
+    pub fn normal(&self, x: usize, y: usize) -> &PointNormal {
+        &self.normals[y * (self.size_x + 1) + x]
+    }
+
     pub fn world_width(&self) -> f32 {
         self.size_x as f32 * GLOBAL_SCALE
     }
 
-    /// Map height in world units.
     pub fn world_height(&self) -> f32 {
         self.size_y as f32 * GLOBAL_SCALE
     }
+}
+
+const CELLFLAG_LAND: u8 = 1 << 0;
+const CELLFLAG_DOWN: u8 = 1 << 5;
+
+/// Ports PointCalcNormals (MatrixMapPrepare.cpp:20-105).
+/// For each point, computes normal from cross products of 4 adjacent triangles.
+fn compute_normals(points: &[CompilePoint], size_x: usize, size_y: usize) -> Vec<PointNormal> {
+    let w = size_x + 1;
+    let h = size_y + 1;
+    let mut normals = vec![PointNormal { x: 0.0, y: 0.0, z: 1.0 }; w * h];
+
+    let get_z = |x: usize, y: usize| -> f32 { points[y * w + x].z };
+    let get_flags = |x: usize, y: usize| -> u8 { points[y * w + x].flags };
+
+    // Check if unit at (ux,uy) is land — unit flags are on point (ux,uy)
+    let is_land = |ux: i32, uy: i32| -> bool {
+        if ux < 0 || uy < 0 || ux >= size_x as i32 || uy >= size_y as i32 { return false; }
+        get_flags(ux as usize, uy as usize) & CELLFLAG_LAND != 0
+    };
+
+    for py in 0..h {
+        for px in 0..w {
+            let ix = px as i32;
+            let iy = py as i32;
+
+            // Original: check unit adjacency for land before using neighbor points
+            // p1=up (unit x,y-1), p2=right (unit x,y), p3=down (unit x,y), p4=left (unit x-1,y)
+            let has_up = is_land(ix, iy - 1);
+            let has_left = is_land(ix - 1, iy);
+            let has_cur = is_land(ix, iy);
+
+            let p0 = [px as f32 * GLOBAL_SCALE, py as f32 * GLOBAL_SCALE, get_z(px, py)];
+
+            // Vectors to neighbors (relative to p0)
+            let v_up = if has_up && py > 0 {
+                Some([0.0, -GLOBAL_SCALE, get_z(px, py - 1) - p0[2]])
+            } else { None };
+
+            let v_right = if has_cur && px < size_x {
+                Some([GLOBAL_SCALE, 0.0, get_z(px + 1, py) - p0[2]])
+            } else { None };
+
+            let v_down = if has_cur && py < size_y {
+                Some([0.0, GLOBAL_SCALE, get_z(px, py + 1) - p0[2]])
+            } else { None };
+
+            let v_left = if has_left && px > 0 {
+                Some([-GLOBAL_SCALE, 0.0, get_z(px - 1, py) - p0[2]])
+            } else { None };
+
+            // Average cross products of adjacent triangle pairs
+            let mut nx = 0.0f32;
+            let mut ny = 0.0f32;
+            let mut nz = 0.0f32;
+            let mut cnt = 0;
+
+            // cross(up, right)
+            if let (Some(a), Some(b)) = (&v_up, &v_right) {
+                let c = cross(a, b);
+                let len = (c[0]*c[0] + c[1]*c[1] + c[2]*c[2]).sqrt();
+                if len > 0.0 { nx += c[0]/len; ny += c[1]/len; nz += c[2]/len; cnt += 1; }
+            }
+            // cross(right, down)
+            if let (Some(a), Some(b)) = (&v_right, &v_down) {
+                let c = cross(a, b);
+                let len = (c[0]*c[0] + c[1]*c[1] + c[2]*c[2]).sqrt();
+                if len > 0.0 { nx += c[0]/len; ny += c[1]/len; nz += c[2]/len; cnt += 1; }
+            }
+            // cross(down, left)
+            if let (Some(a), Some(b)) = (&v_down, &v_left) {
+                let c = cross(a, b);
+                let len = (c[0]*c[0] + c[1]*c[1] + c[2]*c[2]).sqrt();
+                if len > 0.0 { nx += c[0]/len; ny += c[1]/len; nz += c[2]/len; cnt += 1; }
+            }
+            // cross(left, up)
+            if let (Some(a), Some(b)) = (&v_left, &v_up) {
+                let c = cross(a, b);
+                let len = (c[0]*c[0] + c[1]*c[1] + c[2]*c[2]).sqrt();
+                if len > 0.0 { nx += c[0]/len; ny += c[1]/len; nz += c[2]/len; cnt += 1; }
+            }
+
+            if cnt > 0 {
+                let len = (nx*nx + ny*ny + nz*nz).sqrt();
+                if len > 0.0 {
+                    normals[py * w + px] = PointNormal { x: nx/len, y: ny/len, z: nz/len };
+                }
+            }
+        }
+    }
+    normals
+}
+
+fn cross(a: &[f32; 3], b: &[f32; 3]) -> [f32; 3] {
+    [a[1]*b[2] - a[2]*b[1], a[2]*b[0] - a[0]*b[2], a[0]*b[1] - a[1]*b[0]]
 }
 
 fn find_property_int(

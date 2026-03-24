@@ -211,7 +211,7 @@ impl ApplicationHandler for App {
                         let vm = state.camera.view_matrix();
                         state
                             .terrain
-                            .render(&mut encoder, &view, &state.gfx.queue, vp, vm);
+                            .render(&state.gfx.device, &mut encoder, &view, &state.gfx.queue, vp, vm);
                         state.gfx.end_frame(output, encoder);
                     }
                     Err(wgpu::SurfaceError::Lost) => {
