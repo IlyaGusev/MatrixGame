@@ -176,7 +176,7 @@ impl TerrainRenderer {
                     let mv = macro_step * vy as f32;
 
                     vertices.push(Vertex {
-                        position: [world_x, pt.z, world_y],
+                        position: [world_x, world_y, pt.z],
                         color: [r, g, b, 1.0],
                         uv: [u as f32, v as f32],
                         macro_uv: [mu, mv],
@@ -527,7 +527,7 @@ fn build_surface_overlays(
             // Original: position is relative to group center, then m_Matrix._41/_42 applied
             // Here disp_x/disp_y IS the group center offset
             verts.push(Vertex {
-                position: [px + disp_x - cx, pz + 0.05, py + disp_y - cy],
+                position: [px + disp_x - cx, py + disp_y - cy, pz + 0.05],
                 color: [vr * r, vg * g, vb * b, va * a],
                 uv: [tu, tv],
                 macro_uv: [_tum, _tvm],

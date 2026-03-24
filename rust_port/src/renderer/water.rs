@@ -22,7 +22,7 @@ const WATER_TEXTURE_SCALE: f32 = 1.0 / 16.0;
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 struct WaterVertex {
-    position: [f32; 3],   // world position (y = WATER_LEVEL, animated in shader)
+    position: [f32; 3],   // world position (z = WATER_LEVEL, original Z-up coords)
     water_uv: [f32; 2],   // tu/tv for water texture
     depth_alpha: f32,
     _pad: [f32; 2],
@@ -105,9 +105,9 @@ impl Water {
             (lc & 0xFF) as f32 / 255.0,
             1.0,
         ];
-        // Original light_dir is in X-right Y-forward Z-up. Remap to our Y-up: (x, z, -y)
+        // Light dir is already in original Z-up coords — no conversion needed
         let ld = map.light_main_dir;
-        let light_dir = [ld[0], ld[2], -ld[1], 0.0];
+        let light_dir = [ld[0], ld[1], ld[2], 0.0];
 
         let up_level: f32 = -1.0;
         let down_level: f32 = -20.1;
@@ -157,7 +157,7 @@ impl Water {
                         else { 1.0 - (wz - down_level) / (up_level - down_level) };
 
                     all_verts.push(WaterVertex {
-                        position: [wx - cx, WATER_LEVEL, wy - cy],
+                        position: [wx - cx, wy - cy, WATER_LEVEL],
                         water_uv: [tu, tv],
                         depth_alpha: alpha,
                         _pad: [0.0; 2],
@@ -354,8 +354,8 @@ fn build_ocean_tiles(
                     verts.push(WaterVertex {
                         position: [
                             x0 + i as f32 * water_scale,
-                            WATER_LEVEL,
                             y0 + j as f32 * water_scale,
+                            WATER_LEVEL,
                         ],
                         water_uv: [
                             i as f32 * WATER_TEXTURE_SCALE,
@@ -429,22 +429,22 @@ fn wave_height(world_xz: vec2<f32>, t: f32) -> f32 {
     let ws = u.params.x;
     let t = u.params.y;
 
-    // Animate Y using world XZ position for seamless cross-group waves
-    let world_xz = position.xz;
-    let h = wave_height(world_xz, t);
+    // Animate Z (up in original Z-up coords) using world XY position
+    let world_xy = position.xy;
+    let h = wave_height(world_xy, t);
     var pos = position;
-    pos.y += h * ws;
+    pos.z += h * ws;
 
     out.clip_pos = u.view_proj * vec4<f32>(pos, 1.0);
     out.water_uv = water_uv;
 
-    // Normal from wave derivatives
+    // Normal from wave derivatives — Z-up coords: normal = (dz/dx, dz/dy, 1)
     let eps = 0.5;
-    let hL = wave_height(world_xz - vec2(eps, 0.0), t);
-    let hR = wave_height(world_xz + vec2(eps, 0.0), t);
-    let hU = wave_height(world_xz - vec2(0.0, eps), t);
-    let hD = wave_height(world_xz + vec2(0.0, eps), t);
-    let wave_normal = normalize(vec3<f32>(hL - hR, 1.0, hU - hD));
+    let hL = wave_height(world_xy - vec2(eps, 0.0), t);
+    let hR = wave_height(world_xy + vec2(eps, 0.0), t);
+    let hU = wave_height(world_xy - vec2(0.0, eps), t);
+    let hD = wave_height(world_xy + vec2(0.0, eps), t);
+    let wave_normal = normalize(vec3<f32>(hL - hR, hU - hD, 1.0));
     out.cam_normal = (u.normal_mat * vec4<f32>(wave_normal, 0.0)).xyz;
 
     out.world_normal = wave_normal;

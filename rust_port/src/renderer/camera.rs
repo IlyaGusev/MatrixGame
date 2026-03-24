@@ -215,10 +215,11 @@ impl Camera {
         self.xy_strategy[1] = self.xy_strategy[1].clamp(0.0, self.map_cy * 2.0);
 
         // ── CalcLinkPoint for strategy mode (original lines 895-931) ──
+        // Link point in centered Z-up coords (terrain vertices are offset by -cx, -cy)
         let target = Vec3::new(
-            self.xy_strategy[0],
-            self.xy_strategy[1],
-            p.height, // original: height + GetZInterpolatedLand(x, y)
+            self.xy_strategy[0] - self.map_cx,
+            self.xy_strategy[1] - self.map_cy,
+            p.height,
         );
 
         // ── Smooth interpolation (original: mul = 1.0 - pow(0.995, ms)) ──
@@ -231,35 +232,58 @@ impl Camera {
         self.dist = lerp_dist(self.dist_param);
     }
 
-    /// Compute view-projection matrix — ports BeforeDraw (MatrixCamera.cpp lines 727-816).
-    /// Compute eye/target in our coordinate system.
-    fn eye_target(&self) -> (Vec3, Vec3) {
+    /// Compute eye position in Z-up world coords from camera angles and link point.
+    /// Ports the math from BeforeDraw (MatrixCamera.cpp).
+    fn eye_pos(&self) -> Vec3 {
         let lp = self.link_point;
         let sin_z = self.angle_z.sin();
         let cos_z = self.angle_z.cos();
         let sin_x = self.angle_x.sin();
         let cos_x = self.angle_x.cos();
 
-        let eye_x = lp.x + sin_z * cos_x * self.dist;
-        let eye_y = lp.y - cos_z * cos_x * self.dist;
-        let eye_z = lp.z + sin_x * self.dist;
-
-        let eye = Vec3::new(eye_x - self.map_cx, eye_z, -(eye_y - self.map_cy));
-        let target = Vec3::new(lp.x - self.map_cx, lp.z, -(lp.y - self.map_cy));
-        (eye, target)
+        // Camera orbits link_point: offset by angle_z (yaw) and angle_x (pitch) at distance
+        // In Z-up coords: X right, Y forward, Z up
+        Vec3::new(
+            lp.x + sin_z * cos_x * self.dist,
+            lp.y - cos_z * cos_x * self.dist,
+            lp.z + sin_x * self.dist,
+        )
     }
 
+    /// View matrix in Z-up coords using look_at.
     pub fn view_matrix(&self) -> Mat4 {
-        let (eye, target) = self.eye_target();
-        Mat4::look_at_rh(eye, target, Vec3::Y)
+        let eye = self.eye_pos();
+        let target = self.link_point;
+        // Z-up: up vector is (0, 0, 1)
+        Mat4::look_at_rh(eye, target, Vec3::Z)
     }
 
     pub fn view_proj(&self) -> Mat4 {
-        let view = self.view_matrix();
+        // Build view in Z-up coords
+        let eye = self.eye_pos();
+        let target = self.link_point;
+
+        // Convert Z-up positions to Y-up for glam's look_at_rh (which assumes Y-up)
+        // Z-up (x,y,z) → Y-up (x,z,-y)
+        let eye_yup = Vec3::new(eye.x, eye.z, -eye.y);
+        let target_yup = Vec3::new(target.x, target.z, -target.y);
+        let view = Mat4::look_at_rh(eye_yup, target_yup, Vec3::Y);
+
         let half_hfov = CAM_HFOV * 0.5;
         let vfov = 2.0 * (half_hfov.tan() / self.aspect).atan();
         let proj = Mat4::perspective_rh(vfov, self.aspect, self.near, self.far);
-        proj * view
+
+        // Vertex data is in Z-up coords. The view matrix expects Y-up.
+        // Apply Z-up→Y-up conversion to vertices before the view transform:
+        // (x,y,z) → (x,z,-y)
+        let z_to_y = Mat4::from_cols_array(&[
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, -1.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 1.0,
+        ]);
+
+        proj * view * z_to_y
     }
 }
 
