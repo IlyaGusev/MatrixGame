@@ -54,12 +54,19 @@ struct WaterUniforms {
 }
 
 pub struct Water {
+    // Per-group alpha water (shoreline)
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
+    num_indices: u32,
+
+    // Solid ocean quad (infinite water beyond map)
+    ocean_vertex_buffer: wgpu::Buffer,
+    ocean_index_buffer: wgpu::Buffer,
+    ocean_num_indices: u32,
+
     uniform_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     pipeline: wgpu::RenderPipeline,
-    num_indices: u32,
 
     water_color: [f32; 4],
     light_color: [f32; 4],
@@ -186,6 +193,17 @@ impl Water {
         let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Water IB"), contents: bytemuck::cast_slice(&all_idxs), usage: wgpu::BufferUsages::INDEX,
         });
+
+        // Build solid ocean tiles — water for positions outside the map.
+        // Original: DrawWater solid pass (MatrixMap.cpp:1772-1788) +
+        // MatrixVisiCalc.cpp:712-776 computes visible tiles outside map.
+        let (ocean_verts, ocean_idxs) = build_ocean_tiles(cx, cy, map, water_scale, groups_buf);
+        let ocean_vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Ocean VB"), contents: bytemuck::cast_slice(&ocean_verts), usage: wgpu::BufferUsages::VERTEX,
+        });
+        let ocean_index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Ocean IB"), contents: bytemuck::cast_slice(&ocean_idxs), usage: wgpu::BufferUsages::INDEX,
+        });
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Water UB"),
             contents: bytemuck::bytes_of(&WaterUniforms {
@@ -250,7 +268,9 @@ impl Water {
 
         Some(Self {
             vertex_buffer, index_buffer, uniform_buffer, bind_group, pipeline,
-            num_indices: all_idxs.len() as u32, water_color, light_color, light_dir, water_scale, time: 0.0,
+            num_indices: all_idxs.len() as u32,
+            ocean_vertex_buffer, ocean_index_buffer, ocean_num_indices: ocean_idxs.len() as u32,
+            water_color, light_color, light_dir, water_scale, time: 0.0,
         })
     }
 
@@ -273,10 +293,94 @@ impl Water {
 
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
+
+        // Solid pass: draw infinite ocean quad (opaque, full alpha)
+        // Original: DrawWater solid pass (MatrixMap.cpp:1772-1788)
+        pass.set_vertex_buffer(0, self.ocean_vertex_buffer.slice(..));
+        pass.set_index_buffer(self.ocean_index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..self.ocean_num_indices, 0, 0..1);
+
+        // Alpha pass: draw per-group water with shoreline transparency
+        // Original: DrawWater alpha pass (MatrixMap.cpp:1743-1767)
         pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..self.num_indices, 0, 0..1);
     }
+}
+
+/// Build solid ocean water tiles for positions outside the map.
+/// Ports the solid pass from DrawWater (MatrixMap.cpp:1772-1788) +
+/// the visibility calculation from MatrixVisiCalc.cpp:712-776.
+///
+/// The original iterates the camera frustum in group-sized tiles and draws
+/// opaque water for tiles outside the map or with NULL groups. We pre-compute
+/// a border of tiles around the map (no frustum culling yet).
+fn build_ocean_tiles(
+    cx: f32, cy: f32, map: &GameMap, water_scale: f32,
+    groups_buf: &crate::assets::storage::DataBuf,
+) -> (Vec<WaterVertex>, Vec<u32>) {
+    let group_world = MAP_GROUP_SIZE as f32 * GLOBAL_SCALE; // 200 world units per group
+    let gsx = ((map.size_x as f32 + MAP_GROUP_SIZE as f32 - 1.0) / MAP_GROUP_SIZE as f32).ceil() as i32;
+    let gsy = ((map.size_y as f32 + MAP_GROUP_SIZE as f32 - 1.0) / MAP_GROUP_SIZE as f32).ceil() as i32;
+
+    // Collect which map group slots actually have groups
+    let mut has_group = std::collections::HashSet::new();
+    for gi in 0..groups_buf.arrays_count() {
+        let raw = groups_buf.get_bytes(gi);
+        if raw.len() < 4 { continue; }
+        let gx = u16::from_le_bytes([raw[0], raw[1]]) as i32 / MAP_GROUP_SIZE;
+        let gy = u16::from_le_bytes([raw[2], raw[3]]) as i32 / MAP_GROUP_SIZE;
+        has_group.insert((gx, gy));
+    }
+
+    let mut verts = Vec::new();
+    let mut idxs = Vec::new();
+
+    // Extend border tiles around the map (original extends as far as frustum reaches)
+    let border = 5; // 5 groups beyond map edge
+    for gy in -border..gsy + border {
+        for gx in -border..gsx + border {
+            // Skip tiles that have terrain groups — those get alpha water instead
+            let on_map = gx >= 0 && gx < gsx && gy >= 0 && gy < gsy;
+            if on_map && has_group.contains(&(gx, gy)) { continue; }
+
+            let base = verts.len() as u32;
+            let x0 = gx as f32 * group_world - cx;
+            let y0 = gy as f32 * group_world - cy;
+
+            // One group-sized water tile: 17×17 grid matching the shared water mesh
+            for j in 0..=WATER_SIZE {
+                for i in 0..=WATER_SIZE {
+                    verts.push(WaterVertex {
+                        position: [
+                            x0 + i as f32 * water_scale,
+                            WATER_LEVEL,
+                            y0 + j as f32 * water_scale,
+                        ],
+                        water_uv: [
+                            i as f32 * WATER_TEXTURE_SCALE,
+                            j as f32 * WATER_TEXTURE_SCALE,
+                        ],
+                        depth_alpha: 1.0, // fully opaque
+                        _pad: [0.0; 2],
+                    });
+                }
+            }
+
+            let stride = (WATER_SIZE + 1) as u32;
+            for j in 0..WATER_SIZE as u32 {
+                for i in 0..WATER_SIZE as u32 {
+                    let tl = base + j * stride + i;
+                    idxs.push(tl); idxs.push(tl + stride); idxs.push(tl + 1);
+                    idxs.push(tl + 1); idxs.push(tl + stride); idxs.push(tl + stride + 1);
+                }
+            }
+        }
+    }
+
+    log::info!("ocean: {} solid tiles, {} verts, {} tris",
+        verts.len() / ((WATER_SIZE+1)*(WATER_SIZE+1)), verts.len(), idxs.len() / 3);
+    (verts, idxs)
 }
 
 /// Wave phase uses WORLD position (position.xz) so adjacent groups get seamless waves.
