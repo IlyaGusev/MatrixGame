@@ -931,8 +931,10 @@ fn merge_by_mask(atlas: &mut image::RgbaImage, dx: usize, dy: usize, overlay: &i
             let dst = atlas.get_pixel(ax, ay).0;
             let src = overlay.get_pixel(px as u32, py as u32).0;
             let m = mask.get_pixel(px as u32, py as u32).0;
-            // Use luminance of mask as blend factor
-            let alpha = m[0] as u16; // red channel as mask weight
+            // Original MergeByMask (CBitmap.cpp:1280-1283):
+            //   mask=0 → show overlay (bm2), mask=255 → show background (bm1)
+            // So mask value = how much BACKGROUND to keep (inverted from typical alpha)
+            let alpha = (255 - m[0]) as u16; // invert: 0=keep dst, 255=show overlay
             let inv = 255 - alpha;
             atlas.put_pixel(ax, ay, image::Rgba([
                 ((dst[0] as u16 * inv + src[0] as u16 * alpha) / 255) as u8,
