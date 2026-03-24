@@ -50,7 +50,15 @@ python3 -m http.server 8099
 # open http://localhost:8099
 ```
 
-Bump `?v=N` in `index.html` import to bust browser cache after WASM rebuilds.
+### Rebuild and Rerun
+
+When asked to "rebuild and rerun":
+
+1. `wasm-pack build --dev --target web --out-dir pkg` (~2s incremental vs ~46s release)
+2. Bump `?v=N` → `?v=N+1` in `index.html` import line
+3. `fuser -k 8099/tcp 2>/dev/null; nohup python3 -m http.server 8099 > /dev/null 2>&1 &`
+
+When asked to just "rebuild", skip step 3. Use `--dev` by default; only use release (`wasm-pack build --target web --out-dir pkg`) when explicitly requested.
 
 ## Rust Port File Structure (mirrors original C++)
 
