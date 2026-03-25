@@ -7,7 +7,6 @@ use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
 use crate::assets::storage::Storage;
-use crate::game::common::{CELLFLAG_BRIDGE, CELLFLAG_WATER};
 use crate::game::map::{GameMap, GLOBAL_SCALE};
 
 const WATER_LEVEL: f32 = -2.0;
@@ -23,7 +22,6 @@ struct WaterVertex {
     normal: [f32; 3],
     water_uv: [f32; 2],
     alpha_uv: [f32; 2],
-    alpha_tile: [f32; 4],
 }
 
 impl WaterVertex {
@@ -52,11 +50,6 @@ impl WaterVertex {
                     shader_location: 3,
                     format: wgpu::VertexFormat::Float32x2,
                 },
-                wgpu::VertexAttribute {
-                    offset: 40,
-                    shader_location: 4,
-                    format: wgpu::VertexFormat::Float32x4,
-                },
             ],
         }
     }
@@ -75,6 +68,7 @@ struct WaterUniforms {
 
 pub struct Water {
     water_instances: Vec<WaterInstance>,
+    water_draws: Vec<WaterDraw>,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     num_indices: u32,
@@ -85,7 +79,7 @@ pub struct Water {
     ocean_num_indices: u32,
 
     uniform_buffer: wgpu::Buffer,
-    bind_group: wgpu::BindGroup,
+    solid_bind_group: wgpu::BindGroup,
     solid_pipeline: wgpu::RenderPipeline,
     pipeline: wgpu::RenderPipeline,
 
@@ -97,15 +91,18 @@ pub struct Water {
     accum_ms: f32,
     angle: i32,
     phase_offsets: [u16; WATER_SIZE * WATER_SIZE],
-    alpha_atlas_inv_w: f32,
-    alpha_atlas_inv_h: f32,
 }
 
 #[derive(Clone, Copy)]
 struct WaterInstance {
     x0: f32,
     y0: f32,
-    alpha_tile: [f32; 4],
+}
+
+struct WaterDraw {
+    bind_group: wgpu::BindGroup,
+    index_start: u32,
+    index_count: u32,
 }
 
 struct WaterPreset {
@@ -189,21 +186,16 @@ impl Water {
             return None;
         }
 
-        let atlas_cols = (water_groups.len() as f32).sqrt().ceil() as usize;
-        let atlas_rows = water_groups.len().div_ceil(atlas_cols);
-        let atlas_w = (atlas_cols * WATER_ALPHA_SIZE) as u32;
-        let atlas_h = (atlas_rows * WATER_ALPHA_SIZE) as u32;
-        let mut alpha_atlas = image::GrayImage::new(atlas_w, atlas_h);
-
         let up_level: f32 = -1.0;
         let down_level: f32 = -20.1;
         let alpha_step = MAP_GROUP_SIZE as f32 * GLOBAL_SCALE / WATER_ALPHA_SIZE as f32;
+        let mut alpha_images = Vec::with_capacity(water_groups.len());
 
-        for (group_idx, &(gx, gy)) in water_groups.iter().enumerate() {
-            let tile_x = (group_idx % atlas_cols) * WATER_ALPHA_SIZE;
-            let tile_y = (group_idx / atlas_cols) * WATER_ALPHA_SIZE;
+        for &(gx, gy) in &water_groups {
             let group_x0 = gx as f32 * GLOBAL_SCALE;
             let group_y0 = gy as f32 * GLOBAL_SCALE;
+            let mut alpha_image =
+                image::GrayImage::new(WATER_ALPHA_SIZE as u32, WATER_ALPHA_SIZE as u32);
 
             for j in 0..WATER_ALPHA_SIZE {
                 for i in 0..WATER_ALPHA_SIZE {
@@ -219,31 +211,19 @@ impl Water {
                         (255.0 - ((wz - down_level) / (up_level - down_level) * 255.0)) as u8
                     };
 
-                    alpha_atlas.put_pixel(
-                        (tile_x + i) as u32,
-                        (tile_y + j) as u32,
-                        image::Luma([zz]),
-                    );
+                    alpha_image.put_pixel(i as u32, j as u32, image::Luma([zz]));
                 }
             }
+            alpha_images.push(alpha_image);
         }
 
         let mut water_instances = Vec::new();
-        for (group_idx, &(gx, gy)) in water_groups.iter().enumerate() {
+        for &(gx, gy) in &water_groups {
             let group_x0 = gx as f32 * GLOBAL_SCALE;
             let group_y0 = gy as f32 * GLOBAL_SCALE;
-            let tile_x = (group_idx % atlas_cols) * WATER_ALPHA_SIZE;
-            let tile_y = (group_idx / atlas_cols) * WATER_ALPHA_SIZE;
-            let alpha_tile = [
-                tile_x as f32 / atlas_w as f32,
-                tile_y as f32 / atlas_h as f32,
-                WATER_ALPHA_SIZE as f32 / atlas_w as f32,
-                WATER_ALPHA_SIZE as f32 / atlas_h as f32,
-            ];
             water_instances.push(WaterInstance {
                 x0: group_x0 - cx,
                 y0: group_y0 - cy,
-                alpha_tile,
             });
         }
 
@@ -273,29 +253,6 @@ impl Water {
         let water_tex = load_tex(water_preset.water_path, [30, 80, 120, 255]);
         let mirror_tex = load_tex(water_preset.mirror_path, [100, 120, 140, 128]);
 
-        let alpha_tex = {
-            let tex = device.create_texture_with_data(
-                queue,
-                &wgpu::TextureDescriptor {
-                    label: Some("Water Alpha Atlas"),
-                    size: wgpu::Extent3d {
-                        width: atlas_w,
-                        height: atlas_h,
-                        depth_or_array_layers: 1,
-                    },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: wgpu::TextureFormat::R8Unorm,
-                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                    view_formats: &[],
-                },
-                wgpu::util::TextureDataOrder::LayerMajor,
-                alpha_atlas.as_raw(),
-            );
-            tex.create_view(&Default::default())
-        };
-
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Water VB"),
             contents: bytemuck::cast_slice(&all_verts),
@@ -324,7 +281,7 @@ impl Water {
                 water_color,
                 light_color,
                 light_dir,
-                params: [1.0, 0.0, 1.0 / atlas_w as f32, 1.0 / atlas_h as f32],
+                params: [1.0, 0.0, 0.0, 0.0],
             }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -401,36 +358,93 @@ impl Water {
                 },
             ],
         });
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Water BG"),
-            layout: &bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: uniform_buffer.as_entire_binding(),
+        let white_alpha_tex = {
+            let white = [255u8; WATER_ALPHA_SIZE * WATER_ALPHA_SIZE];
+            let tex = device.create_texture_with_data(
+                queue,
+                &wgpu::TextureDescriptor {
+                    label: Some("Water Solid Alpha"),
+                    size: wgpu::Extent3d {
+                        width: WATER_ALPHA_SIZE as u32,
+                        height: WATER_ALPHA_SIZE as u32,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::R8Unorm,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
                 },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&water_tex),
+                wgpu::util::TextureDataOrder::LayerMajor,
+                &white,
+            );
+            tex.create_view(&Default::default())
+        };
+
+        let make_bind_group = |alpha_view: &wgpu::TextureView, label: &str| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(label),
+                layout: &bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: uniform_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&water_tex),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&mirror_tex),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::Sampler(&sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::TextureView(alpha_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::Sampler(&alpha_sampler),
+                    },
+                ],
+            })
+        };
+        let solid_bind_group = make_bind_group(&white_alpha_tex, "Water Solid BG");
+        let idxs_per_instance = (WATER_SIZE * WATER_SIZE * 6) as u32;
+        let mut water_draws = Vec::with_capacity(alpha_images.len());
+        for (group_idx, alpha_image) in alpha_images.iter().enumerate() {
+            let alpha_tex = device.create_texture_with_data(
+                queue,
+                &wgpu::TextureDescriptor {
+                    label: Some("Water Alpha"),
+                    size: wgpu::Extent3d {
+                        width: WATER_ALPHA_SIZE as u32,
+                        height: WATER_ALPHA_SIZE as u32,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::R8Unorm,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
                 },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&mirror_tex),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: wgpu::BindingResource::TextureView(&alpha_tex),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: wgpu::BindingResource::Sampler(&alpha_sampler),
-                },
-            ],
-        });
+                wgpu::util::TextureDataOrder::LayerMajor,
+                alpha_image.as_raw(),
+            );
+            let alpha_view = alpha_tex.create_view(&Default::default());
+            let bind_group = make_bind_group(&alpha_view, "Water Alpha BG");
+            water_draws.push(WaterDraw {
+                bind_group,
+                index_start: group_idx as u32 * idxs_per_instance,
+                index_count: idxs_per_instance,
+            });
+        }
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Water Shader"),
@@ -471,11 +485,7 @@ impl Water {
                 depth_write_enabled: false,
                 depth_compare: wgpu::CompareFunction::LessEqual,
                 stencil: Default::default(),
-                bias: wgpu::DepthBiasState {
-                    constant: 2,
-                    slope_scale: 1.0,
-                    clamp: 0.0,
-                },
+                bias: wgpu::DepthBiasState::default(),
             }),
             multisample: Default::default(),
             multiview_mask: None,
@@ -522,11 +532,7 @@ impl Water {
                 depth_write_enabled: false,
                 depth_compare: wgpu::CompareFunction::LessEqual,
                 stencil: Default::default(),
-                bias: wgpu::DepthBiasState {
-                    constant: 2,
-                    slope_scale: 1.0,
-                    clamp: 0.0,
-                },
+                bias: wgpu::DepthBiasState::default(),
             }),
             multisample: Default::default(),
             multiview_mask: None,
@@ -535,6 +541,7 @@ impl Water {
 
         Some(Self {
             water_instances,
+            water_draws,
             vertex_buffer,
             index_buffer,
             num_indices: all_idxs.len() as u32,
@@ -543,7 +550,7 @@ impl Water {
             ocean_index_buffer,
             ocean_num_indices: ocean_idxs.len() as u32,
             uniform_buffer,
-            bind_group,
+            solid_bind_group,
             solid_pipeline,
             pipeline,
             water_color,
@@ -554,8 +561,6 @@ impl Water {
             accum_ms: 0.0,
             angle: 0,
             phase_offsets,
-            alpha_atlas_inv_w: 1.0 / atlas_w as f32,
-            alpha_atlas_inv_h: 1.0 / atlas_h as f32,
         })
     }
 
@@ -614,14 +619,13 @@ impl Water {
                 water_color: self.water_color,
                 light_color: self.light_color,
                 light_dir: self.light_dir,
-                params: [1.0, 0.0, self.alpha_atlas_inv_w, self.alpha_atlas_inv_h],
+                params: [1.0, 0.0, 0.0, 0.0],
             }),
         );
 
-        pass.set_bind_group(0, &self.bind_group, &[]);
-
         if self.ocean_num_indices > 0 {
             pass.set_pipeline(&self.solid_pipeline);
+            pass.set_bind_group(0, &self.solid_bind_group, &[]);
             pass.set_vertex_buffer(0, self.ocean_vertex_buffer.slice(..));
             pass.set_index_buffer(self.ocean_index_buffer.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..self.ocean_num_indices, 0, 0..1);
@@ -630,53 +634,15 @@ impl Water {
         pass.set_pipeline(&self.pipeline);
         pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-        pass.draw_indexed(0..self.num_indices, 0, 0..1);
+        for draw in &self.water_draws {
+            pass.set_bind_group(0, &draw.bind_group, &[]);
+            pass.draw_indexed(draw.index_start..(draw.index_start + draw.index_count), 0, 0..1);
+        }
     }
 }
 
 fn sample_height_for_water(map: &GameMap, wx: f32, wy: f32) -> f32 {
-    let sx = wx / GLOBAL_SCALE;
-    let sy = wy / GLOBAL_SCALE;
-    let ix = sx.floor() as i32;
-    let iy = sy.floor() as i32;
-
-    if ix >= 0 && (ix as usize) < map.size_x && iy >= 0 && (iy as usize) < map.size_y {
-        let flags = map.point(ix as usize, iy as usize).flags;
-        if flags & CELLFLAG_BRIDGE != 0 {
-            let kx = sx - ix as f32;
-            let ky = sy - iy as f32;
-            let ux = ix as usize;
-            let uy = iy as usize;
-            let z0 = map.point(ux, uy).z;
-            let z1 = map.point(ux + 1, uy).z;
-            let z2 = map.point(ux, uy + 1).z;
-            let z3 = map.point(ux + 1, uy + 1).z;
-            return ky * (kx * z3 + (1.0 - kx) * z2) + (1.0 - ky) * (kx * z1 + (1.0 - kx) * z0);
-        }
-        if flags & CELLFLAG_WATER != 0 {
-            return -1000.0;
-        }
-
-        let local_x = wx - ix as f32 * GLOBAL_SCALE;
-        let local_y = wy - iy as f32 * GLOBAL_SCALE;
-        let p0 = map.point(ix as usize, iy as usize).z;
-        let p1 = map.point(ix as usize + 1, iy as usize).z;
-        let p2 = map.point(ix as usize, iy as usize + 1).z;
-        let p3 = map.point(ix as usize + 1, iy as usize + 1).z;
-
-        if local_y < local_x {
-            let a1 = (p1 - p0) / GLOBAL_SCALE;
-            let b1 = (p3 - p1) / GLOBAL_SCALE;
-            let c1 = p0;
-            return a1 * local_x + b1 * local_y + c1;
-        }
-        let a2 = (p3 - p2) / GLOBAL_SCALE;
-        let b2 = (p2 - p0) / GLOBAL_SCALE;
-        let c2 = p0;
-        return a2 * local_x + b2 * local_y + c2;
-    }
-
-    -1000.0
+    map.get_z(wx, wy)
 }
 
 fn build_phase_offsets() -> [u16; WATER_SIZE * WATER_SIZE] {
@@ -762,7 +728,6 @@ fn build_instance_vertices(
                     normal: lattice_normals[idx],
                     water_uv: [tu, tv],
                     alpha_uv: [i as f32 / WATER_SIZE as f32, j as f32 / WATER_SIZE as f32],
-                    alpha_tile: inst.alpha_tile,
                 });
                 tu += WATER_TEXTURE_SCALE;
             }
@@ -823,7 +788,6 @@ fn build_solid_water_instances(
                 instances.push(WaterInstance {
                     x0: gx as f32 * group_world - map.world_width() * 0.5,
                     y0: gy as f32 * group_world - map.world_height() * 0.5,
-                    alpha_tile: [0.0, 0.0, 0.0, 0.0],
                 });
             }
         }
@@ -852,7 +816,7 @@ struct VOut {
     @location(0) water_uv: vec2<f32>,
     @location(1) cam_normal: vec3<f32>,
     @location(2) world_normal: vec3<f32>,
-    @location(3) alpha_atlas_uv: vec2<f32>,
+    @location(3) alpha_uv: vec2<f32>,
 };
 
 @vertex fn vs_main(
@@ -860,15 +824,11 @@ struct VOut {
     @location(1) normal: vec3<f32>,
     @location(2) water_uv: vec2<f32>,
     @location(3) alpha_uv: vec2<f32>,
-    @location(4) alpha_tile: vec4<f32>,
 ) -> VOut {
     var out: VOut;
     out.clip_pos = u.view_proj * vec4<f32>(position, 1.0);
     out.water_uv = water_uv;
-
-    let half_texel = vec2(u.params.z * 0.5, u.params.w * 0.5);
-    let inset_uv = clamp(alpha_uv, vec2(0.0), vec2(1.0)) * (alpha_tile.zw - 2.0 * half_texel) + alpha_tile.xy + half_texel;
-    out.alpha_atlas_uv = select(inset_uv, vec2(0.0), alpha_tile.z < 0.001);
+    out.alpha_uv = alpha_uv;
 
     out.cam_normal = (u.normal_mat * vec4<f32>(normal, 0.0)).xyz;
     out.world_normal = normal;
@@ -887,9 +847,7 @@ struct VOut {
     let mirror = textureSample(t_mirror, s, mirror_uv);
     let final_rgb = mirror.rgb * mirror.a + stage1 * (1.0 - mirror.a);
 
-    let has_alpha_tile = step(0.001, f.alpha_atlas_uv.x + f.alpha_atlas_uv.y + 0.001);
-    let tex_alpha = textureSample(t_alpha, s_alpha, f.alpha_atlas_uv).r;
-    let alpha = mix(1.0, tex_alpha, has_alpha_tile);
+    let alpha = textureSample(t_alpha, s_alpha, f.alpha_uv).r;
 
     return vec4<f32>(final_rgb, alpha);
 }

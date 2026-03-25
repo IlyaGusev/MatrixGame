@@ -3,6 +3,7 @@
 use anyhow::{bail, Context, Result};
 
 use crate::assets::storage::Storage;
+use crate::game::common::{CELLFLAG_BRIDGE, CELLFLAG_FLAT, CELLFLAG_WATER};
 
 pub const GLOBAL_SCALE: f32 = 20.0;
 
@@ -25,6 +26,18 @@ pub struct PointNormal {
     pub z: f32,
 }
 
+/// Per-cell coefficients matching SMatrixMapUnit fields used by GetZ.
+#[derive(Debug, Clone, Copy)]
+pub struct MapUnit {
+    pub flags: u8,
+    pub a1: f32,
+    pub b1: f32,
+    pub c1: f32,
+    pub a2: f32,
+    pub b2: f32,
+    pub c2: f32,
+}
+
 /// Loaded map data.
 pub struct GameMap {
     pub size_x: usize,
@@ -39,6 +52,7 @@ pub struct GameMap {
     pub macro_texture_size: i32,  // m_MacrotextureSize from "SIM" param
     pub points: Vec<CompilePoint>, // (size_x+1) * (size_y+1) points
     pub normals: Vec<PointNormal>,  // same size, computed from heights
+    pub units: Vec<MapUnit>,        // size_x * size_y cells, ports SMatrixMapUnit GetZ data
 }
 
 impl GameMap {
@@ -165,6 +179,7 @@ impl GameMap {
         // Compute surface normals — ports PointCalcNormals (MatrixMapPrepare.cpp:20-105)
         let _w = size_x + 1;
         let normals = compute_normals(&points, size_x, size_y);
+        let units = compute_units(&points, size_x, size_y);
 
         Ok(Self {
             size_x,
@@ -179,6 +194,7 @@ impl GameMap {
             macro_texture_size,
             points,
             normals,
+            units,
         })
     }
 
@@ -191,12 +207,44 @@ impl GameMap {
         &self.normals[y * (self.size_x + 1) + x]
     }
 
+    pub fn unit(&self, x: usize, y: usize) -> &MapUnit {
+        &self.units[y * self.size_x + x]
+    }
+
     pub fn world_width(&self) -> f32 {
         self.size_x as f32 * GLOBAL_SCALE
     }
 
     pub fn world_height(&self) -> f32 {
         self.size_y as f32 * GLOBAL_SCALE
+    }
+
+    /// Ports CMatrixMap::GetZ for terrain/water boundary tests.
+    pub fn get_z(&self, wx: f32, wy: f32) -> f32 {
+        let sx = wx / GLOBAL_SCALE;
+        let sy = wy / GLOBAL_SCALE;
+        let x = sx.floor() as i32;
+        let y = sy.floor() as i32;
+
+        if x < 0 || y < 0 || x >= self.size_x as i32 || y >= self.size_y as i32 {
+            return -1000.0;
+        }
+
+        let unit = self.unit(x as usize, y as usize);
+        if unit.flags & CELLFLAG_BRIDGE == 0 && unit.flags & CELLFLAG_WATER != 0 {
+            return -1000.0;
+        }
+        if unit.flags & CELLFLAG_FLAT != 0 {
+            return unit.a1;
+        }
+
+        let local_x = wx - x as f32 * GLOBAL_SCALE;
+        let local_y = wy - y as f32 * GLOBAL_SCALE;
+        if local_y < local_x {
+            unit.a1 * local_x + unit.b1 * local_y + unit.c1
+        } else {
+            unit.a2 * local_x + unit.b2 * local_y + unit.c2
+        }
     }
 }
 
@@ -289,6 +337,48 @@ fn compute_normals(points: &[CompilePoint], size_x: usize, size_y: usize) -> Vec
         }
     }
     normals
+}
+
+fn compute_units(points: &[CompilePoint], size_x: usize, size_y: usize) -> Vec<MapUnit> {
+    let stride = size_x + 1;
+    let mut units = Vec::with_capacity(size_x * size_y);
+
+    for y in 0..size_y {
+        for x in 0..size_x {
+            let p0 = points[y * stride + x];
+            let p1 = points[y * stride + x + 1];
+            let p3 = points[(y + 1) * stride + x];
+            let p2 = points[(y + 1) * stride + x + 1];
+
+            let flags = p0.flags;
+            let flat = p0.z == p1.z && p0.z == p2.z && p0.z == p3.z;
+
+            let (a1, b1, c1, a2, b2, c2) = if flat {
+                (p0.z, 0.0, 0.0, p0.z, 0.0, 0.0)
+            } else {
+                (
+                    (p1.z - p0.z) / GLOBAL_SCALE,
+                    (p2.z - p1.z) / GLOBAL_SCALE,
+                    p0.z,
+                    (p2.z - p3.z) / GLOBAL_SCALE,
+                    (p3.z - p0.z) / GLOBAL_SCALE,
+                    p0.z,
+                )
+            };
+
+            units.push(MapUnit {
+                flags: if flat { flags | CELLFLAG_FLAT } else { flags & !CELLFLAG_FLAT },
+                a1,
+                b1,
+                c1,
+                a2,
+                b2,
+                c2,
+            });
+        }
+    }
+
+    units
 }
 
 fn cross(a: &[f32; 3], b: &[f32; 3]) -> [f32; 3] {
