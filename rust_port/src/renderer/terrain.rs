@@ -15,6 +15,7 @@ use crate::assets::storage::Storage;
 use crate::game::common::{TEX_BOTTOM_SIZE, MAP_GROUP_SIZE, CELLFLAG_DOWN, rd_u32, rd_u16};
 use crate::game::map::{GameMap, GLOBAL_SCALE};
 use crate::game::map_prepare::build_tex_union_atlases;
+use crate::renderer::camera::Camera;
 use crate::renderer::ter_surface::build_surface_overlays;
 use crate::renderer::texture::*;
 
@@ -318,7 +319,7 @@ impl TerrainRenderer {
         if let Some(water) = &mut self.water { water.takt(dt_ms, device, queue); }
     }
 
-    pub fn render(&mut self, _device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView, queue: &wgpu::Queue, view_proj: glam::Mat4, view_mat: glam::Mat4) {
+    pub fn render(&mut self, _device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView, queue: &wgpu::Queue, camera: &Camera, view_proj: glam::Mat4, view_mat: glam::Mat4) {
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&Uniforms { view_proj: view_proj.to_cols_array_2d() }));
 
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -351,8 +352,8 @@ impl TerrainRenderer {
         }
 
         // Water
-        if let Some(water) = &self.water {
-            water.render(&mut pass, queue, view_proj, view_mat);
+        if let Some(water) = &mut self.water {
+            water.render(_device, &mut pass, queue, camera, view_proj, view_mat);
         }
     }
 }

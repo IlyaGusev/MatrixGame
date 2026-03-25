@@ -7,6 +7,7 @@ use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
 use crate::assets::storage::Storage;
+use crate::renderer::camera::Camera;
 use crate::game::map::{GameMap, GLOBAL_SCALE};
 
 const WATER_LEVEL: f32 = -2.0;
@@ -73,10 +74,10 @@ pub struct Water {
     index_buffer: wgpu::Buffer,
     num_indices: u32,
 
-    ocean_instances: Vec<WaterInstance>,
     ocean_vertex_buffer: wgpu::Buffer,
     ocean_index_buffer: wgpu::Buffer,
     ocean_num_indices: u32,
+    ocean_capacity_instances: usize,
 
     uniform_buffer: wgpu::Buffer,
     solid_bind_group: wgpu::BindGroup,
@@ -91,6 +92,12 @@ pub struct Water {
     accum_ms: f32,
     angle: i32,
     phase_offsets: [u16; WATER_SIZE * WATER_SIZE],
+    map_group_w: i32,
+    map_group_h: i32,
+    map_half_w: f32,
+    map_half_h: f32,
+    group_world: f32,
+    has_group: std::collections::HashSet<(i32, i32)>,
 }
 
 #[derive(Clone, Copy)]
@@ -227,16 +234,29 @@ impl Water {
             });
         }
 
-        let ocean_instances = build_solid_water_instances(map, groups_buf);
+        let map_group_w =
+            ((map.size_x as f32 + MAP_GROUP_SIZE as f32 - 1.0) / MAP_GROUP_SIZE as f32).ceil()
+                as i32;
+        let map_group_h =
+            ((map.size_y as f32 + MAP_GROUP_SIZE as f32 - 1.0) / MAP_GROUP_SIZE as f32).ceil()
+                as i32;
+        let group_world = MAP_GROUP_SIZE as f32 * GLOBAL_SCALE;
+        let mut has_group = std::collections::HashSet::new();
+        for gi in 0..groups_buf.arrays_count() {
+            let raw = groups_buf.get_bytes(gi);
+            if raw.len() < 4 {
+                continue;
+            }
+            let gx = u16::from_le_bytes([raw[0], raw[1]]) as i32 / MAP_GROUP_SIZE;
+            let gy = u16::from_le_bytes([raw[2], raw[3]]) as i32 / MAP_GROUP_SIZE;
+            has_group.insert((gx, gy));
+        }
         let phase_offsets = build_phase_offsets();
         let (lattice_z, lattice_normals) =
             build_wave_lattice(0, map.water_normal_len, &phase_offsets);
         let all_verts =
             build_instance_vertices(&water_instances, &lattice_z, &lattice_normals, water_scale);
         let all_idxs = build_instance_indices(water_instances.len());
-        let ocean_verts =
-            build_instance_vertices(&ocean_instances, &lattice_z, &lattice_normals, water_scale);
-        let ocean_idxs = build_instance_indices(ocean_instances.len());
 
         let load_tex = |path: &str, fb: [u8; 4]| -> wgpu::TextureView {
             read_texture(path)
@@ -265,13 +285,13 @@ impl Water {
         });
         let ocean_vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Ocean VB"),
-            contents: bytemuck::cast_slice(&ocean_verts),
+            contents: &[],
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         });
         let ocean_index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Ocean IB"),
-            contents: bytemuck::cast_slice(&ocean_idxs),
-            usage: wgpu::BufferUsages::INDEX,
+            contents: &[],
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
         });
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Water UB"),
@@ -545,10 +565,10 @@ impl Water {
             vertex_buffer,
             index_buffer,
             num_indices: all_idxs.len() as u32,
-            ocean_instances,
             ocean_vertex_buffer,
             ocean_index_buffer,
-            ocean_num_indices: ocean_idxs.len() as u32,
+            ocean_num_indices: 0,
+            ocean_capacity_instances: 0,
             uniform_buffer,
             solid_bind_group,
             solid_pipeline,
@@ -561,6 +581,12 @@ impl Water {
             accum_ms: 0.0,
             angle: 0,
             phase_offsets,
+            map_group_w,
+            map_group_h,
+            map_half_w: map.world_width() * 0.5,
+            map_half_h: map.world_height() * 0.5,
+            group_world,
+            has_group,
         })
     }
 
@@ -587,23 +613,14 @@ impl Water {
         );
         queue.write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&water_verts));
 
-        let ocean_verts = build_instance_vertices(
-            &self.ocean_instances,
-            &lattice_z,
-            &lattice_normals,
-            self.water_scale,
-        );
-        queue.write_buffer(
-            &self.ocean_vertex_buffer,
-            0,
-            bytemuck::cast_slice(&ocean_verts),
-        );
     }
 
     pub fn render<'a>(
-        &'a self,
+        &'a mut self,
+        device: &wgpu::Device,
         pass: &mut wgpu::RenderPass<'a>,
         queue: &wgpu::Queue,
+        camera: &Camera,
         view_proj: glam::Mat4,
         view: glam::Mat4,
     ) {
@@ -623,7 +640,21 @@ impl Water {
             }),
         );
 
-        if self.ocean_num_indices > 0 {
+        let ocean_instances = self.collect_visible_ocean_instances(camera);
+        if !ocean_instances.is_empty() {
+            let (lattice_z, lattice_normals) =
+                build_wave_lattice(self.angle, self.water_normal_len, &self.phase_offsets);
+            self.ensure_ocean_capacity(device, ocean_instances.len());
+            let ocean_verts = build_instance_vertices(
+                &ocean_instances,
+                &lattice_z,
+                &lattice_normals,
+                self.water_scale,
+            );
+            let ocean_idxs = build_instance_indices(ocean_instances.len());
+            self.ocean_num_indices = ocean_idxs.len() as u32;
+            queue.write_buffer(&self.ocean_vertex_buffer, 0, bytemuck::cast_slice(&ocean_verts));
+            queue.write_buffer(&self.ocean_index_buffer, 0, bytemuck::cast_slice(&ocean_idxs));
             pass.set_pipeline(&self.solid_pipeline);
             pass.set_bind_group(0, &self.solid_bind_group, &[]);
             pass.set_vertex_buffer(0, self.ocean_vertex_buffer.slice(..));
@@ -638,6 +669,76 @@ impl Water {
             pass.set_bind_group(0, &draw.bind_group, &[]);
             pass.draw_indexed(draw.index_start..(draw.index_start + draw.index_count), 0, 0..1);
         }
+    }
+
+    fn ensure_ocean_capacity(&mut self, device: &wgpu::Device, instance_count: usize) {
+        if instance_count <= self.ocean_capacity_instances {
+            return;
+        }
+        let verts_per_instance = (WATER_SIZE + 1) * (WATER_SIZE + 1);
+        let idxs_per_instance = WATER_SIZE * WATER_SIZE * 6;
+        let new_capacity = instance_count.next_power_of_two().max(16);
+        self.ocean_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Ocean VB"),
+            size: (new_capacity * verts_per_instance * std::mem::size_of::<WaterVertex>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.ocean_index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Ocean IB"),
+            size: (new_capacity * idxs_per_instance * std::mem::size_of::<u32>()) as u64,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.ocean_capacity_instances = new_capacity;
+    }
+
+    fn collect_visible_ocean_instances(&self, camera: &Camera) -> Vec<WaterInstance> {
+        let quad3 = camera.frustum_bounds_on_plane_zup(WATER_LEVEL);
+        let quad = quad3.map(|p| glam::Vec2::new(p.x, p.y));
+        let mut min_x = quad[0].x;
+        let mut max_x = quad[0].x;
+        let mut min_y = quad[0].y;
+        let mut max_y = quad[0].y;
+        for p in &quad[1..] {
+            min_x = min_x.min(p.x);
+            max_x = max_x.max(p.x);
+            min_y = min_y.min(p.y);
+            max_y = max_y.max(p.y);
+        }
+
+        // Frustum points are in centered render-space coordinates. Convert them back to the
+        // original uncentered map/world group space before selecting group indices, matching
+        // the original visibility code that works from GetPos0() world coordinates.
+        let world_min_x = min_x + self.map_half_w;
+        let world_max_x = max_x + self.map_half_w;
+        let world_min_y = min_y + self.map_half_h;
+        let world_max_y = max_y + self.map_half_h;
+
+        let iminx = (world_min_x / self.group_world).floor() as i32 - 1;
+        let imaxx = (world_max_x / self.group_world).ceil() as i32 + 1;
+        let iminy = (world_min_y / self.group_world).floor() as i32 - 1;
+        let imaxy = (world_max_y / self.group_world).ceil() as i32 + 1;
+
+        let mut out = Vec::new();
+        for gy in iminy..=imaxy {
+            for gx in iminx..=imaxx {
+                let on_map = gx >= 0 && gx < self.map_group_w && gy >= 0 && gy < self.map_group_h;
+                if on_map && self.has_group.contains(&(gx, gy)) {
+                    continue;
+                }
+                // Build the test rect in the same centered render-space as the frustum quad.
+                let x0 = gx as f32 * self.group_world - self.map_half_w;
+                let y0 = gy as f32 * self.group_world - self.map_half_h;
+                let rect_min = glam::Vec2::new(x0, y0);
+                let rect_max = glam::Vec2::new(x0 + self.group_world, y0 + self.group_world);
+                if !quad_intersects_rect(&quad, rect_min, rect_max) {
+                    continue;
+                }
+                out.push(WaterInstance { x0, y0 });
+            }
+        }
+        out
     }
 }
 
@@ -758,41 +859,62 @@ fn build_instance_indices(instance_count: usize) -> Vec<u32> {
     idxs
 }
 
-fn build_solid_water_instances(
-    map: &GameMap,
-    groups_buf: &crate::assets::storage::DataBuf,
-) -> Vec<WaterInstance> {
-    let group_world = MAP_GROUP_SIZE as f32 * GLOBAL_SCALE;
-    let gsx =
-        ((map.size_x as f32 + MAP_GROUP_SIZE as f32 - 1.0) / MAP_GROUP_SIZE as f32).ceil() as i32;
-    let gsy =
-        ((map.size_y as f32 + MAP_GROUP_SIZE as f32 - 1.0) / MAP_GROUP_SIZE as f32).ceil() as i32;
+fn quad_intersects_rect(quad: &[glam::Vec2; 4], rect_min: glam::Vec2, rect_max: glam::Vec2) -> bool {
+    let rect = [
+        glam::Vec2::new(rect_min.x, rect_min.y),
+        glam::Vec2::new(rect_max.x, rect_min.y),
+        glam::Vec2::new(rect_max.x, rect_max.y),
+        glam::Vec2::new(rect_min.x, rect_max.y),
+    ];
 
-    let mut has_group = std::collections::HashSet::new();
-    for gi in 0..groups_buf.arrays_count() {
-        let raw = groups_buf.get_bytes(gi);
-        if raw.len() < 4 {
-            continue;
-        }
-        let gx = u16::from_le_bytes([raw[0], raw[1]]) as i32 / MAP_GROUP_SIZE;
-        let gy = u16::from_le_bytes([raw[2], raw[3]]) as i32 / MAP_GROUP_SIZE;
-        has_group.insert((gx, gy));
+    if quad.iter().any(|&p| p.x >= rect_min.x && p.x <= rect_max.x && p.y >= rect_min.y && p.y <= rect_max.y) {
+        return true;
     }
-
-    let mut instances = Vec::new();
-    let border = 5;
-    for gy in -border..gsy + border {
-        for gx in -border..gsx + border {
-            let on_map = gx >= 0 && gx < gsx && gy >= 0 && gy < gsy;
-            if !on_map || !has_group.contains(&(gx, gy)) {
-                instances.push(WaterInstance {
-                    x0: gx as f32 * group_world - map.world_width() * 0.5,
-                    y0: gy as f32 * group_world - map.world_height() * 0.5,
-                });
+    if rect.iter().any(|&p| point_in_convex_quad(p, quad)) {
+        return true;
+    }
+    for i in 0..4 {
+        let a0 = quad[i];
+        let a1 = quad[(i + 1) & 3];
+        for j in 0..4 {
+            let b0 = rect[j];
+            let b1 = rect[(j + 1) & 3];
+            if segments_intersect(a0, a1, b0, b1) {
+                return true;
             }
         }
     }
-    instances
+    false
+}
+
+fn point_in_convex_quad(p: glam::Vec2, quad: &[glam::Vec2; 4]) -> bool {
+    let mut sign = 0.0f32;
+    for i in 0..4 {
+        let a = quad[i];
+        let b = quad[(i + 1) & 3];
+        let cross = (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x);
+        if cross.abs() < 1e-4 {
+            continue;
+        }
+        if sign == 0.0 {
+            sign = cross.signum();
+        } else if sign * cross < 0.0 {
+            return false;
+        }
+    }
+    true
+}
+
+fn segments_intersect(a0: glam::Vec2, a1: glam::Vec2, b0: glam::Vec2, b1: glam::Vec2) -> bool {
+    fn orient(a: glam::Vec2, b: glam::Vec2, c: glam::Vec2) -> f32 {
+        (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
+    }
+    let o1 = orient(a0, a1, b0);
+    let o2 = orient(a0, a1, b1);
+    let o3 = orient(b0, b1, a0);
+    let o4 = orient(b0, b1, a1);
+    (o1 >= 0.0 && o2 <= 0.0 || o1 <= 0.0 && o2 >= 0.0)
+        && (o3 >= 0.0 && o4 <= 0.0 || o3 <= 0.0 && o4 >= 0.0)
 }
 
 const WATER_SHADER: &str = r#"

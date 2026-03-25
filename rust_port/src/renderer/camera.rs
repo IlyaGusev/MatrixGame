@@ -285,6 +285,23 @@ impl Camera {
 
         proj * view * z_to_y
     }
+
+    pub fn frustum_bounds_on_plane_zup(&self, plane_z: f32) -> [Vec3; 4] {
+        let inv_vp = self.view_proj().inverse();
+        let corners = [(-1.0, 1.0), (1.0, 1.0), (1.0, -1.0), (-1.0, -1.0)];
+        corners.map(|(sx, sy)| {
+            let near4 = inv_vp * glam::Vec4::new(sx, sy, 0.0, 1.0);
+            let far4 = inv_vp * glam::Vec4::new(sx, sy, 1.0, 1.0);
+            let near = (near4 / near4.w).truncate();
+            let far = (far4 / far4.w).truncate();
+            let dir = far - near;
+            if dir.z.abs() < 1e-5 {
+                return far;
+            }
+            let t = (plane_z - near.z) / dir.z;
+            near + dir * t
+        })
+    }
 }
 
 /// LERPFLOAT(t, a, b) = a + (b - a) * t
