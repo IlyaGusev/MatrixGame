@@ -135,7 +135,7 @@ impl Storage {
 
             for _ in 0..item_count {
                 let item_name = read_wstr(buf, &mut rpos)?;
-                let item_type = read_u32(buf, &mut rpos)?;
+                let mut item_type = read_u32(buf, &mut rpos)?;
                 let data_size = read_u32(buf, &mut rpos)? as usize;
 
                 if rpos + data_size > buf.len() {
