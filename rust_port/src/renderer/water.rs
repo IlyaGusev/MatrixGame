@@ -480,7 +480,7 @@ impl Water {
             layout: Some(&pl),
             vertex: wgpu::VertexState {
                 module: &shader,
-                entry_point: Some("vs_main"),
+                entry_point: Some("vs_main_solid"),
                 buffers: &[WaterVertex::desc()],
                 compilation_options: Default::default(),
             },
@@ -723,10 +723,6 @@ impl Water {
         let mut out = Vec::new();
         for gy in iminy..=imaxy {
             for gx in iminx..=imaxx {
-                let on_map = gx >= 0 && gx < self.map_group_w && gy >= 0 && gy < self.map_group_h;
-                if on_map && self.has_group.contains(&(gx, gy)) {
-                    continue;
-                }
                 // Build the test rect in the same centered render-space as the frustum quad.
                 let x0 = gx as f32 * self.group_world - self.map_half_w;
                 let y0 = gy as f32 * self.group_world - self.map_half_h;
@@ -949,6 +945,27 @@ struct VOut {
 ) -> VOut {
     var out: VOut;
     out.clip_pos = u.view_proj * vec4<f32>(position, 1.0);
+    out.water_uv = water_uv;
+    out.alpha_uv = alpha_uv;
+
+    out.cam_normal = (u.normal_mat * vec4<f32>(normal, 0.0)).xyz;
+    out.world_normal = normal;
+    return out;
+}
+
+// Solid (ocean) pass: pin clip-space depth to the far plane (NDC z = 1.0) so the
+// LessEqual depth test passes only on pixels where no terrain wrote depth (i.e.,
+// water-only cells + empty groups). This fills shoreline "gap" pixels with solid
+// water while leaving the alpha gradient to blend over real sea-floor terrain.
+@vertex fn vs_main_solid(
+    @location(0) position: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) water_uv: vec2<f32>,
+    @location(3) alpha_uv: vec2<f32>,
+) -> VOut {
+    var out: VOut;
+    let clip = u.view_proj * vec4<f32>(position, 1.0);
+    out.clip_pos = vec4<f32>(clip.xy, clip.w, clip.w);
     out.water_uv = water_uv;
     out.alpha_uv = alpha_uv;
 

@@ -44,6 +44,7 @@ pub struct GameMap {
     pub size_y: usize,
     pub tex_union_dim: usize,
     pub water_color: u32,
+    pub sky_color: u32,
     pub water_name: String,
     pub water_normal_len: f32,
     pub light_main_color: u32,
@@ -77,6 +78,9 @@ impl GameMap {
             .unwrap_or(16) as usize;
         let water_color = find_property_int(prop_names, prop_values, "WaterColor")
             .unwrap_or(0x003060) as u32;
+        // DEF_SKY_COLOR (Common.hpp:27) = 0x1070FF
+        let sky_color = find_property_int(prop_names, prop_values, "SkyColor")
+            .unwrap_or(0x1070FF) as u32;
         let water_name = prop_names
             .find_as_wstr("WaterName")
             .map(|idx| prop_values.get_as_wstr(idx))
@@ -186,6 +190,7 @@ impl GameMap {
             size_y,
             tex_union_dim,
             water_color,
+            sky_color,
             water_name,
             water_normal_len,
             light_main_color,

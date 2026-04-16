@@ -63,6 +63,8 @@ pub struct TerrainRenderer {
     overlay_pipeline: wgpu::RenderPipeline,
     batches: Vec<DrawBatch>,
     overlay_batches: Vec<DrawBatch>,
+    sky: super::sky::Sky,
+    clear_color: wgpu::Color,
     water: Option<super::water::Water>,
     uniform_buffer: wgpu::Buffer,
     depth_texture: wgpu::TextureView,
@@ -308,7 +310,15 @@ impl TerrainRenderer {
 
         let depth_texture = create_depth_texture(device, config);
 
-        Self { pipeline, overlay_pipeline, batches, overlay_batches, water, uniform_buffer, depth_texture }
+        let sky = super::sky::Sky::new(device, config, map.sky_color, map.water_color);
+        let clear_color = wgpu::Color {
+            r: ((map.sky_color >> 16) & 0xFF) as f64 / 255.0,
+            g: ((map.sky_color >> 8) & 0xFF) as f64 / 255.0,
+            b: (map.sky_color & 0xFF) as f64 / 255.0,
+            a: 1.0,
+        };
+
+        Self { pipeline, overlay_pipeline, batches, overlay_batches, sky, clear_color, water, uniform_buffer, depth_texture }
     }
 
     pub fn resize(&mut self, device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) {
@@ -325,11 +335,15 @@ impl TerrainRenderer {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("Terrain Pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment { view, resolve_target: None, depth_slice: None,
-                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.4, g: 0.6, b: 0.9, a: 1.0 }), store: wgpu::StoreOp::Store } })],
+                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(self.clear_color), store: wgpu::StoreOp::Store } })],
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &self.depth_texture,
                 depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }), stencil_ops: None }),
             timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
         });
+
+        // Sky gradient (ports DrawSky, MatrixMap.cpp:2020). Drawn before landscape
+        // so terrain/water overwrite it where geometry exists.
+        self.sky.render(queue, &mut pass, camera);
 
         // Bottom geometry (opaque)
         pass.set_pipeline(&self.pipeline);

@@ -234,7 +234,7 @@ impl Camera {
 
     /// Compute eye position in Z-up world coords from camera angles and link point.
     /// Ports the math from BeforeDraw (MatrixCamera.cpp).
-    fn eye_pos(&self) -> Vec3 {
+    pub fn eye_pos(&self) -> Vec3 {
         let lp = self.link_point;
         let sin_z = self.angle_z.sin();
         let cos_z = self.angle_z.cos();
@@ -284,6 +284,12 @@ impl Camera {
         ]);
 
         proj * view * z_to_y
+    }
+
+    /// Forward direction in Z-up coords (unit vector from eye to target).
+    /// Ports GetDir() (MatrixCamera.hpp:265).
+    pub fn forward(&self) -> Vec3 {
+        (self.link_point - self.eye_pos()).normalize_or_zero()
     }
 
     pub fn frustum_bounds_on_plane_zup(&self, plane_z: f32) -> [Vec3; 4] {
