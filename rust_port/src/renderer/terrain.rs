@@ -68,6 +68,7 @@ pub struct TerrainRenderer {
     sky: super::sky::Sky,
     clear_color: wgpu::Color,
     fog_color: [f32; 4],
+    objects: Option<super::objects::ObjectsRenderer>,
     water: Option<super::water::Water>,
     uniform_buffer: wgpu::Buffer,
     depth_texture: wgpu::TextureView,
@@ -285,6 +286,9 @@ impl TerrainRenderer {
             stor, map, read_texture,
         );
 
+        // Decorative objects (palms / rocks / etc.)
+        let objects = super::objects::ObjectsRenderer::new(device, queue, config, map, stor, read_texture);
+
         // Water (MatrixWater.cpp)
         let water = super::water::Water::new(device, queue, config, map, stor, read_texture);
 
@@ -328,7 +332,7 @@ impl TerrainRenderer {
             a: 1.0,
         };
 
-        Self { pipeline, overlay_pipeline, batches, overlay_batches, sky, clear_color, fog_color, water, uniform_buffer, depth_texture }
+        Self { pipeline, overlay_pipeline, batches, overlay_batches, sky, clear_color, fog_color, objects, water, uniform_buffer, depth_texture }
     }
 
     pub fn resize(&mut self, device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) {
@@ -377,6 +381,11 @@ impl TerrainRenderer {
                 pass.set_index_buffer(batch.index_buffer.slice(..), batch.index_format);
                 pass.draw_indexed(0..batch.num_indices, 0, 0..1);
             }
+        }
+
+        // Decorative objects (pyramid placeholders).
+        if let Some(objects) = &self.objects {
+            objects.render(queue, &mut pass, camera, view_proj);
         }
 
         // Water

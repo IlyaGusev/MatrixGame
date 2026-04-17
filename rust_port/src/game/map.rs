@@ -54,6 +54,22 @@ pub struct GameMap {
     pub points: Vec<CompilePoint>, // (size_x+1) * (size_y+1) points
     pub normals: Vec<PointNormal>,  // same size, computed from heights
     pub units: Vec<MapUnit>,        // size_x * size_y cells, ports SMatrixMapUnit GetZ data
+    pub objects: Vec<ObjectInstance>, // palms / rocks / decorative scenery placements
+}
+
+/// A static object placement — ports the per-instance fields of DATA_OBJECTS
+/// (MatrixMapPrepare.cpp:503-619). Position is uncentered world space (raw map
+/// coords); renderer applies the map-center offset.
+#[derive(Debug, Clone, Copy)]
+pub struct ObjectInstance {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    pub angle_z: f32,
+    pub angle_x: f32,
+    pub angle_y: f32,
+    pub scale: f32,
+    pub type_id: u32,
 }
 
 impl GameMap {
@@ -185,6 +201,9 @@ impl GameMap {
         let normals = compute_normals(&points, size_x, size_y);
         let units = compute_units(&points, size_x, size_y);
 
+        let objects = load_objects(&stor, &points, size_x, size_y);
+        log::info!("map: loaded {} decorative objects", objects.len());
+
         Ok(Self {
             size_x,
             size_y,
@@ -200,6 +219,7 @@ impl GameMap {
             points,
             normals,
             units,
+            objects,
         })
     }
 
@@ -388,6 +408,81 @@ fn compute_units(points: &[CompilePoint], size_x: usize, size_y: usize) -> Vec<M
 
 fn cross(a: &[f32; 3], b: &[f32; 3]) -> [f32; 3] {
     [a[1]*b[2] - a[2]*b[1], a[2]*b[0] - a[0]*b[2], a[0]*b[1] - a[1]*b[0]]
+}
+
+/// Parses DATA_OBJECTS columns from the CMAP (MatrixMapPrepare.cpp:513-576).
+/// Each column is a flat buffer of N elements (one per object), accessed as row 0.
+/// The `Height` column, when present, is an offset above interpolated terrain z at
+/// the object's (x, y); otherwise `Z` is used directly.
+fn load_objects(
+    stor: &Storage,
+    points: &[CompilePoint],
+    size_x: usize,
+    size_y: usize,
+) -> Vec<ObjectInstance> {
+    let Some(col_x) = stor.get_buf("objects", "X") else { return Vec::new(); };
+    let Some(col_y) = stor.get_buf("objects", "Y") else { return Vec::new(); };
+    let Some(col_scale) = stor.get_buf("objects", "Scale") else { return Vec::new(); };
+    let Some(col_type) = stor.get_buf("objects", "Type") else { return Vec::new(); };
+    let Some(col_angle_z) = stor.get_buf("objects", "Angle") else { return Vec::new(); };
+    if col_x.arrays_count() == 0 { return Vec::new(); }
+
+    let xs = read_f32_array(col_x.get_bytes(0));
+    let ys = read_f32_array(col_y.get_bytes(0));
+    let n = xs.len().min(ys.len());
+    if n == 0 { return Vec::new(); }
+
+    let scales = read_f32_array(col_scale.get_bytes(0));
+    let angles_z = read_f32_array(col_angle_z.get_bytes(0));
+    let types = read_u32_array(col_type.get_bytes(0));
+    let angles_x = stor.get_buf("objects", "AngleX").map(|b| read_f32_array(b.get_bytes(0)));
+    let angles_y = stor.get_buf("objects", "AngleY").map(|b| read_f32_array(b.get_bytes(0)));
+    let heights = stor.get_buf("objects", "Height").map(|b| read_f32_array(b.get_bytes(0)));
+    let zs = stor.get_buf("objects", "Z").map(|b| read_f32_array(b.get_bytes(0)));
+
+    let w = size_x + 1;
+    let sample_corners = |x: f32, y: f32| -> f32 {
+        let px = (x / GLOBAL_SCALE) as i32;
+        let py = (y / GLOBAL_SCALE) as i32;
+        let mut sum = 0.0f32;
+        let mut cnt = 0u32;
+        for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+            let cx = px + dx;
+            let cy = py + dy;
+            if cx < 0 || cy < 0 || cx > size_x as i32 || cy > size_y as i32 { continue; }
+            sum += points[cy as usize * w + cx as usize].z;
+            cnt += 1;
+        }
+        if cnt == 0 { 0.0 } else { sum / cnt as f32 }
+    };
+
+    (0..n).map(|i| {
+        let x = xs[i];
+        let y = ys[i];
+        let z = match (&heights, &zs) {
+            (Some(h), _) if i < h.len() => h[i] + sample_corners(x, y),
+            (_, Some(zv)) if i < zv.len() => zv[i],
+            _ => 0.0,
+        };
+        ObjectInstance {
+            x,
+            y,
+            z,
+            angle_z: angles_z.get(i).copied().unwrap_or(0.0),
+            angle_x: angles_x.as_ref().and_then(|a| a.get(i).copied()).unwrap_or(0.0),
+            angle_y: angles_y.as_ref().and_then(|a| a.get(i).copied()).unwrap_or(0.0),
+            scale: scales.get(i).copied().unwrap_or(1.0),
+            type_id: types.get(i).copied().unwrap_or(0),
+        }
+    }).collect()
+}
+
+fn read_f32_array(bytes: &[u8]) -> Vec<f32> {
+    bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+}
+
+fn read_u32_array(bytes: &[u8]) -> Vec<u32> {
+    bytes.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
 }
 
 fn find_property_int(

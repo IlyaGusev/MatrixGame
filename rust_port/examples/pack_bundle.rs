@@ -3,6 +3,8 @@
 use matrixgame_rs::assets::bundle::AssetBundle;
 use matrixgame_rs::assets::pkg_reader::PkgArchive;
 use matrixgame_rs::assets::storage::Storage;
+use matrixgame_rs::game::map::GameMap;
+use matrixgame_rs::game::vo_loader;
 
 fn main() {
     let pkg_data = std::fs::read("../Data/robots.pkg").unwrap();
@@ -13,7 +15,7 @@ fn main() {
     let stor = Storage::from_bytes(&cmap_data).unwrap();
 
     let mut bundle = AssetBundle::new();
-    bundle.add("map.cmap", cmap_data);
+    bundle.add("map.cmap", cmap_data.clone());
 
     let strings = stor.get_buf("strings", "String").unwrap();
     let mut tex_count = 0;
@@ -68,10 +70,15 @@ fn main() {
         }
     }
 
-    // Add water textures
+    // Add water textures under the paths the renderer actually asks for
+    // (matching resolve_water_preset in renderer/water.rs).
     let water_files = [
-        ("water_tex1", "MATRIX/TEXTURES/WATER/1.DDS"),
-        ("water_tex2", "MATRIX/TEXTURES/WATER/MIRROR.DDS"),
+        ("Matrix/Textures/Water/1", "MATRIX/TEXTURES/WATER/1.DDS"),
+        ("Matrix/Textures/Water/MIRROR", "MATRIX/TEXTURES/WATER/MIRROR.DDS"),
+        ("Matrix/Textures/Water/1BLACK", "MATRIX/TEXTURES/WATER/1BLACK.DDS"),
+        ("Matrix/Textures/Water/MIRRORBLACK", "MATRIX/TEXTURES/WATER/MIRRORBLACK.DDS"),
+        ("Matrix/Textures/Water/1PURPLE", "MATRIX/TEXTURES/WATER/1PURPLE.DDS"),
+        ("Matrix/Textures/Water/MIRRORPURPLE", "MATRIX/TEXTURES/WATER/MIRRORPURPLE.DDS"),
     ];
     for (key, pkg_path) in &water_files {
         if let Ok(data) = pkg.read_file(pkg_path) {
@@ -80,6 +87,39 @@ fn main() {
             println!("  {} -> {} ({} bytes)", key, pkg_path, data.len());
         }
     }
+
+    // Pack object .vo meshes + their textures, one per unique object type_id.
+    let map = GameMap::from_cmap_bytes(&cmap_data).unwrap();
+    let mut obj_types: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+    for obj in &map.objects { obj_types.insert(obj.type_id); }
+    let mut vo_count = 0;
+    let mut obj_tex_count = 0;
+    let mut vo_tex_seen = std::collections::HashSet::<String>::new();
+    for type_id in &obj_types {
+        if (*type_id as usize) >= strings.arrays_count() { continue; }
+        let id_str = strings.get_as_wstr(*type_id as usize);
+        let Some(paths) = vo_loader::resolve_paths(&id_str) else { continue };
+        let vo_key = paths.vo_path.to_uppercase();
+        if let Ok(data) = pkg.read_file(&vo_key) {
+            bundle.add(&paths.vo_path, data);
+            vo_count += 1;
+        } else {
+            eprintln!("  MISS vo: {}", paths.vo_path);
+            continue;
+        }
+        if let Some(t) = &paths.texture_path {
+            if !vo_tex_seen.insert(t.clone()) { continue; }
+            let k = t.to_uppercase();
+            for cand in [k.clone(), format!("{k}.DDS"), format!("{k}.PNG")] {
+                if let Ok(data) = pkg.read_file(&cand) {
+                    bundle.add(t, data);
+                    obj_tex_count += 1;
+                    break;
+                }
+            }
+        }
+    }
+    println!("  objects: {} vo files, {} textures packed", vo_count, obj_tex_count);
 
     let bytes = bundle.to_bytes();
     std::fs::create_dir_all("assets").ok();

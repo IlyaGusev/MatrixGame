@@ -1,6 +1,7 @@
 pub mod camera;
 pub mod context;
 pub mod particles;
+pub mod objects;
 pub mod pipeline;
 pub mod sky;
 pub mod ter_surface;
