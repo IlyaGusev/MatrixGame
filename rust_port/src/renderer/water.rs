@@ -10,6 +10,8 @@ use crate::assets::storage::Storage;
 use crate::renderer::camera::Camera;
 use crate::game::map::{GameMap, GLOBAL_SCALE};
 
+use crate::game::common::{FOG_START, FOG_END, unpack_rgb};
+
 const WATER_LEVEL: f32 = -2.0;
 const WATER_SIZE: usize = 16;
 const WATER_ALPHA_SIZE: usize = 64;
@@ -65,11 +67,14 @@ struct WaterUniforms {
     light_color: [f32; 4],
     light_dir: [f32; 4],
     params: [f32; 4],
+    fog_color: [f32; 4],
+    fog_params: [f32; 4],
 }
 
 pub struct Water {
     water_instances: Vec<WaterInstance>,
     water_draws: Vec<WaterDraw>,
+    fog_color: [f32; 4],
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     num_indices: u32,
@@ -150,20 +155,10 @@ impl Water {
         let cx = map.world_width() * 0.5;
         let cy = map.world_height() * 0.5;
 
-        let wc = map.water_color;
-        let water_color = [
-            ((wc >> 16) & 0xFF) as f32 / 255.0,
-            ((wc >> 8) & 0xFF) as f32 / 255.0,
-            (wc & 0xFF) as f32 / 255.0,
-            1.0,
-        ];
-        let lc = map.light_main_color;
-        let light_color = [
-            ((lc >> 16) & 0xFF) as f32 / 255.0,
-            ((lc >> 8) & 0xFF) as f32 / 255.0,
-            (lc & 0xFF) as f32 / 255.0,
-            1.0,
-        ];
+        let [wr, wg, wb] = unpack_rgb(map.water_color);
+        let water_color = [wr, wg, wb, 1.0];
+        let [lr, lg, lb] = unpack_rgb(map.light_main_color);
+        let light_color = [lr, lg, lb, 1.0];
         let ld = map.light_main_dir;
         let light_dir = [ld[0], ld[1], ld[2], 0.0];
         let water_scale = GLOBAL_SCALE * MAP_GROUP_SIZE as f32 / WATER_SIZE as f32;
@@ -293,6 +288,8 @@ impl Water {
             contents: &[],
             usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
         });
+        let [sr, sg, sb] = unpack_rgb(map.sky_color);
+        let fog_color = [sr, sg, sb, 1.0];
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Water UB"),
             contents: bytemuck::bytes_of(&WaterUniforms {
@@ -302,6 +299,8 @@ impl Water {
                 light_color,
                 light_dir,
                 params: [1.0, 0.0, 0.0, 0.0],
+                fog_color,
+                fog_params: [FOG_START, FOG_END, 0.0, 0.0],
             }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -562,6 +561,7 @@ impl Water {
         Some(Self {
             water_instances,
             water_draws,
+            fog_color,
             vertex_buffer,
             index_buffer,
             num_indices: all_idxs.len() as u32,
@@ -637,6 +637,8 @@ impl Water {
                 light_color: self.light_color,
                 light_dir: self.light_dir,
                 params: [1.0, 0.0, 0.0, 0.0],
+                fog_color: self.fog_color,
+                fog_params: [FOG_START, FOG_END, 0.0, 0.0],
             }),
         );
 
@@ -921,6 +923,8 @@ struct U {
     light_color: vec4<f32>,
     light_dir: vec4<f32>,
     params: vec4<f32>,
+    fog_color: vec4<f32>,
+    fog_params: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> u: U;
 @group(0) @binding(1) var t_water: texture_2d<f32>;
@@ -935,6 +939,7 @@ struct VOut {
     @location(1) cam_normal: vec3<f32>,
     @location(2) world_normal: vec3<f32>,
     @location(3) alpha_uv: vec2<f32>,
+    @location(4) view_dist: f32,
 };
 
 @vertex fn vs_main(
@@ -944,12 +949,14 @@ struct VOut {
     @location(3) alpha_uv: vec2<f32>,
 ) -> VOut {
     var out: VOut;
-    out.clip_pos = u.view_proj * vec4<f32>(position, 1.0);
+    let clip = u.view_proj * vec4<f32>(position, 1.0);
+    out.clip_pos = clip;
     out.water_uv = water_uv;
     out.alpha_uv = alpha_uv;
 
     out.cam_normal = (u.normal_mat * vec4<f32>(normal, 0.0)).xyz;
     out.world_normal = normal;
+    out.view_dist = clip.w;
     return out;
 }
 
@@ -971,6 +978,7 @@ struct VOut {
 
     out.cam_normal = (u.normal_mat * vec4<f32>(normal, 0.0)).xyz;
     out.world_normal = normal;
+    out.view_dist = clip.w;
     return out;
 }
 
@@ -986,8 +994,11 @@ struct VOut {
     let mirror = textureSample(t_mirror, s, mirror_uv);
     let final_rgb = mirror.rgb * mirror.a + stage1 * (1.0 - mirror.a);
 
+    let fog_f = clamp((u.fog_params.y - f.view_dist) / (u.fog_params.y - u.fog_params.x), 0.0, 1.0);
+    let fogged = mix(u.fog_color.rgb, final_rgb, fog_f);
+
     let alpha = textureSample(t_alpha, s_alpha, f.alpha_uv).r;
 
-    return vec4<f32>(final_rgb, alpha);
+    return vec4<f32>(fogged, alpha);
 }
 "#;

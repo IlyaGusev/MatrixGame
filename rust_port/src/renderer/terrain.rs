@@ -12,7 +12,7 @@ use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
 use crate::assets::storage::Storage;
-use crate::game::common::{TEX_BOTTOM_SIZE, MAP_GROUP_SIZE, CELLFLAG_DOWN, rd_u32, rd_u16};
+use crate::game::common::{TEX_BOTTOM_SIZE, MAP_GROUP_SIZE, CELLFLAG_DOWN, FOG_START, FOG_END, rd_u32, rd_u16, unpack_rgb};
 use crate::game::map::{GameMap, GLOBAL_SCALE};
 use crate::game::map_prepare::build_tex_union_atlases;
 use crate::renderer::camera::Camera;
@@ -48,6 +48,8 @@ impl Vertex {
 #[derive(Copy, Clone, Pod, Zeroable)]
 struct Uniforms {
     view_proj: [[f32; 4]; 4],
+    fog_color: [f32; 4],
+    fog_params: [f32; 4], // x = fog_start, y = fog_end
 }
 
 pub struct DrawBatch {
@@ -65,6 +67,7 @@ pub struct TerrainRenderer {
     overlay_batches: Vec<DrawBatch>,
     sky: super::sky::Sky,
     clear_color: wgpu::Color,
+    fog_color: [f32; 4],
     water: Option<super::water::Water>,
     uniform_buffer: wgpu::Buffer,
     depth_texture: wgpu::TextureView,
@@ -193,10 +196,17 @@ impl TerrainRenderer {
 
         log::info!("parsed {} group batches", batches_by_tex.len());
 
+        let [sr, sg, sb] = unpack_rgb(map.sky_color);
+        let fog_color = [sr, sg, sb, 1.0];
+
         // GPU resources
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Terrain Uniforms"),
-            contents: bytemuck::bytes_of(&Uniforms { view_proj: glam::Mat4::IDENTITY.to_cols_array_2d() }),
+            contents: bytemuck::bytes_of(&Uniforms {
+                view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
+                fog_color,
+                fog_params: [FOG_START, FOG_END, 0.0, 0.0],
+            }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
@@ -239,7 +249,7 @@ impl TerrainRenderer {
 
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Terrain BGL"), entries: &[
-                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::VERTEX, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
                 wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
                 wgpu::BindGroupLayoutEntry { binding: 2, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
                 wgpu::BindGroupLayoutEntry { binding: 3, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
@@ -312,13 +322,13 @@ impl TerrainRenderer {
 
         let sky = super::sky::Sky::new(device, config, map.sky_color, map.water_color);
         let clear_color = wgpu::Color {
-            r: ((map.sky_color >> 16) & 0xFF) as f64 / 255.0,
-            g: ((map.sky_color >> 8) & 0xFF) as f64 / 255.0,
-            b: (map.sky_color & 0xFF) as f64 / 255.0,
+            r: sr as f64,
+            g: sg as f64,
+            b: sb as f64,
             a: 1.0,
         };
 
-        Self { pipeline, overlay_pipeline, batches, overlay_batches, sky, clear_color, water, uniform_buffer, depth_texture }
+        Self { pipeline, overlay_pipeline, batches, overlay_batches, sky, clear_color, fog_color, water, uniform_buffer, depth_texture }
     }
 
     pub fn resize(&mut self, device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) {
@@ -330,7 +340,11 @@ impl TerrainRenderer {
     }
 
     pub fn render(&mut self, _device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView, queue: &wgpu::Queue, camera: &Camera, view_proj: glam::Mat4, view_mat: glam::Mat4) {
-        queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&Uniforms { view_proj: view_proj.to_cols_array_2d() }));
+        queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&Uniforms {
+            view_proj: view_proj.to_cols_array_2d(),
+            fog_color: self.fog_color,
+            fog_params: [FOG_START, FOG_END, 0.0, 0.0],
+        }));
 
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("Terrain Pass"),
@@ -374,7 +388,11 @@ impl TerrainRenderer {
 
 /// Terrain shader — ports TerBotM (MatrixRenderPipeline.cpp:1198-1213).
 const SHADER: &str = r#"
-struct Uniforms { view_proj: mat4x4<f32> };
+struct Uniforms {
+    view_proj: mat4x4<f32>,
+    fog_color: vec4<f32>,
+    fog_params: vec4<f32>,
+};
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
 @group(0) @binding(1) var t_atlas: texture_2d<f32>;
 @group(0) @binding(2) var s_atlas: sampler;
@@ -392,15 +410,26 @@ struct VOut {
     @location(0) color: vec4<f32>,
     @location(1) uv: vec2<f32>,
     @location(2) macro_uv: vec2<f32>,
+    @location(3) view_dist: f32,
 };
 
 @vertex fn vs_main(in: VIn) -> VOut {
     var out: VOut;
-    out.clip_position = uniforms.view_proj * vec4<f32>(in.position, 1.0);
+    let clip = uniforms.view_proj * vec4<f32>(in.position, 1.0);
+    out.clip_position = clip;
     out.color = in.color;
     out.uv = in.uv;
     out.macro_uv = in.macro_uv;
+    out.view_dist = clip.w;
     return out;
+}
+
+// Linear fog (D3DFOG_LINEAR): factor=1 keeps original color, factor=0 replaces with fog_color.
+// Use clip-space w (== view-space distance along forward axis) as the fog distance,
+// matching D3DFOG_TABLE + WFOG semantics.
+fn apply_fog(color: vec3<f32>, clip_w: f32) -> vec3<f32> {
+    let f = clamp((uniforms.fog_params.y - clip_w) / (uniforms.fog_params.y - uniforms.fog_params.x), 0.0, 1.0);
+    return mix(uniforms.fog_color.rgb, color, f);
 }
 
 fn shade_terrain(in: VOut) -> vec4<f32> {
@@ -412,10 +441,13 @@ fn shade_terrain(in: VOut) -> vec4<f32> {
 
 @fragment fn fs_main_opaque(in: VOut) -> @location(0) vec4<f32> {
     let shaded = shade_terrain(in);
-    return vec4<f32>(shaded.rgb, 1.0);
+    let fogged = apply_fog(shaded.rgb, in.view_dist);
+    return vec4<f32>(fogged, 1.0);
 }
 
 @fragment fn fs_main_alpha(in: VOut) -> @location(0) vec4<f32> {
-    return shade_terrain(in);
+    let shaded = shade_terrain(in);
+    let fogged = apply_fog(shaded.rgb, in.view_dist);
+    return vec4<f32>(fogged, shaded.a);
 }
 "#;

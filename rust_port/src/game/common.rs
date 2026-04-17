@@ -7,6 +7,20 @@ pub const WATER_SIZE: usize = 16;
 pub const WATER_ALPHA_SIZE: usize = 64;
 pub const WATER_TEXTURE_SCALE: f32 = 1.0 / 16.0;
 
+/// Linear fog parameters (MatrixMap.cpp:2213-2214 + MatrixCamera.hpp:58-59).
+/// MAX_VIEW_DISTANCE=4000, FOG_NEAR_K=0.5, FOG_FAR_K=0.7.
+pub const FOG_START: f32 = 4000.0 * 0.5;
+pub const FOG_END: f32 = 4000.0 * 0.7;
+
+/// Unpack a u32 RGB color (0x00RRGGBB) into `[r, g, b]` floats in [0, 1].
+pub fn unpack_rgb(c: u32) -> [f32; 3] {
+    [
+        ((c >> 16) & 0xFF) as f32 / 255.0,
+        ((c >> 8) & 0xFF) as f32 / 255.0,
+        (c & 0xFF) as f32 / 255.0,
+    ]
+}
+
 pub const CELLFLAG_LAND: u8 = 1 << 0;
 pub const CELLFLAG_WATER: u8 = 1 << 1;
 pub const CELLFLAG_BRIDGE: u8 = 1 << 2;

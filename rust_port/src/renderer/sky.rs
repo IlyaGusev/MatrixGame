@@ -8,6 +8,7 @@ use bytemuck::{Pod, Zeroable};
 use glam::{Vec3, Vec4};
 use wgpu::util::DeviceExt;
 
+use crate::game::common::unpack_rgb;
 use crate::renderer::camera::Camera;
 
 /// MAX_VIEW_DISTANCE from MatrixCamera.cpp:13.
@@ -33,13 +34,8 @@ pub struct Sky {
 
 impl Sky {
     pub fn new(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration, sky_color_rgba: u32, water_color_rgba: u32) -> Self {
-        let unpack = |rgb: u32| [
-            ((rgb >> 16) & 0xFF) as f32 / 255.0,
-            ((rgb >> 8) & 0xFF) as f32 / 255.0,
-            (rgb & 0xFF) as f32 / 255.0,
-        ];
-        let sky_color = unpack(sky_color_rgba);
-        let water_color = unpack(water_color_rgba);
+        let sky_color = unpack_rgb(sky_color_rgba);
+        let water_color = unpack_rgb(water_color_rgba);
 
         // 10 verts = sky gradient (6) + separator + water band (4). Use non-strip for clarity.
         let initial = [SkyVertex { position: [0.0, 0.0], color: [0.0; 4] }; 10];
