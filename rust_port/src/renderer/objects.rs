@@ -12,7 +12,7 @@ use wgpu::util::DeviceExt;
 use crate::assets::storage::Storage;
 use crate::game::common::{FOG_START, FOG_END, unpack_rgb};
 use crate::game::map::{GameMap, ObjectInstance};
-use crate::game::vo_loader::{self, VoMesh};
+use crate::game::vo_loader::{self};
 use crate::renderer::camera::Camera;
 use crate::renderer::texture::{decode_texture_bytes, create_texture_from_rgba, create_solid_texture};
 
@@ -45,6 +45,15 @@ struct Uniforms {
     ambient_color: [f32; 4],
     light_color: [f32; 4],
     light_dir: [f32; 4],
+    camera_pos: [f32; 4],
+    time_ms: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct MaterialUniform {
+    flags: [u32; 4],
+    scroll: [f32; 4],
 }
 
 struct MeshBatch {
@@ -64,6 +73,7 @@ pub struct ObjectsRenderer {
     ambient_color: [f32; 4],
     light_color: [f32; 4],
     light_dir: [f32; 4],
+    time_ms: f32,
 }
 
 impl ObjectsRenderer {
@@ -109,6 +119,8 @@ impl ObjectsRenderer {
                 ambient_color,
                 light_color,
                 light_dir,
+                camera_pos: [0.0, 0.0, 0.0, 1.0],
+                time_ms: [0.0, 0.0, 0.0, 0.0],
             }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -139,7 +151,47 @@ impl ObjectsRenderer {
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
                     visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
                     count: None,
                 },
             ],
@@ -155,6 +207,8 @@ impl ObjectsRenderer {
 
         let mut tex_cache: HashMap<String, wgpu::TextureView> = HashMap::new();
         let fallback_tex = create_solid_texture(device, queue, [200, 200, 200, 255]);
+        let black_tex = create_solid_texture(device, queue, [0, 0, 0, 255]);
+        let transparent_tex = create_solid_texture(device, queue, [0, 0, 0, 0]);
 
         let mut batches = Vec::new();
         let mut loaded_types = 0usize;
@@ -181,55 +235,95 @@ impl ObjectsRenderer {
                     continue;
                 }
             };
+            let object_dir = paths.vo_path.rsplit_once('/').map(|(dir, _)| format!("{dir}/"));
 
             let vertices: Vec<Vertex> = mesh.vertices.iter().map(|v| Vertex {
                 position: v.position,
                 normal: v.normal,
                 uv: v.uv,
             }).collect();
-            let indices_u32: Vec<u32> = mesh.indices.iter().map(|&i| i as u32).collect();
-
-            let tex_view = resolve_texture(&paths.texture_path, &mesh, device, queue, &mut tex_cache, read_texture)
-                .unwrap_or_else(|| fallback_tex.clone());
 
             let inst_data: Vec<InstanceData> = instances.iter().map(|obj| {
                 instance_matrix(obj, cx, cy, map)
             }).collect();
 
-            let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Objects Mesh VB"),
-                contents: bytemuck::cast_slice(&vertices),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
-            let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Objects Mesh IB"),
-                contents: bytemuck::cast_slice(&indices_u32),
-                usage: wgpu::BufferUsages::INDEX,
-            });
             let instance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("Objects Inst VB"),
                 contents: bytemuck::cast_slice(&inst_data),
                 usage: wgpu::BufferUsages::VERTEX,
             });
 
-            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("Objects BG"),
-                layout: &bgl,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: uniform_buffer.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&tex_view) },
-                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&sampler) },
-                ],
-            });
+            let use_vo_surface_materials = mesh.surfaces.len() > 1;
+            for surface in &mesh.surfaces {
+                let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Objects Mesh VB"),
+                    contents: bytemuck::cast_slice(&vertices),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+                let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Objects Mesh IB"),
+                    contents: bytemuck::cast_slice(&surface.indices),
+                    usage: wgpu::BufferUsages::INDEX,
+                });
 
-            batches.push(MeshBatch {
-                vertex_buffer,
-                index_buffer,
-                num_indices: indices_u32.len() as u32,
-                instance_buffer,
-                num_instances: inst_data.len() as u32,
-                bind_group,
-            });
+                let surface_material = if use_vo_surface_materials {
+                    surface
+                        .texture_ref
+                        .as_deref()
+                        .map(|spec| vo_loader::parse_material_spec_with_prefix(spec, object_dir.as_deref()))
+                } else {
+                    None
+                };
+                let material = if use_vo_surface_materials {
+                    vo_loader::merge_materials(&paths.material, surface_material.as_ref())
+                } else {
+                    paths.material.clone()
+                };
+                let diffuse_view = resolve_texture(material.diffuse.as_ref(), device, queue, &mut tex_cache, read_texture)
+                    .unwrap_or_else(|| fallback_tex.clone());
+                let gloss_view = resolve_texture(material.gloss.as_ref(), device, queue, &mut tex_cache, read_texture)
+                    .unwrap_or_else(|| black_tex.clone());
+                let back_view = resolve_texture(material.back.as_ref(), device, queue, &mut tex_cache, read_texture)
+                    .unwrap_or_else(|| black_tex.clone());
+                let mask_view = resolve_texture(material.mask.as_ref(), device, queue, &mut tex_cache, read_texture)
+                    .unwrap_or_else(|| transparent_tex.clone());
+                let mat_uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Objects Material UB"),
+                    contents: bytemuck::bytes_of(&MaterialUniform {
+                        flags: [
+                            material.gloss.is_some() as u32,
+                            material.back.is_some() as u32,
+                            material.mask.is_some() as u32,
+                            0,
+                        ],
+                        scroll: [material.scroll[0], material.scroll[1], 0.0, 0.0],
+                    }),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+
+                let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("Objects BG"),
+                    layout: &bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: uniform_buffer.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&diffuse_view) },
+                        wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&gloss_view) },
+                        wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&back_view) },
+                        wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&mask_view) },
+                        wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::Sampler(&sampler) },
+                        wgpu::BindGroupEntry { binding: 6, resource: mat_uniform.as_entire_binding() },
+                    ],
+                });
+
+                batches.push(MeshBatch {
+                    vertex_buffer,
+                    index_buffer,
+                    num_indices: surface.indices.len() as u32,
+                    instance_buffer: instance_buffer.clone(),
+                    num_instances: inst_data.len() as u32,
+                    bind_group,
+                });
+            }
             loaded_types += 1;
         }
 
@@ -306,16 +400,24 @@ impl ObjectsRenderer {
             cache: None,
         });
 
-        Some(Self { pipeline, batches, uniform_buffer, fog_color, ambient_color, light_color, light_dir })
+        Some(Self { pipeline, batches, uniform_buffer, fog_color, ambient_color, light_color, light_dir, time_ms: 0.0 })
+    }
+
+    pub fn takt(&mut self, dt_ms: f32) {
+        self.time_ms += dt_ms;
+        if self.time_ms > 1_000_000.0 {
+            self.time_ms -= 1_000_000.0;
+        }
     }
 
     pub fn render<'a>(
         &'a self,
         queue: &wgpu::Queue,
         pass: &mut wgpu::RenderPass<'a>,
-        _camera: &Camera,
+        camera: &Camera,
         view_proj: glam::Mat4,
     ) {
+        let eye = camera.eye_pos();
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&Uniforms {
             view_proj: view_proj.to_cols_array_2d(),
             fog_color: self.fog_color,
@@ -323,6 +425,8 @@ impl ObjectsRenderer {
             ambient_color: self.ambient_color,
             light_color: self.light_color,
             light_dir: self.light_dir,
+            camera_pos: [eye.x, eye.y, eye.z, 1.0],
+            time_ms: [self.time_ms, 0.0, 0.0, 0.0],
         }));
 
         pass.set_pipeline(&self.pipeline);
@@ -375,31 +479,21 @@ fn instance_matrix(obj: &ObjectInstance, cx: f32, cy: f32, map: &GameMap) -> Ins
 /// Try paths in order: explicit texture_path from the object Id, then the VO's
 /// embedded `surfs/texs` reference. Caches decoded textures by path.
 fn resolve_texture(
-    id_tex_path: &Option<String>,
-    mesh: &VoMesh,
+    tex_path: Option<&String>,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     cache: &mut HashMap<String, wgpu::TextureView>,
     read_texture: &dyn Fn(&str) -> Option<Vec<u8>>,
 ) -> Option<wgpu::TextureView> {
-    let mut candidates: Vec<String> = Vec::new();
-    if let Some(p) = id_tex_path { candidates.push(p.clone()); }
-    if let Some(p) = &mesh.texture_ref {
-        // ".\Matrix\Obj\palm\palm00" → "Matrix/Obj/palm/palm00"
-        candidates.push(p.trim_start_matches(".\\").replace('\\', "/"));
+    let path = tex_path?;
+    if let Some(cached) = cache.get(path) {
+        return Some(cached.clone());
     }
-
-    for path in &candidates {
-        if let Some(cached) = cache.get(path) {
-            return Some(cached.clone());
-        }
-        let Some(data) = read_texture(path) else { continue };
-        let Some(rgba) = decode_texture_bytes(&data) else { continue };
-        let view = create_texture_from_rgba(device, queue, &rgba);
-        cache.insert(path.clone(), view.clone());
-        return Some(view);
-    }
-    None
+    let Some(data) = read_texture(path) else { return None };
+    let Some(rgba) = decode_texture_bytes(&data) else { return None };
+    let view = create_texture_from_rgba(device, queue, &rgba);
+    cache.insert(path.clone(), view.clone());
+    Some(view)
 }
 
 const SHADER: &str = r#"
@@ -410,10 +504,20 @@ struct U {
     ambient_color: vec4<f32>,
     light_color: vec4<f32>,
     light_dir: vec4<f32>,
+    camera_pos: vec4<f32>,
+    time_ms: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> u: U;
 @group(0) @binding(1) var t_diffuse: texture_2d<f32>;
-@group(0) @binding(2) var s_diffuse: sampler;
+@group(0) @binding(2) var t_gloss: texture_2d<f32>;
+@group(0) @binding(3) var t_back: texture_2d<f32>;
+@group(0) @binding(4) var t_mask: texture_2d<f32>;
+@group(0) @binding(5) var s_diffuse: sampler;
+struct M {
+    flags: vec4<u32>,
+    scroll: vec4<f32>,
+};
+@group(0) @binding(6) var<uniform> m: M;
 
 struct VIn {
     @location(0) position: vec3<f32>,
@@ -431,6 +535,7 @@ struct VOut {
     @location(1) normal: vec3<f32>,
     @location(2) view_dist: f32,
     @location(3) terrain_color: vec3<f32>,
+    @location(4) world_pos: vec3<f32>,
 };
 
 @vertex fn vs_main(in: VIn) -> VOut {
@@ -446,6 +551,7 @@ struct VOut {
     out.normal = normalize(n);
     out.view_dist = clip.w;
     out.terrain_color = in.terrain_color.rgb;
+    out.world_pos = world.xyz;
     return out;
 }
 
@@ -459,6 +565,23 @@ struct VOut {
     let ndotl = max(dot(n, l), 0.0);
     let lighting = clamp(u.ambient_color.rgb + u.light_color.rgb * ndotl, vec3<f32>(0.0), vec3<f32>(1.0));
     var rgb = tex.rgb * in.terrain_color * lighting;
+    let scroll_uv = in.uv + m.scroll.xy * u.time_ms.x;
+
+    if (m.flags.z != 0u) {
+        let mask = textureSample(t_mask, s_diffuse, scroll_uv);
+        let back = textureSample(t_back, s_diffuse, scroll_uv);
+        let back_rgb = back.rgb * in.terrain_color * lighting;
+        let blend = max(mask.a, max(mask.r, max(mask.g, mask.b)));
+        rgb = mix(rgb, back_rgb, clamp(blend, 0.0, 1.0));
+    }
+
+    if (m.flags.x != 0u) {
+        let gloss = textureSample(t_gloss, s_diffuse, in.uv).rgb;
+        let view_dir = normalize(u.camera_pos.xyz - in.world_pos);
+        let fresnel = pow(1.0 - max(dot(view_dir, n), 0.0), 4.0);
+        let reflection = mix(u.fog_color.rgb, vec3<f32>(1.0), fresnel);
+        rgb += gloss * reflection;
+    }
 
     let fog_f = clamp((u.fog_params.y - in.view_dist) / (u.fog_params.y - u.fog_params.x), 0.0, 1.0);
     rgb = mix(u.fog_color.rgb, rgb, fog_f);

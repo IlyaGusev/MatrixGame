@@ -341,6 +341,7 @@ impl TerrainRenderer {
 
     pub fn takt(&mut self, dt_ms: f32, device: &wgpu::Device, queue: &wgpu::Queue) {
         if let Some(water) = &mut self.water { water.takt(dt_ms, device, queue); }
+        if let Some(objects) = &mut self.objects { objects.takt(dt_ms); }
     }
 
     pub fn render(&mut self, _device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView, queue: &wgpu::Queue, camera: &Camera, view_proj: glam::Mat4, view_mat: glam::Mat4) {
