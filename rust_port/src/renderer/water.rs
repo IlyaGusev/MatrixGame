@@ -697,7 +697,20 @@ impl Water {
 
     fn collect_visible_ocean_instances(&self, camera: &Camera) -> Vec<WaterInstance> {
         let quad3 = camera.frustum_bounds_on_plane_zup(WATER_LEVEL);
-        let quad = quad3.map(|p| glam::Vec2::new(p.x, p.y));
+        let mut quad = quad3.map(|p| glam::Vec2::new(p.x, p.y));
+
+        // MatrixVisiCalc.cpp expands the projected top edge by one group width
+        // before testing visible groups. Without that padding, ocean tiles can
+        // pop out at the left/right screen edges when the top frustum edge is
+        // nearly parallel to the water plane.
+        let top_dir = quad[1] - quad[0];
+        let top_len = top_dir.length();
+        if top_len > 1e-5 {
+            let ex = top_dir / top_len * self.group_world;
+            quad[0] -= ex;
+            quad[1] += ex;
+        }
+
         let mut min_x = quad[0].x;
         let mut max_x = quad[0].x;
         let mut min_y = quad[0].y;
@@ -725,7 +738,6 @@ impl Water {
         let mut out = Vec::new();
         for gy in iminy..=imaxy {
             for gx in iminx..=imaxx {
-                // Build the test rect in the same centered render-space as the frustum quad.
                 let x0 = gx as f32 * self.group_world - self.map_half_w;
                 let y0 = gy as f32 * self.group_world - self.map_half_h;
                 let rect_min = glam::Vec2::new(x0, y0);

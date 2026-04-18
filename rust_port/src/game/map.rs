@@ -3,7 +3,7 @@
 use anyhow::{bail, Context, Result};
 
 use crate::assets::storage::Storage;
-use crate::game::common::{CELLFLAG_BRIDGE, CELLFLAG_FLAT, CELLFLAG_WATER};
+use crate::game::common::{CELLFLAG_BRIDGE, CELLFLAG_FLAT, CELLFLAG_LAND, CELLFLAG_WATER, MAP_GROUP_SIZE};
 
 pub const GLOBAL_SCALE: f32 = 20.0;
 
@@ -42,6 +42,8 @@ pub struct MapUnit {
 pub struct GameMap {
     pub size_x: usize,
     pub size_y: usize,
+    pub camera_angle: f32,
+    pub camera_pos: Option<[f32; 2]>,
     pub tex_union_dim: usize,
     pub water_color: u32,
     pub sky_color: u32,
@@ -55,6 +57,13 @@ pub struct GameMap {
     pub normals: Vec<PointNormal>,  // same size, computed from heights
     pub units: Vec<MapUnit>,        // size_x * size_y cells, ports SMatrixMapUnit GetZ data
     pub objects: Vec<ObjectInstance>, // palms / rocks / decorative scenery placements
+    /// Per-group max LAND z, size = group_w * group_h.
+    /// Ports GetGroupMaxZLand (MatrixMap.hpp:759): returns 0 for empty groups /
+    /// groups whose max is negative. Used by the camera to keep the link-point
+    /// above mountains (MatrixCamera.cpp:926 → GetZInterpolatedLand).
+    pub group_max_z_land: Vec<f32>,
+    pub group_w: usize,
+    pub group_h: usize,
 }
 
 /// A static object placement — ports the per-instance fields of DATA_OBJECTS
@@ -92,6 +101,15 @@ impl GameMap {
 
         let tex_union_dim = find_property_int(prop_names, prop_values, "TexUnionDim")
             .unwrap_or(16) as usize;
+        let camera_angle = find_property_float(prop_names, prop_values, "CamAngle")
+            .unwrap_or(0.0);
+        let camera_pos = match (
+            find_property_float(prop_names, prop_values, "CamPosX"),
+            find_property_float(prop_names, prop_values, "CamPosY"),
+        ) {
+            (Ok(x), Ok(y)) => Some([x, y]),
+            _ => None,
+        };
         let water_color = find_property_int(prop_names, prop_values, "WaterColor")
             .unwrap_or(0x003060) as u32;
         // DEF_SKY_COLOR (Common.hpp:27) = 0x1070FF
@@ -204,9 +222,18 @@ impl GameMap {
         let objects = load_objects(&stor, &points, size_x, size_y);
         log::info!("map: loaded {} decorative objects", objects.len());
 
+        // No dilation: the stored per-group max is the max of THIS group's
+        // land-cell corner z only. Dilation used to smear mountain height
+        // into neighboring water groups, pushing the camera up while over
+        // water and making the heavily-fogged far water read as sky color.
+        let (group_max_z_land, group_w, group_h) =
+            compute_group_max_z_land(&points, &units, size_x, size_y);
+
         Ok(Self {
             size_x,
             size_y,
+            camera_angle,
+            camera_pos,
             tex_union_dim,
             water_color,
             sky_color,
@@ -220,7 +247,54 @@ impl GameMap {
             normals,
             units,
             objects,
+            group_max_z_land,
+            group_w,
+            group_h,
         })
+    }
+
+    /// Max land-corner z of the group containing world (wx, wy), clamped to 0.
+    /// Ports GetGroupMaxZLand (MatrixMap.hpp:759). Returns 0 for out-of-bounds.
+    pub fn group_max_z_land_at(&self, wx: f32, wy: f32) -> f32 {
+        let gs = MAP_GROUP_SIZE as f32 * GLOBAL_SCALE;
+        let gx = (wx / gs).floor() as i32;
+        let gy = (wy / gs).floor() as i32;
+        if gx < 0 || gy < 0 || gx >= self.group_w as i32 || gy >= self.group_h as i32 {
+            return 0.0;
+        }
+        self.group_max_z_land[gy as usize * self.group_w + gx as usize]
+    }
+
+    /// Bilinear-interpolated per-group max z in GROUP-CENTER coordinates.
+    /// Ports the smooth-over-neighbors idea of GetZInterpolatedLand
+    /// (MatrixMap.cpp:426-469) — a B-spline there, bilinear here. The returned
+    /// value is clamped to `ceiling` so the camera never rises unreasonably
+    /// high over tall terrain (original clamps per-group z to
+    /// `[m_GroundZBaseMiddle, m_GroundZBaseMax]` from buildings).
+    pub fn group_max_z_interpolated(&self, wx: f32, wy: f32, ceiling: f32) -> f32 {
+        let gs = MAP_GROUP_SIZE as f32 * GLOBAL_SCALE;
+        // Group centers are at ((gx + 0.5) * gs, (gy + 0.5) * gs).
+        let fx = wx / gs - 0.5;
+        let fy = wy / gs - 0.5;
+        let gx0 = fx.floor() as i32;
+        let gy0 = fy.floor() as i32;
+        let tx = fx - gx0 as f32;
+        let ty = fy - gy0 as f32;
+
+        let sample = |gx: i32, gy: i32| -> f32 {
+            if gx < 0 || gy < 0 || gx >= self.group_w as i32 || gy >= self.group_h as i32 {
+                return 0.0;
+            }
+            let v = self.group_max_z_land[gy as usize * self.group_w + gx as usize];
+            v.min(ceiling)
+        };
+        let a = sample(gx0,     gy0);
+        let b = sample(gx0 + 1, gy0);
+        let c = sample(gx0,     gy0 + 1);
+        let d = sample(gx0 + 1, gy0 + 1);
+        let ab = a + (b - a) * tx;
+        let cd = c + (d - c) * tx;
+        ab + (cd - ab) * ty
     }
 
     /// Get a heightmap point at grid coordinates.
@@ -273,7 +347,6 @@ impl GameMap {
     }
 }
 
-const CELLFLAG_LAND: u8 = 1 << 0;
 const CELLFLAG_DOWN: u8 = 1 << 5;
 
 /// Ports PointCalcNormals (MatrixMapPrepare.cpp:20-105).
@@ -408,6 +481,66 @@ fn compute_units(points: &[CompilePoint], size_x: usize, size_y: usize) -> Vec<M
 
 fn cross(a: &[f32; 3], b: &[f32; 3]) -> [f32; 3] {
     [a[1]*b[2] - a[2]*b[1], a[2]*b[0] - a[0]*b[2], a[0]*b[1] - a[1]*b[0]]
+}
+
+/// Per-group max land z, clamped to 0 (ports GetGroupMaxZLand + CMatrixMapGroup
+/// max-z tracking; negative underwater groups report 0 like the original).
+fn compute_group_max_z_land(
+    points: &[CompilePoint],
+    units: &[MapUnit],
+    size_x: usize,
+    size_y: usize,
+) -> (Vec<f32>, usize, usize) {
+    let gs = MAP_GROUP_SIZE as usize;
+    let gw = (size_x + gs - 1) / gs;
+    let gh = (size_y + gs - 1) / gs;
+    let stride = size_x + 1;
+    let mut out = vec![0.0f32; gw * gh];
+
+    for gy in 0..gh {
+        for gx in 0..gw {
+            let x0 = gx * gs;
+            let y0 = gy * gs;
+            let x1 = (x0 + gs).min(size_x);
+            let y1 = (y0 + gs).min(size_y);
+            let mut mz = f32::NEG_INFINITY;
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let u = units[y * size_x + x];
+                    if u.flags & CELLFLAG_LAND == 0 { continue; }
+                    for (dx, dy) in [(0usize, 0usize), (1, 0), (0, 1), (1, 1)] {
+                        let z = points[(y + dy) * stride + (x + dx)].z;
+                        if z > mz { mz = z; }
+                    }
+                }
+            }
+            out[gy * gw + gx] = if mz.is_finite() { mz.max(0.0) } else { 0.0 };
+        }
+    }
+    (out, gw, gh)
+}
+
+/// Morphological max-dilation: each cell becomes the max of itself and its
+/// neighbors within `radius` cells. Used to expand per-group max-z so a single
+/// lookup covers the camera's eye offset.
+fn dilate_max(src: &[f32], w: usize, h: usize, radius: i32) -> Vec<f32> {
+    let mut out = vec![0.0f32; w * h];
+    for gy in 0..h {
+        for gx in 0..w {
+            let mut m = 0.0f32;
+            for dy in -radius..=radius {
+                for dx in -radius..=radius {
+                    let nx = gx as i32 + dx;
+                    let ny = gy as i32 + dy;
+                    if nx < 0 || ny < 0 || nx >= w as i32 || ny >= h as i32 { continue; }
+                    let v = src[ny as usize * w + nx as usize];
+                    if v > m { m = v; }
+                }
+            }
+            out[gy * w + gx] = m;
+        }
+    }
+    out
 }
 
 /// Parses DATA_OBJECTS columns from the CMAP (MatrixMapPrepare.cpp:513-576).

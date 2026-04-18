@@ -20,6 +20,7 @@ struct AppState {
     camera: Camera,
     game: World,
     last_time: f64,
+    cursor: [f32; 2],
 }
 
 pub struct App {
@@ -61,10 +62,24 @@ impl ApplicationHandler for App {
 
             let (map, stor, pkg) = load_map();
 
+            let map = Arc::new(map);
             let mut camera = Camera::new(
                 gfx.config.width as f32 / gfx.config.height as f32,
             );
             camera.set_map(map.world_width(), map.world_height());
+            camera.set_aspect(gfx.config.width as f32, gfx.config.height as f32);
+            camera.init_strategy_angle(map.camera_angle);
+            if let Some(pos) = map.camera_pos {
+                camera.set_xy_strategy(pos);
+            }
+            camera.set_terrain_sampler({
+                let m = map.clone();
+                Box::new(move |x, y| m.group_max_z_interpolated(x, y, f32::MAX))
+            });
+            camera.set_ground_sampler({
+                let m = map.clone();
+                Box::new(move |x, y| m.get_z(x, y))
+            });
 
             let tex_reader = |path: &str| -> Option<Vec<u8>> {
                 let pkg = pkg.as_ref()?;
@@ -85,6 +100,7 @@ impl ApplicationHandler for App {
                 camera,
                 game: World::new(),
                 last_time: crate::platform::now_secs(),
+                cursor: [-1.0, -1.0],
             });
         }
 
@@ -97,11 +113,25 @@ impl ApplicationHandler for App {
                 let mut gfx = GfxContext::new(win.clone()).await;
 
                 let (map, stor, bundle) = load_map_async().await;
+                let map = Arc::new(map);
 
                 let mut camera = Camera::new(
                     gfx.config.width as f32 / gfx.config.height as f32,
                 );
                 camera.set_map(map.world_width(), map.world_height());
+                camera.set_aspect(gfx.config.width as f32, gfx.config.height as f32);
+                camera.init_strategy_angle(map.camera_angle);
+                if let Some(pos) = map.camera_pos {
+                    camera.set_xy_strategy(pos);
+                }
+                camera.set_terrain_sampler({
+                    let m = map.clone();
+                    Box::new(move |x, y| m.group_max_z_interpolated(x, y, f32::MAX))
+                });
+                camera.set_ground_sampler({
+                    let m = map.clone();
+                    Box::new(move |x, y| m.get_z(x, y))
+                });
 
                 let tex_reader = |path: &str| -> Option<Vec<u8>> {
                     bundle.read_file(path).map(|s| s.to_vec())
@@ -125,6 +155,7 @@ impl ApplicationHandler for App {
                     camera,
                     game: World::new(),
                     last_time: crate::platform::now_secs(),
+                    cursor: [-1.0, -1.0],
                 });
                 win.request_redraw();
             });
@@ -156,40 +187,50 @@ impl ApplicationHandler for App {
                 }
             }
 
-            // ── Mouse input (ports MatrixFormGame.cpp) ──
+            // ── Mouse input (MatrixFormGame.cpp:530-642) ──
+            // Middle or right button toggles MouseCam mode (rotate-on-drag).
             WindowEvent::MouseInput { state: btn_state, button, .. } => {
                 use winit::event::{ElementState, MouseButton};
-                if button == MouseButton::Right {
+                if matches!(button, MouseButton::Middle | MouseButton::Right) {
                     let pressed = btn_state == ElementState::Pressed;
-                    state.camera.on_mouse_button(pressed, state.camera.last_mouse[0], state.camera.last_mouse[1]);
+                    let [x, y] = state.cursor;
+                    state.camera.on_rotate_button(pressed, x, y);
                 }
             }
 
             WindowEvent::CursorMoved { position, .. } => {
+                state.cursor = [position.x as f32, position.y as f32];
                 state.camera.on_mouse_move(position.x as f32, position.y as f32);
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
+                // Each wheel notch = one ZoomInStep/OutStep call.
                 use winit::event::MouseScrollDelta;
-                let d = match delta {
+                let notches = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y,
-                    MouseScrollDelta::PixelDelta(p) => p.y as f32 / 50.0,
+                    MouseScrollDelta::PixelDelta(p) => p.y as f32 / 120.0,
                 };
-                state.camera.on_mouse_wheel(d);
+                state.camera.on_mouse_wheel(notches);
             }
 
-            // ── Keyboard input (ports Takt keyboard handling) ──
+            // ── Keyboard (MatrixFormGame.cpp:247-282) ──
             WindowEvent::KeyboardInput { event, .. } => {
                 use winit::keyboard::{KeyCode, PhysicalKey};
                 use crate::renderer::camera::KeyAction;
                 let pressed = event.state == winit::event::ElementState::Pressed;
                 let action = match event.physical_key {
-                    PhysicalKey::Code(KeyCode::KeyW) | PhysicalKey::Code(KeyCode::ArrowUp) => Some(KeyAction::MoveDown),
-                    PhysicalKey::Code(KeyCode::KeyS) | PhysicalKey::Code(KeyCode::ArrowDown) => Some(KeyAction::MoveUp),
-                    PhysicalKey::Code(KeyCode::KeyA) | PhysicalKey::Code(KeyCode::ArrowLeft) => Some(KeyAction::MoveLeft),
-                    PhysicalKey::Code(KeyCode::KeyD) | PhysicalKey::Code(KeyCode::ArrowRight) => Some(KeyAction::MoveRight),
-                    PhysicalKey::Code(KeyCode::KeyQ) => Some(KeyAction::RotLeft),
-                    PhysicalKey::Code(KeyCode::KeyE) => Some(KeyAction::RotRight),
+                    PhysicalKey::Code(KeyCode::ArrowUp) | PhysicalKey::Code(KeyCode::KeyW) => Some(KeyAction::MoveBack),
+                    PhysicalKey::Code(KeyCode::ArrowDown) | PhysicalKey::Code(KeyCode::KeyS) => Some(KeyAction::MoveForward),
+                    PhysicalKey::Code(KeyCode::ArrowLeft) | PhysicalKey::Code(KeyCode::KeyA) => Some(KeyAction::MoveLeft),
+                    PhysicalKey::Code(KeyCode::ArrowRight) | PhysicalKey::Code(KeyCode::KeyD) => Some(KeyAction::MoveRight),
+                    // Yaw (KA_ROTATE_LEFT/RIGHT). Original: Home/End + `[`/`]`.
+                    PhysicalKey::Code(KeyCode::Home) | PhysicalKey::Code(KeyCode::BracketLeft) => Some(KeyAction::RotLeft),
+                    PhysicalKey::Code(KeyCode::End) | PhysicalKey::Code(KeyCode::BracketRight) => Some(KeyAction::RotRight),
+                    // Pitch (KA_ROTATE_UP/DOWN). Original: PageUp/PageDown.
+                    PhysicalKey::Code(KeyCode::PageUp)   => Some(KeyAction::RotUp),
+                    PhysicalKey::Code(KeyCode::PageDown) => Some(KeyAction::RotDown),
+                    // Reset angles (KA_CAM_SETDEFAULT). Original: `\`.
+                    PhysicalKey::Code(KeyCode::Backslash) => Some(KeyAction::ResetAngles),
                     _ => None,
                 };
                 if let Some(a) = action {
