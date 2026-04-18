@@ -706,7 +706,7 @@ impl Water {
         let top_dir = quad[1] - quad[0];
         let top_len = top_dir.length();
         if top_len > 1e-5 {
-            let ex = top_dir / top_len * self.group_world;
+            let ex = top_dir / top_len * (self.group_world * 2.0);
             quad[0] -= ex;
             quad[1] += ex;
         }
@@ -721,6 +721,10 @@ impl Water {
             min_y = min_y.min(p.y);
             max_y = max_y.max(p.y);
         }
+        min_x -= self.group_world;
+        max_x += self.group_world;
+        min_y -= self.group_world;
+        max_y += self.group_world;
 
         // Frustum points are in centered render-space coordinates. Convert them back to the
         // original uncentered map/world group space before selecting group indices, matching
