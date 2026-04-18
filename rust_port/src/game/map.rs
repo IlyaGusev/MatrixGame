@@ -50,7 +50,12 @@ pub struct GameMap {
     pub water_name: String,
     pub water_normal_len: f32,
     pub light_main_color: u32,
+    pub light_main_color_obj: u32,
     pub light_main_dir: [f32; 3],
+    pub ambient_color_obj: u32,
+    pub ambient_color: u32,
+    pub terrain2object_influence: f32,
+    pub terrain2object_target_color: u32,
     pub macro_texture_path: Option<String>,
     pub macro_texture_size: i32,  // m_MacrotextureSize from "SIM" param
     pub points: Vec<CompilePoint>, // (size_x+1) * (size_y+1) points
@@ -124,6 +129,23 @@ impl GameMap {
             .unwrap_or(1.0);
         let light_main_color = find_property_int(prop_names, prop_values, "LightMainColor")
             .unwrap_or(0x989898) as u32;
+        let light_main_color_obj = find_property_int(prop_names, prop_values, "LightMainColorObj")
+            .unwrap_or(light_main_color as i32) as u32;
+        let ambient_color_obj = find_property_int(prop_names, prop_values, "AmbientColorObj")
+            .unwrap_or(0x808080) as u32;
+        let ambient_color = find_property_int(prop_names, prop_values, "AmbientColor")
+            .unwrap_or(0x808080) as u32;
+        let mut terrain2object_influence = find_property_float(prop_names, prop_values, "Influence")
+            .unwrap_or(0.0);
+        let terrain2object_target_color = if terrain2object_influence > 0.0 {
+            0xFFFFFF
+        } else if terrain2object_influence < 0.0 {
+            terrain2object_influence = terrain2object_influence.abs();
+            0x000000
+        } else {
+            0x000000
+        };
+        terrain2object_influence = terrain2object_influence.clamp(0.0, 1.0);
 
         // Light direction: RotX(angleX) * RotZ(angleZ) * (0, 0, -1)
         // Ports MatrixMapPrepare.cpp lines 1228-1231
@@ -240,7 +262,12 @@ impl GameMap {
             water_name,
             water_normal_len,
             light_main_color,
+            light_main_color_obj,
             light_main_dir,
+            ambient_color_obj,
+            ambient_color,
+            terrain2object_influence,
+            terrain2object_target_color,
             macro_texture_path,
             macro_texture_size,
             points,
@@ -344,6 +371,51 @@ impl GameMap {
         } else {
             unit.a2 * local_x + unit.b2 * local_y + unit.c2
         }
+    }
+
+    /// Approximate CMatrixMap::GetColor for static objects: bilinear point-color
+    /// sampling on land, object ambient fallback on water or out-of-bounds.
+    pub fn get_color(&self, wx: f32, wy: f32) -> u32 {
+        let sx = wx / GLOBAL_SCALE;
+        let sy = wy / GLOBAL_SCALE;
+        let x = sx.floor() as i32;
+        let y = sy.floor() as i32;
+
+        if x < 0 || y < 0 || x >= self.size_x as i32 || y >= self.size_y as i32 {
+            return self.ambient_color_obj;
+        }
+
+        let unit = self.unit(x as usize, y as usize);
+        if unit.flags & CELLFLAG_WATER != 0 && unit.flags & CELLFLAG_BRIDGE == 0 {
+            return self.ambient_color_obj;
+        }
+
+        let kx = sx - x as f32;
+        let ky = sy - y as f32;
+
+        let c00 = self.point(x as usize, y as usize);
+        let c10 = self.point(x as usize + 1, y as usize);
+        let c01 = self.point(x as usize, y as usize + 1);
+        let c11 = self.point(x as usize + 1, y as usize + 1);
+
+        let lerp = |a: f32, b: f32, t: f32| a + (b - a) * t;
+        let bilerp = |a: f32, b: f32, c: f32, d: f32| {
+            lerp(lerp(a, b, kx), lerp(c, d, kx), ky)
+        };
+
+        let r = bilerp(c00.r as f32, c10.r as f32, c01.r as f32, c11.r as f32).round().clamp(0.0, 255.0) as u32;
+        let g = bilerp(c00.g as f32, c10.g as f32, c01.g as f32, c11.g as f32).round().clamp(0.0, 255.0) as u32;
+        let b = bilerp(c00.b as f32, c10.b as f32, c01.b as f32, c11.b as f32).round().clamp(0.0, 255.0) as u32;
+
+        (r << 16) | (g << 8) | b
+    }
+
+    pub fn static_object_color(&self, wx: f32, wy: f32) -> u32 {
+        blend_color(
+            self.get_color(wx, wy),
+            self.terrain2object_target_color,
+            self.terrain2object_influence,
+        )
     }
 }
 
@@ -616,6 +688,22 @@ fn read_f32_array(bytes: &[u8]) -> Vec<f32> {
 
 fn read_u32_array(bytes: &[u8]) -> Vec<u32> {
     bytes.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+}
+
+fn blend_color(a: u32, b: u32, t: f32) -> u32 {
+    let t = t.clamp(0.0, 1.0);
+    let lerp = |ca: u32, cb: u32| -> u32 {
+        ((ca as f32) + ((cb as f32) - (ca as f32)) * t)
+            .round()
+            .clamp(0.0, 255.0) as u32
+    };
+    let ar = (a >> 16) & 0xFF;
+    let ag = (a >> 8) & 0xFF;
+    let ab = a & 0xFF;
+    let br = (b >> 16) & 0xFF;
+    let bg = (b >> 8) & 0xFF;
+    let bb = b & 0xFF;
+    (lerp(ar, br) << 16) | (lerp(ag, bg) << 8) | lerp(ab, bb)
 }
 
 fn find_property_int(

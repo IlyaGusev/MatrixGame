@@ -33,6 +33,7 @@ struct InstanceData {
     row1: [f32; 4],
     row2: [f32; 4],
     row3: [f32; 4],
+    terrain_color: [f32; 4],
 }
 
 #[repr(C)]
@@ -41,6 +42,9 @@ struct Uniforms {
     view_proj: [[f32; 4]; 4],
     fog_color: [f32; 4],
     fog_params: [f32; 4],
+    ambient_color: [f32; 4],
+    light_color: [f32; 4],
+    light_dir: [f32; 4],
 }
 
 struct MeshBatch {
@@ -57,6 +61,9 @@ pub struct ObjectsRenderer {
     batches: Vec<MeshBatch>,
     uniform_buffer: wgpu::Buffer,
     fog_color: [f32; 4],
+    ambient_color: [f32; 4],
+    light_color: [f32; 4],
+    light_dir: [f32; 4],
 }
 
 impl ObjectsRenderer {
@@ -82,6 +89,16 @@ impl ObjectsRenderer {
 
         let [sr, sg, sb] = unpack_rgb(map.sky_color);
         let fog_color = [sr, sg, sb, 1.0];
+        let [ar, ag, ab] = unpack_rgb(map.ambient_color_obj);
+        let [lr, lg, lb] = unpack_rgb(map.light_main_color_obj);
+        let ambient_color = [ar, ag, ab, 1.0];
+        let light_color = [lr, lg, lb, 1.0];
+        let light_dir = [
+            map.light_main_dir[0],
+            map.light_main_dir[1],
+            map.light_main_dir[2],
+            0.0,
+        ];
 
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Objects UB"),
@@ -89,6 +106,9 @@ impl ObjectsRenderer {
                 view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
                 fog_color,
                 fog_params: [FOG_START, FOG_END, 0.0, 0.0],
+                ambient_color,
+                light_color,
+                light_dir,
             }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -173,7 +193,7 @@ impl ObjectsRenderer {
                 .unwrap_or_else(|| fallback_tex.clone());
 
             let inst_data: Vec<InstanceData> = instances.iter().map(|obj| {
-                instance_matrix(obj, cx, cy)
+                instance_matrix(obj, cx, cy, map)
             }).collect();
 
             let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -252,6 +272,7 @@ impl ObjectsRenderer {
                             wgpu::VertexAttribute { offset: 16, shader_location: 4, format: wgpu::VertexFormat::Float32x4 },
                             wgpu::VertexAttribute { offset: 32, shader_location: 5, format: wgpu::VertexFormat::Float32x4 },
                             wgpu::VertexAttribute { offset: 48, shader_location: 6, format: wgpu::VertexFormat::Float32x4 },
+                            wgpu::VertexAttribute { offset: 64, shader_location: 7, format: wgpu::VertexFormat::Float32x4 },
                         ],
                     },
                 ],
@@ -285,7 +306,7 @@ impl ObjectsRenderer {
             cache: None,
         });
 
-        Some(Self { pipeline, batches, uniform_buffer, fog_color })
+        Some(Self { pipeline, batches, uniform_buffer, fog_color, ambient_color, light_color, light_dir })
     }
 
     pub fn render<'a>(
@@ -299,6 +320,9 @@ impl ObjectsRenderer {
             view_proj: view_proj.to_cols_array_2d(),
             fog_color: self.fog_color,
             fog_params: [FOG_START, FOG_END, 0.0, 0.0],
+            ambient_color: self.ambient_color,
+            light_color: self.light_color,
+            light_dir: self.light_dir,
         }));
 
         pass.set_pipeline(&self.pipeline);
@@ -312,18 +336,39 @@ impl ObjectsRenderer {
     }
 }
 
-/// Build a 4x4 world matrix (Z-up, centered render space) from an instance's
-/// position, yaw (angle_z), and uniform scale. Rows are returned in the order
-/// consumed by the vertex shader (row-major per InstanceData).
-fn instance_matrix(obj: &ObjectInstance, cx: f32, cy: f32) -> InstanceData {
+/// Build the same static-object transform order used by the original renderer:
+/// Rx * Ry * Rz, then uniform scale, then translation into centered render space.
+fn instance_matrix(obj: &ObjectInstance, cx: f32, cy: f32, map: &GameMap) -> InstanceData {
     let s = obj.scale.max(0.0001);
+    let [terrain_r, terrain_g, terrain_b] = unpack_rgb(map.static_object_color(obj.x, obj.y));
+
+    let (sx, cxr) = obj.angle_x.sin_cos();
+    let (sy, cyr) = obj.angle_y.sin_cos();
     let (sz, cz) = obj.angle_z.sin_cos();
-    // M = T * Rz * S, written row-major so rows can be dotted with (x, y, z, 1).
+
+    let rx = glam::Mat3::from_cols_array(&[
+        1.0, 0.0, 0.0,
+        0.0, cxr, sx,
+        0.0, -sx, cxr,
+    ]);
+    let ry = glam::Mat3::from_cols_array(&[
+        cyr, 0.0, -sy,
+        0.0, 1.0, 0.0,
+        sy, 0.0, cyr,
+    ]);
+    let rz = glam::Mat3::from_cols_array(&[
+        cz, sz, 0.0,
+        -sz, cz, 0.0,
+        0.0, 0.0, 1.0,
+    ]);
+    let m = rx * ry * rz * s;
+
     InstanceData {
-        row0: [cz * s, -sz * s, 0.0, obj.x - cx],
-        row1: [sz * s,  cz * s, 0.0, obj.y - cy],
-        row2: [0.0,     0.0,    s,   obj.z],
+        row0: [m.x_axis.x, m.y_axis.x, m.z_axis.x, obj.x - cx],
+        row1: [m.x_axis.y, m.y_axis.y, m.z_axis.y, obj.y - cy],
+        row2: [m.x_axis.z, m.y_axis.z, m.z_axis.z, obj.z],
         row3: [0.0,     0.0,    0.0, 1.0],
+        terrain_color: [terrain_r, terrain_g, terrain_b, 1.0],
     }
 }
 
@@ -362,6 +407,9 @@ struct U {
     view_proj: mat4x4<f32>,
     fog_color: vec4<f32>,
     fog_params: vec4<f32>,
+    ambient_color: vec4<f32>,
+    light_color: vec4<f32>,
+    light_dir: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> u: U;
 @group(0) @binding(1) var t_diffuse: texture_2d<f32>;
@@ -375,12 +423,14 @@ struct VIn {
     @location(4) m1: vec4<f32>,
     @location(5) m2: vec4<f32>,
     @location(6) m3: vec4<f32>,
+    @location(7) terrain_color: vec4<f32>,
 };
 struct VOut {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) normal: vec3<f32>,
     @location(2) view_dist: f32,
+    @location(3) terrain_color: vec3<f32>,
 };
 
 @vertex fn vs_main(in: VIn) -> VOut {
@@ -395,6 +445,7 @@ struct VOut {
     let n = vec3<f32>(dot(in.m0.xyz, in.normal), dot(in.m1.xyz, in.normal), dot(in.m2.xyz, in.normal));
     out.normal = normalize(n);
     out.view_dist = clip.w;
+    out.terrain_color = in.terrain_color.rgb;
     return out;
 }
 
@@ -404,9 +455,10 @@ struct VOut {
     if (tex.a < 0.5) { discard; }
 
     let n = normalize(in.normal);
-    let l = normalize(vec3<f32>(0.4, 0.3, 1.0));
-    let diffuse = max(dot(n, l), 0.0) * 0.6 + 0.5;
-    var rgb = tex.rgb * diffuse;
+    let l = normalize(-u.light_dir.xyz);
+    let ndotl = max(dot(n, l), 0.0);
+    let lighting = clamp(u.ambient_color.rgb + u.light_color.rgb * ndotl, vec3<f32>(0.0), vec3<f32>(1.0));
+    var rgb = tex.rgb * in.terrain_color * lighting;
 
     let fog_f = clamp((u.fog_params.y - in.view_dist) / (u.fog_params.y - u.fog_params.x), 0.0, 1.0);
     rgb = mix(u.fog_color.rgb, rgb, fog_f);
