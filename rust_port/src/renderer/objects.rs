@@ -10,9 +10,9 @@ use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
 use crate::assets::storage::Storage;
+use crate::effects::point_light::PointLightSystem;
 use crate::game::common::{FOG_START, FOG_END, unpack_rgb};
 use crate::game::map::{GameMap, ObjectInstance};
-use crate::game::point_light::PointLightSystem;
 use crate::game::vo_loader::{self};
 use crate::renderer::camera::Camera;
 use crate::renderer::texture::{decode_texture_bytes, create_texture_from_rgba, create_solid_texture};

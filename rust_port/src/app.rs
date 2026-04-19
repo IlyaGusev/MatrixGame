@@ -8,8 +8,8 @@ use winit::{
     window::{Window, WindowAttributes, WindowId},
 };
 
+use crate::effects::point_light::PointLightSystem;
 use crate::game::map::GameMap;
-use crate::game::point_light::PointLightSystem;
 use crate::game::world::World;
 use crate::renderer::camera::Camera;
 use crate::renderer::context::GfxContext;

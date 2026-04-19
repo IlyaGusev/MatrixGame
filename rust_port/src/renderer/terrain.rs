@@ -12,10 +12,10 @@ use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
 use crate::assets::storage::Storage;
+use crate::effects::point_light::{PointLightRenderer, PointLightSystem};
 use crate::game::common::{TEX_BOTTOM_SIZE, MAP_GROUP_SIZE, CELLFLAG_DOWN, FOG_START, FOG_END, rd_u32, rd_u16, unpack_rgb};
 use crate::game::map::{GameMap, GLOBAL_SCALE};
 use crate::game::map_prepare::build_tex_union_atlases;
-use crate::game::point_light::PointLightSystem;
 use crate::renderer::camera::Camera;
 use crate::renderer::ter_surface::build_surface_overlays;
 use crate::renderer::texture::*;
@@ -72,6 +72,7 @@ pub struct TerrainRenderer {
     clear_color: wgpu::Color,
     fog_color: [f32; 4],
     objects: Option<super::objects::ObjectsRenderer>,
+    point_lights: PointLightRenderer,
     water: Option<super::water::Water>,
     uniform_buffer: wgpu::Buffer,
     depth_texture: wgpu::TextureView,
@@ -310,6 +311,7 @@ impl TerrainRenderer {
 
         // Water (MatrixWater.cpp)
         let water = super::water::Water::new(device, queue, config, map, stor, read_texture);
+        let point_lights = PointLightRenderer::new(device, config);
 
         // Pipelines
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("Terrain Shader"), source: wgpu::ShaderSource::Wgsl(SHADER.into()) });
@@ -370,6 +372,7 @@ impl TerrainRenderer {
             clear_color,
             fog_color,
             objects,
+            point_lights,
             water,
             uniform_buffer,
             depth_texture,
@@ -413,6 +416,7 @@ impl TerrainRenderer {
         if let Some(objects) = &mut self.objects {
             objects.takt(dt_ms, queue, map, point_lights);
         }
+        self.point_lights.sync(device, map, point_lights);
     }
 
     pub fn render(&mut self, _device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView, queue: &wgpu::Queue, camera: &Camera, view_proj: glam::Mat4, view_mat: glam::Mat4) {
@@ -459,6 +463,9 @@ impl TerrainRenderer {
         if let Some(objects) = &self.objects {
             objects.render(queue, &mut pass, camera, view_proj);
         }
+
+        // Visible additive point-light pass on terrain-conforming geometry.
+        self.point_lights.render(queue, &mut pass, view_proj);
 
         // Water
         if let Some(water) = &mut self.water {

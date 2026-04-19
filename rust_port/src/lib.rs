@@ -1,5 +1,6 @@
 pub mod app;
 pub mod assets;
+pub mod effects;
 pub mod game;
 pub mod platform;
 pub mod renderer;

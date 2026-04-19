@@ -3,8 +3,8 @@
 use anyhow::{bail, Context, Result};
 
 use crate::assets::storage::Storage;
+use crate::effects::point_light::PointLightSystem;
 use crate::game::common::{CELLFLAG_BRIDGE, CELLFLAG_FLAT, CELLFLAG_LAND, CELLFLAG_WATER, MAP_GROUP_SIZE};
-use crate::game::point_light::PointLightSystem;
 
 pub const GLOBAL_SCALE: f32 = 20.0;
 
