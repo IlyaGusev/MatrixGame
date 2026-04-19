@@ -33,12 +33,20 @@ pub struct Sky {
 }
 
 impl Sky {
-    pub fn new(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration, sky_color_rgba: u32, water_color_rgba: u32) -> Self {
+    pub fn new(
+        device: &wgpu::Device,
+        config: &wgpu::SurfaceConfiguration,
+        sky_color_rgba: u32,
+        water_color_rgba: u32,
+    ) -> Self {
         let sky_color = unpack_rgb(sky_color_rgba);
         let water_color = unpack_rgb(water_color_rgba);
 
         // 10 verts = sky gradient (6) + separator + water band (4). Use non-strip for clarity.
-        let initial = [SkyVertex { position: [0.0, 0.0], color: [0.0; 4] }; 10];
+        let initial = [SkyVertex {
+            position: [0.0, 0.0],
+            color: [0.0; 4],
+        }; 10];
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Sky VB"),
             contents: bytemuck::cast_slice(&initial),
@@ -66,8 +74,16 @@ impl Sky {
                     array_stride: std::mem::size_of::<SkyVertex>() as u64,
                     step_mode: wgpu::VertexStepMode::Vertex,
                     attributes: &[
-                        wgpu::VertexAttribute { offset: 0, shader_location: 0, format: wgpu::VertexFormat::Float32x2 },
-                        wgpu::VertexAttribute { offset: 8, shader_location: 1, format: wgpu::VertexFormat::Float32x4 },
+                        wgpu::VertexAttribute {
+                            offset: 0,
+                            shader_location: 0,
+                            format: wgpu::VertexFormat::Float32x2,
+                        },
+                        wgpu::VertexAttribute {
+                            offset: 8,
+                            shader_location: 1,
+                            format: wgpu::VertexFormat::Float32x4,
+                        },
                     ],
                 }],
                 compilation_options: Default::default(),
@@ -109,10 +125,20 @@ impl Sky {
             cache: None,
         });
 
-        Self { pipeline, vertex_buffer, sky_color, water_color }
+        Self {
+            pipeline,
+            vertex_buffer,
+            sky_color,
+            water_color,
+        }
     }
 
-    pub fn render<'a>(&'a self, queue: &wgpu::Queue, pass: &mut wgpu::RenderPass<'a>, camera: &Camera) {
+    pub fn render<'a>(
+        &'a self,
+        queue: &wgpu::Queue,
+        pass: &mut wgpu::RenderPass<'a>,
+        camera: &Camera,
+    ) {
         let sh_frac = compute_sky_height_frac(camera);
 
         // Screen frac (0=top, 1=bottom) → NDC y (1=top, -1=bottom): ndc_y = 1 - 2*frac
@@ -138,19 +164,49 @@ impl Sky {
 
         let verts = [
             // Sky gradient strip (draw call 1): transparent top → opaque sky at horizon.
-            SkyVertex { position: [-1.0, top_ndc], color: sky_transparent },
-            SkyVertex { position: [ 1.0, top_ndc], color: sky_transparent },
-            SkyVertex { position: [-1.0, mid_ndc], color: sky_opaque },
-            SkyVertex { position: [ 1.0, mid_ndc], color: sky_opaque },
-            SkyVertex { position: [-1.0, bot_ndc], color: sky_opaque },
-            SkyVertex { position: [ 1.0, bot_ndc], color: sky_opaque },
+            SkyVertex {
+                position: [-1.0, top_ndc],
+                color: sky_transparent,
+            },
+            SkyVertex {
+                position: [1.0, top_ndc],
+                color: sky_transparent,
+            },
+            SkyVertex {
+                position: [-1.0, mid_ndc],
+                color: sky_opaque,
+            },
+            SkyVertex {
+                position: [1.0, mid_ndc],
+                color: sky_opaque,
+            },
+            SkyVertex {
+                position: [-1.0, bot_ndc],
+                color: sky_opaque,
+            },
+            SkyVertex {
+                position: [1.0, bot_ndc],
+                color: sky_opaque,
+            },
             // Water band strip (draw call 2): horizon → screen bottom, solid water color.
             // Fills the below-horizon backdrop so shoreline alpha blends water-over-water
             // instead of water-over-sky (eliminates the halo between water and terrain).
-            SkyVertex { position: [-1.0, water_top], color: water_opaque },
-            SkyVertex { position: [ 1.0, water_top], color: water_opaque },
-            SkyVertex { position: [-1.0, -1.0], color: water_opaque },
-            SkyVertex { position: [ 1.0, -1.0], color: water_opaque },
+            SkyVertex {
+                position: [-1.0, water_top],
+                color: water_opaque,
+            },
+            SkyVertex {
+                position: [1.0, water_top],
+                color: water_opaque,
+            },
+            SkyVertex {
+                position: [-1.0, -1.0],
+                color: water_opaque,
+            },
+            SkyVertex {
+                position: [1.0, -1.0],
+                color: water_opaque,
+            },
         ];
         queue.write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&verts));
 

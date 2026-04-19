@@ -17,7 +17,9 @@ fn main() {
     for i in 0..strings.arrays_count() {
         let path = strings.get_as_wstr(i);
         let path = path.split('?').next().unwrap_or("").replace('\\', "/");
-        if path.is_empty() { continue; }
+        if path.is_empty() {
+            continue;
+        }
 
         let pkg_key = path.to_uppercase();
         match pkg.read_file(&pkg_key) {

@@ -14,7 +14,10 @@ fn main() {
 
     // Print string table contents
     if let Some(strings) = stor.get_buf("strings", "String") {
-        println!("\n=== String table ({} entries) ===", strings.arrays_count());
+        println!(
+            "\n=== String table ({} entries) ===",
+            strings.arrays_count()
+        );
         for i in 0..strings.arrays_count().min(30) {
             println!("  [{}] {}", i, strings.get_as_wstr(i));
         }
@@ -37,14 +40,15 @@ fn main() {
     // Check surface-related tables
     for table in &["surfaces", "surfacesM", "texunions", "bottom"] {
         if let Some(buf) = stor.get_buf(table, "Data") {
-            println!(
-                "\n=== {}/Data: {} arrays ===",
-                table,
-                buf.arrays_count()
-            );
+            println!("\n=== {}/Data: {} arrays ===", table, buf.arrays_count());
             for i in 0..buf.arrays_count().min(3) {
                 let bytes = buf.get_bytes(i);
-                println!("  [{}] {} bytes, first 32: {:?}", i, bytes.len(), &bytes[..bytes.len().min(32)]);
+                println!(
+                    "  [{}] {} bytes, first 32: {:?}",
+                    i,
+                    bytes.len(),
+                    &bytes[..bytes.len().min(32)]
+                );
             }
         }
     }

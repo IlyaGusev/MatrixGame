@@ -10,5 +10,8 @@ fn main() {
 
     std::fs::create_dir_all("assets").ok();
     std::fs::write("assets/atoll.cmap", &cmap_data).expect("write CMAP");
-    println!("Extracted {map_name}: {} bytes -> assets/atoll.cmap", cmap_data.len());
+    println!(
+        "Extracted {map_name}: {} bytes -> assets/atoll.cmap",
+        cmap_data.len()
+    );
 }

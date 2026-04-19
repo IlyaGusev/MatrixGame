@@ -16,10 +16,5 @@ pub fn now_secs() -> f64 {
 
 #[cfg(target_arch = "wasm32")]
 pub fn now_secs() -> f64 {
-    web_sys::window()
-        .unwrap()
-        .performance()
-        .unwrap()
-        .now()
-        / 1000.0
+    web_sys::window().unwrap().performance().unwrap().now() / 1000.0
 }

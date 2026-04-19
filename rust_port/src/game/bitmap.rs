@@ -9,16 +9,30 @@ pub fn blit_tile(atlas: &mut image::RgbaImage, dx: usize, dy: usize, src: &image
     let h = TEX_BOTTOM_SIZE.min(src.height() as usize);
     for py in 0..h {
         for px in 0..w {
-            atlas.put_pixel((dx + px) as u32, (dy + py) as u32, *src.get_pixel(px as u32, py as u32));
+            atlas.put_pixel(
+                (dx + px) as u32,
+                (dy + py) as u32,
+                *src.get_pixel(px as u32, py as u32),
+            );
         }
     }
 }
 
 /// Ports CBitmap::MergeByMask (CBitmap.cpp:1239-1288).
 /// Original: mask=0 → show overlay (bm2), mask=255 → show background (bm1).
-pub fn merge_by_mask(atlas: &mut image::RgbaImage, dx: usize, dy: usize, overlay: &image::RgbaImage, mask: &image::RgbaImage) {
-    let w = TEX_BOTTOM_SIZE.min(overlay.width() as usize).min(mask.width() as usize);
-    let h = TEX_BOTTOM_SIZE.min(overlay.height() as usize).min(mask.height() as usize);
+pub fn merge_by_mask(
+    atlas: &mut image::RgbaImage,
+    dx: usize,
+    dy: usize,
+    overlay: &image::RgbaImage,
+    mask: &image::RgbaImage,
+) {
+    let w = TEX_BOTTOM_SIZE
+        .min(overlay.width() as usize)
+        .min(mask.width() as usize);
+    let h = TEX_BOTTOM_SIZE
+        .min(overlay.height() as usize)
+        .min(mask.height() as usize);
     for py in 0..h {
         for px in 0..w {
             let ax = (dx + px) as u32;
@@ -28,18 +42,27 @@ pub fn merge_by_mask(atlas: &mut image::RgbaImage, dx: usize, dy: usize, overlay
             let m = mask.get_pixel(px as u32, py as u32).0;
             let alpha = (255 - m[0]) as u16;
             let inv = 255 - alpha;
-            atlas.put_pixel(ax, ay, image::Rgba([
-                ((dst[0] as u16 * inv + src[0] as u16 * alpha) / 255) as u8,
-                ((dst[1] as u16 * inv + src[1] as u16 * alpha) / 255) as u8,
-                ((dst[2] as u16 * inv + src[2] as u16 * alpha) / 255) as u8,
-                255,
-            ]));
+            atlas.put_pixel(
+                ax,
+                ay,
+                image::Rgba([
+                    ((dst[0] as u16 * inv + src[0] as u16 * alpha) / 255) as u8,
+                    ((dst[1] as u16 * inv + src[1] as u16 * alpha) / 255) as u8,
+                    ((dst[2] as u16 * inv + src[2] as u16 * alpha) / 255) as u8,
+                    255,
+                ]),
+            );
         }
     }
 }
 
 /// Ports CBitmap::MergeWithAlpha.
-pub fn merge_with_alpha(atlas: &mut image::RgbaImage, dx: usize, dy: usize, src: &image::RgbaImage) {
+pub fn merge_with_alpha(
+    atlas: &mut image::RgbaImage,
+    dx: usize,
+    dy: usize,
+    src: &image::RgbaImage,
+) {
     let w = TEX_BOTTOM_SIZE.min(src.width() as usize);
     let h = TEX_BOTTOM_SIZE.min(src.height() as usize);
     for py in 0..h {
@@ -50,12 +73,16 @@ pub fn merge_with_alpha(atlas: &mut image::RgbaImage, dx: usize, dy: usize, src:
             let s = src.get_pixel(px as u32, py as u32).0;
             let alpha = s[3] as u16;
             let inv = 255 - alpha;
-            atlas.put_pixel(ax, ay, image::Rgba([
-                ((dst[0] as u16 * inv + s[0] as u16 * alpha) / 255) as u8,
-                ((dst[1] as u16 * inv + s[1] as u16 * alpha) / 255) as u8,
-                ((dst[2] as u16 * inv + s[2] as u16 * alpha) / 255) as u8,
-                255,
-            ]));
+            atlas.put_pixel(
+                ax,
+                ay,
+                image::Rgba([
+                    ((dst[0] as u16 * inv + s[0] as u16 * alpha) / 255) as u8,
+                    ((dst[1] as u16 * inv + s[1] as u16 * alpha) / 255) as u8,
+                    ((dst[2] as u16 * inv + s[2] as u16 * alpha) / 255) as u8,
+                    255,
+                ]),
+            );
         }
     }
 }

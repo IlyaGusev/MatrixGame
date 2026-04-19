@@ -5,10 +5,15 @@ fn main() {
     let pkg = PkgArchive::from_bytes(pkg_data).unwrap();
 
     let files = pkg.list_files();
-    let mut water: Vec<_> = files.iter().filter(|f| f.to_lowercase().contains("water")).collect();
+    let mut water: Vec<_> = files
+        .iter()
+        .filter(|f| f.to_lowercase().contains("water"))
+        .collect();
     water.sort();
     println!("=== Water-related files ===");
-    for f in &water { println!("  {f}"); }
+    for f in &water {
+        println!("  {f}");
+    }
 
     // Also check data.txt for water config
     if let Ok(data) = pkg.read_file("MATRIX/ROBOT/DATA.TXT") {

@@ -32,23 +32,23 @@ pub const MAX_VIEW_DISTANCE: f32 = 4000.0;
 
 /// Strategy camera parameters (MatrixConfig.cpp:226-249).
 struct CamParam {
-    rot_speed_x: f32,      // pitch speed (rad/ms)
-    rot_speed_z: f32,      // yaw speed (rad/ms)
-    rot_angle_min: f32,    // pitch at param=0 (most top-down)
-    rot_angle_max: f32,    // pitch at param=1 (most level)
+    rot_speed_x: f32,   // pitch speed (rad/ms)
+    rot_speed_z: f32,   // yaw speed (rad/ms)
+    rot_angle_min: f32, // pitch at param=0 (most top-down)
+    rot_angle_max: f32, // pitch at param=1 (most level)
     dist_min: f32,
     dist_max: f32,
-    angle_param: f32,      // default pitch parameter
-    height: f32,           // link-point height above terrain
-    wheel_step: f32,       // `dist_param` delta per mouse-wheel notch
-    move_speed: f32,       // pan speed (world units/ms)
+    angle_param: f32, // default pitch parameter
+    height: f32,      // link-point height above terrain
+    wheel_step: f32,  // `dist_param` delta per mouse-wheel notch
+    move_speed: f32,  // pan speed (world units/ms)
 }
 
 const STRATEGY_PARAMS: CamParam = CamParam {
     rot_speed_x: 0.0005,
     rot_speed_z: 0.001,
     rot_angle_min: 60.0 * std::f32::consts::PI / 180.0,
-    rot_angle_max: 20.0 * std::f32::consts::PI / 180.0,   // original (MatrixConfig.cpp)
+    rot_angle_max: 20.0 * std::f32::consts::PI / 180.0, // original (MatrixConfig.cpp)
     dist_min: 70.0,
     dist_max: 250.0,
     angle_param: 0.4,
@@ -56,7 +56,6 @@ const STRATEGY_PARAMS: CamParam = CamParam {
     wheel_step: 0.225,
     move_speed: 1.05,
 };
-
 
 const MOUSE_EDGE: f32 = 4.0; // MatrixFormGame.hpp:9 (MOUSE_BORDER)
 
@@ -69,7 +68,7 @@ pub struct Camera {
     link_point: Vec3,
 
     // Target state (user-controlled).
-    xy_strategy: [f32; 2],   // in uncentered world coords
+    xy_strategy: [f32; 2], // in uncentered world coords
     ang_strategy: f32,
     angle_param: f32,
     dist_param: f32,
@@ -81,7 +80,7 @@ pub struct Camera {
 
     // Input state.
     actions: u32,
-    mouse_cam: bool,          // middle-button drag active
+    mouse_cam: bool, // middle-button drag active
     last_mouse: [f32; 2],
     cursor: [f32; 2],
     screen: [f32; 2],
@@ -96,14 +95,14 @@ pub struct Camera {
     sample_ground: Option<Box<dyn Fn(f32, f32) -> f32 + Send + Sync>>,
 }
 
-const ACT_MOVE_LEFT:  u32 = 1 << 0;
+const ACT_MOVE_LEFT: u32 = 1 << 0;
 const ACT_MOVE_RIGHT: u32 = 1 << 1;
-const ACT_MOVE_FWD:   u32 = 1 << 2;
-const ACT_MOVE_BACK:  u32 = 1 << 3;
-const ACT_ROT_LEFT:   u32 = 1 << 4;
-const ACT_ROT_RIGHT:  u32 = 1 << 5;
-const ACT_ROT_UP:     u32 = 1 << 6;
-const ACT_ROT_DOWN:   u32 = 1 << 7;
+const ACT_MOVE_FWD: u32 = 1 << 2;
+const ACT_MOVE_BACK: u32 = 1 << 3;
+const ACT_ROT_LEFT: u32 = 1 << 4;
+const ACT_ROT_RIGHT: u32 = 1 << 5;
+const ACT_ROT_UP: u32 = 1 << 6;
+const ACT_ROT_DOWN: u32 = 1 << 7;
 
 impl Camera {
     pub fn new(aspect: f32) -> Self {
@@ -157,17 +156,11 @@ impl Camera {
         self.xy_strategy = pos;
     }
 
-    pub fn set_terrain_sampler(
-        &mut self,
-        f: Box<dyn Fn(f32, f32) -> f32 + Send + Sync>,
-    ) {
+    pub fn set_terrain_sampler(&mut self, f: Box<dyn Fn(f32, f32) -> f32 + Send + Sync>) {
         self.sample_terrain = Some(f);
     }
 
-    pub fn set_ground_sampler(
-        &mut self,
-        f: Box<dyn Fn(f32, f32) -> f32 + Send + Sync>,
-    ) {
+    pub fn set_ground_sampler(&mut self, f: Box<dyn Fn(f32, f32) -> f32 + Send + Sync>) {
         self.sample_ground = Some(f);
     }
 
@@ -225,17 +218,21 @@ impl Camera {
             _ => {}
         }
         let bit = match key {
-            KeyAction::MoveLeft    => ACT_MOVE_LEFT,
-            KeyAction::MoveRight   => ACT_MOVE_RIGHT,
+            KeyAction::MoveLeft => ACT_MOVE_LEFT,
+            KeyAction::MoveRight => ACT_MOVE_RIGHT,
             KeyAction::MoveForward => ACT_MOVE_FWD,
-            KeyAction::MoveBack    => ACT_MOVE_BACK,
-            KeyAction::RotLeft     => ACT_ROT_LEFT,
-            KeyAction::RotRight    => ACT_ROT_RIGHT,
-            KeyAction::RotUp       => ACT_ROT_UP,
-            KeyAction::RotDown     => ACT_ROT_DOWN,
+            KeyAction::MoveBack => ACT_MOVE_BACK,
+            KeyAction::RotLeft => ACT_ROT_LEFT,
+            KeyAction::RotRight => ACT_ROT_RIGHT,
+            KeyAction::RotUp => ACT_ROT_UP,
+            KeyAction::RotDown => ACT_ROT_DOWN,
             KeyAction::ResetAngles => return,
         };
-        if pressed { self.actions |= bit; } else { self.actions &= !bit; }
+        if pressed {
+            self.actions |= bit;
+        } else {
+            self.actions &= !bit;
+        }
     }
 
     // ── Per-frame update ──────────────────────────────────────────────────
@@ -259,24 +256,37 @@ impl Camera {
         // Combine keyboard-held pan bits with per-frame edge-pan, without
         // touching self.actions (clearing it would wipe the keyboard hold and
         // stall movement between OS key-repeat events — the "laggy WASD" bug).
-        let mut move_bits = self.actions & (ACT_MOVE_LEFT|ACT_MOVE_RIGHT|ACT_MOVE_FWD|ACT_MOVE_BACK);
+        let mut move_bits =
+            self.actions & (ACT_MOVE_LEFT | ACT_MOVE_RIGHT | ACT_MOVE_FWD | ACT_MOVE_BACK);
         let [cx, cy] = self.cursor;
         let [w, h] = self.screen;
         if cx >= 0.0 && cy >= 0.0 && cx < w && cy < h {
-            if cx < MOUSE_EDGE     { move_bits |= ACT_MOVE_LEFT; }
-            if cx > w - MOUSE_EDGE { move_bits |= ACT_MOVE_RIGHT; }
-            if cy < MOUSE_EDGE     { move_bits |= ACT_MOVE_FWD; }
-            if cy > h - MOUSE_EDGE { move_bits |= ACT_MOVE_BACK; }
+            if cx < MOUSE_EDGE {
+                move_bits |= ACT_MOVE_LEFT;
+            }
+            if cx > w - MOUSE_EDGE {
+                move_bits |= ACT_MOVE_RIGHT;
+            }
+            if cy < MOUSE_EDGE {
+                move_bits |= ACT_MOVE_FWD;
+            }
+            if cy > h - MOUSE_EDGE {
+                move_bits |= ACT_MOVE_BACK;
+            }
         }
 
         // Yaw/pitch (MatrixCamera.cpp:1103-1127). These bits are cleared on
         // key release via on_key, so we leave self.actions untouched here.
-        if self.actions & ACT_ROT_LEFT  != 0 { self.ang_strategy -= p.rot_speed_z * dt_ms; }
-        if self.actions & ACT_ROT_RIGHT != 0 { self.ang_strategy += p.rot_speed_z * dt_ms; }
-        if self.actions & ACT_ROT_UP    != 0 {
+        if self.actions & ACT_ROT_LEFT != 0 {
+            self.ang_strategy -= p.rot_speed_z * dt_ms;
+        }
+        if self.actions & ACT_ROT_RIGHT != 0 {
+            self.ang_strategy += p.rot_speed_z * dt_ms;
+        }
+        if self.actions & ACT_ROT_UP != 0 {
             self.angle_param = (self.angle_param + p.rot_speed_x * dt_ms).min(1.0);
         }
-        if self.actions & ACT_ROT_DOWN  != 0 {
+        if self.actions & ACT_ROT_DOWN != 0 {
             self.angle_param = (self.angle_param - p.rot_speed_x * dt_ms).max(0.0);
         }
 
@@ -289,13 +299,28 @@ impl Camera {
             let rdir = Vec2::new(-dir.y, dir.x);
             let tdir = dir;
             let bdir = -dir;
-            if move_bits & ACT_MOVE_LEFT  != 0 { self.xy_strategy[0] += ldir.x; self.xy_strategy[1] += ldir.y; }
-            if move_bits & ACT_MOVE_RIGHT != 0 { self.xy_strategy[0] += rdir.x; self.xy_strategy[1] += rdir.y; }
-            if move_bits & ACT_MOVE_FWD   != 0 { self.xy_strategy[0] += tdir.x; self.xy_strategy[1] += tdir.y; }
-            if move_bits & ACT_MOVE_BACK  != 0 { self.xy_strategy[0] += bdir.x; self.xy_strategy[1] += bdir.y; }
+            if move_bits & ACT_MOVE_LEFT != 0 {
+                self.xy_strategy[0] += ldir.x;
+                self.xy_strategy[1] += ldir.y;
+            }
+            if move_bits & ACT_MOVE_RIGHT != 0 {
+                self.xy_strategy[0] += rdir.x;
+                self.xy_strategy[1] += rdir.y;
+            }
+            if move_bits & ACT_MOVE_FWD != 0 {
+                self.xy_strategy[0] += tdir.x;
+                self.xy_strategy[1] += tdir.y;
+            }
+            if move_bits & ACT_MOVE_BACK != 0 {
+                self.xy_strategy[0] += bdir.x;
+                self.xy_strategy[1] += bdir.y;
+            }
         }
 
-        let to_center = Vec2::new(self.map_cx - self.xy_strategy[0], self.map_cy - self.xy_strategy[1]);
+        let to_center = Vec2::new(
+            self.map_cx - self.xy_strategy[0],
+            self.map_cy - self.xy_strategy[1],
+        );
         let r = to_center.length();
         let rlim = 3.0 * self.map_cx.max(self.map_cy);
         if r > rlim && r > 0.0 {
@@ -347,10 +372,7 @@ impl Camera {
         let proj = Mat4::perspective_rh(CAM_FOV, self.aspect, self.near, self.far);
 
         let z_to_y = Mat4::from_cols_array(&[
-            1.0, 0.0, 0.0, 0.0,
-            0.0, 0.0, -1.0, 0.0,
-            0.0, 1.0, 0.0, 0.0,
-            0.0, 0.0, 0.0, 1.0,
+            1.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0,
         ]);
         proj * view * z_to_y
     }

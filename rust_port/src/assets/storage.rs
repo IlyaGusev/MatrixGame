@@ -46,13 +46,22 @@ impl DataBuf {
             if te_offset + 12 > raw.len() {
                 bail!("DataBuf table entry out of bounds");
             }
-            let disp =
-                u32::from_le_bytes([raw[te_offset], raw[te_offset + 1], raw[te_offset + 2], raw[te_offset + 3]])
-                    as usize;
-            let count =
-                u32::from_le_bytes([raw[te_offset + 4], raw[te_offset + 5], raw[te_offset + 6], raw[te_offset + 7]])
-                    as usize;
-            arrays.push(ArrayEntry { offset: disp, count });
+            let disp = u32::from_le_bytes([
+                raw[te_offset],
+                raw[te_offset + 1],
+                raw[te_offset + 2],
+                raw[te_offset + 3],
+            ]) as usize;
+            let count = u32::from_le_bytes([
+                raw[te_offset + 4],
+                raw[te_offset + 5],
+                raw[te_offset + 6],
+                raw[te_offset + 7],
+            ]) as usize;
+            arrays.push(ArrayEntry {
+                offset: disp,
+                count,
+            });
         }
 
         Ok(Self {
@@ -161,7 +170,11 @@ impl Storage {
             }
         }
 
-        log::info!("storage: loaded {} records with {} items total", record_count, items.len());
+        log::info!(
+            "storage: loaded {} records with {} items total",
+            record_count,
+            items.len()
+        );
         Ok(Self { items })
     }
 
@@ -177,7 +190,11 @@ impl Storage {
         println!("=== Storage structure ({} items) ===", keys.len());
         for (rec, item) in &keys {
             let db = &self.items[&(rec.clone(), item.clone())];
-            println!("  {rec}/{item}: {} arrays, elem_size={}", db.arrays_count(), db.element_size);
+            println!(
+                "  {rec}/{item}: {} arrays, elem_size={}",
+                db.arrays_count(),
+                db.element_size
+            );
         }
     }
 }
@@ -237,16 +254,22 @@ fn zl_decompress_all(data: &[u8]) -> Result<Vec<u8>> {
         if iptr + 4 > data.len() {
             bail!("ZL03 block header out of bounds at offset {}", iptr);
         }
-        let szb = u32::from_le_bytes([data[iptr], data[iptr + 1], data[iptr + 2], data[iptr + 3]]) as usize;
+        let szb = u32::from_le_bytes([data[iptr], data[iptr + 1], data[iptr + 2], data[iptr + 3]])
+            as usize;
         iptr += 4;
 
         if iptr + szb > data.len() {
-            bail!("ZL03 block data out of bounds: need {} bytes at offset {}", szb, iptr);
+            bail!(
+                "ZL03 block data out of bounds: need {} bytes at offset {}",
+                szb,
+                iptr
+            );
         }
 
         let mut decoder = ZlibDecoder::new(&data[iptr..iptr + szb]);
         let mut decompressed = Vec::new();
-        decoder.read_to_end(&mut decompressed)
+        decoder
+            .read_to_end(&mut decompressed)
             .context("ZL03 zlib decompression failed")?;
         result.extend_from_slice(&decompressed);
 

@@ -37,7 +37,10 @@ fn main() {
             } else {
                 "<bad-id>".to_string()
             };
-            println!("argb={color_dw:08X} alpha={} index={} tex={}", alpha, index, tex_path);
+            println!(
+                "argb={color_dw:08X} alpha={} index={} tex={}",
+                alpha, index, tex_path
+            );
         }
     }
 }

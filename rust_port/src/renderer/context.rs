@@ -58,8 +58,14 @@ impl GfxContext {
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
-            width: size.width.max(1).min(device.limits().max_texture_dimension_2d),
-            height: size.height.max(1).min(device.limits().max_texture_dimension_2d),
+            width: size
+                .width
+                .max(1)
+                .min(device.limits().max_texture_dimension_2d),
+            height: size
+                .height
+                .max(1)
+                .min(device.limits().max_texture_dimension_2d),
             present_mode: wgpu::PresentMode::AutoVsync,
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
@@ -82,12 +88,25 @@ impl GfxContext {
         self.surface.configure(&self.device, &self.config);
     }
 
-    pub fn begin_frame(&self) -> Result<(wgpu::SurfaceTexture, wgpu::TextureView, wgpu::CommandEncoder), wgpu::SurfaceError> {
+    pub fn begin_frame(
+        &self,
+    ) -> Result<
+        (
+            wgpu::SurfaceTexture,
+            wgpu::TextureView,
+            wgpu::CommandEncoder,
+        ),
+        wgpu::SurfaceError,
+    > {
         let output = self.surface.get_current_texture()?;
-        let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("Render Encoder"),
-        });
+        let view = output
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Render Encoder"),
+            });
         Ok((output, view, encoder))
     }
 

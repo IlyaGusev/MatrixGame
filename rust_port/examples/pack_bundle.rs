@@ -42,7 +42,12 @@ fn main() {
                 bundle.add(&path, data);
                 tex_count += 1;
                 found = true;
-                println!("  {} -> {} ({} bytes)", path, candidate, bundle.to_bytes().len());
+                println!(
+                    "  {} -> {} ({} bytes)",
+                    path,
+                    candidate,
+                    bundle.to_bytes().len()
+                );
                 break;
             }
         }
@@ -57,14 +62,29 @@ fn main() {
         if let Some(vals) = stor.get_buf("properties", "Value") {
             if let Some(idx) = props.find_as_wstr("MacroTexture") {
                 let macro_path = vals.get_as_wstr(idx);
-                let file_part = macro_path.split('\\').last().unwrap_or("").split('?').next().unwrap_or("");
+                let file_part = macro_path
+                    .split('\\')
+                    .last()
+                    .unwrap_or("")
+                    .split('?')
+                    .next()
+                    .unwrap_or("");
                 let pkg_key = format!("MATRIX/MACROTEXTURE/{}.PNG", file_part.to_uppercase());
                 if let Ok(data) = pkg.read_file(&pkg_key) {
                     // Store under both the real path and the fallback alias
-                    let real_path = macro_path.split('?').next().unwrap_or("").replace('\\', "/");
+                    let real_path = macro_path
+                        .split('?')
+                        .next()
+                        .unwrap_or("")
+                        .replace('\\', "/");
                     bundle.add(&real_path, data.clone());
                     bundle.add("macrotexture", data.clone());
-                    println!("  macrotexture -> {} as '{}' + 'macrotexture' ({} bytes)", pkg_key, real_path, data.len());
+                    println!(
+                        "  macrotexture -> {} as '{}' + 'macrotexture' ({} bytes)",
+                        pkg_key,
+                        real_path,
+                        data.len()
+                    );
                 }
             }
         }
@@ -74,11 +94,26 @@ fn main() {
     // (matching resolve_water_preset in renderer/water.rs).
     let water_files = [
         ("Matrix/Textures/Water/1", "MATRIX/TEXTURES/WATER/1.DDS"),
-        ("Matrix/Textures/Water/MIRROR", "MATRIX/TEXTURES/WATER/MIRROR.DDS"),
-        ("Matrix/Textures/Water/1BLACK", "MATRIX/TEXTURES/WATER/1BLACK.DDS"),
-        ("Matrix/Textures/Water/MIRRORBLACK", "MATRIX/TEXTURES/WATER/MIRRORBLACK.DDS"),
-        ("Matrix/Textures/Water/1PURPLE", "MATRIX/TEXTURES/WATER/1PURPLE.DDS"),
-        ("Matrix/Textures/Water/MIRRORPURPLE", "MATRIX/TEXTURES/WATER/MIRRORPURPLE.DDS"),
+        (
+            "Matrix/Textures/Water/MIRROR",
+            "MATRIX/TEXTURES/WATER/MIRROR.DDS",
+        ),
+        (
+            "Matrix/Textures/Water/1BLACK",
+            "MATRIX/TEXTURES/WATER/1BLACK.DDS",
+        ),
+        (
+            "Matrix/Textures/Water/MIRRORBLACK",
+            "MATRIX/TEXTURES/WATER/MIRRORBLACK.DDS",
+        ),
+        (
+            "Matrix/Textures/Water/1PURPLE",
+            "MATRIX/TEXTURES/WATER/1PURPLE.DDS",
+        ),
+        (
+            "Matrix/Textures/Water/MIRRORPURPLE",
+            "MATRIX/TEXTURES/WATER/MIRRORPURPLE.DDS",
+        ),
     ];
     for (key, pkg_path) in &water_files {
         if let Ok(data) = pkg.read_file(pkg_path) {
@@ -91,14 +126,20 @@ fn main() {
     // Pack object .vo meshes + their textures, one per unique object type_id.
     let map = GameMap::from_cmap_bytes(&cmap_data).unwrap();
     let mut obj_types: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
-    for obj in &map.objects { obj_types.insert(obj.type_id); }
+    for obj in &map.objects {
+        obj_types.insert(obj.type_id);
+    }
     let mut vo_count = 0;
     let mut obj_tex_count = 0;
     let mut vo_tex_seen = std::collections::HashSet::<String>::new();
     for type_id in &obj_types {
-        if (*type_id as usize) >= strings.arrays_count() { continue; }
+        if (*type_id as usize) >= strings.arrays_count() {
+            continue;
+        }
         let id_str = strings.get_as_wstr(*type_id as usize);
-        let Some(paths) = vo_loader::resolve_paths(&id_str) else { continue };
+        let Some(paths) = vo_loader::resolve_paths(&id_str) else {
+            continue;
+        };
         let vo_key = paths.vo_path.to_uppercase();
         if let Ok(data) = pkg.read_file(&vo_key) {
             bundle.add(&paths.vo_path, data);
@@ -108,7 +149,9 @@ fn main() {
             continue;
         }
         if let Some(t) = &paths.texture_path {
-            if !vo_tex_seen.insert(t.clone()) { continue; }
+            if !vo_tex_seen.insert(t.clone()) {
+                continue;
+            }
             let k = t.to_uppercase();
             for cand in [k.clone(), format!("{k}.DDS"), format!("{k}.PNG")] {
                 if let Ok(data) = pkg.read_file(&cand) {
@@ -119,7 +162,10 @@ fn main() {
             }
         }
     }
-    println!("  objects: {} vo files, {} textures packed", vo_count, obj_tex_count);
+    println!(
+        "  objects: {} vo files, {} textures packed",
+        vo_count, obj_tex_count
+    );
 
     let bytes = bundle.to_bytes();
     std::fs::create_dir_all("assets").ok();

@@ -7,10 +7,10 @@ use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
 use crate::assets::storage::Storage;
-use crate::renderer::camera::Camera;
 use crate::game::map::{GameMap, GLOBAL_SCALE};
+use crate::renderer::camera::Camera;
 
-use crate::game::common::{FOG_START, FOG_END, unpack_rgb};
+use crate::game::common::{unpack_rgb, FOG_END, FOG_START};
 
 const WATER_LEVEL: f32 = -2.0;
 const WATER_SIZE: usize = 16;
@@ -229,12 +229,12 @@ impl Water {
             });
         }
 
-        let map_group_w =
-            ((map.size_x as f32 + MAP_GROUP_SIZE as f32 - 1.0) / MAP_GROUP_SIZE as f32).ceil()
-                as i32;
-        let map_group_h =
-            ((map.size_y as f32 + MAP_GROUP_SIZE as f32 - 1.0) / MAP_GROUP_SIZE as f32).ceil()
-                as i32;
+        let map_group_w = ((map.size_x as f32 + MAP_GROUP_SIZE as f32 - 1.0)
+            / MAP_GROUP_SIZE as f32)
+            .ceil() as i32;
+        let map_group_h = ((map.size_y as f32 + MAP_GROUP_SIZE as f32 - 1.0)
+            / MAP_GROUP_SIZE as f32)
+            .ceil() as i32;
         let group_world = MAP_GROUP_SIZE as f32 * GLOBAL_SCALE;
         let mut has_group = std::collections::HashSet::new();
         for gi in 0..groups_buf.arrays_count() {
@@ -612,7 +612,6 @@ impl Water {
             self.water_scale,
         );
         queue.write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&water_verts));
-
     }
 
     pub fn render<'a>(
@@ -655,8 +654,16 @@ impl Water {
             );
             let ocean_idxs = build_instance_indices(ocean_instances.len());
             self.ocean_num_indices = ocean_idxs.len() as u32;
-            queue.write_buffer(&self.ocean_vertex_buffer, 0, bytemuck::cast_slice(&ocean_verts));
-            queue.write_buffer(&self.ocean_index_buffer, 0, bytemuck::cast_slice(&ocean_idxs));
+            queue.write_buffer(
+                &self.ocean_vertex_buffer,
+                0,
+                bytemuck::cast_slice(&ocean_verts),
+            );
+            queue.write_buffer(
+                &self.ocean_index_buffer,
+                0,
+                bytemuck::cast_slice(&ocean_idxs),
+            );
             pass.set_pipeline(&self.solid_pipeline);
             pass.set_bind_group(0, &self.solid_bind_group, &[]);
             pass.set_vertex_buffer(0, self.ocean_vertex_buffer.slice(..));
@@ -669,7 +676,11 @@ impl Water {
         pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
         for draw in &self.water_draws {
             pass.set_bind_group(0, &draw.bind_group, &[]);
-            pass.draw_indexed(draw.index_start..(draw.index_start + draw.index_count), 0, 0..1);
+            pass.draw_indexed(
+                draw.index_start..(draw.index_start + draw.index_count),
+                0,
+                0..1,
+            );
         }
     }
 
@@ -895,7 +906,11 @@ fn build_instance_indices(instance_count: usize) -> Vec<u32> {
     idxs
 }
 
-fn quad_intersects_rect(quad: &[glam::Vec2; 4], rect_min: glam::Vec2, rect_max: glam::Vec2) -> bool {
+fn quad_intersects_rect(
+    quad: &[glam::Vec2; 4],
+    rect_min: glam::Vec2,
+    rect_max: glam::Vec2,
+) -> bool {
     let rect = [
         glam::Vec2::new(rect_min.x, rect_min.y),
         glam::Vec2::new(rect_max.x, rect_min.y),
@@ -903,7 +918,10 @@ fn quad_intersects_rect(quad: &[glam::Vec2; 4], rect_min: glam::Vec2, rect_max: 
         glam::Vec2::new(rect_min.x, rect_max.y),
     ];
 
-    if quad.iter().any(|&p| p.x >= rect_min.x && p.x <= rect_max.x && p.y >= rect_min.y && p.y <= rect_max.y) {
+    if quad
+        .iter()
+        .any(|&p| p.x >= rect_min.x && p.x <= rect_max.x && p.y >= rect_min.y && p.y <= rect_max.y)
+    {
         return true;
     }
     if rect.iter().any(|&p| point_in_convex_quad(p, quad)) {

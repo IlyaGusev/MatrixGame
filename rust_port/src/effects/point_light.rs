@@ -280,12 +280,7 @@ impl PointLightRenderer {
         }
     }
 
-    pub fn sync(
-        &mut self,
-        device: &wgpu::Device,
-        map: &GameMap,
-        point_lights: &PointLightSystem,
-    ) {
+    pub fn sync(&mut self, device: &wgpu::Device, map: &GameMap, point_lights: &PointLightSystem) {
         let revision = point_lights.revision();
         if revision == self.last_revision {
             return;
@@ -348,10 +343,14 @@ impl PointLightRenderer {
 
         pass.set_pipeline(&self.pipeline);
         for batch in &self.batches {
-            queue.write_buffer(&batch.uniform_buffer, 0, bytemuck::bytes_of(&Uniforms {
-                view_proj: view_proj.to_cols_array_2d(),
-                color: batch.color,
-            }));
+            queue.write_buffer(
+                &batch.uniform_buffer,
+                0,
+                bytemuck::bytes_of(&Uniforms {
+                    view_proj: view_proj.to_cols_array_2d(),
+                    color: batch.color,
+                }),
+            );
             pass.set_bind_group(0, &batch.bind_group, &[]);
             pass.set_vertex_buffer(0, batch.vertex_buffer.slice(..));
             pass.set_index_buffer(batch.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
@@ -522,12 +521,47 @@ mod tests {
             macro_texture_path: None,
             macro_texture_size: 1,
             points: vec![
-                CompilePoint { move_idx: 0, z: 0.0, b: 16, g: 32, r: 64, flags: CELLFLAG_LAND },
-                CompilePoint { move_idx: 0, z: 0.0, b: 16, g: 32, r: 64, flags: CELLFLAG_LAND },
-                CompilePoint { move_idx: 0, z: 0.0, b: 16, g: 32, r: 64, flags: CELLFLAG_LAND },
-                CompilePoint { move_idx: 0, z: 0.0, b: 16, g: 32, r: 64, flags: CELLFLAG_LAND },
+                CompilePoint {
+                    move_idx: 0,
+                    z: 0.0,
+                    b: 16,
+                    g: 32,
+                    r: 64,
+                    flags: CELLFLAG_LAND,
+                },
+                CompilePoint {
+                    move_idx: 0,
+                    z: 0.0,
+                    b: 16,
+                    g: 32,
+                    r: 64,
+                    flags: CELLFLAG_LAND,
+                },
+                CompilePoint {
+                    move_idx: 0,
+                    z: 0.0,
+                    b: 16,
+                    g: 32,
+                    r: 64,
+                    flags: CELLFLAG_LAND,
+                },
+                CompilePoint {
+                    move_idx: 0,
+                    z: 0.0,
+                    b: 16,
+                    g: 32,
+                    r: 64,
+                    flags: CELLFLAG_LAND,
+                },
             ],
-            normals: vec![PointNormal { x: 0.0, y: 0.0, z: 1.0 }; 4],
+            normals: vec![
+                PointNormal {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 1.0
+                };
+                4
+            ],
             units: vec![MapUnit {
                 flags: CELLFLAG_LAND,
                 a1: 0.0,

@@ -124,20 +124,12 @@ impl PkgArchive {
                 bail!("compressed block too small for ZL03 header");
             }
             if &block_data[0..4] != b"ZL03" && &block_data[0..4] != b"ZL02" {
-                bail!(
-                    "expected ZL02/ZL03 magic, got {:?}",
-                    &block_data[0..4]
-                );
+                bail!("expected ZL02/ZL03 magic, got {:?}", &block_data[0..4]);
             }
-            let _uncompressed_size = u32::from_le_bytes([
-                block_data[4],
-                block_data[5],
-                block_data[6],
-                block_data[7],
-            ]);
+            let _uncompressed_size =
+                u32::from_le_bytes([block_data[4], block_data[5], block_data[6], block_data[7]]);
 
-            let mut decoder =
-                flate2::read::ZlibDecoder::new(Cursor::new(&block_data[8..]));
+            let mut decoder = flate2::read::ZlibDecoder::new(Cursor::new(&block_data[8..]));
             let mut decompressed = Vec::new();
             decoder
                 .read_to_end(&mut decompressed)

@@ -17,17 +17,26 @@ fn main() {
                 println!("    size: {}x{}", rgba.width(), rgba.height());
                 // Check channels
                 let p = rgba.get_pixel(32, 32).0;
-                println!("    center pixel: R={} G={} B={} A={}", p[0], p[1], p[2], p[3]);
+                println!(
+                    "    center pixel: R={} G={} B={} A={}",
+                    p[0], p[1], p[2], p[3]
+                );
                 // Check if grayscale
                 let mut is_gray = true;
                 for px in rgba.pixels() {
-                    if px.0[0] != px.0[1] || px.0[1] != px.0[2] { is_gray = false; break; }
+                    if px.0[0] != px.0[1] || px.0[1] != px.0[2] {
+                        is_gray = false;
+                        break;
+                    }
                 }
                 println!("    grayscale: {}", is_gray);
                 // Alpha stats
                 let mut min_a = 255u8;
                 let mut max_a = 0u8;
-                for px in rgba.pixels() { min_a = min_a.min(px.0[3]); max_a = max_a.max(px.0[3]); }
+                for px in rgba.pixels() {
+                    min_a = min_a.min(px.0[3]);
+                    max_a = max_a.max(px.0[3]);
+                }
                 println!("    alpha range: {}..{}", min_a, max_a);
                 rgba.save(format!("assets/mask_{}.png", i)).ok();
             }

@@ -14,8 +14,8 @@ pub async fn load_bytes(path: &str) -> anyhow::Result<Vec<u8>> {
         use web_sys::{Request, RequestInit, Response};
 
         let opts = RequestInit::new();
-        let request = Request::new_with_str_and_init(path, &opts)
-            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        let request =
+            Request::new_with_str_and_init(path, &opts).map_err(|e| anyhow::anyhow!("{e:?}"))?;
 
         let window = web_sys::window().unwrap();
         let response = JsFuture::from(window.fetch_with_request(&request))

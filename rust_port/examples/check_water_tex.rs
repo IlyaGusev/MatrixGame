@@ -4,7 +4,10 @@ fn main() {
     let pkg_data = std::fs::read("../Data/robots.pkg").unwrap();
     let pkg = PkgArchive::from_bytes(pkg_data).unwrap();
 
-    for (name, path) in [("water", "MATRIX/TEXTURES/WATER/1.DDS"), ("mirror", "MATRIX/TEXTURES/WATER/MIRROR.DDS")] {
+    for (name, path) in [
+        ("water", "MATRIX/TEXTURES/WATER/1.DDS"),
+        ("mirror", "MATRIX/TEXTURES/WATER/MIRROR.DDS"),
+    ] {
         let data = pkg.read_file(path).unwrap();
         println!("=== {} ({} bytes) ===", name, data.len());
         // DDS header
@@ -21,12 +24,21 @@ fn main() {
             let mut count = 0u64;
             for p in img.pixels() {
                 let a = p.0[3];
-                if a < min_a { min_a = a; }
-                if a > max_a { max_a = a; }
+                if a < min_a {
+                    min_a = a;
+                }
+                if a > max_a {
+                    max_a = a;
+                }
                 sum_a += a as u64;
                 count += 1;
             }
-            println!("  alpha: min={}, max={}, avg={:.1}", min_a, max_a, sum_a as f64 / count as f64);
+            println!(
+                "  alpha: min={}, max={}, avg={:.1}",
+                min_a,
+                max_a,
+                sum_a as f64 / count as f64
+            );
 
             // Save for visual inspection
             img.save(format!("assets/{}_decoded.png", name)).ok();

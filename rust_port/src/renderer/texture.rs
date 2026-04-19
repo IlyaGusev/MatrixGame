@@ -11,7 +11,9 @@ pub fn decode_texture_bytes(data: &[u8]) -> Option<image::RgbaImage> {
 }
 
 fn decode_dds(data: &[u8]) -> Option<image::RgbaImage> {
-    if data.len() < 128 { return None; }
+    if data.len() < 128 {
+        return None;
+    }
     let height = u32::from_le_bytes([data[12], data[13], data[14], data[15]]);
     let width = u32::from_le_bytes([data[16], data[17], data[18], data[19]]);
     let fourcc = &data[84..88];
@@ -19,7 +21,13 @@ fn decode_dds(data: &[u8]) -> Option<image::RgbaImage> {
 
     let is_dxt3 = fourcc == b"DXT3";
     let is_dxt5 = fourcc == b"DXT5";
-    let block_bytes = if fourcc == b"DXT1" { 8usize } else if is_dxt3 || is_dxt5 { 16 } else { return None };
+    let block_bytes = if fourcc == b"DXT1" {
+        8usize
+    } else if is_dxt3 || is_dxt5 {
+        16
+    } else {
+        return None;
+    };
 
     let bw = ((width + 3) / 4) as usize;
     let bh = ((height + 3) / 4) as usize;
@@ -28,7 +36,9 @@ fn decode_dds(data: &[u8]) -> Option<image::RgbaImage> {
     for by in 0..bh {
         for bx in 0..bw {
             let block_start = (by * bw + bx) * block_bytes;
-            if block_start + block_bytes > pixel_data.len() { break; }
+            if block_start + block_bytes > pixel_data.len() {
+                break;
+            }
 
             let color_off = if block_bytes == 16 { 8 } else { 0 };
             let mut colors = decode_dxt_color_block(
@@ -39,7 +49,8 @@ fn decode_dds(data: &[u8]) -> Option<image::RgbaImage> {
             if is_dxt3 {
                 let alpha_block = &pixel_data[block_start..block_start + 8];
                 for py in 0..4usize {
-                    let row_bits = u16::from_le_bytes([alpha_block[py * 2], alpha_block[py * 2 + 1]]);
+                    let row_bits =
+                        u16::from_le_bytes([alpha_block[py * 2], alpha_block[py * 2 + 1]]);
                     for px in 0..4usize {
                         let a4 = ((row_bits >> (px * 4)) & 0xF) as u8;
                         colors[py * 4 + px][3] = (a4 << 4) | a4;
@@ -53,9 +64,13 @@ fn decode_dds(data: &[u8]) -> Option<image::RgbaImage> {
                 alpha_lut[0] = a0 as u8;
                 alpha_lut[1] = a1 as u8;
                 if a0 > a1 {
-                    for i in 2..8u16 { alpha_lut[i as usize] = ((a0 * (8 - i) + a1 * (i - 1)) / 7) as u8; }
+                    for i in 2..8u16 {
+                        alpha_lut[i as usize] = ((a0 * (8 - i) + a1 * (i - 1)) / 7) as u8;
+                    }
                 } else {
-                    for i in 2..6u16 { alpha_lut[i as usize] = ((a0 * (6 - i) + a1 * (i - 1)) / 5) as u8; }
+                    for i in 2..6u16 {
+                        alpha_lut[i as usize] = ((a0 * (6 - i) + a1 * (i - 1)) / 5) as u8;
+                    }
                     alpha_lut[6] = 0;
                     alpha_lut[7] = 255;
                 }
@@ -88,17 +103,40 @@ fn decode_dds(data: &[u8]) -> Option<image::RgbaImage> {
 fn decode_dxt_color_block(block: &[u8], allow_dxt1_transparency: bool) -> [[u8; 4]; 16] {
     let c0 = u16::from_le_bytes([block[0], block[1]]);
     let c1 = u16::from_le_bytes([block[2], block[3]]);
-    let expand5 = |v: u16| -> u8 { let x = (v & 0x1F) as u8; (x << 3) | (x >> 2) };
-    let expand6 = |v: u16| -> u8 { let x = (v & 0x3F) as u8; (x << 2) | (x >> 4) };
+    let expand5 = |v: u16| -> u8 {
+        let x = (v & 0x1F) as u8;
+        (x << 3) | (x >> 2)
+    };
+    let expand6 = |v: u16| -> u8 {
+        let x = (v & 0x3F) as u8;
+        (x << 2) | (x >> 4)
+    };
 
     let col0 = [expand5(c0 >> 11), expand6(c0 >> 5), expand5(c0), 255];
     let col1 = [expand5(c1 >> 11), expand6(c1 >> 5), expand5(c1), 255];
 
     let (col2, col3) = if !allow_dxt1_transparency || c0 > c1 {
-        ([((2*col0[0] as u16 + col1[0] as u16)/3) as u8, ((2*col0[1] as u16 + col1[1] as u16)/3) as u8, ((2*col0[2] as u16 + col1[2] as u16)/3) as u8, 255],
-         [((col0[0] as u16 + 2*col1[0] as u16)/3) as u8, ((col0[1] as u16 + 2*col1[1] as u16)/3) as u8, ((col0[2] as u16 + 2*col1[2] as u16)/3) as u8, 255])
+        (
+            [
+                ((2 * col0[0] as u16 + col1[0] as u16) / 3) as u8,
+                ((2 * col0[1] as u16 + col1[1] as u16) / 3) as u8,
+                ((2 * col0[2] as u16 + col1[2] as u16) / 3) as u8,
+                255,
+            ],
+            [
+                ((col0[0] as u16 + 2 * col1[0] as u16) / 3) as u8,
+                ((col0[1] as u16 + 2 * col1[1] as u16) / 3) as u8,
+                ((col0[2] as u16 + 2 * col1[2] as u16) / 3) as u8,
+                255,
+            ],
+        )
     } else {
-        let avg = [((col0[0] as u16 + col1[0] as u16) / 2) as u8, ((col0[1] as u16 + col1[1] as u16) / 2) as u8, ((col0[2] as u16 + col1[2] as u16) / 2) as u8, 255];
+        let avg = [
+            ((col0[0] as u16 + col1[0] as u16) / 2) as u8,
+            ((col0[1] as u16 + col1[1] as u16) / 2) as u8,
+            ((col0[2] as u16 + col1[2] as u16) / 2) as u8,
+            255,
+        ];
         let transparent = [avg[0], avg[1], avg[2], 0];
         (avg, transparent)
     };
@@ -107,31 +145,64 @@ fn decode_dxt_color_block(block: &[u8], allow_dxt1_transparency: bool) -> [[u8; 
     let mut result = [[0u8; 4]; 16];
     for row in 0..4 {
         let bits = block[4 + row] as u32;
-        for col in 0..4 { result[row * 4 + col] = palette[((bits >> (col * 2)) & 3) as usize]; }
+        for col in 0..4 {
+            result[row * 4 + col] = palette[((bits >> (col * 2)) & 3) as usize];
+        }
     }
     result
 }
 
-pub fn create_solid_texture(device: &wgpu::Device, queue: &wgpu::Queue, color: [u8; 4]) -> wgpu::TextureView {
+pub fn create_solid_texture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    color: [u8; 4],
+) -> wgpu::TextureView {
     let pixels: Vec<u8> = color.repeat(4);
-    let texture = device.create_texture_with_data(queue, &wgpu::TextureDescriptor {
-        label: Some("solid"), size: wgpu::Extent3d { width: 2, height: 2, depth_or_array_layers: 1 },
-        mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8UnormSrgb, usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST, view_formats: &[],
-    }, wgpu::util::TextureDataOrder::LayerMajor, &pixels);
+    let texture = device.create_texture_with_data(
+        queue,
+        &wgpu::TextureDescriptor {
+            label: Some("solid"),
+            size: wgpu::Extent3d {
+                width: 2,
+                height: 2,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        },
+        wgpu::util::TextureDataOrder::LayerMajor,
+        &pixels,
+    );
     texture.create_view(&Default::default())
 }
 
-pub fn create_texture_from_rgba(device: &wgpu::Device, queue: &wgpu::Queue, img: &image::RgbaImage) -> wgpu::TextureView {
+pub fn create_texture_from_rgba(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    img: &image::RgbaImage,
+) -> wgpu::TextureView {
     create_texture_from_rgba_mipped(device, queue, img, 1)
 }
 
 /// Ports CTextureManaged::LoadFromBitmap(bm, D3DFMT_DXT1, levels).
-pub fn create_texture_from_rgba_mipped(device: &wgpu::Device, queue: &wgpu::Queue, img: &image::RgbaImage, levels: u32) -> wgpu::TextureView {
+pub fn create_texture_from_rgba_mipped(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    img: &image::RgbaImage,
+    levels: u32,
+) -> wgpu::TextureView {
     let w = img.width();
     let h = img.height();
     let max_levels = (w.max(h) as f32).log2().floor() as u32 + 1;
-    let mip_count = if levels <= 1 { 1 } else { levels.min(max_levels) };
+    let mip_count = if levels <= 1 {
+        1
+    } else {
+        levels.min(max_levels)
+    };
 
     let mut all_data: Vec<u8> = Vec::new();
     all_data.extend_from_slice(img.as_raw());
@@ -145,43 +216,112 @@ pub fn create_texture_from_rgba_mipped(device: &wgpu::Device, queue: &wgpu::Queu
             for x in 0..mw {
                 let sx = x * 2;
                 let sy = y * 2;
-                let p00 = current.get_pixel(sx.min(current.width()-1), sy.min(current.height()-1)).0;
-                let p10 = current.get_pixel((sx+1).min(current.width()-1), sy.min(current.height()-1)).0;
-                let p01 = current.get_pixel(sx.min(current.width()-1), (sy+1).min(current.height()-1)).0;
-                let p11 = current.get_pixel((sx+1).min(current.width()-1), (sy+1).min(current.height()-1)).0;
+                let p00 = current
+                    .get_pixel(sx.min(current.width() - 1), sy.min(current.height() - 1))
+                    .0;
+                let p10 = current
+                    .get_pixel(
+                        (sx + 1).min(current.width() - 1),
+                        sy.min(current.height() - 1),
+                    )
+                    .0;
+                let p01 = current
+                    .get_pixel(
+                        sx.min(current.width() - 1),
+                        (sy + 1).min(current.height() - 1),
+                    )
+                    .0;
+                let p11 = current
+                    .get_pixel(
+                        (sx + 1).min(current.width() - 1),
+                        (sy + 1).min(current.height() - 1),
+                    )
+                    .0;
                 let a00 = p00[3] as f32 / 255.0;
                 let a10 = p10[3] as f32 / 255.0;
                 let a01 = p01[3] as f32 / 255.0;
                 let a11 = p11[3] as f32 / 255.0;
-                let out_a = (p00[3] as u16 + p10[3] as u16 + p01[3] as u16 + p11[3] as u16) as f32 / (4.0 * 255.0);
-                let premul_r = ((p00[0] as f32 * a00) + (p10[0] as f32 * a10) + (p01[0] as f32 * a01) + (p11[0] as f32 * a11)) * 0.25;
-                let premul_g = ((p00[1] as f32 * a00) + (p10[1] as f32 * a10) + (p01[1] as f32 * a01) + (p11[1] as f32 * a11)) * 0.25;
-                let premul_b = ((p00[2] as f32 * a00) + (p10[2] as f32 * a10) + (p01[2] as f32 * a01) + (p11[2] as f32 * a11)) * 0.25;
+                let out_a = (p00[3] as u16 + p10[3] as u16 + p01[3] as u16 + p11[3] as u16) as f32
+                    / (4.0 * 255.0);
+                let premul_r = ((p00[0] as f32 * a00)
+                    + (p10[0] as f32 * a10)
+                    + (p01[0] as f32 * a01)
+                    + (p11[0] as f32 * a11))
+                    * 0.25;
+                let premul_g = ((p00[1] as f32 * a00)
+                    + (p10[1] as f32 * a10)
+                    + (p01[1] as f32 * a01)
+                    + (p11[1] as f32 * a11))
+                    * 0.25;
+                let premul_b = ((p00[2] as f32 * a00)
+                    + (p10[2] as f32 * a10)
+                    + (p01[2] as f32 * a01)
+                    + (p11[2] as f32 * a11))
+                    * 0.25;
                 let (out_r, out_g, out_b) = if out_a > 1e-6 {
-                    ((premul_r / out_a).clamp(0.0, 255.0) as u8, (premul_g / out_a).clamp(0.0, 255.0) as u8, (premul_b / out_a).clamp(0.0, 255.0) as u8)
-                } else { (0, 0, 0) };
-                mip.put_pixel(x, y, image::Rgba([out_r, out_g, out_b, (out_a * 255.0).round().clamp(0.0, 255.0) as u8]));
+                    (
+                        (premul_r / out_a).clamp(0.0, 255.0) as u8,
+                        (premul_g / out_a).clamp(0.0, 255.0) as u8,
+                        (premul_b / out_a).clamp(0.0, 255.0) as u8,
+                    )
+                } else {
+                    (0, 0, 0)
+                };
+                mip.put_pixel(
+                    x,
+                    y,
+                    image::Rgba([
+                        out_r,
+                        out_g,
+                        out_b,
+                        (out_a * 255.0).round().clamp(0.0, 255.0) as u8,
+                    ]),
+                );
             }
         }
         all_data.extend_from_slice(mip.as_raw());
         current = mip;
     }
 
-    let texture = device.create_texture_with_data(queue, &wgpu::TextureDescriptor {
-        label: None,
-        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-        mip_level_count: mip_count, sample_count: 1, dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8UnormSrgb,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST, view_formats: &[],
-    }, wgpu::util::TextureDataOrder::MipMajor, &all_data);
+    let texture = device.create_texture_with_data(
+        queue,
+        &wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: mip_count,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        },
+        wgpu::util::TextureDataOrder::MipMajor,
+        &all_data,
+    );
     texture.create_view(&Default::default())
 }
 
-pub fn create_depth_texture(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) -> wgpu::TextureView {
+pub fn create_depth_texture(
+    device: &wgpu::Device,
+    config: &wgpu::SurfaceConfiguration,
+) -> wgpu::TextureView {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("Depth"), size: wgpu::Extent3d { width: config.width, height: config.height, depth_or_array_layers: 1 },
-        mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Depth32Float, usage: wgpu::TextureUsages::RENDER_ATTACHMENT, view_formats: &[],
+        label: Some("Depth"),
+        size: wgpu::Extent3d {
+            width: config.width,
+            height: config.height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Depth32Float,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
     });
     texture.create_view(&Default::default())
 }

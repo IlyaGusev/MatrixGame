@@ -54,7 +54,10 @@ fn main() {
 
         let needed = off + vcnt * 32 + idxsz;
         if needed > raw.len() {
-            println!("TRUNC surf {i}: {tex_path}, index={index}, vcnt={vcnt}, idxsz={idxsz}, raw={}", raw.len());
+            println!(
+                "TRUNC surf {i}: {tex_path}, index={index}, vcnt={vcnt}, idxsz={idxsz}, raw={}",
+                raw.len()
+            );
             bad += 1;
             continue;
         }

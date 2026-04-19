@@ -12,15 +12,19 @@ fn main() {
 
     // Check first texunion
     let un_data = tuc.get_bytes(0);
-    let un: Vec<i32> = un_data.chunks_exact(4)
+    let un: Vec<i32> = un_data
+        .chunks_exact(4)
         .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
 
     let mut overlay_counts = std::collections::HashMap::new();
     for k in 0..un.len().min(256) {
-        if un[k] < 0 { continue; }
+        if un[k] < 0 {
+            continue;
+        }
         let bot_raw = botc.get_bytes(un[k] as usize);
-        let bot: Vec<i32> = bot_raw.chunks_exact(4)
+        let bot: Vec<i32> = bot_raw
+            .chunks_exact(4)
             .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
         let overlay_count = (bot.len() - 1) / 2;

@@ -66,9 +66,7 @@ impl ApplicationHandler for App {
             let (map, stor, pkg) = load_map();
 
             let map = Arc::new(map);
-            let mut camera = Camera::new(
-                gfx.config.width as f32 / gfx.config.height as f32,
-            );
+            let mut camera = Camera::new(gfx.config.width as f32 / gfx.config.height as f32);
             camera.set_map(map.world_width(), map.world_height());
             camera.set_aspect(gfx.config.width as f32, gfx.config.height as f32);
             camera.init_strategy_angle(map.camera_angle);
@@ -94,7 +92,14 @@ impl ApplicationHandler for App {
                 }
                 None
             };
-            let terrain = TerrainRenderer::new(&gfx.device, &gfx.queue, &gfx.config, &map, &stor, &tex_reader);
+            let terrain = TerrainRenderer::new(
+                &gfx.device,
+                &gfx.queue,
+                &gfx.config,
+                &map,
+                &stor,
+                &tex_reader,
+            );
             let point_lights = PointLightSystem::new(&map);
 
             *self.state.borrow_mut() = Some(AppState {
@@ -121,9 +126,7 @@ impl ApplicationHandler for App {
                 let (map, stor, bundle) = load_map_async().await;
                 let map = Arc::new(map);
 
-                let mut camera = Camera::new(
-                    gfx.config.width as f32 / gfx.config.height as f32,
-                );
+                let mut camera = Camera::new(gfx.config.width as f32 / gfx.config.height as f32);
                 camera.set_map(map.world_width(), map.world_height());
                 camera.set_aspect(gfx.config.width as f32, gfx.config.height as f32);
                 camera.init_strategy_angle(map.camera_angle);
@@ -139,16 +142,30 @@ impl ApplicationHandler for App {
                     Box::new(move |x, y| m.get_z(x, y))
                 });
 
-                let tex_reader = |path: &str| -> Option<Vec<u8>> {
-                    bundle.read_file(path).map(|s| s.to_vec())
-                };
-                let mut terrain = TerrainRenderer::new(&gfx.device, &gfx.queue, &gfx.config, &map, &stor, &tex_reader);
+                let tex_reader =
+                    |path: &str| -> Option<Vec<u8>> { bundle.read_file(path).map(|s| s.to_vec()) };
+                let mut terrain = TerrainRenderer::new(
+                    &gfx.device,
+                    &gfx.queue,
+                    &gfx.config,
+                    &map,
+                    &stor,
+                    &tex_reader,
+                );
                 let point_lights = PointLightSystem::new(&map);
 
                 // Force resize to match actual canvas dimensions
                 let size = win.inner_size();
-                log::info!("wasm init: window inner_size = {}x{}", size.width, size.height);
-                log::info!("wasm init: surface config = {}x{}", gfx.config.width, gfx.config.height);
+                log::info!(
+                    "wasm init: window inner_size = {}x{}",
+                    size.width,
+                    size.height
+                );
+                log::info!(
+                    "wasm init: surface config = {}x{}",
+                    gfx.config.width,
+                    gfx.config.height
+                );
                 if size.width > 0 && size.height > 0 {
                     gfx.resize(size.width, size.height);
                     terrain.resize(&gfx.device, &gfx.config);
@@ -198,7 +215,11 @@ impl ApplicationHandler for App {
 
             // ── Mouse input (MatrixFormGame.cpp:530-642) ──
             // Middle or right button toggles MouseCam mode (rotate-on-drag).
-            WindowEvent::MouseInput { state: btn_state, button, .. } => {
+            WindowEvent::MouseInput {
+                state: btn_state,
+                button,
+                ..
+            } => {
                 use winit::event::{ElementState, MouseButton};
                 if matches!(button, MouseButton::Middle | MouseButton::Right) {
                     let pressed = btn_state == ElementState::Pressed;
@@ -209,7 +230,9 @@ impl ApplicationHandler for App {
 
             WindowEvent::CursorMoved { position, .. } => {
                 state.cursor = [position.x as f32, position.y as f32];
-                state.camera.on_mouse_move(position.x as f32, position.y as f32);
+                state
+                    .camera
+                    .on_mouse_move(position.x as f32, position.y as f32);
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
@@ -224,24 +247,32 @@ impl ApplicationHandler for App {
 
             // ── Keyboard (MatrixFormGame.cpp:247-282) ──
             WindowEvent::KeyboardInput { event, .. } => {
-                use winit::keyboard::{KeyCode, PhysicalKey};
                 use crate::renderer::camera::KeyAction;
+                use winit::keyboard::{KeyCode, PhysicalKey};
                 let pressed = event.state == winit::event::ElementState::Pressed;
-                let action = match event.physical_key {
-                    PhysicalKey::Code(KeyCode::ArrowUp) | PhysicalKey::Code(KeyCode::KeyW) => Some(KeyAction::MoveBack),
-                    PhysicalKey::Code(KeyCode::ArrowDown) | PhysicalKey::Code(KeyCode::KeyS) => Some(KeyAction::MoveForward),
-                    PhysicalKey::Code(KeyCode::ArrowLeft) | PhysicalKey::Code(KeyCode::KeyA) => Some(KeyAction::MoveLeft),
-                    PhysicalKey::Code(KeyCode::ArrowRight) | PhysicalKey::Code(KeyCode::KeyD) => Some(KeyAction::MoveRight),
-                    // Yaw (KA_ROTATE_LEFT/RIGHT). Original: Home/End + `[`/`]`.
-                    PhysicalKey::Code(KeyCode::Home) | PhysicalKey::Code(KeyCode::BracketLeft) => Some(KeyAction::RotLeft),
-                    PhysicalKey::Code(KeyCode::End) | PhysicalKey::Code(KeyCode::BracketRight) => Some(KeyAction::RotRight),
-                    // Pitch (KA_ROTATE_UP/DOWN). Original: PageUp/PageDown.
-                    PhysicalKey::Code(KeyCode::PageUp)   => Some(KeyAction::RotUp),
-                    PhysicalKey::Code(KeyCode::PageDown) => Some(KeyAction::RotDown),
-                    // Reset angles (KA_CAM_SETDEFAULT). Original: `\`.
-                    PhysicalKey::Code(KeyCode::Backslash) => Some(KeyAction::ResetAngles),
-                    _ => None,
-                };
+                let action =
+                    match event.physical_key {
+                        PhysicalKey::Code(KeyCode::ArrowUp) | PhysicalKey::Code(KeyCode::KeyW) => {
+                            Some(KeyAction::MoveBack)
+                        }
+                        PhysicalKey::Code(KeyCode::ArrowDown)
+                        | PhysicalKey::Code(KeyCode::KeyS) => Some(KeyAction::MoveForward),
+                        PhysicalKey::Code(KeyCode::ArrowLeft)
+                        | PhysicalKey::Code(KeyCode::KeyA) => Some(KeyAction::MoveLeft),
+                        PhysicalKey::Code(KeyCode::ArrowRight)
+                        | PhysicalKey::Code(KeyCode::KeyD) => Some(KeyAction::MoveRight),
+                        // Yaw (KA_ROTATE_LEFT/RIGHT). Original: Home/End + `[`/`]`.
+                        PhysicalKey::Code(KeyCode::Home)
+                        | PhysicalKey::Code(KeyCode::BracketLeft) => Some(KeyAction::RotLeft),
+                        PhysicalKey::Code(KeyCode::End)
+                        | PhysicalKey::Code(KeyCode::BracketRight) => Some(KeyAction::RotRight),
+                        // Pitch (KA_ROTATE_UP/DOWN). Original: PageUp/PageDown.
+                        PhysicalKey::Code(KeyCode::PageUp) => Some(KeyAction::RotUp),
+                        PhysicalKey::Code(KeyCode::PageDown) => Some(KeyAction::RotDown),
+                        // Reset angles (KA_CAM_SETDEFAULT). Original: `\`.
+                        PhysicalKey::Code(KeyCode::Backslash) => Some(KeyAction::ResetAngles),
+                        _ => None,
+                    };
                 if let Some(a) = action {
                     state.camera.on_key(a, pressed);
                 }
@@ -265,9 +296,15 @@ impl ApplicationHandler for App {
                     Ok((output, view, mut encoder)) => {
                         let vp = state.camera.view_proj();
                         let vm = state.camera.view_matrix();
-                        state
-                            .terrain
-                            .render(&state.gfx.device, &mut encoder, &view, &state.gfx.queue, &state.camera, vp, vm);
+                        state.terrain.render(
+                            &state.gfx.device,
+                            &mut encoder,
+                            &view,
+                            &state.gfx.queue,
+                            &state.camera,
+                            vp,
+                            vm,
+                        );
                         state.gfx.end_frame(output, encoder);
                     }
                     Err(wgpu::SurfaceError::Lost) => {
@@ -294,7 +331,11 @@ impl ApplicationHandler for App {
 
 /// Load map — native reads from pkg, returns map + storage + pkg for texture loading.
 #[cfg(not(target_arch = "wasm32"))]
-fn load_map() -> (GameMap, crate::assets::storage::Storage, Option<crate::assets::pkg_reader::PkgArchive>) {
+fn load_map() -> (
+    GameMap,
+    crate::assets::storage::Storage,
+    Option<crate::assets::pkg_reader::PkgArchive>,
+) {
     use crate::assets::pkg_reader::PkgArchive;
     use crate::assets::storage::Storage;
 
@@ -325,7 +366,11 @@ fn load_map() -> (GameMap, crate::assets::storage::Storage, Option<crate::assets
 }
 
 #[cfg(target_arch = "wasm32")]
-async fn load_map_async() -> (GameMap, crate::assets::storage::Storage, crate::assets::bundle::AssetBundle) {
+async fn load_map_async() -> (
+    GameMap,
+    crate::assets::storage::Storage,
+    crate::assets::bundle::AssetBundle,
+) {
     use crate::assets::bundle::AssetBundle;
 
     let bundle_data = crate::assets::loader::load_bytes("assets/atoll.bundle")
@@ -333,8 +378,12 @@ async fn load_map_async() -> (GameMap, crate::assets::storage::Storage, crate::a
         .expect("failed to fetch asset bundle");
     let bundle = AssetBundle::from_bytes(&bundle_data).expect("failed to parse bundle");
 
-    let cmap_data = bundle.read_file("map.cmap").expect("no map.cmap in bundle").to_vec();
-    let stor = crate::assets::storage::Storage::from_bytes(&cmap_data).expect("failed to parse CStorage");
+    let cmap_data = bundle
+        .read_file("map.cmap")
+        .expect("no map.cmap in bundle")
+        .to_vec();
+    let stor =
+        crate::assets::storage::Storage::from_bytes(&cmap_data).expect("failed to parse CStorage");
     let map = GameMap::from_cmap_bytes(&cmap_data).expect("failed to parse CMAP");
     (map, stor, bundle)
 }
