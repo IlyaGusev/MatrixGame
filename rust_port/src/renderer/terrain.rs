@@ -812,6 +812,7 @@ impl TerrainRenderer {
         if let Some(objects) = &mut self.objects {
             objects.takt(dt_ms, queue, map, point_lights);
         }
+        self.sky.takt(dt_ms);
         self.point_lights.sync(device, map, point_lights);
     }
 

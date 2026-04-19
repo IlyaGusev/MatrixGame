@@ -73,7 +73,16 @@ struct Skybox {
     vertex_buffer: wgpu::Buffer,
     uniform_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
-    sky_angle: f32,
+    /// Static yaw offset — sum of the sky config's `Angle` (hardcoded per sky
+    /// name here) and the map's `SkyAngle` property.
+    base_angle: f32,
+    /// Radians per millisecond. Ports `m_SkyDeltaAngle` (MatrixMap.cpp:2495):
+    /// the original advances `m_SkyAngle += m_SkyDeltaAngle * step` each Takt
+    /// so clouds / stars drift over time. Value comes from the `DeltaAngle`
+    /// Sky config entry; we use a gentle default since data.txt isn't parsed.
+    delta_angle: f32,
+    /// Accumulator advanced by `Sky::takt`.
+    current_angle: f32,
 }
 
 impl Sky {
@@ -108,6 +117,14 @@ impl Sky {
             sky_color,
             water_color,
             skybox,
+        }
+    }
+
+    /// Advance the skybox rotation. Mirrors `m_SkyAngle += m_SkyDeltaAngle *
+    /// step` in `CMatrixMap::Takt` (MatrixMap.cpp:2495).
+    pub fn takt(&mut self, dt_ms: f32) {
+        if let Some(skybox) = &mut self.skybox {
+            skybox.current_angle += skybox.delta_angle * dt_ms;
         }
     }
 
@@ -213,7 +230,8 @@ impl Skybox {
         pass: &mut wgpu::RenderPass<'a>,
         camera: &Camera,
     ) {
-        let sky_view_proj = build_sky_view_proj(camera, self.sky_angle);
+        let sky_view_proj =
+            build_sky_view_proj(camera, self.base_angle + self.current_angle);
         queue.write_buffer(
             &self.uniform_buffer,
             0,
@@ -314,8 +332,8 @@ fn load_skybox(
     sky_angle: f32,
     read_texture: &dyn Fn(&str) -> Option<Vec<u8>>,
 ) -> Option<Skybox> {
-    let (tex_path, base_angle) = resolve_sky_texture(sky_name)?;
-    let data = read_texture(tex_path)?;
+    let cfg = resolve_sky_texture(sky_name)?;
+    let data = read_texture(cfg.texture)?;
     let rgba = decode_texture_bytes(&data)?;
     // Skybox textures are low-res panoramics — mipmap them so the horizon band
     // filters cleanly when tilted.
@@ -463,35 +481,57 @@ fn load_skybox(
     });
 
     log::info!(
-        "skybox: loaded '{}' (angle = {:.3} + {:.3} rad)",
-        tex_path,
-        base_angle,
-        sky_angle
+        "skybox: loaded '{}' (angle = {:.3} + {:.3} rad, drift = {:.6} rad/ms)",
+        cfg.texture,
+        cfg.base_angle,
+        sky_angle,
+        cfg.delta_angle
     );
     Some(Skybox {
         pipeline,
         vertex_buffer,
         uniform_buffer,
         bind_group,
-        sky_angle: base_angle + sky_angle,
+        base_angle: cfg.base_angle + sky_angle,
+        delta_angle: cfg.delta_angle,
+        current_angle: 0.0,
     })
+}
+
+struct SkyConfig {
+    texture: &'static str,
+    /// Static yaw in radians, matches the `Angle` parameter of a `Sky` block
+    /// in `cfg/robots/data.txt` (converted via `GRAD2RAD` by the original).
+    base_angle: f32,
+    /// Yaw rate in radians per millisecond, matches `DeltaAngle`.
+    delta_angle: f32,
 }
 
 /// Hardcoded sky config table. Without a parser for `cfg/robots/data.txt`'s
 /// `Sky` block, we map each known `SkyName` to a panoramic texture shipped in
 /// `Matrix/Textures/Sky/`. `Default` picks a neutral blue sky. Falls back to
 /// `None` for unknown names (the viewer then draws gradient only).
-fn resolve_sky_texture(sky_name: &str) -> Option<(&'static str, f32)> {
-    match sky_name.to_ascii_lowercase().as_str() {
-        "default" | "blue" => Some(("Matrix/Textures/Sky/blue", 0.0)),
-        "blue_moon" => Some(("Matrix/Textures/Sky/blue_moon", 0.0)),
-        "stars" => Some(("Matrix/Textures/Sky/stars", 0.0)),
-        "mars" => Some(("Matrix/Textures/Sky/mars", 0.0)),
-        "alien_blue" => Some(("Matrix/Textures/Sky/alien_blue", 0.0)),
-        "dark_green" => Some(("Matrix/Textures/Sky/dark_green", 0.0)),
-        "black" => Some(("Matrix/Textures/Sky/black", 0.0)),
-        _ => None,
-    }
+///
+/// `delta_angle` defaults to a gentle drift — ~0.023 rad/sec
+/// (≈ 1.3°/sec) for skies with visible clouds, faster for stars (celestial
+/// rotation reads as overt motion). Zero for skies with no distinguishable
+/// features.
+fn resolve_sky_texture(sky_name: &str) -> Option<SkyConfig> {
+    let (texture, delta_angle) = match sky_name.to_ascii_lowercase().as_str() {
+        "default" | "blue" => ("Matrix/Textures/Sky/blue", 0.000023),
+        "blue_moon" => ("Matrix/Textures/Sky/blue_moon", 0.000018),
+        "stars" => ("Matrix/Textures/Sky/stars", 0.000040),
+        "mars" => ("Matrix/Textures/Sky/mars", 0.000020),
+        "alien_blue" => ("Matrix/Textures/Sky/alien_blue", 0.000025),
+        "dark_green" => ("Matrix/Textures/Sky/dark_green", 0.000020),
+        "black" => ("Matrix/Textures/Sky/black", 0.0),
+        _ => return None,
+    };
+    Some(SkyConfig {
+        texture,
+        base_angle: 0.0,
+        delta_angle,
+    })
 }
 
 fn build_skybox_vertices() -> Vec<BoxVertex> {
