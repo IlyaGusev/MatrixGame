@@ -757,6 +757,28 @@ impl Water {
 }
 
 fn sample_height_for_water(map: &GameMap, wx: f32, wy: f32) -> f32 {
+    let scaledx = wx / GLOBAL_SCALE;
+    let scaledy = wy / GLOBAL_SCALE;
+    let ix = scaledx as i32;
+    let iy = scaledy as i32;
+
+    if ix >= 0 && iy >= 0 && ix < map.size_x as i32 && iy < map.size_y as i32 {
+        let unit = map.unit(ix as usize, iy as usize);
+        if unit.flags & crate::game::common::CELLFLAG_BRIDGE != 0 {
+            let kx = scaledx - ix as f32;
+            let ky = scaledy - iy as f32;
+
+            let z0 = map.point(ix as usize, iy as usize).z;
+            let z1 = map.point(ix as usize + 1, iy as usize).z;
+            let z2 = map.point(ix as usize, iy as usize + 1).z;
+            let z3 = map.point(ix as usize + 1, iy as usize + 1).z;
+
+            let top = z0 + (z1 - z0) * kx;
+            let bottom = z2 + (z3 - z2) * kx;
+            return top + (bottom - top) * ky;
+        }
+    }
+
     map.get_z(wx, wy)
 }
 
