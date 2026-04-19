@@ -50,6 +50,8 @@ pub struct GameMap {
     pub tex_union_dim: usize,
     pub water_color: u32,
     pub sky_color: u32,
+    pub sky_name: String,
+    pub sky_angle: f32,
     pub water_name: String,
     pub water_normal_len: f32,
     pub light_main_color: u32,
@@ -137,6 +139,15 @@ impl GameMap {
         // DEF_SKY_COLOR (Common.hpp:27) = 0x1070FF
         let sky_color =
             find_property_int(prop_names, prop_values, "SkyColor").unwrap_or(0x1070FF) as u32;
+        let sky_name = prop_names
+            .find_as_wstr("SkyName")
+            .map(|idx| prop_values.get_as_wstr(idx))
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "Default".to_string());
+        // DATA_SKYANGLE is an offset in radians applied on top of the sky
+        // config block's base angle (MatrixMapPrepare.cpp:1170-1174).
+        let sky_angle =
+            find_property_float(prop_names, prop_values, "SkyAngle").unwrap_or(0.0);
         let water_name = prop_names
             .find_as_wstr("WaterName")
             .map(|idx| prop_values.get_as_wstr(idx))
@@ -281,6 +292,8 @@ impl GameMap {
             tex_union_dim,
             water_color,
             sky_color,
+            sky_name,
+            sky_angle,
             water_name,
             water_normal_len,
             light_main_color,

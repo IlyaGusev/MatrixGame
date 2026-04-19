@@ -737,7 +737,16 @@ impl TerrainRenderer {
 
         let depth_texture = create_depth_texture(device, config);
 
-        let sky = super::sky::Sky::new(device, config, map.sky_color, map.water_color);
+        let sky = super::sky::Sky::new(
+            device,
+            queue,
+            config,
+            map.sky_color,
+            map.water_color,
+            &map.sky_name,
+            map.sky_angle,
+            read_texture,
+        );
         let clear_color = wgpu::Color {
             r: sr as f64,
             g: sg as f64,

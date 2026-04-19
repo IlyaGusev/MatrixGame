@@ -24,7 +24,7 @@ Implemented overlap exists in these areas:
 - terrain bottom rendering
 - terrain surface overlays
 - water rendering
-- sky rendering
+- sky rendering (skybox panorama + horizon gradient)
 - decorative static object loading and rendering
 - projected static object shadows
 - point-light luminance system and visible additive pass
@@ -371,7 +371,7 @@ So shoreline behavior is closer than it was, and the broad water architecture
 place — but it is still not a faithful replay of every edge case in the
 original water pipeline.
 
-## 7. Sky rendering still only covers the no-skybox style
+## 7. Sky rendering covers both skybox and no-skybox branches
 
 Rust:
 
@@ -379,17 +379,41 @@ Rust:
 
 Original:
 
-- `MatrixGame/src/MatrixMap.cpp`
+- `MatrixGame/src/MatrixMap.cpp`, `DrawSky` (MatrixMap.cpp:2020-2189)
+- `MatrixGame/src/MatrixCamera.cpp`, `CalcSkyMatrix` (MatrixCamera.cpp:717)
 
-Rust implements the no-skybox style and uses a water-colored lower band to hide
-gaps between shoreline alpha water and the background.
+The Rust sky now runs both passes from `DrawSky`:
 
-This is practical for the viewer, but it is not the full original sky system.
-The original has more branching and a broader sky setup than the Rust viewer
-currently represents.
+- **Skybox pass**: four textured walls of a cube around the camera,
+  textured from a single panoramic image (Fore / Rite / Back / Left are the
+  four vertical strips of a 1024×1024 sky texture). Vertex shader uses a
+  rotation-only view (translation stripped) and a shallow perspective
+  (near=0.01, far=3, HFOV=60°) matching `CalcSkyMatrix` + the skybox-only
+  projection set in `DrawSky:2048`. Clip-space z is pinned to w so the wall
+  always lands on the far plane without needing to poke at depth state.
+  `SkyName` and `SkyAngle` are read from the map's STRG properties; the
+  angle adds onto a per-sky base and rotates the cube around Z.
+- **Gradient pass**: preserved from before, but now the top color switches
+  to `sky_color` with alpha=0 when a skybox is active so the gradient fades
+  into the skybox (matching `DrawSky:2117`'s `m_SkyColorUp = m_SkyColor &
+  0x00FFFFFF`). Without a skybox it uses the old transparent-black top,
+  matching the `else` branch at `DrawSky:2147`.
 
-So the Rust sky is acceptable as a viewer approximation, but not a faithful
-replacement for the full original behavior.
+What remains approximate:
+
+- the `Sky` config block normally lives in `cfg/robots/data.txt`
+  (`CBlockPar` text format). Since the port doesn't parse that file, the
+  mapping from `SkyName` → texture path / base angle / UV layout is
+  hardcoded in `resolve_sky_texture`. Unknown names fall back to
+  gradient-only rendering.
+- all shipped sky textures are laid out as 4 vertical strips (`(0, n/4,
+  1, (n+1)/4)`); the port assumes this rather than reading per-face UV
+  ranges from `Fore=<tex,x,y,x1,y1>` config entries
+- the skybox `cut_dn` horizon shift in the original varies with camera Z;
+  the port uses a fixed `geo_dn = -0.05`, good for cameras near sea level
+- the `_high` skybox variants (`g_Config.m_SkyBox == 2`) are not selected
+- the skybox `Up` face (defined in config but commented out in `DrawSky`)
+  is not drawn, same as the original
 
 ## 8. Camera scope is intentionally narrower
 
@@ -418,6 +442,7 @@ the strategy-viewer slice.
 - texture-union atlas construction
 - terrain bottom geometry generation
 - terrain surface overlay base pass + additive gloss/reflection pass
+- skybox panorama pass + gradient horizon fade
 - water as a real renderer (including bridge shoreline sampling)
 - decorative `.vo` mesh loading and per-surface material spec parsing
 - projected static / dynamic object shadow pass
@@ -437,7 +462,8 @@ the strategy-viewer slice.
   culling/sort order)
 - sphere-map approximation of `TCI_CAMERASPACEREFLECTIONVECTOR` used by both
   terrain surface gloss and water mirror passes
-- the full sky system
+- `SkyName` → skybox texture mapping is hardcoded rather than loaded from
+  `cfg/robots/data.txt`; `_high` skybox variant is not selected
 - anything outside the strategy/viewer slice
 
 ## Bottom Line

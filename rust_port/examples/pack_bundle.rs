@@ -77,6 +77,20 @@ fn main() {
 
     // Also pack the global reflection texture used by the gloss surface pass.
     extra_paths.push("Matrix/Textures/reflection".to_string());
+    // Sky panorama textures referenced by the hardcoded sky config table in
+    // `renderer/sky.rs::resolve_sky_texture`. Pack all of them so every sky
+    // name resolves regardless of which map is loaded next.
+    for name in [
+        "blue",
+        "blue_moon",
+        "stars",
+        "mars",
+        "alien_blue",
+        "dark_green",
+        "black",
+    ] {
+        extra_paths.push(format!("Matrix/Textures/Sky/{}", name));
+    }
 
     for extra in &extra_paths {
         let pkg_key = extra.to_uppercase();
