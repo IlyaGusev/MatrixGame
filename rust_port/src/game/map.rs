@@ -462,6 +462,44 @@ impl GameMap {
         (r << 16) | (g << 8) | b
     }
 
+    /// Port of `CMatrixMap::GetNormal` — bilinearly interpolates point normals.
+    /// Returns Z-up world-space normal at `(wx, wy)`.
+    pub fn get_normal(&self, wx: f32, wy: f32) -> [f32; 3] {
+        let scaled_x = wx / GLOBAL_SCALE;
+        let scaled_y = wy / GLOBAL_SCALE;
+        let x = scaled_x.floor() as i32;
+        let y = scaled_y.floor() as i32;
+
+        if x < 0 || y < 0 || x >= self.size_x as i32 || y >= self.size_y as i32 {
+            return [0.0, 0.0, 1.0];
+        }
+
+        let unit = self.unit(x as usize, y as usize);
+        if unit.flags & CELLFLAG_FLAT != 0 || unit.flags & CELLFLAG_WATER != 0 {
+            return [0.0, 0.0, 1.0];
+        }
+
+        let kx = scaled_x - x as f32;
+        let ky = scaled_y - y as f32;
+        let n00 = self.normal(x as usize, y as usize);
+        let n10 = self.normal(x as usize + 1, y as usize);
+        let n01 = self.normal(x as usize, y as usize + 1);
+        let n11 = self.normal(x as usize + 1, y as usize + 1);
+
+        let lerp = |a: f32, b: f32, t: f32| a + (b - a) * t;
+        let x0 = lerp(n00.x, n10.x, kx);
+        let y0 = lerp(n00.y, n10.y, kx);
+        let z0 = lerp(n00.z, n10.z, kx);
+        let x1 = lerp(n01.x, n11.x, kx);
+        let y1 = lerp(n01.y, n11.y, kx);
+        let z1 = lerp(n01.z, n11.z, kx);
+        let nx = lerp(x0, x1, ky);
+        let ny = lerp(y0, y1, ky);
+        let nz = lerp(z0, z1, ky);
+        let len = (nx * nx + ny * ny + nz * nz).sqrt().max(1e-6);
+        [nx / len, ny / len, nz / len]
+    }
+
     pub fn static_object_color(&self, wx: f32, wy: f32) -> u32 {
         self.static_object_color_with_lighting(wx, wy, None)
     }

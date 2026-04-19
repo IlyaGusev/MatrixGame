@@ -19,11 +19,30 @@ fn main() {
 
     let strings = stor.get_buf("strings", "String").unwrap();
     let mut tex_count = 0;
+    let mut extra_paths: Vec<String> = Vec::new();
     for i in 0..strings.arrays_count() {
         let raw_path = strings.get_as_wstr(i);
-        let path = raw_path.split('?').next().unwrap_or("").replace('\\', "/");
+        let mut iter = raw_path.split('?');
+        let base = iter.next().unwrap_or("");
+        let path = base.replace('\\', "/");
         if path.is_empty() || path.contains('*') {
             continue;
+        }
+
+        // Surface ids also carry `?gloss=<name>` — pack the gloss sibling too.
+        for param in iter {
+            if let Some((k, v)) = param.split_once('=') {
+                if k.eq_ignore_ascii_case("gloss") && !v.is_empty() {
+                    let slash = path.rfind('/');
+                    let dir = slash.map(|i| &path[..i]).unwrap_or("");
+                    let gloss_path = if dir.is_empty() {
+                        v.to_string()
+                    } else {
+                        format!("{}/{}", dir, v)
+                    };
+                    extra_paths.push(gloss_path);
+                }
+            }
         }
 
         // Try exact path, then with .png, .dds extensions
@@ -53,6 +72,26 @@ fn main() {
         }
         if !found && path.to_lowercase().contains("ter") {
             eprintln!("  MISS: {}", path);
+        }
+    }
+
+    // Also pack the global reflection texture used by the gloss surface pass.
+    extra_paths.push("Matrix/Textures/reflection".to_string());
+
+    for extra in &extra_paths {
+        let pkg_key = extra.to_uppercase();
+        let candidates = [
+            pkg_key.clone(),
+            format!("{}.PNG", pkg_key),
+            format!("{}.DDS", pkg_key),
+        ];
+        for candidate in &candidates {
+            if let Ok(data) = pkg.read_file(candidate) {
+                bundle.add(extra, data);
+                tex_count += 1;
+                println!("  extra {} -> {}", extra, candidate);
+                break;
+            }
         }
     }
 
@@ -148,12 +187,20 @@ fn main() {
             eprintln!("  MISS vo: {}", paths.vo_path);
             continue;
         }
-        if let Some(t) = &paths.texture_path {
+        for t in [
+            paths.material.diffuse.as_ref(),
+            paths.material.gloss.as_ref(),
+            paths.material.back.as_ref(),
+            paths.material.mask.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
             if !vo_tex_seen.insert(t.clone()) {
                 continue;
             }
             let k = t.to_uppercase();
-            for cand in [k.clone(), format!("{k}.DDS"), format!("{k}.PNG")] {
+            for cand in [k.clone(), format!("{}.DDS", k), format!("{}.PNG", k)] {
                 if let Ok(data) = pkg.read_file(&cand) {
                     bundle.add(t, data);
                     obj_tex_count += 1;

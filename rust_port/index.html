@@ -12,6 +12,8 @@
   <canvas id="game-canvas"></canvas>
 
   <script type="module">
+    import init from "./pkg/matrixgame_rs.js?v=4";
+
     const MAX = 2048; // WebGL max texture dimension
     const canvas = document.getElementById("game-canvas");
 
@@ -22,7 +24,7 @@
     resize();
     window.addEventListener("resize", resize);
 
-    import init from "./pkg/matrixgame_rs.js?v=106";
+
     await init();
   </script>
 </body>

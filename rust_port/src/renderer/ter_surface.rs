@@ -1,6 +1,9 @@
-//! Terrain surface overlays — ports CTerSurface::LoadM from MatrixTerSurface.cpp.
+//! Terrain surface overlays — ports CTerSurface::LoadM + TerSurfMW / TerSurfGlossMW
+//! (MatrixTerSurface.cpp + MatrixRenderPipeline.cpp).
 
 use std::collections::HashMap;
+
+use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
 use super::terrain::{DrawBatch, Vertex};
@@ -10,6 +13,62 @@ use crate::game::map::GameMap;
 use crate::renderer::texture::{
     create_solid_texture, create_texture_from_rgba_mipped, decode_texture_bytes,
 };
+
+/// Per-vertex data for the gloss pass. Carries view-space normal inputs and
+/// the atlas UV so the fragment shader can weight the additive contribution by
+/// the base atlas alpha (matching the original single-pass gloss pipeline).
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub struct GlossVertex {
+    pub position: [f32; 3],
+    pub normal: [f32; 3],
+    pub uv: [f32; 2],
+}
+
+impl GlossVertex {
+    pub fn desc() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Self>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[
+                wgpu::VertexAttribute {
+                    offset: 0,
+                    shader_location: 0,
+                    format: wgpu::VertexFormat::Float32x3,
+                },
+                wgpu::VertexAttribute {
+                    offset: 12,
+                    shader_location: 1,
+                    format: wgpu::VertexFormat::Float32x3,
+                },
+                wgpu::VertexAttribute {
+                    offset: 24,
+                    shader_location: 2,
+                    format: wgpu::VertexFormat::Float32x2,
+                },
+            ],
+        }
+    }
+}
+
+pub struct GlossBatch {
+    pub bind_group: wgpu::BindGroup,
+    pub vertex_buffer: wgpu::Buffer,
+    pub index_buffer: wgpu::Buffer,
+    pub num_indices: u32,
+}
+
+pub struct SurfaceOverlays {
+    pub base: Vec<DrawBatch>,
+    pub gloss: Vec<GlossBatch>,
+}
+
+pub struct GlossResources<'a> {
+    pub bgl: &'a wgpu::BindGroupLayout,
+    pub uniform_buffer: &'a wgpu::Buffer,
+    pub reflection_view: &'a wgpu::TextureView,
+    pub reflection_sampler: &'a wgpu::Sampler,
+}
 
 pub fn build_surface_overlays(
     device: &wgpu::Device,
@@ -23,30 +82,42 @@ pub fn build_surface_overlays(
     stor: &Storage,
     map: &GameMap,
     read_texture: &dyn Fn(&str) -> Option<Vec<u8>>,
-) -> Vec<DrawBatch> {
+    gloss: Option<GlossResources<'_>>,
+) -> SurfaceOverlays {
     let srfm = match stor.get_buf("surfacesM", "Data") {
         Some(b) if b.arrays_count() > 0 => b,
-        _ => return vec![],
+        _ => {
+            return SurfaceOverlays {
+                base: vec![],
+                gloss: vec![],
+            };
+        }
     };
     let strings = match stor.get_buf("strings", "String") {
         Some(b) => b,
-        _ => return vec![],
+        _ => {
+            return SurfaceOverlays {
+                base: vec![],
+                gloss: vec![],
+            };
+        }
     };
 
     let cx = map.world_width() * 0.5;
     let cy = map.world_height() * 0.5;
 
     let mut tex_cache: HashMap<String, wgpu::TextureView> = HashMap::new();
+    let mut gloss_cache: HashMap<String, wgpu::TextureView> = HashMap::new();
     let white = create_solid_texture(device, queue, [255, 255, 255, 255]);
 
-    #[allow(dead_code)]
     struct SurfData {
         index: i32,
         tex_path: String,
+        gloss_path: Option<String>,
         wrap_y: bool,
-        color: [f32; 4],
         verts: Vec<Vertex>,
         indices: Vec<u16>,
+        gloss_verts: Vec<GlossVertex>,
     }
     let mut surfaces: Vec<SurfData> = Vec::new();
 
@@ -66,16 +137,22 @@ pub fn build_surface_overlays(
         let disp_x = rd_f32(raw, &mut off);
         let disp_y = rd_f32(raw, &mut off);
 
-        let tex_path = if ids >= 0 && (ids as usize) < strings.arrays_count() {
-            strings
-                .get_as_wstr(ids as usize)
-                .split('?')
-                .next()
-                .unwrap_or("")
-                .replace('\\', "/")
+        let ids_str = if ids >= 0 && (ids as usize) < strings.arrays_count() {
+            strings.get_as_wstr(ids as usize)
         } else {
             continue;
         };
+
+        let (tex_path, params) = ids_str
+            .split_once('?')
+            .map(|(t, p)| (t.to_string(), p.to_string()))
+            .unwrap_or((ids_str.clone(), String::new()));
+
+        let tex_path = tex_path.replace('\\', "/");
+
+        let gloss_path = gloss.as_ref().and_then(|_| {
+            parse_gloss_param(&params).and_then(|name| resolve_gloss_path(&tex_path, &name))
+        });
 
         let r = ((color_dw >> 16) & 0xFF) as f32 / 255.0;
         let g = ((color_dw >> 8) & 0xFF) as f32 / 255.0;
@@ -88,6 +165,11 @@ pub fn build_surface_overlays(
         }
 
         let mut verts = Vec::with_capacity(vcnt);
+        let mut gloss_verts = if gloss_path.is_some() {
+            Vec::with_capacity(vcnt)
+        } else {
+            Vec::new()
+        };
         let mut wrap_y = false;
         for _ in 0..vcnt {
             let px = rd_f32(raw, &mut off);
@@ -103,16 +185,29 @@ pub fn build_surface_overlays(
             let vg = ((vcol >> 8) & 0xFF) as f32 / 255.0;
             let vb = (vcol & 0xFF) as f32 / 255.0;
             let va = ((vcol >> 24) & 0xFF) as f32 / 255.0;
-            if tv < 0.0 || tv > 1.0 {
+            if !(0.0..=1.0).contains(&tv) {
                 wrap_y = true;
             }
 
+            let world_x = px + disp_x - cx;
+            let world_y = py + disp_y - cy;
+            let world_z = pz + 0.05;
+
             verts.push(Vertex {
-                position: [px + disp_x - cx, py + disp_y - cy, pz + 0.05],
+                position: [world_x, world_y, world_z],
                 color: [vr * r, vg * g, vb * b, va * a],
                 uv: [tu, tv],
                 macro_uv: [_tum, _tvm],
             });
+
+            if gloss_path.is_some() {
+                let n = map.get_normal(px + disp_x, py + disp_y);
+                gloss_verts.push(GlossVertex {
+                    position: [world_x, world_y, world_z],
+                    normal: n,
+                    uv: [tu, tv],
+                });
+            }
         }
 
         let idx_count = idxsz / 2;
@@ -135,20 +230,37 @@ pub fn build_surface_overlays(
             }
         }
 
+        if let Some(gp) = gloss_path.as_ref() {
+            if !gloss_cache.contains_key(gp) {
+                if let Some(data) = read_texture(gp) {
+                    if let Some(rgba) = decode_texture_bytes(&data) {
+                        gloss_cache.insert(
+                            gp.clone(),
+                            create_texture_from_rgba_mipped(device, queue, &rgba, 6),
+                        );
+                    }
+                }
+            }
+        }
+
         surfaces.push(SurfData {
             index,
             tex_path,
+            gloss_path,
             wrap_y,
-            color: [r, g, b, a],
             verts,
             indices: strip,
+            gloss_verts,
         });
     }
 
     surfaces.sort_by_key(|s| s.index);
 
-    let mut overlay_batches = Vec::new();
+    let mut base = Vec::new();
+    let mut gloss_batches = Vec::new();
     let mut overlay_tris = 0u32;
+    let mut gloss_tris = 0u32;
+    let mut skipped_gloss = 0usize;
 
     for surf in &surfaces {
         if surf.indices.len() < 3 {
@@ -156,6 +268,11 @@ pub fn build_surface_overlays(
         }
 
         let tex_view = tex_cache.get(surf.tex_path.as_str()).unwrap_or(&white);
+        let sampler = if surf.wrap_y {
+            sampler_wrap_v
+        } else {
+            sampler_clamp
+        };
 
         let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,
@@ -181,11 +298,7 @@ pub fn build_surface_overlays(
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: wgpu::BindingResource::Sampler(if surf.wrap_y {
-                        sampler_wrap_v
-                    } else {
-                        sampler_clamp
-                    }),
+                    resource: wgpu::BindingResource::Sampler(sampler),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
@@ -198,9 +311,8 @@ pub fn build_surface_overlays(
             ],
         });
 
-        let prim_count = surf.indices.len().saturating_sub(2) as u32;
-        overlay_tris += prim_count;
-        overlay_batches.push(DrawBatch {
+        overlay_tris += surf.indices.len().saturating_sub(2) as u32;
+        base.push(DrawBatch {
             bind_group: bg,
             vertex_buffer: vb,
             index_buffer: ib,
@@ -209,13 +321,103 @@ pub fn build_surface_overlays(
             cpu_vertices: None,
             point_coords: None,
         });
+
+        // Gloss pass: adds gloss * reflection weighted by atlas alpha.
+        if let (Some(gloss_res), Some(gloss_path)) = (gloss.as_ref(), surf.gloss_path.as_ref()) {
+            let Some(gloss_view) = gloss_cache.get(gloss_path.as_str()) else {
+                skipped_gloss += 1;
+                continue;
+            };
+            let g_vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(&surf.gloss_verts),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+            let g_ib = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(&surf.indices),
+                usage: wgpu::BufferUsages::INDEX,
+            });
+            let g_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: gloss_res.bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: gloss_res.uniform_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(tex_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(gloss_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::TextureView(gloss_res.reflection_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::Sampler(gloss_res.reflection_sampler),
+                    },
+                ],
+            });
+            gloss_tris += surf.indices.len().saturating_sub(2) as u32;
+            gloss_batches.push(GlossBatch {
+                bind_group: g_bg,
+                vertex_buffer: g_vb,
+                index_buffer: g_ib,
+                num_indices: surf.indices.len() as u32,
+            });
+        }
     }
 
     log::info!(
-        "terrain overlays: {} batches, {} triangles, {} textures",
-        overlay_batches.len(),
+        "terrain overlays: {} base ({} tris), {} gloss ({} tris, {} skipped), {} base tex, {} gloss tex",
+        base.len(),
         overlay_tris,
-        tex_cache.len()
+        gloss_batches.len(),
+        gloss_tris,
+        skipped_gloss,
+        tex_cache.len(),
+        gloss_cache.len()
     );
-    overlay_batches
+    SurfaceOverlays {
+        base,
+        gloss: gloss_batches,
+    }
+}
+
+/// Parse `gloss=name` from a surface-id parameter string like `gloss=floor05_gloss`.
+/// Returns `None` when the gloss parameter is absent or empty (matching the
+/// original's `parv.IsEmpty()` skip — only `surfaces` / `Load()` guards against
+/// empty names; `LoadM` accepts empty names, so we do the same via `Some("")`
+/// handling below at the call site).
+fn parse_gloss_param(params: &str) -> Option<String> {
+    for chunk in params.split('?') {
+        let (k, v) = chunk.split_once('=')?;
+        if k.eq_ignore_ascii_case("gloss") && !v.is_empty() {
+            return Some(v.to_string());
+        }
+    }
+    None
+}
+
+/// Replace the filename of `tex_path` with `name` (matching
+/// `CacheReplaceFileNameAndExt`). The extension is left off so the texture
+/// reader can try `.DDS` / `.PNG` in turn.
+fn resolve_gloss_path(tex_path: &str, name: &str) -> Option<String> {
+    let slash = tex_path.rfind('/');
+    let dir = slash.map(|i| &tex_path[..i]).unwrap_or("");
+    if dir.is_empty() {
+        Some(name.to_string())
+    } else {
+        Some(format!("{}/{}", dir, name))
+    }
 }

@@ -19,7 +19,9 @@ use crate::game::common::{
 use crate::game::map::{GameMap, GLOBAL_SCALE};
 use crate::game::map_prepare::build_tex_union_atlases;
 use crate::renderer::camera::Camera;
-use crate::renderer::ter_surface::build_surface_overlays;
+use crate::renderer::ter_surface::{
+    build_surface_overlays, GlossBatch, GlossResources, GlossVertex,
+};
 use crate::renderer::texture::*;
 
 /// Bottom vertex — ports SMatrixMapVertexBottom.
@@ -71,6 +73,17 @@ struct Uniforms {
     fog_params: [f32; 4], // x = fog_start, y = fog_end
 }
 
+/// Uniforms for the gloss pass. Carries view matrix so the vertex shader can
+/// transform normals to camera space (matching D3DTSS_TCI_CAMERASPACEREFLECTIONVECTOR).
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct GlossUniforms {
+    view_proj: [[f32; 4]; 4],
+    normal_mat: [[f32; 4]; 4],
+    fog_color: [f32; 4],
+    fog_params: [f32; 4],
+}
+
 pub struct DrawBatch {
     pub bind_group: wgpu::BindGroup,
     pub vertex_buffer: wgpu::Buffer,
@@ -84,8 +97,10 @@ pub struct DrawBatch {
 pub struct TerrainRenderer {
     pipeline: wgpu::RenderPipeline,
     overlay_pipeline: wgpu::RenderPipeline,
+    gloss_pipeline: wgpu::RenderPipeline,
     batches: Vec<DrawBatch>,
     overlay_batches: Vec<DrawBatch>,
+    gloss_batches: Vec<GlossBatch>,
     sky: super::sky::Sky,
     clear_color: wgpu::Color,
     fog_color: [f32; 4],
@@ -93,6 +108,7 @@ pub struct TerrainRenderer {
     point_lights: PointLightRenderer,
     water: Option<super::water::Water>,
     uniform_buffer: wgpu::Buffer,
+    gloss_uniform_buffer: wgpu::Buffer,
     depth_texture: wgpu::TextureView,
     last_point_light_revision: u64,
 }
@@ -432,8 +448,97 @@ impl TerrainRenderer {
             total_tris
         );
 
+        // Reflection texture for the gloss pass — falls back to a warm highlight
+        // if the asset isn't found (matches TEXTURE_PATH_REFLECTION from
+        // StringConstants.hpp:124).
+        let reflection_view = if let Some(rgba) = read_texture("Matrix/Textures/reflection")
+            .and_then(|data| decode_texture_bytes(&data))
+        {
+            create_texture_from_rgba_mipped(device, queue, &rgba, 6)
+        } else {
+            create_solid_texture(device, queue, [230, 220, 200, 255])
+        };
+        let reflection_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Gloss Reflection Sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            ..Default::default()
+        });
+
+        let gloss_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Gloss Uniforms"),
+            contents: bytemuck::bytes_of(&GlossUniforms {
+                view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
+                normal_mat: glam::Mat4::IDENTITY.to_cols_array_2d(),
+                fog_color,
+                fog_params: [FOG_START, FOG_END, 0.0, 0.0],
+            }),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let gloss_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Gloss BGL"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+
         // Surface overlays (MatrixTerSurface.cpp)
-        let overlay_batches = build_surface_overlays(
+        let overlays = build_surface_overlays(
             device,
             queue,
             &uniform_buffer,
@@ -445,7 +550,15 @@ impl TerrainRenderer {
             stor,
             map,
             read_texture,
+            Some(GlossResources {
+                bgl: &gloss_bgl,
+                uniform_buffer: &gloss_uniform_buffer,
+                reflection_view: &reflection_view,
+                reflection_sampler: &reflection_sampler,
+            }),
         );
+        let overlay_batches = overlays.base;
+        let gloss_batches = overlays.gloss;
 
         // Decorative objects (palms / rocks / etc.)
         let objects =
@@ -556,6 +669,72 @@ impl TerrainRenderer {
             cache: None,
         });
 
+        // Gloss pipeline — ports TerSurfGlossMW (MatrixRenderPipeline.cpp:1460).
+        // Runs as a second additive pass on top of the base overlay, weighted by
+        // atlas alpha so unused texels don't leak into the highlight.
+        let gloss_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Gloss Overlay Shader"),
+            source: wgpu::ShaderSource::Wgsl(GLOSS_SHADER.into()),
+        });
+        let gloss_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Gloss Overlay Layout"),
+                bind_group_layouts: &[&gloss_bgl],
+                immediate_size: 0,
+            });
+        let gloss_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Gloss Overlay Pipeline"),
+            layout: Some(&gloss_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &gloss_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[GlossVertex::desc()],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &gloss_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::SrcAlpha,
+                            dst_factor: wgpu::BlendFactor::One,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                        alpha: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::Zero,
+                            dst_factor: wgpu::BlendFactor::One,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                    }),
+                    write_mask: wgpu::ColorWrites::COLOR,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleStrip,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                strip_index_format: Some(wgpu::IndexFormat::Uint16),
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: Default::default(),
+                bias: wgpu::DepthBiasState {
+                    constant: -2,
+                    slope_scale: 0.0,
+                    clamp: 0.0,
+                },
+            }),
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
         let depth_texture = create_depth_texture(device, config);
 
         let sky = super::sky::Sky::new(device, config, map.sky_color, map.water_color);
@@ -566,24 +745,13 @@ impl TerrainRenderer {
             a: 1.0,
         };
 
-        let overlay_batches = overlay_batches
-            .into_iter()
-            .map(|batch| DrawBatch {
-                bind_group: batch.bind_group,
-                vertex_buffer: batch.vertex_buffer,
-                index_buffer: batch.index_buffer,
-                num_indices: batch.num_indices,
-                index_format: batch.index_format,
-                cpu_vertices: None,
-                point_coords: None,
-            })
-            .collect();
-
         Self {
             pipeline,
             overlay_pipeline,
+            gloss_pipeline,
             batches,
             overlay_batches,
+            gloss_batches,
             sky,
             clear_color,
             fog_color,
@@ -591,6 +759,7 @@ impl TerrainRenderer {
             point_lights,
             water,
             uniform_buffer,
+            gloss_uniform_buffer,
             depth_texture,
             last_point_light_revision: 0,
         }
@@ -657,6 +826,24 @@ impl TerrainRenderer {
             }),
         );
 
+        // Gloss pass needs a camera-space normal matrix matching
+        // D3DTSS_TCI_CAMERASPACEREFLECTIONVECTOR: inverse-transpose of the
+        // rendering view matrix. `view_mat` is the Z-up look-at used by the
+        // water renderer for the same purpose.
+        if !self.gloss_batches.is_empty() {
+            let normal_mat = view_mat.inverse().transpose();
+            queue.write_buffer(
+                &self.gloss_uniform_buffer,
+                0,
+                bytemuck::bytes_of(&GlossUniforms {
+                    view_proj: view_proj.to_cols_array_2d(),
+                    normal_mat: normal_mat.to_cols_array_2d(),
+                    fog_color: self.fog_color,
+                    fog_params: [FOG_START, FOG_END, 0.0, 0.0],
+                }),
+            );
+        }
+
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("Terrain Pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -701,6 +888,19 @@ impl TerrainRenderer {
                 pass.set_bind_group(0, &batch.bind_group, &[]);
                 pass.set_vertex_buffer(0, batch.vertex_buffer.slice(..));
                 pass.set_index_buffer(batch.index_buffer.slice(..), batch.index_format);
+                pass.draw_indexed(0..batch.num_indices, 0, 0..1);
+            }
+        }
+
+        // Gloss pass: adds gloss*reflection weighted by atlas alpha on top of
+        // the already-composited overlay (ports the stage 5 ADD(TEMP, CURRENT)
+        // step of TerSurfGlossMW).
+        if !self.gloss_batches.is_empty() {
+            pass.set_pipeline(&self.gloss_pipeline);
+            for batch in &self.gloss_batches {
+                pass.set_bind_group(0, &batch.bind_group, &[]);
+                pass.set_vertex_buffer(0, batch.vertex_buffer.slice(..));
+                pass.set_index_buffer(batch.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
                 pass.draw_indexed(0..batch.num_indices, 0, 0..1);
             }
         }
@@ -783,5 +983,63 @@ fn shade_terrain(in: VOut) -> vec4<f32> {
     let shaded = shade_terrain(in);
     let fogged = apply_fog(shaded.rgb, in.view_dist);
     return vec4<f32>(fogged, shaded.a);
+}
+"#;
+
+/// Gloss overlay shader — ports TerSurfGlossMW (MatrixRenderPipeline.cpp:1460).
+/// Runs as an additive pass on top of the already-composited base overlay: we
+/// add `gloss.rgb * reflection.rgb` and pipe `atlas.a` through as the source
+/// alpha so the hardware blend does `final += gloss*refl*atlas.a`, matching
+/// the stage 5 `ADD(TEMP, CURRENT)` with SrcAlpha/InvSrcAlpha blending in the
+/// original single-pass pipeline.
+const GLOSS_SHADER: &str = r#"
+struct GU {
+    view_proj: mat4x4<f32>,
+    normal_mat: mat4x4<f32>,
+    fog_color: vec4<f32>,
+    fog_params: vec4<f32>,
+};
+@group(0) @binding(0) var<uniform> u: GU;
+@group(0) @binding(1) var t_atlas: texture_2d<f32>;
+@group(0) @binding(2) var s_atlas: sampler;
+@group(0) @binding(3) var t_gloss: texture_2d<f32>;
+@group(0) @binding(4) var t_refl: texture_2d<f32>;
+@group(0) @binding(5) var s_refl: sampler;
+
+struct VOut {
+    @builtin(position) clip_pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) cam_normal: vec3<f32>,
+    @location(2) view_dist: f32,
+};
+
+@vertex fn vs_main(
+    @location(0) position: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) uv: vec2<f32>,
+) -> VOut {
+    var out: VOut;
+    let clip = u.view_proj * vec4<f32>(position, 1.0);
+    out.clip_pos = clip;
+    out.uv = uv;
+    out.cam_normal = (u.normal_mat * vec4<f32>(normal, 0.0)).xyz;
+    out.view_dist = clip.w;
+    return out;
+}
+
+@fragment fn fs_main(in: VOut) -> @location(0) vec4<f32> {
+    let atlas = textureSample(t_atlas, s_atlas, in.uv);
+    // Gloss texture uses the same UVs as the atlas (same clamp/wrap rules),
+    // so we reuse the atlas sampler rather than carving out a second binding.
+    let gloss = textureSample(t_gloss, s_atlas, in.uv);
+    // Reflection UV from camera-space normal (sphere map, matches water mirror
+    // sampling in water.rs).
+    let refl_uv = normalize(in.cam_normal).xy * 0.5 + 0.5;
+    let refl = textureSample(t_refl, s_refl, refl_uv);
+    let spec = gloss.rgb * refl.rgb;
+    // Fog attenuates specular the same way it attenuates the diffuse base.
+    let f = clamp((u.fog_params.y - in.view_dist) / (u.fog_params.y - u.fog_params.x), 0.0, 1.0);
+    let spec_fogged = spec * f;
+    return vec4<f32>(spec_fogged, atlas.a);
 }
 "#;
