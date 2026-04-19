@@ -4,7 +4,9 @@ use anyhow::{bail, Context, Result};
 
 use crate::assets::storage::Storage;
 use crate::effects::point_light::PointLightSystem;
-use crate::game::common::{CELLFLAG_BRIDGE, CELLFLAG_FLAT, CELLFLAG_LAND, CELLFLAG_WATER, MAP_GROUP_SIZE};
+use crate::game::common::{
+    CELLFLAG_BRIDGE, CELLFLAG_FLAT, CELLFLAG_LAND, CELLFLAG_WATER, MAP_GROUP_SIZE,
+};
 
 pub const GLOBAL_SCALE: f32 = 20.0;
 
@@ -58,10 +60,10 @@ pub struct GameMap {
     pub terrain2object_influence: f32,
     pub terrain2object_target_color: u32,
     pub macro_texture_path: Option<String>,
-    pub macro_texture_size: i32,  // m_MacrotextureSize from "SIM" param
+    pub macro_texture_size: i32,   // m_MacrotextureSize from "SIM" param
     pub points: Vec<CompilePoint>, // (size_x+1) * (size_y+1) points
-    pub normals: Vec<PointNormal>,  // same size, computed from heights
-    pub units: Vec<MapUnit>,        // size_x * size_y cells, ports SMatrixMapUnit GetZ data
+    pub normals: Vec<PointNormal>, // same size, computed from heights
+    pub units: Vec<MapUnit>,       // size_x * size_y cells, ports SMatrixMapUnit GetZ data
     pub objects: Vec<ObjectInstance>, // palms / rocks / decorative scenery placements
     /// Per-group max LAND z, size = group_w * group_h.
     /// Ports GetGroupMaxZLand (MatrixMap.hpp:759): returns 0 for empty groups /
@@ -75,7 +77,7 @@ pub struct GameMap {
 /// A static object placement — ports the per-instance fields of DATA_OBJECTS
 /// (MatrixMapPrepare.cpp:503-619). Position is uncentered world space (raw map
 /// coords); renderer applies the map-center offset.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ObjectInstance {
     pub x: f32,
     pub y: f32,
@@ -85,6 +87,21 @@ pub struct ObjectInstance {
     pub angle_y: f32,
     pub scale: f32,
     pub type_id: u32,
+    pub shadow: Option<ObjectShadow>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ObjectShadow {
+    pub vertices: Vec<ObjectShadowVertex>,
+    pub indices: Vec<u32>,
+    pub camera_pos: [f32; 3],
+    pub dimensions: [f32; 2],
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ObjectShadowVertex {
+    pub position: [f32; 3],
+    pub uv: [f32; 2],
 }
 
 impl GameMap {
@@ -105,10 +122,9 @@ impl GameMap {
         let size_y = find_property_int(prop_names, prop_values, "SizeInUnitsY")
             .context("missing SizeInUnitsY")? as usize;
 
-        let tex_union_dim = find_property_int(prop_names, prop_values, "TexUnionDim")
-            .unwrap_or(16) as usize;
-        let camera_angle = find_property_float(prop_names, prop_values, "CamAngle")
-            .unwrap_or(0.0);
+        let tex_union_dim =
+            find_property_int(prop_names, prop_values, "TexUnionDim").unwrap_or(16) as usize;
+        let camera_angle = find_property_float(prop_names, prop_values, "CamAngle").unwrap_or(0.0);
         let camera_pos = match (
             find_property_float(prop_names, prop_values, "CamPosX"),
             find_property_float(prop_names, prop_values, "CamPosY"),
@@ -116,28 +132,28 @@ impl GameMap {
             (Ok(x), Ok(y)) => Some([x, y]),
             _ => None,
         };
-        let water_color = find_property_int(prop_names, prop_values, "WaterColor")
-            .unwrap_or(0x003060) as u32;
+        let water_color =
+            find_property_int(prop_names, prop_values, "WaterColor").unwrap_or(0x003060) as u32;
         // DEF_SKY_COLOR (Common.hpp:27) = 0x1070FF
-        let sky_color = find_property_int(prop_names, prop_values, "SkyColor")
-            .unwrap_or(0x1070FF) as u32;
+        let sky_color =
+            find_property_int(prop_names, prop_values, "SkyColor").unwrap_or(0x1070FF) as u32;
         let water_name = prop_names
             .find_as_wstr("WaterName")
             .map(|idx| prop_values.get_as_wstr(idx))
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| "water_blue".to_string());
-        let water_normal_len = find_property_float(prop_names, prop_values, "WaterNormLen")
-            .unwrap_or(1.0);
-        let light_main_color = find_property_int(prop_names, prop_values, "LightMainColor")
-            .unwrap_or(0x989898) as u32;
+        let water_normal_len =
+            find_property_float(prop_names, prop_values, "WaterNormLen").unwrap_or(1.0);
+        let light_main_color =
+            find_property_int(prop_names, prop_values, "LightMainColor").unwrap_or(0x989898) as u32;
         let light_main_color_obj = find_property_int(prop_names, prop_values, "LightMainColorObj")
             .unwrap_or(light_main_color as i32) as u32;
         let ambient_color_obj = find_property_int(prop_names, prop_values, "AmbientColorObj")
             .unwrap_or(0x808080) as u32;
-        let ambient_color = find_property_int(prop_names, prop_values, "AmbientColor")
-            .unwrap_or(0x808080) as u32;
-        let mut terrain2object_influence = find_property_float(prop_names, prop_values, "Influence")
-            .unwrap_or(0.0);
+        let ambient_color =
+            find_property_int(prop_names, prop_values, "AmbientColor").unwrap_or(0x808080) as u32;
+        let mut terrain2object_influence =
+            find_property_float(prop_names, prop_values, "Influence").unwrap_or(0.0);
         let terrain2object_target_color = if terrain2object_influence > 0.0 {
             0xFFFFFF
         } else if terrain2object_influence < 0.0 {
@@ -150,10 +166,10 @@ impl GameMap {
 
         // Light direction: RotX(angleX) * RotZ(angleZ) * (0, 0, -1)
         // Ports MatrixMapPrepare.cpp lines 1228-1231
-        let angle_x = find_property_float(prop_names, prop_values, "LightMainAngleX")
-            .unwrap_or(0.61);
-        let angle_z = find_property_float(prop_names, prop_values, "LightMainAngleZ")
-            .unwrap_or(-1.75);
+        let angle_x =
+            find_property_float(prop_names, prop_values, "LightMainAngleX").unwrap_or(0.61);
+        let angle_z =
+            find_property_float(prop_names, prop_values, "LightMainAngleZ").unwrap_or(-1.75);
         let (sx, cx_) = angle_x.sin_cos();
         let (sz, cz) = angle_z.sin_cos();
         // D3DXMatrixRotationX * D3DXMatrixRotationZ * (0,0,-1)
@@ -180,7 +196,12 @@ impl GameMap {
             }
         }
 
-        log::info!("map: size = {}x{} units, TexUnionDim={}", size_x, size_y, tex_union_dim);
+        log::info!(
+            "map: size = {}x{} units, TexUnionDim={}",
+            size_x,
+            size_y,
+            tex_union_dim
+        );
 
         // Read heightmap points
         let points_buf = stor
@@ -242,7 +263,7 @@ impl GameMap {
         let normals = compute_normals(&points, size_x, size_y);
         let units = compute_units(&points, size_x, size_y);
 
-        let objects = load_objects(&stor, &points, size_x, size_y);
+        let objects = load_objects(&stor, &points, &normals, size_x, size_y);
         log::info!("map: loaded {} decorative objects", objects.len());
 
         // No dilation: the stored per-group max is the max of THIS group's
@@ -316,9 +337,9 @@ impl GameMap {
             let v = self.group_max_z_land[gy as usize * self.group_w + gx as usize];
             v.min(ceiling)
         };
-        let a = sample(gx0,     gy0);
+        let a = sample(gx0, gy0);
         let b = sample(gx0 + 1, gy0);
-        let c = sample(gx0,     gy0 + 1);
+        let c = sample(gx0, gy0 + 1);
         let d = sample(gx0 + 1, gy0 + 1);
         let ab = a + (b - a) * tx;
         let cd = c + (d - c) * tx;
@@ -407,23 +428,32 @@ impl GameMap {
         let c10 = self.point(x as usize + 1, y as usize);
         let c01 = self.point(x as usize, y as usize + 1);
         let c11 = self.point(x as usize + 1, y as usize + 1);
-        let l00 = point_lights.map(|lights| lights.point_lum(x as usize, y as usize, self.size_x)).unwrap_or([0, 0, 0]);
-        let l10 = point_lights.map(|lights| lights.point_lum(x as usize + 1, y as usize, self.size_x)).unwrap_or([0, 0, 0]);
-        let l01 = point_lights.map(|lights| lights.point_lum(x as usize, y as usize + 1, self.size_x)).unwrap_or([0, 0, 0]);
-        let l11 = point_lights.map(|lights| lights.point_lum(x as usize + 1, y as usize + 1, self.size_x)).unwrap_or([0, 0, 0]);
+        let l00 = point_lights
+            .map(|lights| lights.point_lum(x as usize, y as usize, self.size_x))
+            .unwrap_or([0, 0, 0]);
+        let l10 = point_lights
+            .map(|lights| lights.point_lum(x as usize + 1, y as usize, self.size_x))
+            .unwrap_or([0, 0, 0]);
+        let l01 = point_lights
+            .map(|lights| lights.point_lum(x as usize, y as usize + 1, self.size_x))
+            .unwrap_or([0, 0, 0]);
+        let l11 = point_lights
+            .map(|lights| lights.point_lum(x as usize + 1, y as usize + 1, self.size_x))
+            .unwrap_or([0, 0, 0]);
 
-        let sample = |c00: u8, c10: u8, c01: u8, c11: u8, l00: i32, l10: i32, l01: i32, l11: i32| -> u32 {
-            // MatrixMap.cpp:
-            //   Float2Int(LERPFLOAT(ky, LERPFLOAT(kx, c00, c10), LERPFLOAT(kx, c01, c11)))
-            // using the per-point color plus runtime luminance.
-            let top_left = c00 as i32 + l00;
-            let top_right = c10 as i32 + l10;
-            let bottom_left = c01 as i32 + l01;
-            let bottom_right = c11 as i32 + l11;
-            let top = top_left as f32 + (top_right - top_left) as f32 * kx;
-            let bottom = bottom_left as f32 + (bottom_right - bottom_left) as f32 * kx;
-            float2int(top + (bottom - top) * ky).clamp(0, 255) as u32
-        };
+        let sample =
+            |c00: u8, c10: u8, c01: u8, c11: u8, l00: i32, l10: i32, l01: i32, l11: i32| -> u32 {
+                // MatrixMap.cpp:
+                //   Float2Int(LERPFLOAT(ky, LERPFLOAT(kx, c00, c10), LERPFLOAT(kx, c01, c11)))
+                // using the per-point color plus runtime luminance.
+                let top_left = c00 as i32 + l00;
+                let top_right = c10 as i32 + l10;
+                let bottom_left = c01 as i32 + l01;
+                let bottom_right = c11 as i32 + l11;
+                let top = top_left as f32 + (top_right - top_left) as f32 * kx;
+                let bottom = bottom_left as f32 + (bottom_right - bottom_left) as f32 * kx;
+                float2int(top + (bottom - top) * ky).clamp(0, 255) as u32
+            };
 
         let r = sample(c00.r, c10.r, c01.r, c11.r, l00[0], l10[0], l01[0], l11[0]);
         let g = sample(c00.g, c10.g, c01.g, c11.g, l00[1], l10[1], l01[1], l11[1]);
@@ -457,14 +487,23 @@ const CELLFLAG_DOWN: u8 = 1 << 5;
 fn compute_normals(points: &[CompilePoint], size_x: usize, size_y: usize) -> Vec<PointNormal> {
     let w = size_x + 1;
     let h = size_y + 1;
-    let mut normals = vec![PointNormal { x: 0.0, y: 0.0, z: 1.0 }; w * h];
+    let mut normals = vec![
+        PointNormal {
+            x: 0.0,
+            y: 0.0,
+            z: 1.0
+        };
+        w * h
+    ];
 
     let get_z = |x: usize, y: usize| -> f32 { points[y * w + x].z };
     let get_flags = |x: usize, y: usize| -> u8 { points[y * w + x].flags };
 
     // Check if unit at (ux,uy) is land — unit flags are on point (ux,uy)
     let is_land = |ux: i32, uy: i32| -> bool {
-        if ux < 0 || uy < 0 || ux >= size_x as i32 || uy >= size_y as i32 { return false; }
+        if ux < 0 || uy < 0 || ux >= size_x as i32 || uy >= size_y as i32 {
+            return false;
+        }
         get_flags(ux as usize, uy as usize) & CELLFLAG_LAND != 0
     };
 
@@ -479,24 +518,36 @@ fn compute_normals(points: &[CompilePoint], size_x: usize, size_y: usize) -> Vec
             let has_left = is_land(ix - 1, iy);
             let has_cur = is_land(ix, iy);
 
-            let p0 = [px as f32 * GLOBAL_SCALE, py as f32 * GLOBAL_SCALE, get_z(px, py)];
+            let p0 = [
+                px as f32 * GLOBAL_SCALE,
+                py as f32 * GLOBAL_SCALE,
+                get_z(px, py),
+            ];
 
             // Vectors to neighbors (relative to p0)
             let v_up = if has_up && py > 0 {
                 Some([0.0, -GLOBAL_SCALE, get_z(px, py - 1) - p0[2]])
-            } else { None };
+            } else {
+                None
+            };
 
             let v_right = if has_cur && px < size_x {
                 Some([GLOBAL_SCALE, 0.0, get_z(px + 1, py) - p0[2]])
-            } else { None };
+            } else {
+                None
+            };
 
             let v_down = if has_cur && py < size_y {
                 Some([0.0, GLOBAL_SCALE, get_z(px, py + 1) - p0[2]])
-            } else { None };
+            } else {
+                None
+            };
 
             let v_left = if has_left && px > 0 {
                 Some([-GLOBAL_SCALE, 0.0, get_z(px - 1, py) - p0[2]])
-            } else { None };
+            } else {
+                None
+            };
 
             // Average cross products of adjacent triangle pairs
             let mut nx = 0.0f32;
@@ -507,32 +558,56 @@ fn compute_normals(points: &[CompilePoint], size_x: usize, size_y: usize) -> Vec
             // cross(up, right)
             if let (Some(a), Some(b)) = (&v_up, &v_right) {
                 let c = cross(a, b);
-                let len = (c[0]*c[0] + c[1]*c[1] + c[2]*c[2]).sqrt();
-                if len > 0.0 { nx += c[0]/len; ny += c[1]/len; nz += c[2]/len; cnt += 1; }
+                let len = (c[0] * c[0] + c[1] * c[1] + c[2] * c[2]).sqrt();
+                if len > 0.0 {
+                    nx += c[0] / len;
+                    ny += c[1] / len;
+                    nz += c[2] / len;
+                    cnt += 1;
+                }
             }
             // cross(right, down)
             if let (Some(a), Some(b)) = (&v_right, &v_down) {
                 let c = cross(a, b);
-                let len = (c[0]*c[0] + c[1]*c[1] + c[2]*c[2]).sqrt();
-                if len > 0.0 { nx += c[0]/len; ny += c[1]/len; nz += c[2]/len; cnt += 1; }
+                let len = (c[0] * c[0] + c[1] * c[1] + c[2] * c[2]).sqrt();
+                if len > 0.0 {
+                    nx += c[0] / len;
+                    ny += c[1] / len;
+                    nz += c[2] / len;
+                    cnt += 1;
+                }
             }
             // cross(down, left)
             if let (Some(a), Some(b)) = (&v_down, &v_left) {
                 let c = cross(a, b);
-                let len = (c[0]*c[0] + c[1]*c[1] + c[2]*c[2]).sqrt();
-                if len > 0.0 { nx += c[0]/len; ny += c[1]/len; nz += c[2]/len; cnt += 1; }
+                let len = (c[0] * c[0] + c[1] * c[1] + c[2] * c[2]).sqrt();
+                if len > 0.0 {
+                    nx += c[0] / len;
+                    ny += c[1] / len;
+                    nz += c[2] / len;
+                    cnt += 1;
+                }
             }
             // cross(left, up)
             if let (Some(a), Some(b)) = (&v_left, &v_up) {
                 let c = cross(a, b);
-                let len = (c[0]*c[0] + c[1]*c[1] + c[2]*c[2]).sqrt();
-                if len > 0.0 { nx += c[0]/len; ny += c[1]/len; nz += c[2]/len; cnt += 1; }
+                let len = (c[0] * c[0] + c[1] * c[1] + c[2] * c[2]).sqrt();
+                if len > 0.0 {
+                    nx += c[0] / len;
+                    ny += c[1] / len;
+                    nz += c[2] / len;
+                    cnt += 1;
+                }
             }
 
             if cnt > 0 {
-                let len = (nx*nx + ny*ny + nz*nz).sqrt();
+                let len = (nx * nx + ny * ny + nz * nz).sqrt();
                 if len > 0.0 {
-                    normals[py * w + px] = PointNormal { x: nx/len, y: ny/len, z: nz/len };
+                    normals[py * w + px] = PointNormal {
+                        x: nx / len,
+                        y: ny / len,
+                        z: nz / len,
+                    };
                 }
             }
         }
@@ -568,7 +643,11 @@ fn compute_units(points: &[CompilePoint], size_x: usize, size_y: usize) -> Vec<M
             };
 
             units.push(MapUnit {
-                flags: if flat { flags | CELLFLAG_FLAT } else { flags & !CELLFLAG_FLAT },
+                flags: if flat {
+                    flags | CELLFLAG_FLAT
+                } else {
+                    flags & !CELLFLAG_FLAT
+                },
                 a1,
                 b1,
                 c1,
@@ -583,7 +662,11 @@ fn compute_units(points: &[CompilePoint], size_x: usize, size_y: usize) -> Vec<M
 }
 
 fn cross(a: &[f32; 3], b: &[f32; 3]) -> [f32; 3] {
-    [a[1]*b[2] - a[2]*b[1], a[2]*b[0] - a[0]*b[2], a[0]*b[1] - a[1]*b[0]]
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
 }
 
 /// Per-group max land z, clamped to 0 (ports GetGroupMaxZLand + CMatrixMapGroup
@@ -610,10 +693,14 @@ fn compute_group_max_z_land(
             for y in y0..y1 {
                 for x in x0..x1 {
                     let u = units[y * size_x + x];
-                    if u.flags & CELLFLAG_LAND == 0 { continue; }
+                    if u.flags & CELLFLAG_LAND == 0 {
+                        continue;
+                    }
                     for (dx, dy) in [(0usize, 0usize), (1, 0), (0, 1), (1, 1)] {
                         let z = points[(y + dy) * stride + (x + dx)].z;
-                        if z > mz { mz = z; }
+                        if z > mz {
+                            mz = z;
+                        }
                     }
                 }
             }
@@ -635,9 +722,13 @@ fn dilate_max(src: &[f32], w: usize, h: usize, radius: i32) -> Vec<f32> {
                 for dx in -radius..=radius {
                     let nx = gx as i32 + dx;
                     let ny = gy as i32 + dy;
-                    if nx < 0 || ny < 0 || nx >= w as i32 || ny >= h as i32 { continue; }
+                    if nx < 0 || ny < 0 || nx >= w as i32 || ny >= h as i32 {
+                        continue;
+                    }
                     let v = src[ny as usize * w + nx as usize];
-                    if v > m { m = v; }
+                    if v > m {
+                        m = v;
+                    }
                 }
             }
             out[gy * w + gx] = m;
@@ -653,28 +744,52 @@ fn dilate_max(src: &[f32], w: usize, h: usize, radius: i32) -> Vec<f32> {
 fn load_objects(
     stor: &Storage,
     points: &[CompilePoint],
+    normals: &[PointNormal],
     size_x: usize,
     size_y: usize,
 ) -> Vec<ObjectInstance> {
-    let Some(col_x) = stor.get_buf("objects", "X") else { return Vec::new(); };
-    let Some(col_y) = stor.get_buf("objects", "Y") else { return Vec::new(); };
-    let Some(col_scale) = stor.get_buf("objects", "Scale") else { return Vec::new(); };
-    let Some(col_type) = stor.get_buf("objects", "Type") else { return Vec::new(); };
-    let Some(col_angle_z) = stor.get_buf("objects", "Angle") else { return Vec::new(); };
-    if col_x.arrays_count() == 0 { return Vec::new(); }
+    let Some(col_x) = stor.get_buf("objects", "X") else {
+        return Vec::new();
+    };
+    let Some(col_y) = stor.get_buf("objects", "Y") else {
+        return Vec::new();
+    };
+    let Some(col_scale) = stor.get_buf("objects", "Scale") else {
+        return Vec::new();
+    };
+    let Some(col_type) = stor.get_buf("objects", "Type") else {
+        return Vec::new();
+    };
+    let Some(col_angle_z) = stor.get_buf("objects", "Angle") else {
+        return Vec::new();
+    };
+    if col_x.arrays_count() == 0 {
+        return Vec::new();
+    }
 
     let xs = read_f32_array(col_x.get_bytes(0));
     let ys = read_f32_array(col_y.get_bytes(0));
     let n = xs.len().min(ys.len());
-    if n == 0 { return Vec::new(); }
+    if n == 0 {
+        return Vec::new();
+    }
 
     let scales = read_f32_array(col_scale.get_bytes(0));
     let angles_z = read_f32_array(col_angle_z.get_bytes(0));
     let types = read_u32_array(col_type.get_bytes(0));
-    let angles_x = stor.get_buf("objects", "AngleX").map(|b| read_f32_array(b.get_bytes(0)));
-    let angles_y = stor.get_buf("objects", "AngleY").map(|b| read_f32_array(b.get_bytes(0)));
-    let heights = stor.get_buf("objects", "Height").map(|b| read_f32_array(b.get_bytes(0)));
-    let zs = stor.get_buf("objects", "Z").map(|b| read_f32_array(b.get_bytes(0)));
+    let angles_x = stor
+        .get_buf("objects", "AngleX")
+        .map(|b| read_f32_array(b.get_bytes(0)));
+    let angles_y = stor
+        .get_buf("objects", "AngleY")
+        .map(|b| read_f32_array(b.get_bytes(0)));
+    let heights = stor
+        .get_buf("objects", "Height")
+        .map(|b| read_f32_array(b.get_bytes(0)));
+    let zs = stor
+        .get_buf("objects", "Z")
+        .map(|b| read_f32_array(b.get_bytes(0)));
+    let shadows = stor.get_buf("objects", "Shadow");
 
     let w = size_x + 1;
     let sample_corners = |x: f32, y: f32| -> f32 {
@@ -685,40 +800,185 @@ fn load_objects(
         for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
             let cx = px + dx;
             let cy = py + dy;
-            if cx < 0 || cy < 0 || cx > size_x as i32 || cy > size_y as i32 { continue; }
+            if cx < 0 || cy < 0 || cx > size_x as i32 || cy > size_y as i32 {
+                continue;
+            }
             sum += points[cy as usize * w + cx as usize].z;
             cnt += 1;
         }
-        if cnt == 0 { 0.0 } else { sum / cnt as f32 }
+        if cnt == 0 {
+            0.0
+        } else {
+            sum / cnt as f32
+        }
     };
 
-    (0..n).map(|i| {
-        let x = xs[i];
-        let y = ys[i];
-        let z = match (&heights, &zs) {
-            (Some(h), _) if i < h.len() => h[i] + sample_corners(x, y),
-            (_, Some(zv)) if i < zv.len() => zv[i],
-            _ => 0.0,
-        };
-        ObjectInstance {
-            x,
-            y,
-            z,
-            angle_z: angles_z.get(i).copied().unwrap_or(0.0),
-            angle_x: angles_x.as_ref().and_then(|a| a.get(i).copied()).unwrap_or(0.0),
-            angle_y: angles_y.as_ref().and_then(|a| a.get(i).copied()).unwrap_or(0.0),
-            scale: scales.get(i).copied().unwrap_or(1.0),
-            type_id: types.get(i).copied().unwrap_or(0),
+    (0..n)
+        .map(|i| {
+            let x = xs[i];
+            let y = ys[i];
+            let z = match (&heights, &zs) {
+                (Some(h), _) if i < h.len() => h[i] + sample_corners(x, y),
+                (_, Some(zv)) if i < zv.len() => zv[i],
+                _ => 0.0,
+            };
+            ObjectInstance {
+                x,
+                y,
+                z,
+                angle_z: angles_z.get(i).copied().unwrap_or(0.0),
+                angle_x: angles_x
+                    .as_ref()
+                    .and_then(|a| a.get(i).copied())
+                    .unwrap_or(0.0),
+                angle_y: angles_y
+                    .as_ref()
+                    .and_then(|a| a.get(i).copied())
+                    .unwrap_or(0.0),
+                scale: scales.get(i).copied().unwrap_or(1.0),
+                type_id: types.get(i).copied().unwrap_or(0),
+                shadow: shadows
+                    .and_then(|buf| parse_object_shadow(buf, i, points, normals, size_x, size_y)),
+            }
+        })
+        .collect()
+}
+
+fn parse_object_shadow(
+    buf: &crate::assets::storage::DataBuf,
+    index: usize,
+    points: &[CompilePoint],
+    normals: &[PointNormal],
+    size_x: usize,
+    size_y: usize,
+) -> Option<ObjectShadow> {
+    if index >= buf.arrays_count() {
+        return None;
+    }
+    let bytes = buf.get_bytes(index);
+    if bytes.len() < 4 {
+        return None;
+    }
+
+    let mut off = 0usize;
+    let group_count = read_i32_le(bytes, &mut off)? as usize;
+    let group_bytes = group_count.checked_mul(4)?;
+    if off + group_bytes > bytes.len() {
+        return None;
+    }
+    off += group_bytes;
+
+    let _min_x = read_i32_le(bytes, &mut off)?;
+    let _min_y = read_i32_le(bytes, &mut off)?;
+    let vert_count = read_i32_le(bytes, &mut off)? as usize;
+    let index_byte_size = read_i32_le(bytes, &mut off)? as usize;
+    let index_count = index_byte_size / 2;
+
+    let vertex_bytes = vert_count.checked_mul(12)?;
+    let index_bytes = index_byte_size;
+    if off + vertex_bytes + index_bytes + 20 > bytes.len() {
+        return None;
+    }
+
+    let mut vertices = Vec::with_capacity(vert_count);
+    for _ in 0..vert_count {
+        let px = u16::from_le_bytes([bytes[off], bytes[off + 1]]) as usize;
+        let py = u16::from_le_bytes([bytes[off + 2], bytes[off + 3]]) as usize;
+        let tu = f32::from_le_bytes([
+            bytes[off + 4],
+            bytes[off + 5],
+            bytes[off + 6],
+            bytes[off + 7],
+        ]);
+        let tv = f32::from_le_bytes([
+            bytes[off + 8],
+            bytes[off + 9],
+            bytes[off + 10],
+            bytes[off + 11],
+        ]);
+        off += 12;
+
+        if px > size_x || py > size_y {
+            return None;
         }
-    }).collect()
+        let p = points[py * (size_x + 1) + px];
+        let n = normals[py * (size_x + 1) + px];
+        vertices.push(ObjectShadowVertex {
+            position: [
+                px as f32 * GLOBAL_SCALE + n.x * 0.1,
+                py as f32 * GLOBAL_SCALE + n.y * 0.1,
+                p.z + n.z * 0.1,
+            ],
+            uv: [tu, tv],
+        });
+    }
+
+    let mut indices = Vec::with_capacity(index_count);
+    for _ in 0..index_count {
+        indices.push(u16::from_le_bytes([bytes[off], bytes[off + 1]]) as u32);
+        off += 2;
+    }
+
+    let camera_pos = [
+        f32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]),
+        f32::from_le_bytes([
+            bytes[off + 4],
+            bytes[off + 5],
+            bytes[off + 6],
+            bytes[off + 7],
+        ]),
+        f32::from_le_bytes([
+            bytes[off + 8],
+            bytes[off + 9],
+            bytes[off + 10],
+            bytes[off + 11],
+        ]),
+    ];
+    off += 12;
+    let dimensions = [
+        f32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]),
+        f32::from_le_bytes([
+            bytes[off + 4],
+            bytes[off + 5],
+            bytes[off + 6],
+            bytes[off + 7],
+        ]),
+    ];
+
+    Some(ObjectShadow {
+        vertices,
+        indices,
+        camera_pos,
+        dimensions,
+    })
+}
+
+fn read_i32_le(bytes: &[u8], off: &mut usize) -> Option<i32> {
+    if *off + 4 > bytes.len() {
+        return None;
+    }
+    let value = i32::from_le_bytes([
+        bytes[*off],
+        bytes[*off + 1],
+        bytes[*off + 2],
+        bytes[*off + 3],
+    ]);
+    *off += 4;
+    Some(value)
 }
 
 fn read_f32_array(bytes: &[u8]) -> Vec<f32> {
-    bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+    bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
 }
 
 fn read_u32_array(bytes: &[u8]) -> Vec<u32> {
-    bytes.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+    bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
 }
 
 fn blend_color(a: u32, b: u32, t: f32) -> u32 {

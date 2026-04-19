@@ -44,7 +44,9 @@ pub struct MaterialSpec {
 pub fn parse_vo(data: &[u8]) -> Result<VoMesh> {
     let stor = Storage::from_bytes(data).context("parsing VO as CStorage")?;
 
-    let verts_buf = stor.get_buf("verts", "data").context("missing verts/data")?;
+    let verts_buf = stor
+        .get_buf("verts", "data")
+        .context("missing verts/data")?;
     let idxs_buf = stor.get_buf("idxs", "data").context("missing idxs/data")?;
     if verts_buf.arrays_count() == 0 || idxs_buf.arrays_count() == 0 {
         anyhow::bail!("VO has empty verts or idxs");
@@ -55,7 +57,14 @@ pub fn parse_vo(data: &[u8]) -> Result<VoMesh> {
     let mut vertices = Vec::with_capacity(vcount);
     for i in 0..vcount {
         let off = i * 32;
-        let f = |o: usize| f32::from_le_bytes([vb[off + o], vb[off + o + 1], vb[off + o + 2], vb[off + o + 3]]);
+        let f = |o: usize| {
+            f32::from_le_bytes([
+                vb[off + o],
+                vb[off + o + 1],
+                vb[off + o + 2],
+                vb[off + o + 3],
+            ])
+        };
         vertices.push(VoVertex {
             position: [f(0), f(4), f(8)],
             normal: [f(12), f(16), f(20)],
@@ -87,25 +96,65 @@ pub fn parse_vo(data: &[u8]) -> Result<VoMesh> {
 pub struct ResolvedObjectPaths {
     pub vo_path: String,
     pub material: MaterialSpec,
+    pub shadow: ShadowSpec,
+}
+
+#[derive(Clone, Debug)]
+pub struct ShadowSpec {
+    pub kind: ShadowKind,
+    pub texture_size: u32,
+    pub cache_tag: Option<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ShadowKind {
+    None,
+    Stencil,
+    ProjectedStatic,
+    ProjectedDynamic,
 }
 
 pub fn resolve_paths(id_string: &str) -> Option<ResolvedObjectPaths> {
     let parts: Vec<&str> = id_string.split('*').collect();
-    if parts.len() < 2 { return None; }
+    if parts.len() < 2 {
+        return None;
+    }
     let path = parts[0].replace('\\', "/");
     let vo_name = parts[1];
-    if vo_name.is_empty() { return None; }
+    if vo_name.is_empty() {
+        return None;
+    }
     let vo_path = format!("{}{}.vo", path, vo_name);
 
     let material = MaterialSpec {
-        diffuse: parts.get(2).and_then(|t| resolve_texture_name(t, Some(&path))),
-        gloss: parts.get(3).and_then(|t| resolve_texture_name(t, Some(&path))),
-        back: parts.get(4).and_then(|t| resolve_texture_name(t, Some(&path))),
-        mask: parts.get(5).and_then(|t| resolve_texture_name(t, Some(&path))),
+        diffuse: parts
+            .get(2)
+            .and_then(|t| resolve_texture_name(t, Some(&path))),
+        gloss: parts
+            .get(3)
+            .and_then(|t| resolve_texture_name(t, Some(&path))),
+        back: parts
+            .get(4)
+            .and_then(|t| resolve_texture_name(t, Some(&path))),
+        mask: parts
+            .get(5)
+            .and_then(|t| resolve_texture_name(t, Some(&path))),
         scroll: parts.get(6).map(|t| parse_scroll(t)).unwrap_or([0.0, 0.0]),
     };
+    let shadow = parts
+        .get(7)
+        .map(|t| parse_shadow_spec(t))
+        .unwrap_or(ShadowSpec {
+            kind: ShadowKind::None,
+            texture_size: 128,
+            cache_tag: None,
+        });
 
-    Some(ResolvedObjectPaths { vo_path, material })
+    Some(ResolvedObjectPaths {
+        vo_path,
+        material,
+        shadow,
+    })
 }
 
 pub fn parse_material_spec(spec: &str) -> MaterialSpec {
@@ -132,7 +181,11 @@ pub fn merge_materials(base: &MaterialSpec, overlay: Option<&MaterialSpec>) -> M
         gloss: overlay.gloss.clone().or_else(|| base.gloss.clone()),
         back: overlay.back.clone().or_else(|| base.back.clone()),
         mask: overlay.mask.clone().or_else(|| base.mask.clone()),
-        scroll: if overlay.scroll != [0.0, 0.0] { overlay.scroll } else { base.scroll },
+        scroll: if overlay.scroll != [0.0, 0.0] {
+            overlay.scroll
+        } else {
+            base.scroll
+        },
     }
 }
 
@@ -155,9 +208,44 @@ fn resolve_texture_name(raw: &str, prefix: Option<&str>) -> Option<String> {
 
 fn parse_scroll(raw: &str) -> [f32; 2] {
     let mut it = raw.split(',');
-    let u = it.next().and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(0.0);
-    let v = it.next().and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(0.0);
+    let u = it
+        .next()
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .unwrap_or(0.0);
+    let v = it
+        .next()
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .unwrap_or(0.0);
     [u, v]
+}
+
+fn parse_shadow_spec(raw: &str) -> ShadowSpec {
+    let spec = raw.trim();
+    if spec.is_empty() {
+        return ShadowSpec {
+            kind: ShadowKind::None,
+            texture_size: 128,
+            cache_tag: None,
+        };
+    }
+    let mut parts = spec.split(',');
+    let kind = match parts.next().unwrap_or("").trim() {
+        "Stencil" => ShadowKind::Stencil,
+        "Proj" => ShadowKind::ProjectedStatic,
+        "ProjEx" => ShadowKind::ProjectedDynamic,
+        _ => ShadowKind::None,
+    };
+    let texture_size = parts
+        .next()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(128);
+    let cache_tag = parts.next().and_then(|v| v.trim().parse::<u32>().ok());
+    ShadowSpec {
+        kind,
+        texture_size,
+        cache_tag,
+    }
 }
 
 fn parse_surfaces(stor: &Storage, indices: &[u16]) -> Vec<VoSurfaceMesh> {
