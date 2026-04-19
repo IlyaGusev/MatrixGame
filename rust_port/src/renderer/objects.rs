@@ -12,6 +12,7 @@ use wgpu::util::DeviceExt;
 use crate::assets::storage::Storage;
 use crate::game::common::{FOG_START, FOG_END, unpack_rgb};
 use crate::game::map::{GameMap, ObjectInstance};
+use crate::game::point_light::PointLightSystem;
 use crate::game::vo_loader::{self};
 use crate::renderer::camera::Camera;
 use crate::renderer::texture::{decode_texture_bytes, create_texture_from_rgba, create_solid_texture};
@@ -63,6 +64,8 @@ struct MeshBatch {
     instance_buffer: wgpu::Buffer,
     num_instances: u32,
     bind_group: wgpu::BindGroup,
+    objects: Vec<ObjectInstance>,
+    center: [f32; 2],
 }
 
 pub struct ObjectsRenderer {
@@ -74,6 +77,7 @@ pub struct ObjectsRenderer {
     light_color: [f32; 4],
     light_dir: [f32; 4],
     time_ms: f32,
+    last_point_light_revision: u64,
 }
 
 impl ObjectsRenderer {
@@ -244,13 +248,13 @@ impl ObjectsRenderer {
             }).collect();
 
             let inst_data: Vec<InstanceData> = instances.iter().map(|obj| {
-                instance_matrix(obj, cx, cy, map)
+                instance_matrix(obj, cx, cy, map, None)
             }).collect();
 
             let instance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("Objects Inst VB"),
                 contents: bytemuck::cast_slice(&inst_data),
-                usage: wgpu::BufferUsages::VERTEX,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             });
 
             let use_vo_surface_materials = mesh.surfaces.len() > 1;
@@ -322,6 +326,8 @@ impl ObjectsRenderer {
                     instance_buffer: instance_buffer.clone(),
                     num_instances: inst_data.len() as u32,
                     bind_group,
+                    objects: instances.iter().map(|obj| **obj).collect(),
+                    center: [cx, cy],
                 });
             }
             loaded_types += 1;
@@ -400,13 +406,41 @@ impl ObjectsRenderer {
             cache: None,
         });
 
-        Some(Self { pipeline, batches, uniform_buffer, fog_color, ambient_color, light_color, light_dir, time_ms: 0.0 })
+        Some(Self {
+            pipeline,
+            batches,
+            uniform_buffer,
+            fog_color,
+            ambient_color,
+            light_color,
+            light_dir,
+            time_ms: 0.0,
+            last_point_light_revision: 0,
+        })
     }
 
-    pub fn takt(&mut self, dt_ms: f32) {
+    pub fn takt(
+        &mut self,
+        dt_ms: f32,
+        queue: &wgpu::Queue,
+        map: &GameMap,
+        point_lights: &PointLightSystem,
+    ) {
         self.time_ms += dt_ms;
         if self.time_ms > 1_000_000.0 {
             self.time_ms -= 1_000_000.0;
+        }
+
+        let revision = point_lights.revision();
+        if revision != self.last_point_light_revision {
+            for batch in &mut self.batches {
+                let [cx, cy] = batch.center;
+                let inst_data: Vec<InstanceData> = batch.objects.iter().map(|obj| {
+                    instance_matrix(obj, cx, cy, map, Some(point_lights))
+                }).collect();
+                queue.write_buffer(&batch.instance_buffer, 0, bytemuck::cast_slice(&inst_data));
+            }
+            self.last_point_light_revision = revision;
         }
     }
 
@@ -442,9 +476,16 @@ impl ObjectsRenderer {
 
 /// Build the same static-object transform order used by the original renderer:
 /// Rx * Ry * Rz, then uniform scale, then translation into centered render space.
-fn instance_matrix(obj: &ObjectInstance, cx: f32, cy: f32, map: &GameMap) -> InstanceData {
+fn instance_matrix(
+    obj: &ObjectInstance,
+    cx: f32,
+    cy: f32,
+    map: &GameMap,
+    point_lights: Option<&PointLightSystem>,
+) -> InstanceData {
     let s = obj.scale.max(0.0001);
-    let [terrain_r, terrain_g, terrain_b] = unpack_rgb(map.static_object_color(obj.x, obj.y));
+    let [terrain_r, terrain_g, terrain_b] =
+        unpack_rgb(map.static_object_color_with_lighting(obj.x, obj.y, point_lights));
 
     let (sx, cxr) = obj.angle_x.sin_cos();
     let (sy, cyr) = obj.angle_y.sin_cos();

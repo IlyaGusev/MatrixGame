@@ -4,6 +4,7 @@ use anyhow::{bail, Context, Result};
 
 use crate::assets::storage::Storage;
 use crate::game::common::{CELLFLAG_BRIDGE, CELLFLAG_FLAT, CELLFLAG_LAND, CELLFLAG_WATER, MAP_GROUP_SIZE};
+use crate::game::point_light::PointLightSystem;
 
 pub const GLOBAL_SCALE: f32 = 20.0;
 
@@ -373,9 +374,18 @@ impl GameMap {
         }
     }
 
-    /// Approximate CMatrixMap::GetColor for static objects: bilinear point-color
-    /// sampling on land, object ambient fallback on water or out-of-bounds.
     pub fn get_color(&self, wx: f32, wy: f32) -> u32 {
+        self.get_color_with_lighting(wx, wy, None)
+    }
+
+    /// Port of `CMatrixMap::GetColor`, including optional point-light
+    /// luminance contributions when a point-light system is present.
+    pub fn get_color_with_lighting(
+        &self,
+        wx: f32,
+        wy: f32,
+        point_lights: Option<&PointLightSystem>,
+    ) -> u32 {
         let sx = wx / GLOBAL_SCALE;
         let sy = wy / GLOBAL_SCALE;
         let x = sx.floor() as i32;
@@ -397,22 +407,43 @@ impl GameMap {
         let c10 = self.point(x as usize + 1, y as usize);
         let c01 = self.point(x as usize, y as usize + 1);
         let c11 = self.point(x as usize + 1, y as usize + 1);
+        let l00 = point_lights.map(|lights| lights.point_lum(x as usize, y as usize, self.size_x)).unwrap_or([0, 0, 0]);
+        let l10 = point_lights.map(|lights| lights.point_lum(x as usize + 1, y as usize, self.size_x)).unwrap_or([0, 0, 0]);
+        let l01 = point_lights.map(|lights| lights.point_lum(x as usize, y as usize + 1, self.size_x)).unwrap_or([0, 0, 0]);
+        let l11 = point_lights.map(|lights| lights.point_lum(x as usize + 1, y as usize + 1, self.size_x)).unwrap_or([0, 0, 0]);
 
-        let lerp = |a: f32, b: f32, t: f32| a + (b - a) * t;
-        let bilerp = |a: f32, b: f32, c: f32, d: f32| {
-            lerp(lerp(a, b, kx), lerp(c, d, kx), ky)
+        let sample = |c00: u8, c10: u8, c01: u8, c11: u8, l00: i32, l10: i32, l01: i32, l11: i32| -> u32 {
+            // MatrixMap.cpp:
+            //   Float2Int(LERPFLOAT(ky, LERPFLOAT(kx, c00, c10), LERPFLOAT(kx, c01, c11)))
+            // using the per-point color plus runtime luminance.
+            let top_left = c00 as i32 + l00;
+            let top_right = c10 as i32 + l10;
+            let bottom_left = c01 as i32 + l01;
+            let bottom_right = c11 as i32 + l11;
+            let top = top_left as f32 + (top_right - top_left) as f32 * kx;
+            let bottom = bottom_left as f32 + (bottom_right - bottom_left) as f32 * kx;
+            float2int(top + (bottom - top) * ky).clamp(0, 255) as u32
         };
 
-        let r = bilerp(c00.r as f32, c10.r as f32, c01.r as f32, c11.r as f32).round().clamp(0.0, 255.0) as u32;
-        let g = bilerp(c00.g as f32, c10.g as f32, c01.g as f32, c11.g as f32).round().clamp(0.0, 255.0) as u32;
-        let b = bilerp(c00.b as f32, c10.b as f32, c01.b as f32, c11.b as f32).round().clamp(0.0, 255.0) as u32;
+        let r = sample(c00.r, c10.r, c01.r, c11.r, l00[0], l10[0], l01[0], l11[0]);
+        let g = sample(c00.g, c10.g, c01.g, c11.g, l00[1], l10[1], l01[1], l11[1]);
+        let b = sample(c00.b, c10.b, c01.b, c11.b, l00[2], l10[2], l01[2], l11[2]);
 
         (r << 16) | (g << 8) | b
     }
 
     pub fn static_object_color(&self, wx: f32, wy: f32) -> u32 {
+        self.static_object_color_with_lighting(wx, wy, None)
+    }
+
+    pub fn static_object_color_with_lighting(
+        &self,
+        wx: f32,
+        wy: f32,
+        point_lights: Option<&PointLightSystem>,
+    ) -> u32 {
         blend_color(
-            self.get_color(wx, wy),
+            self.get_color_with_lighting(wx, wy, point_lights),
             self.terrain2object_target_color,
             self.terrain2object_influence,
         )
@@ -704,6 +735,12 @@ fn blend_color(a: u32, b: u32, t: f32) -> u32 {
     let bg = (b >> 8) & 0xFF;
     let bb = b & 0xFF;
     (lerp(ar, br) << 16) | (lerp(ag, bg) << 8) | lerp(ab, bb)
+}
+
+fn float2int(x: f32) -> i32 {
+    // The original uses x87 `fistp` via Float2Int. Rust has no direct stable
+    // equivalent, so use nearest-integer rounding for the current viewer port.
+    x.round() as i32
 }
 
 fn find_property_int(

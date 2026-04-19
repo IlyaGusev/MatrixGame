@@ -15,6 +15,7 @@ use crate::assets::storage::Storage;
 use crate::game::common::{TEX_BOTTOM_SIZE, MAP_GROUP_SIZE, CELLFLAG_DOWN, FOG_START, FOG_END, rd_u32, rd_u16, unpack_rgb};
 use crate::game::map::{GameMap, GLOBAL_SCALE};
 use crate::game::map_prepare::build_tex_union_atlases;
+use crate::game::point_light::PointLightSystem;
 use crate::renderer::camera::Camera;
 use crate::renderer::ter_surface::build_surface_overlays;
 use crate::renderer::texture::*;
@@ -58,6 +59,8 @@ pub struct DrawBatch {
     pub index_buffer: wgpu::Buffer,
     pub num_indices: u32,
     pub index_format: wgpu::IndexFormat,
+    pub cpu_vertices: Option<Vec<Vertex>>,
+    pub point_coords: Option<Vec<(usize, usize)>>,
 }
 
 pub struct TerrainRenderer {
@@ -72,6 +75,7 @@ pub struct TerrainRenderer {
     water: Option<super::water::Water>,
     uniform_buffer: wgpu::Buffer,
     depth_texture: wgpu::TextureView,
+    last_point_light_revision: u64,
 }
 
 impl TerrainRenderer {
@@ -96,7 +100,7 @@ impl TerrainRenderer {
         let cx = map.world_width() * 0.5;
         let cy = map.world_height() * 0.5;
 
-        let mut batches_by_tex: std::collections::HashMap<u32, (Vec<Vertex>, Vec<u32>)> = std::collections::HashMap::new();
+        let mut batches_by_tex: std::collections::HashMap<u32, (Vec<Vertex>, Vec<u32>, Vec<(usize, usize)>)> = std::collections::HashMap::new();
 
         if let Some(grp) = groups_buf {
             for gi in 0..grp.arrays_count() {
@@ -135,6 +139,7 @@ impl TerrainRenderer {
                 let macro_step = 1.0 / map.macro_texture_size as f32;
 
                 let mut vertices = Vec::with_capacity(vert_count);
+                let mut point_coords = Vec::with_capacity(vert_count);
                 for _ in 0..vert_count {
                     if off + 8 > raw.len() { break; }
                     let vx = rd_u16(raw, &mut off) as i32;
@@ -182,12 +187,14 @@ impl TerrainRenderer {
                         uv: [u as f32, v as f32],
                         macro_uv: [mu, mv],
                     });
+                    point_coords.push((vxi, vyi));
                 }
 
                 for geom in &geoms {
-                    let (verts, idxs) = batches_by_tex.entry(geom.texture).or_default();
+                    let (verts, idxs, coords) = batches_by_tex.entry(geom.texture).or_default();
                     let base = verts.len() as u32;
                     verts.extend_from_slice(&vertices);
+                    coords.extend_from_slice(&point_coords);
                     for i in geom.idx_offset..geom.idx_offset + geom.idx_count {
                         idxs.push(base + all_indices[i] as u32);
                     }
@@ -263,10 +270,14 @@ impl TerrainRenderer {
 
         let mut batches = Vec::new();
         let mut total_tris = 0u32;
-        for (tex_idx, (verts, idxs)) in &batches_by_tex {
+        for (tex_idx, (verts, idxs, point_coords)) in &batches_by_tex {
             if idxs.is_empty() { continue; }
             let tex_view = atlas_views.get(*tex_idx as usize).unwrap_or(&white_view);
-            let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(verts), usage: wgpu::BufferUsages::VERTEX });
+            let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(verts),
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            });
             let ib = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(idxs), usage: wgpu::BufferUsages::INDEX });
             let bg = device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &bgl, entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: uniform_buffer.as_entire_binding() },
@@ -276,7 +287,15 @@ impl TerrainRenderer {
                 wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&macro_sampler) },
             ]});
             total_tris += idxs.len() as u32 / 3;
-            batches.push(DrawBatch { bind_group: bg, vertex_buffer: vb, index_buffer: ib, num_indices: idxs.len() as u32, index_format: wgpu::IndexFormat::Uint32 });
+            batches.push(DrawBatch {
+                bind_group: bg,
+                vertex_buffer: vb,
+                index_buffer: ib,
+                num_indices: idxs.len() as u32,
+                index_format: wgpu::IndexFormat::Uint32,
+                cpu_vertices: Some(verts.clone()),
+                point_coords: Some(point_coords.clone()),
+            });
         }
         log::info!("terrain bottom: {} draw batches, {} triangles", batches.len(), total_tris);
 
@@ -332,16 +351,68 @@ impl TerrainRenderer {
             a: 1.0,
         };
 
-        Self { pipeline, overlay_pipeline, batches, overlay_batches, sky, clear_color, fog_color, objects, water, uniform_buffer, depth_texture }
+        let overlay_batches = overlay_batches.into_iter().map(|batch| DrawBatch {
+            bind_group: batch.bind_group,
+            vertex_buffer: batch.vertex_buffer,
+            index_buffer: batch.index_buffer,
+            num_indices: batch.num_indices,
+            index_format: batch.index_format,
+            cpu_vertices: None,
+            point_coords: None,
+        }).collect();
+
+        Self {
+            pipeline,
+            overlay_pipeline,
+            batches,
+            overlay_batches,
+            sky,
+            clear_color,
+            fog_color,
+            objects,
+            water,
+            uniform_buffer,
+            depth_texture,
+            last_point_light_revision: 0,
+        }
     }
 
     pub fn resize(&mut self, device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) {
         self.depth_texture = create_depth_texture(device, config);
     }
 
-    pub fn takt(&mut self, dt_ms: f32, device: &wgpu::Device, queue: &wgpu::Queue) {
+    pub fn takt(
+        &mut self,
+        dt_ms: f32,
+        map: &GameMap,
+        point_lights: &PointLightSystem,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) {
+        let revision = point_lights.revision();
+        if revision != self.last_point_light_revision {
+            for batch in &mut self.batches {
+                let (Some(cpu_vertices), Some(point_coords)) =
+                    (batch.cpu_vertices.as_mut(), batch.point_coords.as_ref())
+                else {
+                    continue;
+                };
+                for (vertex, &(px, py)) in cpu_vertices.iter_mut().zip(point_coords.iter()) {
+                    let point = map.point(px, py);
+                    let lum = point_lights.point_lum(px, py, map.size_x);
+                    vertex.color[0] = ((point.r as i32 + lum[0]).clamp(0, 255) as f32) / 255.0;
+                    vertex.color[1] = ((point.g as i32 + lum[1]).clamp(0, 255) as f32) / 255.0;
+                    vertex.color[2] = ((point.b as i32 + lum[2]).clamp(0, 255) as f32) / 255.0;
+                }
+                queue.write_buffer(&batch.vertex_buffer, 0, bytemuck::cast_slice(cpu_vertices));
+            }
+            self.last_point_light_revision = revision;
+        }
+
         if let Some(water) = &mut self.water { water.takt(dt_ms, device, queue); }
-        if let Some(objects) = &mut self.objects { objects.takt(dt_ms); }
+        if let Some(objects) = &mut self.objects {
+            objects.takt(dt_ms, queue, map, point_lights);
+        }
     }
 
     pub fn render(&mut self, _device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView, queue: &wgpu::Queue, camera: &Camera, view_proj: glam::Mat4, view_mat: glam::Mat4) {

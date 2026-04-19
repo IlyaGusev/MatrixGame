@@ -9,6 +9,7 @@ use winit::{
 };
 
 use crate::game::map::GameMap;
+use crate::game::point_light::PointLightSystem;
 use crate::game::world::World;
 use crate::renderer::camera::Camera;
 use crate::renderer::context::GfxContext;
@@ -16,6 +17,8 @@ use crate::renderer::terrain::TerrainRenderer;
 struct AppState {
     window: Arc<Window>,
     gfx: GfxContext,
+    map: Arc<GameMap>,
+    point_lights: PointLightSystem,
     terrain: TerrainRenderer,
     camera: Camera,
     game: World,
@@ -92,10 +95,13 @@ impl ApplicationHandler for App {
                 None
             };
             let terrain = TerrainRenderer::new(&gfx.device, &gfx.queue, &gfx.config, &map, &stor, &tex_reader);
+            let point_lights = PointLightSystem::new(&map);
 
             *self.state.borrow_mut() = Some(AppState {
                 window,
                 gfx,
+                map,
+                point_lights,
                 terrain,
                 camera,
                 game: World::new(),
@@ -137,6 +143,7 @@ impl ApplicationHandler for App {
                     bundle.read_file(path).map(|s| s.to_vec())
                 };
                 let mut terrain = TerrainRenderer::new(&gfx.device, &gfx.queue, &gfx.config, &map, &stor, &tex_reader);
+                let point_lights = PointLightSystem::new(&map);
 
                 // Force resize to match actual canvas dimensions
                 let size = win.inner_size();
@@ -151,6 +158,8 @@ impl ApplicationHandler for App {
                 *state_slot.borrow_mut() = Some(AppState {
                     window: win.clone(),
                     gfx,
+                    map,
+                    point_lights,
                     terrain,
                     camera,
                     game: World::new(),
@@ -244,7 +253,13 @@ impl ApplicationHandler for App {
                 state.last_time = now;
                 state.game.update(dt);
                 state.camera.takt(dt * 1000.0); // camera update (ms)
-                state.terrain.takt(dt * 1000.0, &state.gfx.device, &state.gfx.queue); // water animation
+                state.terrain.takt(
+                    dt * 1000.0,
+                    &state.map,
+                    &mut state.point_lights,
+                    &state.gfx.device,
+                    &state.gfx.queue,
+                ); // water animation + dynamic object tint updates
 
                 match state.gfx.begin_frame() {
                     Ok((output, view, mut encoder)) => {

@@ -141,6 +141,8 @@ pub fn build_surface_overlays(
             bind_group: bg, vertex_buffer: vb, index_buffer: ib,
             num_indices: surf.indices.len() as u32,
             index_format: wgpu::IndexFormat::Uint16,
+            cpu_vertices: None,
+            point_coords: None,
         });
     }
 
