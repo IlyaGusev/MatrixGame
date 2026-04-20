@@ -179,7 +179,12 @@ impl Sky {
         let bot_ndc = 1.0 - 2.0 * sh_frac;
         let mid_ndc = 1.0 - 2.0 * (sh_frac - SH2_FRAC);
         let mut top_ndc = 1.0 - 2.0 * (sh_frac - SH1_FRAC);
-        if top_ndc < 1.0 {
+        // DrawSky only clamps the top edge to the screen top in the no-skybox
+        // branch (`if (v[0].p.y > 0) v[0].p.y = 0` at MatrixMap.cpp:2158).
+        // With a skybox present (MatrixMap.cpp:2117-2137), the top edge is
+        // left at `m_SkyHeight - SH1` so the fade keeps its natural width and
+        // the skybox fills anything above it.
+        if !has_skybox && top_ndc < 1.0 {
             top_ndc = 1.0;
         }
 
