@@ -1112,7 +1112,7 @@ fn point_in_convex_quad(p: glam::Vec2, quad: &[glam::Vec2; 4]) -> bool {
 /// groups inside the quad's bounding box, and runs the original
 /// CheckCandidate test: does the 2D group rect touch the projected quad, or
 /// does the group's 3D AABB pass the frustum plane test?
-fn visible_groups_mask(camera: &Camera, map: &GameMap) -> Vec<bool> {
+pub(crate) fn visible_groups_mask(camera: &Camera, map: &GameMap) -> Vec<bool> {
     let mut out = vec![false; map.group_w * map.group_h];
     let pos = {
         let p3 = camera.frustum_bounds_on_plane_zup(map.min_z);

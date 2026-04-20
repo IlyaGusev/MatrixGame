@@ -307,6 +307,7 @@ impl ApplicationHandler for App {
                             &state.camera,
                             vp,
                             vm,
+                            &state.map,
                         );
                         state.gfx.end_frame(output, encoder);
                     }

@@ -20,8 +20,9 @@ use crate::game::map::{GameMap, GLOBAL_SCALE};
 use crate::game::map_prepare::build_tex_union_atlases;
 use crate::renderer::camera::Camera;
 use crate::renderer::ter_surface::{
-    build_surface_overlays, GlossBatch, GlossResources, GlossVertex,
+    build_surface_overlays, GlossOverlayBatch, GlossResources, GlossVertex, OverlayBatch,
 };
+use crate::renderer::water::visible_groups_mask;
 use crate::renderer::texture::*;
 
 /// Bottom vertex — ports SMatrixMapVertexBottom.
@@ -99,8 +100,8 @@ pub struct TerrainRenderer {
     overlay_pipeline: wgpu::RenderPipeline,
     gloss_pipeline: wgpu::RenderPipeline,
     batches: Vec<DrawBatch>,
-    overlay_batches: Vec<DrawBatch>,
-    gloss_batches: Vec<GlossBatch>,
+    overlay_batches: Vec<OverlayBatch>,
+    gloss_batches: Vec<GlossOverlayBatch>,
     sky: super::sky::Sky,
     clear_color: wgpu::Color,
     fog_color: [f32; 4],
@@ -836,6 +837,7 @@ impl TerrainRenderer {
         camera: &Camera,
         view_proj: glam::Mat4,
         view_mat: glam::Mat4,
+        map: &GameMap,
     ) {
         queue.write_buffer(
             &self.uniform_buffer,
@@ -902,14 +904,32 @@ impl TerrainRenderer {
             pass.draw_indexed(0..batch.num_indices, 0, 0..1);
         }
 
+        // Per-group visibility mask, matches CMatrixMap::m_VisibleGroups
+        // after CalcMapGroupVisibility (MatrixVisiCalc.cpp:534-779). Surfaces
+        // the C++ attached to a specific group via `g->AddSurface(this)` only
+        // draw when at least one of their owning groups is visible.
+        let visible = visible_groups_mask(camera, map);
+        let overlay_visible = |groups: &[u32]| -> bool {
+            if groups.is_empty() {
+                return true;
+            }
+            groups
+                .iter()
+                .any(|&gi| visible.get(gi as usize).copied().unwrap_or(false))
+        };
+
         // Surface overlays (alpha blended, triangle strips)
         if !self.overlay_batches.is_empty() {
             pass.set_pipeline(&self.overlay_pipeline);
             for batch in &self.overlay_batches {
-                pass.set_bind_group(0, &batch.bind_group, &[]);
-                pass.set_vertex_buffer(0, batch.vertex_buffer.slice(..));
-                pass.set_index_buffer(batch.index_buffer.slice(..), batch.index_format);
-                pass.draw_indexed(0..batch.num_indices, 0, 0..1);
+                if !overlay_visible(&batch.groups) {
+                    continue;
+                }
+                let draw = &batch.draw;
+                pass.set_bind_group(0, &draw.bind_group, &[]);
+                pass.set_vertex_buffer(0, draw.vertex_buffer.slice(..));
+                pass.set_index_buffer(draw.index_buffer.slice(..), draw.index_format);
+                pass.draw_indexed(0..draw.num_indices, 0, 0..1);
             }
         }
 
@@ -919,10 +939,14 @@ impl TerrainRenderer {
         if !self.gloss_batches.is_empty() {
             pass.set_pipeline(&self.gloss_pipeline);
             for batch in &self.gloss_batches {
-                pass.set_bind_group(0, &batch.bind_group, &[]);
-                pass.set_vertex_buffer(0, batch.vertex_buffer.slice(..));
-                pass.set_index_buffer(batch.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
-                pass.draw_indexed(0..batch.num_indices, 0, 0..1);
+                if !overlay_visible(&batch.groups) {
+                    continue;
+                }
+                let draw = &batch.draw;
+                pass.set_bind_group(0, &draw.bind_group, &[]);
+                pass.set_vertex_buffer(0, draw.vertex_buffer.slice(..));
+                pass.set_index_buffer(draw.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+                pass.draw_indexed(0..draw.num_indices, 0, 0..1);
             }
         }
 

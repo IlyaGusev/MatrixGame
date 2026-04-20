@@ -58,9 +58,23 @@ pub struct GlossBatch {
     pub num_indices: u32,
 }
 
+/// A surface draw batch plus the list of `CMatrixMapGroup` indices the
+/// original attached it to via `g->AddSurface(this)`
+/// (MatrixTerSurface.cpp:187-193). Empty `groups` means the surface had
+/// no `grpsc` list and should be drawn unconditionally.
+pub struct OverlayBatch {
+    pub draw: DrawBatch,
+    pub groups: Vec<u32>,
+}
+
+pub struct GlossOverlayBatch {
+    pub draw: GlossBatch,
+    pub groups: Vec<u32>,
+}
+
 pub struct SurfaceOverlays {
-    pub base: Vec<DrawBatch>,
-    pub gloss: Vec<GlossBatch>,
+    pub base: Vec<OverlayBatch>,
+    pub gloss: Vec<GlossOverlayBatch>,
 }
 
 pub struct GlossResources<'a> {
@@ -118,6 +132,7 @@ pub fn build_surface_overlays(
         verts: Vec<Vertex>,
         indices: Vec<u16>,
         gloss_verts: Vec<GlossVertex>,
+        groups: Vec<u32>,
     }
     let mut surfaces: Vec<SurfData> = Vec::new();
 
@@ -133,7 +148,7 @@ pub fn build_surface_overlays(
         let color_dw = rd_u32(raw, &mut off);
         let vcnt = rd_u32(raw, &mut off) as usize;
         let idxsz = rd_u32(raw, &mut off) as usize;
-        let _grpsc = rd_u32(raw, &mut off) as usize;
+        let grpsc = rd_u32(raw, &mut off) as usize;
         let disp_x = rd_f32(raw, &mut off);
         let disp_y = rd_f32(raw, &mut off);
 
@@ -159,7 +174,7 @@ pub fn build_surface_overlays(
         let b = (color_dw & 0xFF) as f32 / 255.0;
         let a = ((color_dw >> 24) & 0xFF) as f32 / 255.0;
 
-        let needed = off + vcnt * 32 + idxsz;
+        let needed = off + vcnt * 32 + idxsz + grpsc * 4;
         if needed > raw.len() {
             continue;
         }
@@ -219,6 +234,18 @@ pub fn build_surface_overlays(
             strip.push(rd_u16(raw, &mut off));
         }
 
+        // Trailing `grpsc` DWORDs: indices into the linear group array
+        // (`m_Group[idx]`, MatrixTerSurface.cpp:187-193 / 274-280). Each
+        // index matches `gy * group_w + gx` on our side — same ordering
+        // as `visible_groups_mask`.
+        let mut groups = Vec::with_capacity(grpsc);
+        for _ in 0..grpsc {
+            if off + 4 > raw.len() {
+                break;
+            }
+            groups.push(rd_u32(raw, &mut off));
+        }
+
         if !tex_cache.contains_key(&tex_path) {
             if let Some(data) = read_texture(&tex_path) {
                 if let Some(rgba) = decode_texture_bytes(&data) {
@@ -251,6 +278,7 @@ pub fn build_surface_overlays(
             verts,
             indices: strip,
             gloss_verts,
+            groups,
         });
     }
 
@@ -312,14 +340,17 @@ pub fn build_surface_overlays(
         });
 
         overlay_tris += surf.indices.len().saturating_sub(2) as u32;
-        base.push(DrawBatch {
-            bind_group: bg,
-            vertex_buffer: vb,
-            index_buffer: ib,
-            num_indices: surf.indices.len() as u32,
-            index_format: wgpu::IndexFormat::Uint16,
-            cpu_vertices: None,
-            point_coords: None,
+        base.push(OverlayBatch {
+            draw: DrawBatch {
+                bind_group: bg,
+                vertex_buffer: vb,
+                index_buffer: ib,
+                num_indices: surf.indices.len() as u32,
+                index_format: wgpu::IndexFormat::Uint16,
+                cpu_vertices: None,
+                point_coords: None,
+            },
+            groups: surf.groups.clone(),
         });
 
         // Gloss pass: adds gloss * reflection weighted by atlas alpha.
@@ -369,11 +400,14 @@ pub fn build_surface_overlays(
                 ],
             });
             gloss_tris += surf.indices.len().saturating_sub(2) as u32;
-            gloss_batches.push(GlossBatch {
-                bind_group: g_bg,
-                vertex_buffer: g_vb,
-                index_buffer: g_ib,
-                num_indices: surf.indices.len() as u32,
+            gloss_batches.push(GlossOverlayBatch {
+                draw: GlossBatch {
+                    bind_group: g_bg,
+                    vertex_buffer: g_vb,
+                    index_buffer: g_ib,
+                    num_indices: surf.indices.len() as u32,
+                },
+                groups: surf.groups.clone(),
             });
         }
     }
