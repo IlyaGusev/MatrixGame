@@ -84,14 +84,33 @@ pub struct Water {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
 
+    /// Fully-off-map and empty-on-map (cmg == NULL) tiles. Drawn with
+    /// `vs_main` at the real water-plane z — matches MatrixMap.cpp:1782-1784
+    /// where the original reuses the same water matrix for the solid pass
+    /// and avoids any far-plane depth trick at the map boundary.
     ocean_vertex_buffer: wgpu::Buffer,
     ocean_index_buffer: wgpu::Buffer,
     ocean_num_indices: u32,
     ocean_capacity_instances: usize,
 
+    /// Shoreline-fill tiles for every on-map group that has a record in
+    /// `groups/Data`. Drawn with `vs_main_solid` (NDC z = 1, LessEqual) so
+    /// it only paints pixels the terrain didn't cover — i.e. the water-cell
+    /// holes the map compiler drops over some cells inside mixed-coast
+    /// groups. Without this pass the alpha water blends against the clear
+    /// color in those holes and the sky peeks through around coastal atolls.
+    fill_vertex_buffer: wgpu::Buffer,
+    fill_index_buffer: wgpu::Buffer,
+    fill_num_indices: u32,
+    fill_capacity_instances: usize,
+
     uniform_buffer: wgpu::Buffer,
     solid_bind_group: wgpu::BindGroup,
+    /// Real-z solid pipeline (`vs_main`). Used for off-map ocean tiles.
     solid_pipeline: wgpu::RenderPipeline,
+    /// Depth-pinned solid pipeline (`vs_main_solid`). Used for on-map
+    /// shoreline hole fill.
+    fill_pipeline: wgpu::RenderPipeline,
     pipeline: wgpu::RenderPipeline,
 
     water_color: [f32; 4],
@@ -105,6 +124,14 @@ pub struct Water {
     map_half_w: f32,
     map_half_h: f32,
     group_world: f32,
+    /// Map-group extent in group units (cells / MAP_GROUP_SIZE rounded up).
+    map_group_w: i32,
+    map_group_h: i32,
+    /// Group indices that have a `groups/Data` record. An on-map cell not
+    /// in this set hits the `cmg == NULL` fallback in MatrixVisiCalc.cpp:
+    /// 726-729 — we route those through the real-z ocean pass just like
+    /// true off-map tiles.
+    has_group: std::collections::HashSet<(i32, i32)>,
 
     inshore: Option<InshoreSystem>,
 }
@@ -335,10 +362,10 @@ impl Water {
             });
         }
 
-        let _map_group_w = ((map.size_x as f32 + MAP_GROUP_SIZE as f32 - 1.0)
+        let map_group_w = ((map.size_x as f32 + MAP_GROUP_SIZE as f32 - 1.0)
             / MAP_GROUP_SIZE as f32)
             .ceil() as i32;
-        let _map_group_h = ((map.size_y as f32 + MAP_GROUP_SIZE as f32 - 1.0)
+        let map_group_h = ((map.size_y as f32 + MAP_GROUP_SIZE as f32 - 1.0)
             / MAP_GROUP_SIZE as f32)
             .ceil() as i32;
         let group_world = MAP_GROUP_SIZE as f32 * GLOBAL_SCALE;
@@ -399,6 +426,16 @@ impl Water {
         });
         let ocean_index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Ocean IB"),
+            contents: &[],
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+        });
+        let fill_vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Water Fill VB"),
+            contents: &[],
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        });
+        let fill_index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Water Fill IB"),
             contents: &[],
             usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
         });
@@ -588,8 +625,57 @@ impl Water {
             bind_group_layouts: &[&bgl],
             immediate_size: 0,
         });
+        // Off-map / null-cmg solid pass: `vs_main` at real water-plane z
+        // (matches MatrixMap.cpp:1782-1784 — the original reuses the same
+        // water matrix for both alpha and solid). Writes full-opaque water
+        // at the real depth, seamlessly continuing the in-map alpha water
+        // past the map boundary.
         let solid_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Water Solid Pipeline"),
+            layout: Some(&pl),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[WaterVertex::desc()],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: Default::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        // On-map shoreline fill: `vs_main_solid` pins NDC z = 1 so LessEqual
+        // only paints pixels the terrain didn't cover. Used exclusively for
+        // has_group groups to patch the water-cell holes the map compiler
+        // drops inside mixed-coast meshes — without this, the alpha pass
+        // blends against the clear color there and the sky shows through
+        // near coastal atolls. Because z is pinned to the far plane, the
+        // depth test automatically rejects it wherever real seabed terrain
+        // wrote depth, preserving shore transitions.
+        let fill_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Water Fill Pipeline"),
             layout: Some(&pl),
             vertex: wgpu::VertexState {
                 module: &shader,
@@ -693,9 +779,14 @@ impl Water {
             ocean_index_buffer,
             ocean_num_indices: 0,
             ocean_capacity_instances: 0,
+            fill_vertex_buffer,
+            fill_index_buffer,
+            fill_num_indices: 0,
+            fill_capacity_instances: 0,
             uniform_buffer,
             solid_bind_group,
             solid_pipeline,
+            fill_pipeline,
             pipeline,
             water_color,
             light_color,
@@ -708,6 +799,9 @@ impl Water {
             map_half_w: map.world_width() * 0.5,
             map_half_h: map.world_height() * 0.5,
             group_world,
+            map_group_w,
+            map_group_h,
+            has_group,
             inshore,
         })
     }
@@ -779,10 +873,14 @@ impl Water {
             }),
         );
 
-        let ocean_instances = self.collect_visible_ocean_instances(camera);
+        let (ocean_instances, fill_instances) = self.collect_visible_solid_tiles(camera);
+        let (lattice_z, lattice_normals) = if !ocean_instances.is_empty() || !fill_instances.is_empty()
+        {
+            build_wave_lattice(self.angle, self.water_normal_len, &self.phase_offsets)
+        } else {
+            (Vec::new(), Vec::new())
+        };
         if !ocean_instances.is_empty() {
-            let (lattice_z, lattice_normals) =
-                build_wave_lattice(self.angle, self.water_normal_len, &self.phase_offsets);
             self.ensure_ocean_capacity(device, ocean_instances.len());
             let ocean_verts = build_instance_vertices(
                 &ocean_instances,
@@ -807,6 +905,32 @@ impl Water {
             pass.set_vertex_buffer(0, self.ocean_vertex_buffer.slice(..));
             pass.set_index_buffer(self.ocean_index_buffer.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..self.ocean_num_indices, 0, 0..1);
+        }
+        if !fill_instances.is_empty() {
+            self.ensure_fill_capacity(device, fill_instances.len());
+            let fill_verts = build_instance_vertices(
+                &fill_instances,
+                &lattice_z,
+                &lattice_normals,
+                self.water_scale,
+            );
+            let fill_idxs = build_instance_indices(fill_instances.len());
+            self.fill_num_indices = fill_idxs.len() as u32;
+            queue.write_buffer(
+                &self.fill_vertex_buffer,
+                0,
+                bytemuck::cast_slice(&fill_verts),
+            );
+            queue.write_buffer(
+                &self.fill_index_buffer,
+                0,
+                bytemuck::cast_slice(&fill_idxs),
+            );
+            pass.set_pipeline(&self.fill_pipeline);
+            pass.set_bind_group(0, &self.solid_bind_group, &[]);
+            pass.set_vertex_buffer(0, self.fill_vertex_buffer.slice(..));
+            pass.set_index_buffer(self.fill_index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..self.fill_num_indices, 0, 0..1);
         }
 
         pass.set_pipeline(&self.pipeline);
@@ -848,7 +972,43 @@ impl Water {
         self.ocean_capacity_instances = new_capacity;
     }
 
-    fn collect_visible_ocean_instances(&self, camera: &Camera) -> Vec<WaterInstance> {
+    fn ensure_fill_capacity(&mut self, device: &wgpu::Device, instance_count: usize) {
+        if instance_count <= self.fill_capacity_instances {
+            return;
+        }
+        let verts_per_instance = (WATER_SIZE + 1) * (WATER_SIZE + 1);
+        let idxs_per_instance = WATER_SIZE * WATER_SIZE * 6;
+        let new_capacity = instance_count.next_power_of_two().max(16);
+        self.fill_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Water Fill VB"),
+            size: (new_capacity * verts_per_instance * std::mem::size_of::<WaterVertex>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.fill_index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Water Fill IB"),
+            size: (new_capacity * idxs_per_instance * std::mem::size_of::<u32>()) as u64,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.fill_capacity_instances = new_capacity;
+    }
+
+    /// Walks the frustum footprint and splits every candidate group tile
+    /// into one of two buckets:
+    ///   * **ocean** — off-map groups or on-map groups without a `groups/Data`
+    ///     record (the `cmg == NULL` branch in MatrixVisiCalc.cpp:726-729).
+    ///     Rendered at real water-plane z so the mesh stitches onto the in-map
+    ///     alpha water without a far-plane seam.
+    ///   * **fill** — on-map groups that *do* have a record. Rendered with
+    ///     NDC z pinned to the far plane so the pass only paints shoreline
+    ///     holes the map compiler dropped over water cells inside the mesh;
+    ///     wherever real seabed terrain wrote depth the LessEqual test
+    ///     rejects the fill, preserving shore transitions.
+    fn collect_visible_solid_tiles(
+        &self,
+        camera: &Camera,
+    ) -> (Vec<WaterInstance>, Vec<WaterInstance>) {
         let quad3 = camera.frustum_bounds_on_plane_zup(WATER_LEVEL);
         let mut quad = quad3.map(|p| glam::Vec2::new(p.x, p.y));
 
@@ -892,7 +1052,8 @@ impl Water {
         let iminy = (world_min_y / self.group_world).floor() as i32 - 1;
         let imaxy = (world_max_y / self.group_world).ceil() as i32 + 1;
 
-        let mut out = Vec::new();
+        let mut ocean = Vec::new();
+        let mut fill = Vec::new();
         for gy in iminy..=imaxy {
             for gx in iminx..=imaxx {
                 let x0 = gx as f32 * self.group_world - self.map_half_w;
@@ -902,10 +1063,17 @@ impl Water {
                 if !quad_intersects_rect(&quad, rect_min, rect_max) {
                     continue;
                 }
-                out.push(WaterInstance { x0, y0 });
+                let on_map =
+                    gx >= 0 && gx < self.map_group_w && gy >= 0 && gy < self.map_group_h;
+                let has_record = on_map && self.has_group.contains(&(gx, gy));
+                if has_record {
+                    fill.push(WaterInstance { x0, y0 });
+                } else {
+                    ocean.push(WaterInstance { x0, y0 });
+                }
             }
         }
-        out
+        (ocean, fill)
     }
 }
 
@@ -1847,10 +2015,17 @@ struct VOut {
     return out;
 }
 
-// Solid (ocean) pass: pin clip-space depth to the far plane (NDC z = 1.0) so the
-// LessEqual depth test passes only on pixels where no terrain wrote depth (i.e.,
-// water-only cells + empty groups). This fills shoreline "gap" pixels with solid
-// water while leaving the alpha gradient to blend over real sea-floor terrain.
+// Solid (ocean) pass vertex shader — writes clip-space z = w so post-divide
+// NDC z = 1.0 (far plane). Combined with LessEqual depth testing, this
+// paints a solid-water backdrop only on pixels where no terrain drew depth:
+//   * truly off-map cells (depth buffer still cleared to 1.0)
+//   * water "holes" inside on-map has_group meshes where the map compiler
+//     skipped triangles over specific water cells (seen around Atoll's
+//     coastal atolls — without this fill the alpha water pass blends
+//     against the clear color and the sky shows through).
+// Fog still reads `view_dist` from clip.w so atmospheric depth matches the
+// alpha pass (MatrixWater.cpp's single `m_Water->Draw(m)` reuses one mesh
+// for both passes).
 @vertex fn vs_main_solid(
     @location(0) position: vec3<f32>,
     @location(1) normal: vec3<f32>,
