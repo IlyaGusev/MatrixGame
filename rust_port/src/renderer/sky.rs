@@ -698,7 +698,7 @@ fn build_sky_view_proj(camera: &Camera, sky_angle: f32) -> Mat4 {
     // origin pointing along the camera's forward direction.
     let fwd = camera.forward();
     let y_up_fwd = Vec3::new(fwd.x, fwd.z, -fwd.y);
-    let view_rot = Mat4::look_at_rh(Vec3::ZERO, y_up_fwd, Vec3::Y);
+    let view_rot = Mat4::look_at_lh(Vec3::ZERO, y_up_fwd, Vec3::Y);
 
     let yaw = Mat4::from_rotation_z(sky_angle);
     let z_to_y = Mat4::from_cols_array(&[
@@ -707,7 +707,7 @@ fn build_sky_view_proj(camera: &Camera, sky_angle: f32) -> Mat4 {
 
     // DrawSky:2048 — near=0.01, far=3. A narrow FOV replays the original's
     // `CAM_HFOV` (60°) so walls project 1-to-1 per face.
-    let proj = Mat4::perspective_rh(SKY_HFOV, camera.aspect, 0.01, 3.0);
+    let proj = Mat4::perspective_lh(SKY_HFOV, camera.aspect, 0.01, 3.0);
 
     proj * view_rot * z_to_y * yaw
 }

@@ -292,8 +292,8 @@ impl Camera {
         if move_bits != 0 {
             let speed = p.move_speed * dt_ms;
             let dir = self.bottom_plane_xy_dir() * speed;
-            let ldir = Vec2::new(dir.y, -dir.x);
-            let rdir = Vec2::new(-dir.y, dir.x);
+            let ldir = Vec2::new(-dir.y, dir.x);
+            let rdir = Vec2::new(dir.y, -dir.x);
             let tdir = dir;
             let bdir = -dir;
             if move_bits & ACT_MOVE_LEFT != 0 {
@@ -364,19 +364,22 @@ impl Camera {
     pub fn view_matrix(&self) -> Mat4 {
         let eye = self.eye_pos();
         let target = self.link_point;
-        Mat4::look_at_rh(eye, target, Vec3::Z)
+        Mat4::look_at_lh(eye, target, Vec3::Z)
     }
 
     pub fn view_proj(&self) -> Mat4 {
         let eye = self.eye_pos();
         let target = self.link_point;
 
-        // Z-up (x,y,z) → Y-up (x,z,-y) for glam's look_at_rh.
+        // Z-up (x,y,z) → Y-up (x,z,-y) before LH look-at. Using `look_at_rh`
+        // here computes `right = f × up` and puts world +X on screen LEFT,
+        // mirroring every asymmetric map; `look_at_lh` gives `right = up × f`
+        // and matches the original D3D matView.
         let eye_yup = Vec3::new(eye.x, eye.z, -eye.y);
         let target_yup = Vec3::new(target.x, target.z, -target.y);
-        let view = Mat4::look_at_rh(eye_yup, target_yup, Vec3::Y);
+        let view = Mat4::look_at_lh(eye_yup, target_yup, Vec3::Y);
 
-        let proj = Mat4::perspective_rh(CAM_FOV, self.aspect, self.near, self.far);
+        let proj = Mat4::perspective_lh(CAM_FOV, self.aspect, self.near, self.far);
 
         let z_to_y = Mat4::from_cols_array(&[
             1.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0,
@@ -393,8 +396,8 @@ impl Camera {
         let target = self.link_point;
         let eye_yup = Vec3::new(eye.x, eye.z, -eye.y);
         let target_yup = Vec3::new(target.x, target.z, -target.y);
-        let view = Mat4::look_at_rh(eye_yup, target_yup, Vec3::Y);
-        let proj = Mat4::perspective_rh(CAM_FOV, self.aspect, self.near, self.far);
+        let view = Mat4::look_at_lh(eye_yup, target_yup, Vec3::Y);
+        let proj = Mat4::perspective_lh(CAM_FOV, self.aspect, self.near, self.far);
         let inv_vp = (proj * view).inverse();
 
         let sample_corner = |sx: f32| {
@@ -406,14 +409,11 @@ impl Camera {
         };
         let lb = sample_corner(-1.0);
         let rb = sample_corner(1.0);
-        let n = lb.cross(rb).normalize_or_zero();
+        let n = rb.cross(lb).normalize_or_zero();
         let xy = Vec2::new(n.x, -n.z);
         if xy.length_squared() < 1e-8 {
             let s = self.angle_z.sin();
             let c = self.angle_z.cos();
-            // Negated from the old (-s, c) to match the new eye orientation —
-            // at angle_z=0 the camera now sits at +Y and looks -Y, so the
-            // bottom-frustum projection should point -Y.
             Vec2::new(s, -c)
         } else {
             xy.normalize()
@@ -458,7 +458,7 @@ impl Camera {
             project(lb, false),
         ];
 
-        let bottom_norm_z = lb.cross(rb).normalize_or_zero().z;
+        let bottom_norm_z = rb.cross(lb).normalize_or_zero().z;
         if bottom_norm_z > 0.0 {
             let bottom_mid = (out[2] + out[3]) * 0.5;
             let disp = Vec2::new(center.x - bottom_mid.x, center.y - bottom_mid.y);

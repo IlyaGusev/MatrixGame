@@ -1194,31 +1194,38 @@ fn check_candidate(
         }
     }
 
-    // Step 2: separating-axis test against the projected quad's 4 edges.
-    // For every edge walk, if every one of the rect's 4 corners lies on the
-    // OUTSIDE side of that edge, the rect is separated from the quad and we
-    // can early-out as invisible. Mirrors the goto-driven loop in
-    // MatrixVisiCalc.cpp:481-502 (edges walked as (3,0), (0,1), (1,2), (2,3)
-    // via `i0 = NPOS-1; i1 = 0; ... i0 = i1++`). Only if NO edge separates
-    // does the routine fall through to IsInFrustum.
-    //
-    // The original comment on `PointLineCatch` (Math3D.hpp:137) claims it
-    // returns "true if on the right side", but that is right-side in D3D's
-    // left-handed XY plane. Our Z-up right-handed math has `cross > 0` = LEFT
-    // side. Since pos[] is walked LT→RT→RB→LB which is *clockwise* in our
-    // coord frame, the interior of the quad sits on the side where `cross <
-    // 0`. Flip the `PointLineCatch` result so "inside" corresponds to the
-    // polygon's interior for both coord conventions.
+    // Step 2: separating-axis test against the projected quad's 4 edges —
+    // mirrors the goto-driven loop in MatrixVisiCalc.cpp:481-502. The
+    // camera's LH view-proj gives a CCW walk through pos[LT, RT, RB, LB]
+    // (the original's comment assumed CW), so detect winding via the
+    // shoelace formula and pick the correct interior side.
     let corners = [
         p0,
         p1,
         glam::Vec2::new(p0.x, p1.y),
         glam::Vec2::new(p1.x, p0.y),
     ];
+    let signed_area_2x = {
+        let mut sum = 0.0f32;
+        for i in 0..4 {
+            let a = pos[i];
+            let b = pos[(i + 1) & 3];
+            sum += (b.x - a.x) * (b.y + a.y);
+        }
+        sum
+    };
+    let interior_is_right = signed_area_2x > 0.0;
     for edge in 0..4 {
         let a = pos[(edge + 3) & 3];
         let b = pos[edge];
-        let any_inside = corners.iter().any(|&c| !point_line_catch(a, b, c));
+        let any_inside = corners.iter().any(|&c| {
+            let left_of = point_line_catch(a, b, c);
+            if interior_is_right {
+                !left_of
+            } else {
+                left_of
+            }
+        });
         if !any_inside {
             return false;
         }
