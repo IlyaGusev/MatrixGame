@@ -200,55 +200,42 @@ struct WaterPreset {
 }
 
 /// Port of `MatrixMapPrepare.cpp:1208-1219` + `MatrixWater.cpp:213-216`:
-/// look up `Water/<water_name>` in the serialized BlockPar tree and read
-/// its `water` / `mirror` params. Falls back to the first configured preset
-/// when the named one is absent (matches the original's
-/// `m_WaterName = BlockGet(PAR_SOURCE_WATER)->BlockGetName(0)` rescue), and
-/// to the shipped `water_blue` paths when no BlockPar data is available at
-/// all (e.g. robots.dat missing on native).
-fn resolve_water_preset(matrix_data: Option<&Storage>, water_name: &str) -> WaterPreset {
-    let fallback = || WaterPreset {
-        resolved_name: water_name.to_string(),
-        water_path: "Matrix/Textures/Water/1".to_string(),
-        mirror_path: "Matrix/Textures/Water/MIRROR".to_string(),
-        inshore_path: "Matrix/Textures/Water/inshorewave".to_string(),
-    };
-
-    let Some(stor) = matrix_data else {
-        return fallback();
-    };
-    let Some(water_root) = stor.block_record("da", "Water") else {
-        return fallback();
-    };
+/// look up `Water/<water_name>` in the serialized BlockPar tree and read its
+/// `water` / `mirror` / `inshore` params. Falls back to the first configured
+/// preset when the named one is absent (matches the original's
+/// `m_WaterName = BlockGet(PAR_SOURCE_WATER)->BlockGetName(0)` rescue).
+///
+/// Returns `None` when the `Water` block or any required preset param is
+/// missing — the original dereferences `g_MatrixData->BlockGet(PAR_SOURCE_WATER)`
+/// unconditionally (MatrixWater.cpp:44, 213), so a missing block is a fatal
+/// configuration error, not a viewer fallback.
+fn resolve_water_preset(matrix_data: Option<&Storage>, water_name: &str) -> Option<WaterPreset> {
+    let stor = matrix_data?;
+    let water_root = stor.block_record("da", "Water")?;
 
     let (resolved_name, preset_record) = match stor.block_record(&water_root, water_name) {
         Some(rec) => (water_name.to_string(), rec),
-        None => match stor.first_block(&water_root) {
-            Some((name, rec)) => {
-                log::warn!(
-                    "water: preset '{}' not in Water block; falling back to '{}'",
-                    water_name,
-                    name
-                );
-                (name, rec)
-            }
-            None => return fallback(),
-        },
+        None => {
+            let (name, rec) = stor.first_block(&water_root)?;
+            log::warn!(
+                "water: preset '{}' not in Water block; falling back to '{}'",
+                water_name,
+                name
+            );
+            (name, rec)
+        }
     };
 
     let fix_path = |p: Option<String>| p.map(|s| s.replace('\\', "/"));
-    let water_path = fix_path(stor.block_param(&preset_record, "water"))
-        .unwrap_or_else(|| "Matrix/Textures/Water/1".to_string());
-    let mirror_path = fix_path(stor.block_param(&preset_record, "mirror"))
-        .unwrap_or_else(|| "Matrix/Textures/Water/MIRROR".to_string());
-    let inshore_path = fix_path(stor.block_param(&preset_record, "inshore"))
-        .unwrap_or_else(|| "Matrix/Textures/Water/inshorewave".to_string());
-    WaterPreset {
+    let water_path = fix_path(stor.block_param(&preset_record, "water"))?;
+    let mirror_path = fix_path(stor.block_param(&preset_record, "mirror"))?;
+    let inshore_path = fix_path(stor.block_param(&preset_record, "inshore"))?;
+    Some(WaterPreset {
         resolved_name,
         water_path,
         mirror_path,
         inshore_path,
-    }
+    })
 }
 
 impl Water {
@@ -272,7 +259,16 @@ impl Water {
         let ld = map.light_main_dir;
         let light_dir = [ld[0], ld[1], ld[2], 0.0];
         let water_scale = GLOBAL_SCALE * MAP_GROUP_SIZE as f32 / WATER_SIZE as f32;
-        let water_preset = resolve_water_preset(matrix_data, &map.water_name);
+        let water_preset = match resolve_water_preset(matrix_data, &map.water_name) {
+            Some(p) => p,
+            None => {
+                log::warn!(
+                    "water: no usable Water config for '{}'; subsystem disabled",
+                    map.water_name
+                );
+                return None;
+            }
+        };
 
         let mut water_groups: Vec<(i32, i32)> = Vec::new();
         for gi in 0..groups_buf.arrays_count() {
@@ -363,11 +359,18 @@ impl Water {
             build_instance_vertices(&water_instances, &lattice_z, &lattice_normals, water_scale);
         let all_idxs = build_instance_indices(water_instances.len());
 
-        let load_tex = |path: &str, fb: [u8; 4]| -> wgpu::TextureView {
-            read_texture(path)
+        let load_required_tex = |path: &str, label: &str| -> Option<wgpu::TextureView> {
+            let view = read_texture(path)
                 .and_then(|d| super::texture::decode_texture_bytes(&d))
-                .map(|rgba| super::texture::create_texture_from_rgba(device, queue, &rgba))
-                .unwrap_or_else(|| super::texture::create_solid_texture(device, queue, fb))
+                .map(|rgba| super::texture::create_texture_from_rgba(device, queue, &rgba));
+            if view.is_none() {
+                log::warn!(
+                    "water: failed to load {} texture '{}'; subsystem disabled",
+                    label,
+                    path
+                );
+            }
+            view
         };
         log::info!(
             "water: requested='{}' resolved='{}' water='{}' mirror='{}'",
@@ -376,8 +379,8 @@ impl Water {
             water_preset.water_path,
             water_preset.mirror_path
         );
-        let water_tex = load_tex(&water_preset.water_path, [30, 80, 120, 255]);
-        let mirror_tex = load_tex(&water_preset.mirror_path, [100, 120, 140, 128]);
+        let water_tex = load_required_tex(&water_preset.water_path, "water")?;
+        let mirror_tex = load_required_tex(&water_preset.mirror_path, "mirror")?;
 
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Water VB"),
@@ -677,7 +680,8 @@ impl Water {
             &water_preset,
             read_texture,
             fog_color,
-        );
+        )
+        .ok()?;
 
         Some(Self {
             water_instances,
@@ -1452,8 +1456,14 @@ fn irnd(state: &mut u32, n: u32) -> u32 {
 /// is taken from the already-resolved `WaterPreset` so that `water`,
 /// `mirror`, and `inshore` all come from the same preset record — matching
 /// the original's use of the rewritten `m_WaterName` (MatrixWater.cpp:44,
-/// MatrixMapPrepare.cpp:1208-1219). Returns `None` and logs a warning if
-/// texture decode fails — water still renders, just without shoreline foam.
+/// MatrixMapPrepare.cpp:1208-1219).
+///
+/// Returns `Ok(None)` when the map has no inshore prespawns (the original
+/// loads the texture lazily in `SInshorewave::BuildObject`, so no
+/// prespawns = no texture needed — MatrixWater.cpp:42-46). Returns `Err` when
+/// prespawns do exist but the configured texture can't be loaded; the caller
+/// propagates that as a water subsystem failure, matching the original's
+/// crash-on-missing-asset behavior.
 fn build_inshore_system(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -1462,16 +1472,28 @@ fn build_inshore_system(
     water_preset: &WaterPreset,
     read_texture: &dyn Fn(&str) -> Option<Vec<u8>>,
     fog_color: [f32; 4],
-) -> Option<InshoreSystem> {
+) -> Result<Option<InshoreSystem>, ()> {
     if map.inshore_prespawns.iter().all(|v| v.is_empty()) {
         log::info!("water: no inshore prespawns — shoreline foam disabled");
-        return None;
+        return Ok(None);
     }
 
     let tex_path = water_preset.inshore_path.as_str();
 
-    let tex_bytes = read_texture(tex_path)?;
-    let rgba = super::texture::decode_texture_bytes(&tex_bytes)?;
+    let Some(tex_bytes) = read_texture(tex_path) else {
+        log::warn!(
+            "water: inshore texture '{}' not found; subsystem disabled",
+            tex_path
+        );
+        return Err(());
+    };
+    let Some(rgba) = super::texture::decode_texture_bytes(&tex_bytes) else {
+        log::warn!(
+            "water: inshore texture '{}' failed to decode; subsystem disabled",
+            tex_path
+        );
+        return Err(());
+    };
     let tex_view = super::texture::create_texture_from_rgba(device, queue, &rgba);
 
     let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -1701,7 +1723,7 @@ fn build_inshore_system(
         map.inshorewave_color & 0xFFFFFF
     );
 
-    Some(InshoreSystem {
+    Ok(Some(InshoreSystem {
         pipeline,
         vertex_buffer,
         instance_buffer,
@@ -1715,7 +1737,7 @@ fn build_inshore_system(
         map_half_w: map.world_width() * 0.5,
         map_half_h: map.world_height() * 0.5,
         draw_count: 0,
-    })
+    }))
 }
 
 const INSHORE_SHADER: &str = r#"
