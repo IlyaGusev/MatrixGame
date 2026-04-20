@@ -200,6 +200,7 @@ struct WaterPreset {
     resolved_name: String,
     water_path: String,
     mirror_path: String,
+    inshore_path: String,
 }
 
 /// Port of `MatrixMapPrepare.cpp:1208-1219` + `MatrixWater.cpp:213-216`:
@@ -214,6 +215,7 @@ fn resolve_water_preset(matrix_data: Option<&Storage>, water_name: &str) -> Wate
         resolved_name: water_name.to_string(),
         water_path: "Matrix/Textures/Water/1".to_string(),
         mirror_path: "Matrix/Textures/Water/MIRROR".to_string(),
+        inshore_path: "Matrix/Textures/Water/inshorewave".to_string(),
     };
 
     let Some(stor) = matrix_data else {
@@ -243,10 +245,13 @@ fn resolve_water_preset(matrix_data: Option<&Storage>, water_name: &str) -> Wate
         .unwrap_or_else(|| "Matrix/Textures/Water/1".to_string());
     let mirror_path = fix_path(stor.block_param(&preset_record, "mirror"))
         .unwrap_or_else(|| "Matrix/Textures/Water/MIRROR".to_string());
+    let inshore_path = fix_path(stor.block_param(&preset_record, "inshore"))
+        .unwrap_or_else(|| "Matrix/Textures/Water/inshorewave".to_string());
     WaterPreset {
         resolved_name,
         water_path,
         mirror_path,
+        inshore_path,
     }
 }
 
@@ -673,7 +678,7 @@ impl Water {
             queue,
             config,
             map,
-            matrix_data,
+            &water_preset,
             read_texture,
             fog_color,
         );
@@ -1445,17 +1450,18 @@ fn irnd(state: &mut u32, n: u32) -> u32 {
     (r as i64).clamp(0, (n - 1) as i64) as u32
 }
 
-/// Build the per-group prespawn pool + pipeline. Reads the inshore texture
-/// path from the `Water/<water_name>/inshore` BlockPar in `robots.dat` and
-/// loads the resulting texture via `read_texture`. Returns `None` and logs a
-/// warning if any of those steps fail — water still renders, just without
-/// shoreline foam.
+/// Build the per-group prespawn pool + pipeline. The inshore texture path
+/// is taken from the already-resolved `WaterPreset` so that `water`,
+/// `mirror`, and `inshore` all come from the same preset record — matching
+/// the original's use of the rewritten `m_WaterName` (MatrixWater.cpp:44,
+/// MatrixMapPrepare.cpp:1208-1219). Returns `None` and logs a warning if
+/// texture decode fails — water still renders, just without shoreline foam.
 fn build_inshore_system(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     config: &wgpu::SurfaceConfiguration,
     map: &GameMap,
-    matrix_data: Option<&Storage>,
+    water_preset: &WaterPreset,
     read_texture: &dyn Fn(&str) -> Option<Vec<u8>>,
     fog_color: [f32; 4],
 ) -> Option<InshoreSystem> {
@@ -1464,16 +1470,9 @@ fn build_inshore_system(
         return None;
     }
 
-    let tex_path = matrix_data
-        .and_then(|stor| {
-            let water_root = stor.block_record("da", "Water")?;
-            let preset = stor.block_record(&water_root, &map.water_name)?;
-            stor.block_param(&preset, "inshore")
-        })
-        .map(|p| p.replace('\\', "/"))
-        .unwrap_or_else(|| "Matrix/Textures/Water/inshorewave".to_string());
+    let tex_path = water_preset.inshore_path.as_str();
 
-    let tex_bytes = read_texture(&tex_path)?;
+    let tex_bytes = read_texture(tex_path)?;
     let rgba = super::texture::decode_texture_bytes(&tex_bytes)?;
     let tex_view = super::texture::create_texture_from_rgba(device, queue, &rgba);
 
