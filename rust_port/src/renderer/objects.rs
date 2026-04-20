@@ -14,7 +14,7 @@ use crate::assets::storage::Storage;
 use crate::effects::point_light::PointLightSystem;
 use crate::game::common::{unpack_rgb, FOG_END, FOG_START};
 use crate::game::map::{GameMap, ObjectInstance, ObjectShadow};
-use crate::game::vo_loader::{self, ShadowKind};
+use crate::game::vo_loader::{self, ShadowKind, VoAnimation, VoFrame, VoSurfaceMesh};
 use crate::renderer::camera::Camera;
 use crate::renderer::texture::{
     create_solid_texture, create_texture_from_rgba, decode_texture_bytes,
@@ -83,12 +83,123 @@ struct ShadowTextureUniform {
 struct MeshBatch {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
-    num_indices: u32,
+    /// `(offset, count)` sub-range per VO frame inside `index_buffer`. Frames
+    /// where this surface has no geometry get `(_, 0)`. Updated each time the
+    /// shared animation state advances to a new VO frame.
+    frame_ranges: Vec<(u32, u32)>,
+    current_vo_frame: usize,
     instance_buffer: wgpu::Buffer,
     num_instances: u32,
     bind_group: wgpu::BindGroup,
     objects: Vec<ObjectInstance>,
     center: [f32; 2],
+    /// Index into `ObjectsRenderer::anims` (one `AnimState` per VO type). All
+    /// surfaces belonging to the same type share one state so they advance in
+    /// lockstep — mirrors `CVectorObjectAnim` owning a single `m_VOFrame`.
+    anim_slot: Option<usize>,
+}
+
+/// Per-VO-type animation runtime — ports CVectorObjectAnim's frame scheduler
+/// (VectorObject.cpp:1863).
+///
+/// * `anim` is the current animation index (`m_Anim`, defaulting to 0).
+/// * `frame_slot` is the step inside that animation's frame list (`m_Frame`).
+/// * `vo_frame` is the resolved SVOKadr index (`m_VOFrame`) — the frame whose
+///   surface partition should render this tick.
+/// * `looped` comes from the sign of the first frame's time field
+///   (VectorObject.hpp:390: `GetAnimLooped`).
+struct AnimState {
+    animations: Vec<VoAnimation>,
+    anim: usize,
+    frame_slot: usize,
+    vo_frame: usize,
+    time_ms: i32,
+    time_next: i32,
+    looped: bool,
+}
+
+impl AnimState {
+    fn new(animations: Vec<VoAnimation>) -> Self {
+        let mut s = Self {
+            animations,
+            anim: 0,
+            frame_slot: 0,
+            vo_frame: 0,
+            time_ms: 0,
+            time_next: 0,
+            looped: true,
+        };
+        s.first_frame();
+        s
+    }
+
+    fn current_anim_frame_count(&self) -> usize {
+        self.animations.get(self.anim).map(|a| a.frames.len()).unwrap_or(0)
+    }
+
+    fn anim_frame_time(&self, slot: usize) -> i32 {
+        self.animations
+            .get(self.anim)
+            .and_then(|a| a.frames.get(slot))
+            .map(|f| f.time_ms.abs())
+            .unwrap_or(0)
+    }
+
+    fn anim_frame_index(&self, slot: usize) -> usize {
+        self.animations
+            .get(self.anim)
+            .and_then(|a| a.frames.get(slot))
+            .map(|f| f.frame_index)
+            .unwrap_or(0)
+    }
+
+    /// Mirrors `CVectorObjectAnim::FirstFrame` (VectorObject.hpp:552).
+    fn first_frame(&mut self) {
+        self.frame_slot = 0;
+        self.vo_frame = self.anim_frame_index(0);
+        self.time_next = self.time_ms + self.anim_frame_time(0);
+        // VectorObject.hpp:390 — loop flag follows the sign of the first
+        // frame's time. Non-animated objects fall back to looping at rate 0.
+        self.looped = self
+            .animations
+            .get(self.anim)
+            .and_then(|a| a.frames.first())
+            .map(|f| f.time_ms > 0)
+            .unwrap_or(true);
+    }
+
+    /// Port of `CVectorObjectAnim::Takt(cms)`. Returns true when `vo_frame`
+    /// changed (caller can use this to skip work when nothing moved).
+    fn takt(&mut self, cms: i32) -> bool {
+        self.time_ms = self.time_ms.saturating_add(cms);
+        let fcnt = self.current_anim_frame_count();
+        if fcnt == 0 {
+            return false;
+        }
+        let old_frame = self.frame_slot;
+        while self.time_ms > self.time_next {
+            self.frame_slot += 1;
+            if self.looped {
+                if self.frame_slot >= fcnt {
+                    self.frame_slot = 0;
+                }
+            } else if self.frame_slot >= fcnt {
+                // Non-looped animation pinned to its last pose: advance the
+                // deadline by an arbitrary 1s so we don't spin here next tick
+                // (matches the C++ `m_TimeNext += 1000` stall).
+                self.time_next = self.time_next.saturating_add(1000);
+                self.frame_slot = fcnt - 1;
+                break;
+            }
+            self.time_next = self.time_next.saturating_add(self.anim_frame_time(self.frame_slot));
+        }
+        if old_frame != self.frame_slot {
+            self.vo_frame = self.anim_frame_index(self.frame_slot);
+            true
+        } else {
+            false
+        }
+    }
 }
 
 struct ShadowBatch {
@@ -103,11 +214,85 @@ struct SurfaceShadowSource {
     diffuse_view: wgpu::TextureView,
 }
 
+/// Flattened per-surface view across all VO frames. `concat_indices` holds
+/// every frame's indices back-to-back; `frame_ranges[f] = (offset, count)`
+/// points at the sub-range for frame `f` inside that buffer.
+struct PerSurfaceFrames {
+    texture_ref: Option<String>,
+    concat_indices: Vec<u32>,
+    frame_ranges: Vec<(u32, u32)>,
+}
+
+/// Walks every frame's `surfaces` list, matching by `texture_ref`, and packs
+/// per-frame triangle ranges into one `concat_indices` buffer per surface
+/// slot. Surfaces that first appear in a later frame still register a slot
+/// and earlier frames get `(_, 0)` placeholder ranges.
+fn build_per_surface_frame_ranges(frames: &[VoFrame]) -> Vec<PerSurfaceFrames> {
+    if frames.is_empty() {
+        return Vec::new();
+    }
+
+    // Stable ordering: first time we see a surface (by texture_ref), assign
+    // it a new slot. Mirrors the surfs/texs order the original enforces.
+    let mut slot_by_key: Vec<Option<String>> = Vec::new();
+    let slot_for = |key: &Option<String>, slots: &mut Vec<Option<String>>| -> usize {
+        if let Some(idx) = slots.iter().position(|k| k == key) {
+            idx
+        } else {
+            slots.push(key.clone());
+            slots.len() - 1
+        }
+    };
+
+    // Pass 1: collect the surface slots in a deterministic order.
+    for frame in frames {
+        for s in &frame.surfaces {
+            slot_for(&s.texture_ref, &mut slot_by_key);
+        }
+    }
+
+    let mut out: Vec<PerSurfaceFrames> = slot_by_key
+        .into_iter()
+        .map(|key| PerSurfaceFrames {
+            texture_ref: key,
+            concat_indices: Vec::new(),
+            frame_ranges: vec![(0, 0); frames.len()],
+        })
+        .collect();
+
+    // Pass 2: append frame indices per slot and record offsets.
+    for (fi, frame) in frames.iter().enumerate() {
+        for s in &frame.surfaces {
+            let slot = out
+                .iter()
+                .position(|ps| ps.texture_ref == s.texture_ref)
+                .expect("slot registered in pass 1");
+            let ps = &mut out[slot];
+            let offset = ps.concat_indices.len() as u32;
+            ps.concat_indices.extend_from_slice(&s.indices);
+            ps.frame_ranges[fi] = (offset, s.indices.len() as u32);
+        }
+    }
+
+    // Drop surfaces that had no indices in any frame — they carry a slot but
+    // no geometry (shouldn't happen for real data, defensive).
+    out.retain(|ps| !ps.concat_indices.is_empty());
+    out
+}
+
+// Silence unused-import warning when VoSurfaceMesh / VoAnimation / VoFrame
+// happen to only be named through field types below.
+#[allow(dead_code)]
+fn _keep_vo_types_alive(_s: &VoSurfaceMesh, _a: &VoAnimation, _f: &VoFrame) {}
+
 pub struct ObjectsRenderer {
     pipeline: wgpu::RenderPipeline,
     shadow_pipeline: wgpu::RenderPipeline,
     batches: Vec<MeshBatch>,
     shadow_batches: Vec<ShadowBatch>,
+    /// One animation runtime per VO type. `MeshBatch::anim_slot` references
+    /// this vector so surfaces of the same type share one `vo_frame`.
+    anims: Vec<AnimState>,
     uniform_buffer: wgpu::Buffer,
     shadow_uniform_buffer: wgpu::Buffer,
     fog_color: [f32; 4],
@@ -198,8 +383,10 @@ impl ObjectsRenderer {
 
         let mut batches = Vec::new();
         let mut shadow_batches = Vec::new();
+        let mut anims: Vec<AnimState> = Vec::new();
         let mut loaded_types = 0usize;
         let mut failed_types = 0usize;
+        let mut animated_types = 0usize;
 
         for (type_id, instances) in &by_type {
             let id_str = if (*type_id as usize) < strings.arrays_count() {
@@ -248,10 +435,27 @@ impl ObjectsRenderer {
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             });
 
-            let use_vo_surface_materials = mesh.surfaces.len() > 1;
+            // Merge every frame's surface partition into one concat-indices
+            // buffer per surface slot plus per-frame `(offset, count)` spans.
+            // This lets us flip which triangle range is drawn each tick
+            // without reallocating GPU buffers.
+            let per_surface = build_per_surface_frame_ranges(&mesh.frames);
+            let use_vo_surface_materials = per_surface.len() > 1;
             let mut shadow_surfaces = Vec::new();
 
-            for surface in &mesh.surfaces {
+            // One animation runtime per VO type. Single-frame meshes keep
+            // `anim_slot = None` and render their sole frame with no tick
+            // overhead (palms / rocks).
+            let anim_slot = if mesh.frames.len() > 1 && !mesh.animations.is_empty() {
+                animated_types += 1;
+                let slot = anims.len();
+                anims.push(AnimState::new(mesh.animations.clone()));
+                Some(slot)
+            } else {
+                None
+            };
+
+            for surface in &per_surface {
                 let surface_material = if use_vo_surface_materials {
                     surface.texture_ref.as_deref().map(|spec| {
                         vo_loader::parse_material_spec_with_prefix(spec, object_dir.as_deref())
@@ -305,7 +509,7 @@ impl ObjectsRenderer {
                 });
                 let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("Objects Mesh IB"),
-                    contents: bytemuck::cast_slice(&surface.indices),
+                    contents: bytemuck::cast_slice(&surface.concat_indices),
                     usage: wgpu::BufferUsages::INDEX,
                 });
                 let mat_uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -359,15 +563,28 @@ impl ObjectsRenderer {
                 batches.push(MeshBatch {
                     vertex_buffer,
                     index_buffer,
-                    num_indices: surface.indices.len() as u32,
+                    frame_ranges: surface.frame_ranges.clone(),
+                    current_vo_frame: 0,
                     instance_buffer: instance_buffer.clone(),
                     num_instances: inst_data.len() as u32,
                     bind_group,
                     objects: instances.iter().map(|obj| (*obj).clone()).collect(),
                     center: [cx, cy],
+                    anim_slot,
                 });
+                // Projected shadows still use frame-0 geometry — animated
+                // shadow volumes would need per-frame rebuilds which the
+                // original also recomputes only for ProjEx dynamic shadows.
+                let frame0_range = surface.frame_ranges.first().copied().unwrap_or((0, 0));
+                let frame0_indices = if frame0_range.1 > 0 {
+                    let start = frame0_range.0 as usize;
+                    let end = start + frame0_range.1 as usize;
+                    surface.concat_indices[start..end].to_vec()
+                } else {
+                    Vec::new()
+                };
                 shadow_surfaces.push(SurfaceShadowSource {
-                    indices: surface.indices.clone(),
+                    indices: frame0_indices,
                     diffuse_view: diffuse_view.clone(),
                 });
             }
@@ -416,11 +633,17 @@ impl ObjectsRenderer {
             return None;
         }
 
+        log::info!(
+            "objects: {} animated types scheduled for tick advancement",
+            animated_types
+        );
+
         Some(Self {
             pipeline,
             shadow_pipeline,
             batches,
             shadow_batches,
+            anims,
             uniform_buffer,
             shadow_uniform_buffer,
             fog_color,
@@ -442,6 +665,21 @@ impl ObjectsRenderer {
         self.time_ms += dt_ms;
         if self.time_ms > 1_000_000.0 {
             self.time_ms -= 1_000_000.0;
+        }
+
+        // Advance each VO-type animation by the elapsed ms. Frame flips here
+        // only mutate the per-type `vo_frame`; render() pulls that value per
+        // batch to choose which index-buffer range to draw.
+        let cms = dt_ms.round() as i32;
+        if cms > 0 {
+            for anim in &mut self.anims {
+                anim.takt(cms);
+            }
+        }
+        for batch in &mut self.batches {
+            if let Some(slot) = batch.anim_slot {
+                batch.current_vo_frame = self.anims[slot].vo_frame;
+            }
         }
 
         let revision = point_lights.revision();
@@ -502,11 +740,19 @@ impl ObjectsRenderer {
         if !self.batches.is_empty() {
             pass.set_pipeline(&self.pipeline);
             for batch in &self.batches {
+                let (offset, count) = batch
+                    .frame_ranges
+                    .get(batch.current_vo_frame)
+                    .copied()
+                    .unwrap_or((0, 0));
+                if count == 0 {
+                    continue;
+                }
                 pass.set_bind_group(0, &batch.bind_group, &[]);
                 pass.set_vertex_buffer(0, batch.vertex_buffer.slice(..));
                 pass.set_vertex_buffer(1, batch.instance_buffer.slice(..));
                 pass.set_index_buffer(batch.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..batch.num_indices, 0, 0..batch.num_instances);
+                pass.draw_indexed(offset..offset + count, 0, 0..batch.num_instances);
             }
         }
     }

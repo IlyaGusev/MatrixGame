@@ -1,13 +1,18 @@
-//! `.vo` mesh loader — ports VectorObject.cpp:130-386 for static meshes.
+//! `.vo` mesh loader — ports VectorObject.cpp:130-386.
 //!
 //! Each .vo file is a CStorage archive with these relevant buffers:
-//!   verts/data    : one array of SVOVertex = pos[3]f32 + normal[3]f32 + uv[2]f32 (32 bytes)
-//!   idxs/data     : one array of u16 triangle indices
-//!   surfs/texs    : wide-char per-surface texture references
-//!   unions/data   : frame-independent surface/triangle ranges
-//!   frames/data   : frame metadata, including the union range for frame 0
+//!   verts/data     : one array of SVOVertex = pos[3]f32 + normal[3]f32 + uv[2]f32 (32 bytes)
+//!   idxs/data      : one array of u16 triangle indices
+//!   surfs/texs     : wide-char per-surface texture references
+//!   unions/data    : surface/triangle ranges as SVOUnion (24 bytes)
+//!   frames/data    : SVOKadr[] (64 bytes each) — per-frame bounds + union range
+//!   frames/unions  : u32 indices into unions/data, sliced by each frame's [UnionStart, UnionStart+UnionCnt)
+//!   anims/{name,id,disp,cnt,frames}: named animations pointing at per-anim sequences
+//!     of (frame_index, duration_ms) pairs (SVOFrameIndex[] in anims/frames)
 //!
-//! Animations (anims/*, frames/*, matrices/*) are ignored; we use frame 0 only.
+//! We parse all frames and animations. `VoMesh::surfaces` stays as frame 0's
+//! surface list so existing consumers keep working; `VoMesh::frames[n].surfaces`
+//! exposes the same data per frame.
 
 use anyhow::{Context, Result};
 
@@ -15,7 +20,44 @@ use crate::assets::storage::Storage;
 
 pub struct VoMesh {
     pub vertices: Vec<VoVertex>,
+    /// Frame 0's surfaces. Convenience alias for `frames[0].surfaces` so
+    /// non-animated consumers don't need to touch the frame list.
     pub surfaces: Vec<VoSurfaceMesh>,
+    /// All frames — at least one. Each frame has its own surface/triangle
+    /// partition computed from `frames/unions` + `unions/data`.
+    pub frames: Vec<VoFrame>,
+    /// Named animations, each a sequence of (frame index, duration ms).
+    /// Empty for non-animated objects.
+    pub animations: Vec<VoAnimation>,
+}
+
+/// Per-frame geometry state. Mirrors SVOKadr (VectorObject.hpp:214) plus the
+/// materialized surface partition for that frame.
+#[derive(Clone, Debug)]
+pub struct VoFrame {
+    pub bounds_min: [f32; 3],
+    pub bounds_max: [f32; 3],
+    pub geo_center: [f32; 3],
+    pub radius: f32,
+    pub surfaces: Vec<VoSurfaceMesh>,
+}
+
+/// Ports SVOAnimation (VectorObject.hpp:237). `frames` resolves the raw
+/// `anims/frames` SVOFrameIndex[] slice selected by this animation's
+/// `FramesStart`/`FramesCnt`.
+#[derive(Clone, Debug)]
+pub struct VoAnimation {
+    pub name: String,
+    pub id: u32,
+    pub frames: Vec<VoFrameRef>,
+}
+
+/// Ports SVOFrameIndex (VectorObject.hpp:252). `time_ms` is the duration the
+/// pose from `frame_index` should hold before advancing.
+#[derive(Clone, Copy, Debug)]
+pub struct VoFrameRef {
+    pub frame_index: usize,
+    pub time_ms: i32,
 }
 
 #[repr(C)]
@@ -80,9 +122,19 @@ pub fn parse_vo(data: &[u8]) -> Result<VoMesh> {
         indices.push(u16::from_le_bytes([ib[off], ib[off + 1]]));
     }
 
-    let surfaces = parse_surfaces(&stor, &indices);
+    let frames = parse_frames(&stor, &indices);
+    let animations = parse_animations(&stor);
+    let surfaces = frames
+        .first()
+        .map(|f| f.surfaces.clone())
+        .unwrap_or_default();
 
-    Ok(VoMesh { vertices, surfaces })
+    Ok(VoMesh {
+        vertices,
+        surfaces,
+        frames,
+        animations,
+    })
 }
 
 /// Resolve an object Id string (from `strings/String`, '*'-delimited) into a
@@ -248,100 +300,206 @@ fn parse_shadow_spec(raw: &str) -> ShadowSpec {
     }
 }
 
-fn parse_surfaces(stor: &Storage, indices: &[u16]) -> Vec<VoSurfaceMesh> {
-    let surfaces_buf = stor.get_buf("surfs", "texs");
-    let frame_buf = stor.get_buf("frames", "data");
-    let frame_unions_buf = stor.get_buf("frames", "unions");
-    let unions_buf = stor.get_buf("unions", "data");
+/// SVOKadr size on disk — `/Zp1` keeps the struct 64 bytes (6 floats bounds +
+/// 1 float radius + 6 i32 counters; VectorObject.hpp:214).
+const SVO_KADR_SIZE: usize = 64;
+/// SVOUnion size on disk — 6 i32 under `/Zp1` (VectorObject.hpp:200).
+const SVO_UNION_SIZE: usize = 24;
+/// SVOFrameIndex size — two i32 (VectorObject.hpp:252).
+const SVO_FRAME_INDEX_SIZE: usize = 8;
 
-    let mut texture_refs = Vec::new();
-    if let Some(buf) = surfaces_buf {
+/// Fallback frame used when a VO has no frame metadata (or the storage is
+/// malformed). All indices land in a single untextured surface so the mesh
+/// still renders at identity pose.
+fn fallback_frame(indices: &[u16], tex0: Option<String>) -> VoFrame {
+    VoFrame {
+        bounds_min: [0.0; 3],
+        bounds_max: [0.0; 3],
+        geo_center: [0.0; 3],
+        radius: 0.0,
+        surfaces: vec![VoSurfaceMesh {
+            indices: indices.iter().map(|&i| i as u32).collect(),
+            texture_ref: tex0,
+        }],
+    }
+}
+
+fn parse_frames(stor: &Storage, indices: &[u16]) -> Vec<VoFrame> {
+    let mut texture_refs: Vec<Option<String>> = Vec::new();
+    if let Some(buf) = stor.get_buf("surfs", "texs") {
         for i in 0..buf.arrays_count() {
             let s = buf.get_as_wstr(i);
             let s = s.trim_end_matches('\0').trim().to_string();
             texture_refs.push(if s.is_empty() { None } else { Some(s) });
         }
     }
-
-    let Some(frame_data) = frame_buf.map(|b| b.get_bytes(0)) else {
-        return vec![VoSurfaceMesh {
-            indices: indices.iter().map(|&i| i as u32).collect(),
-            texture_ref: texture_refs.into_iter().next().flatten(),
-        }];
-    };
-    let Some(frame_unions) = frame_unions_buf.map(|b| b.get_bytes(0)) else {
-        return vec![VoSurfaceMesh {
-            indices: indices.iter().map(|&i| i as u32).collect(),
-            texture_ref: texture_refs.into_iter().next().flatten(),
-        }];
-    };
-    let Some(unions_data) = unions_buf.map(|b| b.get_bytes(0)) else {
-        return vec![VoSurfaceMesh {
-            indices: indices.iter().map(|&i| i as u32).collect(),
-            texture_ref: texture_refs.into_iter().next().flatten(),
-        }];
-    };
-    if frame_data.len() < 48 || frame_unions.len() < 4 || unions_data.len() < 24 {
-        return vec![VoSurfaceMesh {
-            indices: indices.iter().map(|&i| i as u32).collect(),
-            texture_ref: texture_refs.into_iter().next().flatten(),
-        }];
-    }
-
-    let union_start = read_i32(frame_data, 40).max(0) as usize;
-    let union_count = read_i32(frame_data, 44).max(0) as usize;
     let surface_count = texture_refs.len().max(1);
-    let mut out: Vec<VoSurfaceMesh> = (0..surface_count)
-        .map(|i| VoSurfaceMesh {
-            indices: Vec::new(),
-            texture_ref: texture_refs.get(i).cloned().unwrap_or(None),
-        })
-        .collect();
+    let tex0 = texture_refs.first().cloned().flatten();
 
-    for i in 0..union_count {
-        let union_index_off = (union_start + i) * 4;
-        if union_index_off + 4 > frame_unions.len() {
-            break;
-        }
-        let union_index = u32::from_le_bytes([
-            frame_unions[union_index_off],
-            frame_unions[union_index_off + 1],
-            frame_unions[union_index_off + 2],
-            frame_unions[union_index_off + 3],
-        ]) as usize;
-        let union_off = union_index * 24;
-        if union_off + 24 > unions_data.len() {
-            continue;
-        }
-
-        let surface = read_i32(unions_data, union_off).max(0) as usize;
-        let base = read_i32(unions_data, union_off + 4);
-        let tri_cnt = read_i32(unions_data, union_off + 16).max(0) as usize;
-        let tri_start = read_i32(unions_data, union_off + 20).max(0) as usize;
-        let dst_index = if surface < out.len() { surface } else { 0 };
-        let dst = &mut out[dst_index];
-        let start = tri_start * 3;
-        let end = start + tri_cnt * 3;
-        if end > indices.len() {
-            continue;
-        }
-        dst.indices.extend(
-            indices[start..end]
-                .iter()
-                .map(|&idx| (idx as i32 + base) as u32),
-        );
+    let Some(frame_data) = stor.get_buf("frames", "data").map(|b| b.get_bytes(0)) else {
+        return vec![fallback_frame(indices, tex0)];
+    };
+    let Some(frame_unions) = stor.get_buf("frames", "unions").map(|b| b.get_bytes(0)) else {
+        return vec![fallback_frame(indices, tex0)];
+    };
+    let Some(unions_data) = stor.get_buf("unions", "data").map(|b| b.get_bytes(0)) else {
+        return vec![fallback_frame(indices, tex0)];
+    };
+    if frame_data.len() < SVO_KADR_SIZE
+        || frame_unions.len() < 4
+        || unions_data.len() < SVO_UNION_SIZE
+    {
+        return vec![fallback_frame(indices, tex0)];
     }
 
-    if out.iter().all(|s| s.indices.is_empty()) {
-        return vec![VoSurfaceMesh {
-            indices: indices.iter().map(|&i| i as u32).collect(),
-            texture_ref: texture_refs.into_iter().next().flatten(),
-        }];
+    let frame_count = frame_data.len() / SVO_KADR_SIZE;
+    let mut frames = Vec::with_capacity(frame_count);
+    for fi in 0..frame_count {
+        let off = fi * SVO_KADR_SIZE;
+        let bounds_min = [
+            read_f32(frame_data, off),
+            read_f32(frame_data, off + 4),
+            read_f32(frame_data, off + 8),
+        ];
+        let bounds_max = [
+            read_f32(frame_data, off + 12),
+            read_f32(frame_data, off + 16),
+            read_f32(frame_data, off + 20),
+        ];
+        let geo_center = [
+            read_f32(frame_data, off + 24),
+            read_f32(frame_data, off + 28),
+            read_f32(frame_data, off + 32),
+        ];
+        let radius = read_f32(frame_data, off + 36);
+        let union_start = read_i32(frame_data, off + 40).max(0) as usize;
+        let union_count = read_i32(frame_data, off + 44).max(0) as usize;
+
+        let mut surfs: Vec<VoSurfaceMesh> = (0..surface_count)
+            .map(|i| VoSurfaceMesh {
+                indices: Vec::new(),
+                texture_ref: texture_refs.get(i).cloned().unwrap_or(None),
+            })
+            .collect();
+
+        for i in 0..union_count {
+            let idx_off = (union_start + i) * 4;
+            if idx_off + 4 > frame_unions.len() {
+                break;
+            }
+            let union_index = read_u32(frame_unions, idx_off) as usize;
+            let union_off = union_index * SVO_UNION_SIZE;
+            if union_off + SVO_UNION_SIZE > unions_data.len() {
+                continue;
+            }
+            let surface = read_i32(unions_data, union_off).max(0) as usize;
+            let base = read_i32(unions_data, union_off + 4);
+            let tri_cnt = read_i32(unions_data, union_off + 16).max(0) as usize;
+            let tri_start = read_i32(unions_data, union_off + 20).max(0) as usize;
+
+            let dst_idx = surface.min(surfs.len().saturating_sub(1));
+            let dst = &mut surfs[dst_idx];
+            let start = tri_start * 3;
+            let end = start + tri_cnt * 3;
+            if end > indices.len() {
+                continue;
+            }
+            dst.indices.extend(
+                indices[start..end]
+                    .iter()
+                    .map(|&idx| (idx as i32 + base) as u32),
+            );
+        }
+
+        let surfaces: Vec<VoSurfaceMesh> =
+            surfs.into_iter().filter(|s| !s.indices.is_empty()).collect();
+
+        frames.push(VoFrame {
+            bounds_min,
+            bounds_max,
+            geo_center,
+            radius,
+            surfaces,
+        });
     }
 
-    out.into_iter().filter(|s| !s.indices.is_empty()).collect()
+    if frames.is_empty() || frames.iter().all(|f| f.surfaces.is_empty()) {
+        return vec![fallback_frame(indices, tex0)];
+    }
+
+    frames
+}
+
+fn parse_animations(stor: &Storage) -> Vec<VoAnimation> {
+    let Some(name_buf) = stor.get_buf("anims", "name") else {
+        return Vec::new();
+    };
+    let Some(id_buf) = stor.get_buf("anims", "id") else {
+        return Vec::new();
+    };
+    let Some(disp_buf) = stor.get_buf("anims", "disp") else {
+        return Vec::new();
+    };
+    let Some(cnt_buf) = stor.get_buf("anims", "cnt") else {
+        return Vec::new();
+    };
+    let Some(frames_buf) = stor.get_buf("anims", "frames") else {
+        return Vec::new();
+    };
+
+    let count = name_buf.arrays_count();
+    if count == 0
+        || id_buf.arrays_count() == 0
+        || disp_buf.arrays_count() == 0
+        || cnt_buf.arrays_count() == 0
+        || frames_buf.arrays_count() == 0
+    {
+        return Vec::new();
+    }
+
+    let ids = id_buf.get_bytes(0);
+    let disps = disp_buf.get_bytes(0);
+    let cnts = cnt_buf.get_bytes(0);
+    let frames_blob = frames_buf.get_bytes(0);
+
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let name = name_buf
+            .get_as_wstr(i)
+            .trim_end_matches('\0')
+            .trim()
+            .to_string();
+        let id = read_u32(ids, i * 4);
+        let frames_start = read_u32(disps, i * 4) as usize;
+        let frames_cnt = read_u32(cnts, i * 4) as usize;
+
+        let mut frames = Vec::with_capacity(frames_cnt);
+        for f in 0..frames_cnt {
+            let off = (frames_start + f) * SVO_FRAME_INDEX_SIZE;
+            if off + SVO_FRAME_INDEX_SIZE > frames_blob.len() {
+                break;
+            }
+            let frame_index = read_i32(frames_blob, off).max(0) as usize;
+            let time_ms = read_i32(frames_blob, off + 4);
+            frames.push(VoFrameRef {
+                frame_index,
+                time_ms,
+            });
+        }
+
+        out.push(VoAnimation { name, id, frames });
+    }
+    out
 }
 
 fn read_i32(bytes: &[u8], off: usize) -> i32 {
     i32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]])
+}
+
+fn read_u32(bytes: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]])
+}
+
+fn read_f32(bytes: &[u8], off: usize) -> f32 {
+    f32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]])
 }
