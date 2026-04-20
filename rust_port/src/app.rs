@@ -185,6 +185,7 @@ impl ApplicationHandler for App {
                     cursor: [-1.0, -1.0],
                 });
                 win.request_redraw();
+                hide_loading_overlay();
             });
         }
     }
@@ -477,6 +478,15 @@ async fn load_map_async() -> (
 
 /// Parse the current page URL for a `?bundle=<url>` parameter. Returns None
 /// when the parameter isn't set or the URL APIs aren't available.
+#[cfg(target_arch = "wasm32")]
+fn hide_loading_overlay() {
+    if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
+        if let Some(el) = doc.get_element_by_id("loading") {
+            let _ = el.set_attribute("class", "fade");
+        }
+    }
+}
+
 #[cfg(target_arch = "wasm32")]
 fn bundle_url_from_query() -> Option<String> {
     let location = web_sys::window()?.location();

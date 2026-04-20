@@ -6,13 +6,36 @@
   <style>
     html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #000; }
     canvas { width: 100%; height: 100%; display: block; }
+    #loading {
+      position: fixed; inset: 0; z-index: 10;
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center;
+      background: #000; color: #c8d4e0;
+      font-family: system-ui, -apple-system, Segoe UI, sans-serif;
+      letter-spacing: 0.15em; text-transform: uppercase;
+      transition: opacity 280ms ease;
+    }
+    #loading.fade { opacity: 0; pointer-events: none; }
+    #loading .spinner {
+      width: 42px; height: 42px; margin-bottom: 18px;
+      border: 3px solid rgba(200, 212, 224, 0.18);
+      border-top-color: #c8d4e0;
+      border-radius: 50%;
+      animation: spin 900ms linear infinite;
+    }
+    #loading .label { font-size: 13px; }
+    @keyframes spin { to { transform: rotate(360deg); } }
   </style>
 </head>
 <body>
   <canvas id="game-canvas"></canvas>
+  <div id="loading">
+    <div class="spinner"></div>
+    <div class="label">Loading…</div>
+  </div>
 
   <script type="module">
-    import init from "./pkg/matrixgame_rs.js?v=50";
+    import init from "./pkg/matrixgame_rs.js?v=51";
 
     const MAX = 2048; // WebGL max texture dimension
     const canvas = document.getElementById("game-canvas");
