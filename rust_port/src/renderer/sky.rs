@@ -47,14 +47,28 @@ struct GradientVertex {
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 struct BoxVertex {
-    position: [f32; 3],
-    uv: [f32; 2],
+    /// XY of the cube corner in the skybox's local space. Z is recovered in
+    /// the shader from `bottom_w` and the per-frame `cut_dn` uniform.
+    xy: [f32; 2],
+    /// 0 for a top corner, 1 for a bottom corner. The shader uses this to
+    /// interpolate both Z (top=1.0, bottom=geo_dn) and V (top=v0,
+    /// bottom=v0+(v1-v0)*cut_dn).
+    bottom_w: f32,
+    /// Normalized U for this corner.
+    u: f32,
+    /// Normalized V at the top edge of the face (unscaled).
+    v0: f32,
+    /// Normalized V at the configured bottom edge of the face (pre-cut_dn).
+    v1: f32,
 }
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 struct SkyboxUniforms {
     sky_view_proj: [[f32; 4]; 4],
+    /// `cut_dn` in .x; .yzw unused. Padded to vec4 for std140 alignment.
+    /// See `compute_cut_dn` / MatrixMap.cpp:2064.
+    cut_dn: [f32; 4],
 }
 
 pub struct Sky {
@@ -241,11 +255,13 @@ impl Sky {
 impl Skybox {
     fn render<'a>(&'a self, queue: &wgpu::Queue, pass: &mut wgpu::RenderPass<'a>, camera: &Camera) {
         let sky_view_proj = build_sky_view_proj(camera, self.base_angle + self.current_angle);
+        let cut_dn = compute_cut_dn(camera.eye_pos().z);
         queue.write_buffer(
             &self.uniform_buffer,
             0,
             bytemuck::bytes_of(&SkyboxUniforms {
                 sky_view_proj: sky_view_proj.to_cols_array_2d(),
+                cut_dn: [cut_dn, 0.0, 0.0, 0.0],
             }),
         );
 
@@ -416,15 +432,35 @@ fn load_skybox(
                 array_stride: std::mem::size_of::<BoxVertex>() as u64,
                 step_mode: wgpu::VertexStepMode::Vertex,
                 attributes: &[
+                    // xy
                     wgpu::VertexAttribute {
                         offset: 0,
                         shader_location: 0,
-                        format: wgpu::VertexFormat::Float32x3,
+                        format: wgpu::VertexFormat::Float32x2,
                     },
+                    // bottom_w
+                    wgpu::VertexAttribute {
+                        offset: 8,
+                        shader_location: 1,
+                        format: wgpu::VertexFormat::Float32,
+                    },
+                    // u
                     wgpu::VertexAttribute {
                         offset: 12,
-                        shader_location: 1,
-                        format: wgpu::VertexFormat::Float32x2,
+                        shader_location: 2,
+                        format: wgpu::VertexFormat::Float32,
+                    },
+                    // v0
+                    wgpu::VertexAttribute {
+                        offset: 16,
+                        shader_location: 3,
+                        format: wgpu::VertexFormat::Float32,
+                    },
+                    // v1
+                    wgpu::VertexAttribute {
+                        offset: 20,
+                        shader_location: 4,
+                        format: wgpu::VertexFormat::Float32,
                     },
                 ],
             }],
@@ -471,6 +507,7 @@ fn load_skybox(
         label: Some("Skybox UB"),
         contents: bytemuck::bytes_of(&SkyboxUniforms {
             sky_view_proj: Mat4::IDENTITY.to_cols_array_2d(),
+            cut_dn: [0.5, 0.0, 0.0, 0.0],
         }),
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
     });
@@ -588,53 +625,22 @@ fn build_skybox_vertices(cfg: &SkyConfig, tex_w: f32, tex_h: f32) -> Vec<BoxVert
     // Z-up world-space cube centered on the camera: Y is forward, X is right,
     // Z is up (matches the rest of the port's coordinate system).
     //
-    // Each face is one horizontal panoramic strip sampled from the face's
-    // configured UV rectangle. `geo_dn` (the horizon row) is chosen so the
-    // bottom of each face sits ~flush with the ground plane when the camera
-    // is near z=0; the original uses `2*(1-cut_dn)-1` with `cut_dn≈0.525`
-    // (MatrixMap.cpp:2064-2067), which we approximate with a fixed value.
-    let top_z = 1.0_f32;
-    let bot_z = -0.05_f32;
+    // Only XY is baked here. The shader derives Z (top=1.0, bottom=geo_dn)
+    // and the bottom V from the `cut_dn` uniform so the horizon tracks camera
+    // height, matching the per-frame recompute in DrawSky (MatrixMap.cpp:2064-2076).
 
-    // Face corner positions, indexed by FACE_CONFIG_KEYS: Fore, Right, Back, Left.
-    let positions: [[[f32; 3]; 4]; 4] = [
-        // Fore: +Y wall (tl, tr, bl, br).
-        [
-            [-1.0, 1.0, top_z],
-            [1.0, 1.0, top_z],
-            [-1.0, 1.0, bot_z],
-            [1.0, 1.0, bot_z],
-        ],
+    // Face corner XY positions, indexed by FACE_CONFIG_KEYS: Fore, Right,
+    // Back, Left. Each face is (tl, tr, bl, br).
+    let positions: [[[f32; 2]; 4]; 4] = [
+        // Fore: +Y wall.
+        [[-1.0, 1.0], [1.0, 1.0], [-1.0, 1.0], [1.0, 1.0]],
         // Right: +X wall.
-        [
-            [1.0, 1.0, top_z],
-            [1.0, -1.0, top_z],
-            [1.0, 1.0, bot_z],
-            [1.0, -1.0, bot_z],
-        ],
+        [[1.0, 1.0], [1.0, -1.0], [1.0, 1.0], [1.0, -1.0]],
         // Back: -Y wall.
-        [
-            [1.0, -1.0, top_z],
-            [-1.0, -1.0, top_z],
-            [1.0, -1.0, bot_z],
-            [-1.0, -1.0, bot_z],
-        ],
+        [[1.0, -1.0], [-1.0, -1.0], [1.0, -1.0], [-1.0, -1.0]],
         // Left: -X wall.
-        [
-            [-1.0, -1.0, top_z],
-            [-1.0, 1.0, top_z],
-            [-1.0, -1.0, bot_z],
-            [-1.0, 1.0, bot_z],
-        ],
+        [[-1.0, -1.0], [-1.0, 1.0], [-1.0, -1.0], [-1.0, 1.0]],
     ];
-
-    // The face quads only span the top ~half of a unit cube vertically (top_z
-    // to bot_z), so the bottom UV must shrink to match. The original solves
-    // this with `v1 = (v1-v0)*cut_dn + v0` (MatrixMap.cpp:2072), where
-    // `cut_dn = (1-geo_dn)/2`. Skipping this scale pushes the bottom vertex
-    // past v=1.0 on the Right face (config v1=1198/1024=1.17), which clamps
-    // to the last texture row and smears a near-white horizon strip.
-    let cut_dn = (1.0 - bot_z) * 0.5;
 
     let mut verts = Vec::with_capacity(24);
     for (i, p) in positions.iter().enumerate() {
@@ -642,18 +648,8 @@ fn build_skybox_vertices(cfg: &SkyConfig, tex_w: f32, tex_h: f32) -> Vec<BoxVert
         let nu0 = u0 / tex_w;
         let nu1 = u1 / tex_w;
         let nv0 = v0 / tex_h;
-        let nv1 = nv0 + (v1 / tex_h - nv0) * cut_dn;
-        push_face(
-            &mut verts,
-            p[0],
-            p[1],
-            p[2],
-            p[3],
-            [nu0, nv0],
-            [nu1, nv0],
-            [nu0, nv1],
-            [nu1, nv1],
-        );
+        let nv1 = v1 / tex_h;
+        push_face(&mut verts, p[0], p[1], p[2], p[3], nu0, nu1, nv0, nv1);
     }
 
     verts
@@ -662,40 +658,33 @@ fn build_skybox_vertices(cfg: &SkyConfig, tex_w: f32, tex_h: f32) -> Vec<BoxVert
 #[allow(clippy::too_many_arguments)]
 fn push_face(
     out: &mut Vec<BoxVertex>,
-    p_tl: [f32; 3],
-    p_tr: [f32; 3],
-    p_bl: [f32; 3],
-    p_br: [f32; 3],
-    uv_tl: [f32; 2],
-    uv_tr: [f32; 2],
-    uv_bl: [f32; 2],
-    uv_br: [f32; 2],
+    xy_tl: [f32; 2],
+    xy_tr: [f32; 2],
+    xy_bl: [f32; 2],
+    xy_br: [f32; 2],
+    u_left: f32,
+    u_right: f32,
+    v0: f32,
+    v1: f32,
 ) {
+    let tl = BoxVertex { xy: xy_tl, bottom_w: 0.0, u: u_left,  v0, v1 };
+    let tr = BoxVertex { xy: xy_tr, bottom_w: 0.0, u: u_right, v0, v1 };
+    let bl = BoxVertex { xy: xy_bl, bottom_w: 1.0, u: u_left,  v0, v1 };
+    let br = BoxVertex { xy: xy_br, bottom_w: 1.0, u: u_right, v0, v1 };
     // Two triangles per face (TL, BL, TR) and (TR, BL, BR).
-    out.push(BoxVertex {
-        position: p_tl,
-        uv: uv_tl,
-    });
-    out.push(BoxVertex {
-        position: p_bl,
-        uv: uv_bl,
-    });
-    out.push(BoxVertex {
-        position: p_tr,
-        uv: uv_tr,
-    });
-    out.push(BoxVertex {
-        position: p_tr,
-        uv: uv_tr,
-    });
-    out.push(BoxVertex {
-        position: p_bl,
-        uv: uv_bl,
-    });
-    out.push(BoxVertex {
-        position: p_br,
-        uv: uv_br,
-    });
+    out.push(tl);
+    out.push(bl);
+    out.push(tr);
+    out.push(tr);
+    out.push(bl);
+    out.push(br);
+}
+
+/// Matches `cut_dn = (200 + m_Camera.GetFrustumCenter().z) * 0.5 /
+/// MAX_VIEW_DISTANCE + 0.5` from MatrixMap.cpp:2064. Called per-frame so the
+/// skybox's horizon row tracks the camera's altitude.
+fn compute_cut_dn(eye_z: f32) -> f32 {
+    (200.0 + eye_z) * 0.5 / MAX_VIEW_DISTANCE + 0.5
 }
 
 fn build_sky_view_proj(camera: &Camera, sky_angle: f32) -> Mat4 {
@@ -763,6 +752,9 @@ struct VOut {
 const SKYBOX_SHADER: &str = r#"
 struct U {
     sky_view_proj: mat4x4<f32>,
+    // .x = cut_dn. Ports MatrixMap.cpp:2064 — recomputed each frame from
+    // camera altitude so the skybox's horizon row tracks the view.
+    cut_dn: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> u: U;
 @group(0) @binding(1) var t: texture_2d<f32>;
@@ -774,14 +766,25 @@ struct VOut {
 };
 
 @vertex fn vs_main(
-    @location(0) pos: vec3<f32>,
-    @location(1) uv: vec2<f32>,
+    @location(0) xy: vec2<f32>,
+    @location(1) bottom_w: f32,
+    @location(2) u_coord: f32,
+    @location(3) v0: f32,
+    @location(4) v1: f32,
 ) -> VOut {
     var out: VOut;
+    let cut = u.cut_dn.x;
+    // Top corners at z=1.0, bottom corners at geo_dn = 1 - 2*cut_dn
+    // (MatrixMap.cpp:2067). bottom_w is 0 or 1, interpolating between them.
+    let z = 1.0 - 2.0 * cut * bottom_w;
+    let pos = vec3<f32>(xy, z);
+    // Bottom V scales with cut_dn too (MatrixMap.cpp:2072): top = v0,
+    // bottom = v0 + (v1 - v0) * cut_dn.
+    let v = v0 + (v1 - v0) * cut * bottom_w;
     let clip = u.sky_view_proj * vec4<f32>(pos, 1.0);
     // Pin to far plane so the depth test never rejects the skybox.
     out.clip_pos = vec4<f32>(clip.xy, clip.w, clip.w);
-    out.uv = uv;
+    out.uv = vec2<f32>(u_coord, v);
     return out;
 }
 
