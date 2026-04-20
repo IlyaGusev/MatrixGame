@@ -99,23 +99,36 @@ pub fn build_surface_overlays(
     read_texture: &dyn Fn(&str) -> Option<Vec<u8>>,
     gloss: Option<GlossResources<'_>>,
 ) -> SurfaceOverlays {
-    let srfm = match stor.get_buf("surfacesM", "Data") {
-        Some(b) if b.arrays_count() > 0 => b,
-        _ => {
-            return SurfaceOverlays {
-                base: vec![],
-                gloss: vec![],
-            };
-        }
-    };
-    let strings = match stor.get_buf("strings", "String") {
-        Some(b) => b,
-        _ => {
-            return SurfaceOverlays {
-                base: vec![],
-                gloss: vec![],
-            };
-        }
+    // The original processes both buffers: `surfacesM` entries via
+    // `CTerSurface::LoadM` (32-byte vertices with macro UVs) and `surfaces`
+    // entries via `CTerSurface::Load` (24-byte vertices, no macro UVs)
+    // (MatrixMapPrepare.cpp:1544-1579). Maps typically only populate one of
+    // the two — atoll uses `surfacesM`, training uses plain `surfaces`.
+    // Collect `(buffer, has_macro_uv)` pairs and feed them through the same
+    // assembly loop; macro UVs default to (0, 0) when the vertex doesn't
+    // carry them, matching the C++'s SURFF_MACRO-less render path.
+    let srfm = stor
+        .get_buf("surfacesM", "Data")
+        .filter(|b| b.arrays_count() > 0);
+    let srf = stor
+        .get_buf("surfaces", "Data")
+        .filter(|b| b.arrays_count() > 0);
+    if srfm.is_none() && srf.is_none() {
+        return SurfaceOverlays {
+            base: vec![],
+            gloss: vec![],
+        };
+    }
+    let sources: Vec<(&crate::assets::storage::DataBuf, bool)> = srfm
+        .map(|b| (b, true))
+        .into_iter()
+        .chain(srf.map(|b| (b, false)))
+        .collect();
+    let Some(strings) = stor.get_buf("strings", "String") else {
+        return SurfaceOverlays {
+            base: vec![],
+            gloss: vec![],
+        };
     };
 
     let cx = map.world_width() * 0.5;
@@ -137,7 +150,9 @@ pub fn build_surface_overlays(
     }
     let mut surfaces: Vec<SurfData> = Vec::new();
 
-    for i in 0..srfm.arrays_count() {
+    for (srfm, has_macro_uv) in &sources {
+        let vert_size = if *has_macro_uv { 32 } else { 24 };
+        for i in 0..srfm.arrays_count() {
         let raw = srfm.get_bytes(i);
         if raw.len() < 32 {
             continue;
@@ -175,7 +190,7 @@ pub fn build_surface_overlays(
         let b = (color_dw & 0xFF) as f32 / 255.0;
         let a = ((color_dw >> 24) & 0xFF) as f32 / 255.0;
 
-        let needed = off + vcnt * 32 + idxsz + grpsc * 4;
+        let needed = off + vcnt * vert_size + idxsz + grpsc * 4;
         if needed > raw.len() {
             continue;
         }
@@ -194,8 +209,17 @@ pub fn build_surface_overlays(
             let vcol = rd_u32(raw, &mut off);
             let tu = rd_f32(raw, &mut off);
             let tv = rd_f32(raw, &mut off);
-            let _tum = rd_f32(raw, &mut off);
-            let _tvm = rd_f32(raw, &mut off);
+            // Plain (non-M) surfaces don't carry macro UVs in their vertex
+            // stream — `CTerSurface::Load` uses `STerSurfVertex` (24 bytes)
+            // versus `STerSurfVertexM` (32 bytes) in `LoadM`. Skip reading
+            // the tum/tvm pair and emit (0, 0) instead; the draw path's
+            // macrotexture is disabled on maps that use plain surfaces
+            // (training has MacroTexture=""), so the value is irrelevant.
+            let (_tum, _tvm) = if *has_macro_uv {
+                (rd_f32(raw, &mut off), rd_f32(raw, &mut off))
+            } else {
+                (0.0, 0.0)
+            };
 
             let vr = ((vcol >> 16) & 0xFF) as f32 / 255.0;
             let vg = ((vcol >> 8) & 0xFF) as f32 / 255.0;
@@ -281,6 +305,7 @@ pub fn build_surface_overlays(
             gloss_verts,
             groups,
         });
+        }
     }
 
     surfaces.sort_by_key(|s| s.index);

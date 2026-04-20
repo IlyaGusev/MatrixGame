@@ -83,7 +83,6 @@ impl ApplicationHandler for App {
             });
 
             let tex_reader = |path: &str| -> Option<Vec<u8>> {
-                let pkg = pkg.as_ref()?;
                 let key = path.to_uppercase();
                 for candidate in [&key, &format!("{key}.PNG"), &format!("{key}.DDS")] {
                     if let Ok(data) = pkg.read_file(candidate) {
@@ -98,7 +97,7 @@ impl ApplicationHandler for App {
                 &gfx.config,
                 &map,
                 &stor,
-                matrix_data.as_ref(),
+                &matrix_data,
                 &tex_reader,
             );
             let point_lights = PointLightSystem::new(&map);
@@ -151,7 +150,7 @@ impl ApplicationHandler for App {
                     &gfx.config,
                     &map,
                     &stor,
-                    matrix_data.as_ref(),
+                    &matrix_data,
                     &tex_reader,
                 );
                 let point_lights = PointLightSystem::new(&map);
@@ -335,12 +334,19 @@ impl ApplicationHandler for App {
 
 /// Load map — native reads from pkg, returns map + map storage + global
 /// matrix data storage (robots.dat) + pkg for texture loading.
+///
+/// Matches the original startup contract (MatrixGame.cpp:240-257, 383-399):
+/// the caller can request a specific map via the first CLI argument; if
+/// absent, we fall back to `Config/Map` in the global data. Global data
+/// itself is a required dependency (MatrixGame.cpp:240-257) — the engine
+/// dereferences `g_MatrixData->BlockGet(...)` without NULL guards all over
+/// Init, so missing `robots.dat` is a fatal startup error.
 #[cfg(not(target_arch = "wasm32"))]
 fn load_map() -> (
     GameMap,
     crate::assets::storage::Storage,
-    Option<crate::assets::storage::Storage>,
-    Option<crate::assets::pkg_reader::PkgArchive>,
+    crate::assets::storage::Storage,
+    crate::assets::pkg_reader::PkgArchive,
 ) {
     use crate::assets::pkg_reader::PkgArchive;
     use crate::assets::storage::Storage;
@@ -359,60 +365,96 @@ fn load_map() -> (
     let pkg_data = std::fs::read(pkg_path).expect("failed to read robots.pkg");
     let pkg = PkgArchive::from_bytes(pkg_data).expect("failed to parse pkg");
 
-    let files = pkg.list_files();
-    let mut cmaps: Vec<_> = files.iter().filter(|f| f.ends_with(".CMAP")).collect();
-    cmaps.sort();
-    let map_name = cmaps.first().expect("no CMAP files found in pkg");
-    log::info!("loading map: {}", map_name);
-
-    let cmap_data = pkg.read_file(map_name).expect("failed to read CMAP");
-    let stor = Storage::from_bytes(&cmap_data).expect("failed to parse CStorage");
-    let map = GameMap::from_cmap_bytes(&cmap_data).expect("failed to parse CMAP");
-
-    // Load robots.dat alongside the pkg. This is the serialized global
-    // BlockPar tree (Sky/Water/Side/...). Optional — missing file just
-    // disables the skybox/water config lookups.
+    // robots.dat is required, not optional — the original game crashes with
+    // a null deref if it's absent (see MatrixGame.cpp:240-257, 371-373).
     let dat_candidates = [
         "../Data/robots.dat",
         "Data/robots.dat",
         "../../Data/robots.dat",
     ];
-    let matrix_data = dat_candidates
+    let dat_path = dat_candidates
         .iter()
         .find(|c| std::path::Path::new(c).exists())
-        .and_then(|path| match std::fs::read(path) {
-            Ok(bytes) => match Storage::from_bytes(&bytes) {
-                Ok(s) => {
-                    log::info!("loaded matrix data: {}", path);
-                    Some(s)
-                }
-                Err(e) => {
-                    log::warn!("failed to parse {}: {}", path, e);
-                    None
-                }
-            },
-            Err(e) => {
-                log::warn!("failed to read {}: {}", path, e);
-                None
-            }
-        });
+        .expect(
+            "robots.dat is required; place it next to robots.pkg (e.g. ../Data/robots.dat)",
+        );
+    log::info!("loading matrix data: {}", dat_path);
+    let dat_bytes = std::fs::read(dat_path).expect("failed to read robots.dat");
+    let matrix_data =
+        Storage::from_bytes(&dat_bytes).expect("failed to parse robots.dat CStorage");
 
-    (map, stor, matrix_data, Some(pkg))
+    // Pick the map the same way the original does (MatrixGame.cpp:383-394):
+    // CLI arg wins; otherwise read `Config/Map` from the global data.
+    let cli_map = std::env::args().nth(1);
+    let mapname = match cli_map.as_deref() {
+        Some(arg) if !arg.is_empty() => resolve_map_name(arg),
+        _ => {
+            let config_rec = matrix_data
+                .block_record("da", "Config")
+                .expect("robots.dat has no Config block");
+            let map_param = matrix_data
+                .block_param(&config_rec, "Map")
+                .filter(|s| !s.is_empty())
+                .expect(
+                    "no map requested and Config/Map is missing — pass a map name as the first CLI arg",
+                );
+            resolve_map_name(&map_param)
+        }
+    };
+    log::info!("loading map: {}", mapname);
+
+    let cmap_data = pkg
+        .read_file(&mapname)
+        .unwrap_or_else(|e| panic!("failed to read {}: {}", mapname, e));
+    let stor = Storage::from_bytes(&cmap_data).expect("failed to parse map CStorage");
+    let map = GameMap::from_cmap_bytes(&cmap_data).expect("failed to parse CMAP");
+
+    (map, stor, matrix_data, pkg)
 }
 
+/// Mirror the path-building in `MatrixGame::Init` (MatrixGame.cpp:385-394):
+/// a bare name like `Atoll` becomes `Matrix\Map\Atoll.CMAP`; anything with
+/// a path separator is used verbatim. We normalize to forward slashes,
+/// uppercase for the pkg's case-folded lookup, and append `.CMAP` when the
+/// caller didn't supply it.
+#[cfg(not(target_arch = "wasm32"))]
+fn resolve_map_name(requested: &str) -> String {
+    let trimmed = requested.trim();
+    let has_sep = trimmed.contains('/') || trimmed.contains('\\');
+    let normalized = trimmed.replace('\\', "/");
+    let with_prefix = if has_sep {
+        normalized
+    } else {
+        format!("MATRIX/MAP/{normalized}")
+    };
+    let with_ext = if with_prefix.to_uppercase().ends_with(".CMAP") {
+        with_prefix
+    } else {
+        format!("{with_prefix}.CMAP")
+    };
+    with_ext.to_uppercase()
+}
+
+/// WASM counterpart of `load_map`. The bundle URL is taken from the page's
+/// `?bundle=<url>` query parameter so the same build can serve different
+/// maps without rewiring JS — this mirrors the original's configurable map
+/// path (MatrixGame.cpp:383-394) inside the bundle-delivery model.
+/// `assets/atoll.bundle` is kept as the default for backwards compatibility.
 #[cfg(target_arch = "wasm32")]
 async fn load_map_async() -> (
     GameMap,
     crate::assets::storage::Storage,
-    Option<crate::assets::storage::Storage>,
+    crate::assets::storage::Storage,
     crate::assets::bundle::AssetBundle,
 ) {
     use crate::assets::bundle::AssetBundle;
     use crate::assets::storage::Storage;
 
-    let bundle_data = crate::assets::loader::load_bytes("assets/atoll.bundle")
+    let bundle_url = bundle_url_from_query().unwrap_or_else(|| "assets/atoll.bundle".to_string());
+    log::info!("loading bundle: {}", bundle_url);
+    let bundle_data = crate::assets::loader::load_bytes(&bundle_url)
         .await
-        .expect("failed to fetch asset bundle");
+        .unwrap_or_else(|_| panic!("failed to fetch asset bundle: {}", bundle_url));
     let bundle = AssetBundle::from_bytes(&bundle_data).expect("failed to parse bundle");
 
     let cmap_data = bundle
@@ -422,21 +464,28 @@ async fn load_map_async() -> (
     let stor = Storage::from_bytes(&cmap_data).expect("failed to parse CStorage");
     let map = GameMap::from_cmap_bytes(&cmap_data).expect("failed to parse CMAP");
 
+    // robots.dat is required here too — see the native loader comment.
+    let dat_bytes = bundle.read_file("robots.dat").expect(
+        "bundle must contain robots.dat; rebuild the bundle with examples/pack_bundle.rs",
+    );
     let matrix_data =
-        bundle
-            .read_file("robots.dat")
-            .and_then(|bytes| match Storage::from_bytes(bytes) {
-                Ok(s) => {
-                    log::info!("loaded matrix data from bundle (robots.dat)");
-                    Some(s)
-                }
-                Err(e) => {
-                    log::warn!("failed to parse bundled robots.dat: {}", e);
-                    None
-                }
-            });
+        Storage::from_bytes(dat_bytes).expect("failed to parse bundled robots.dat CStorage");
+    log::info!("loaded matrix data from bundle (robots.dat)");
 
     (map, stor, matrix_data, bundle)
+}
+
+/// Parse the current page URL for a `?bundle=<url>` parameter. Returns None
+/// when the parameter isn't set or the URL APIs aren't available.
+#[cfg(target_arch = "wasm32")]
+fn bundle_url_from_query() -> Option<String> {
+    let location = web_sys::window()?.location();
+    let search = location.search().ok()?;
+    if search.is_empty() {
+        return None;
+    }
+    let params = web_sys::UrlSearchParams::new_with_str(&search).ok()?;
+    params.get("bundle").filter(|s| !s.is_empty())
 }
 
 #[cfg(not(target_arch = "wasm32"))]

@@ -106,7 +106,7 @@ impl Sky {
         water_color_rgba: u32,
         sky_name: &str,
         sky_angle: f32,
-        matrix_data: Option<&Storage>,
+        matrix_data: &Storage,
         read_texture: &dyn Fn(&str) -> Option<Vec<u8>>,
     ) -> Self {
         let sky_color = unpack_rgb(sky_color_rgba);
@@ -124,15 +124,13 @@ impl Sky {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         });
 
-        let sky_cfg = matrix_data
-            .and_then(|stor| resolve_sky_config(stor, sky_name))
-            .or_else(|| {
-                log::warn!(
-                    "sky: no config for '{}' in robots.dat; skybox disabled",
-                    sky_name
-                );
-                None
-            });
+        let sky_cfg = resolve_sky_config(matrix_data, sky_name).or_else(|| {
+            log::warn!(
+                "sky: no config for '{}' in robots.dat; skybox disabled",
+                sky_name
+            );
+            None
+        });
         let skybox = sky_cfg
             .and_then(|cfg| load_skybox(device, queue, config, &cfg, sky_angle, read_texture));
 

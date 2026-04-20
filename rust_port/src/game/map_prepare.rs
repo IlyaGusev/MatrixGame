@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use crate::assets::storage::Storage;
 use crate::game::bitmap::{blit_tile, copy_col, copy_row, merge_by_mask, merge_with_alpha};
 use crate::game::common::TEX_BOTTOM_SIZE;
-use crate::renderer::texture::create_texture_from_rgba_mipped;
+use crate::renderer::texture::{create_texture_from_rgba_mipped, decode_texture_bytes};
 
 /// Ports BuildTexUnions (MatrixMapPrepare.cpp:108-293).
 pub fn build_tex_union_atlases(
@@ -37,6 +37,11 @@ pub fn build_tex_union_atlases(
     let mut src_cache: HashMap<usize, image::RgbaImage> = HashMap::new();
     let mut bmp_cache: HashMap<usize, image::RgbaImage> = HashMap::new();
 
+    // Terrain tiles ship as either PNG (e.g. atoll) or DXT DDS (e.g. training
+    // uses a 4.8 MB STONES05.DDS). `image::load_from_memory` doesn't handle
+    // DDS, so using it silently loses DDS tiles and the atlas keeps the zero-
+    // initialized (0,0,0,0) patches. Route through `decode_texture_bytes`
+    // which already knows DXT1/3/5 in addition to the image crate's formats.
     let load_src = |id: usize,
                     cache: &mut HashMap<usize, image::RgbaImage>,
                     strings: &crate::assets::storage::DataBuf,
@@ -51,8 +56,10 @@ pub fn build_tex_union_atlases(
                     .replace('\\', "/")
                     .to_string();
                 if let Some(data) = read_texture(&path) {
-                    if let Ok(img) = image::load_from_memory(&data) {
-                        entry.insert(img.to_rgba8());
+                    if let Some(rgba) = decode_texture_bytes(&data) {
+                        entry.insert(rgba);
+                    } else {
+                        log::warn!("terrain atlas: decode failed for '{}'", path);
                     }
                 }
             }

@@ -97,9 +97,13 @@ pub struct DrawBatch {
 
 pub struct TerrainRenderer {
     pipeline: wgpu::RenderPipeline,
+    /// Depth-only pipeline for the `-1` texture sentinel. See
+    /// MatrixMapGroup.cpp:593-606.
+    depth_only_pipeline: wgpu::RenderPipeline,
     overlay_pipeline: wgpu::RenderPipeline,
     gloss_pipeline: wgpu::RenderPipeline,
     batches: Vec<DrawBatch>,
+    depth_only_batches: Vec<DrawBatch>,
     overlay_batches: Vec<OverlayBatch>,
     gloss_batches: Vec<GlossOverlayBatch>,
     sky: super::sky::Sky,
@@ -121,7 +125,7 @@ impl TerrainRenderer {
         config: &wgpu::SurfaceConfiguration,
         map: &GameMap,
         stor: &Storage,
-        matrix_data: Option<&Storage>,
+        matrix_data: &Storage,
         read_texture: &dyn Fn(&str) -> Option<Vec<u8>>,
     ) -> Self {
         let tex_union_dim = map.tex_union_dim;
@@ -311,7 +315,13 @@ impl TerrainRenderer {
             ..Default::default()
         });
 
-        // Load macrotexture
+        // Load macrotexture. When the map has no `MacroTexture` property set
+        // (training.cmap leaves it blank) we must not paint a gray/semi-opaque
+        // placeholder — the terrain shader blends `macro.rgb*macro.a +
+        // atlas.rgb*(1-macro.a)`, so any non-zero macro alpha washes the
+        // ground toward the placeholder color. Alpha=0 makes the stage a
+        // no-op, mirroring the original's behavior of simply not binding a
+        // macrotexture in that case.
         let macro_view = if let Some(data) = map
             .macro_texture_path
             .as_deref()
@@ -326,11 +336,12 @@ impl TerrainRenderer {
                 );
                 create_texture_from_rgba_mipped(device, queue, &rgba, 6)
             } else {
-                create_solid_texture(device, queue, [180, 180, 180, 128])
+                log::warn!("terrain: macrotexture decode failed; disabling macro stage");
+                create_solid_texture(device, queue, [0, 0, 0, 0])
             }
         } else {
-            log::warn!("terrain: macrotexture not found");
-            create_solid_texture(device, queue, [180, 180, 180, 128])
+            log::info!("terrain: no macrotexture for this map; disabling macro stage");
+            create_solid_texture(device, queue, [0, 0, 0, 0])
         };
 
         let macro_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -390,16 +401,41 @@ impl TerrainRenderer {
             ],
         });
 
-        let white_view = create_solid_texture(device, queue, [200, 200, 200, 255]);
         let transparent = create_solid_texture(device, queue, [0, 0, 0, 0]);
 
         let mut batches = Vec::new();
+        let mut depth_only_batches = Vec::new();
         let mut total_tris = 0u32;
+        // Some batches bind the atlas and write color; the -1 sentinel batch
+        // just needs geometry — no atlas sample. Reuse the first available
+        // atlas view for the sentinel bind group so the layout is satisfied.
+        let sentinel_atlas = atlas_views.first();
         for (tex_idx, (verts, idxs, point_coords)) in &batches_by_tex {
             if idxs.is_empty() {
                 continue;
             }
-            let tex_view = atlas_views.get(*tex_idx as usize).unwrap_or(&white_view);
+            let is_sentinel = *tex_idx == u32::MAX;
+            let tex_view = if is_sentinel {
+                match sentinel_atlas {
+                    Some(v) => v,
+                    None => {
+                        log::warn!("terrain: -1 batch with no atlases available; skipping");
+                        continue;
+                    }
+                }
+            } else {
+                match atlas_views.get(*tex_idx as usize) {
+                    Some(v) => v,
+                    None => {
+                        log::warn!(
+                            "terrain: batch texture index {} out of range (have {} atlases); skipping",
+                            tex_idx,
+                            atlas_views.len()
+                        );
+                        continue;
+                    }
+                }
+            };
             let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: None,
                 contents: bytemuck::cast_slice(verts),
@@ -437,7 +473,7 @@ impl TerrainRenderer {
                 ],
             });
             total_tris += idxs.len() as u32 / 3;
-            batches.push(DrawBatch {
+            let batch = DrawBatch {
                 bind_group: bg,
                 vertex_buffer: vb,
                 index_buffer: ib,
@@ -445,7 +481,12 @@ impl TerrainRenderer {
                 index_format: wgpu::IndexFormat::Uint32,
                 cpu_vertices: Some(verts.clone()),
                 point_coords: Some(point_coords.clone()),
-            });
+            };
+            if is_sentinel {
+                depth_only_batches.push(batch);
+            } else {
+                batches.push(batch);
+            }
         }
         log::info!(
             "terrain bottom: {} draw batches, {} triangles",
@@ -622,6 +663,47 @@ impl TerrainRenderer {
             cache: None,
         });
 
+        // Depth-only pipeline for groups whose geometry carries a -1 texture
+        // sentinel. Ports MatrixMapGroup.cpp:593-606: draws the triangles with
+        // color writes disabled so they only populate the depth buffer —
+        // occluding water / distant geometry without contributing any color.
+        let depth_only_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Bottom Depth-Only Pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[Vertex::desc()],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main_opaque"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::empty(),
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
         let overlay_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Overlay Pipeline"),
             layout: Some(&pipeline_layout),
@@ -763,9 +845,11 @@ impl TerrainRenderer {
 
         Self {
             pipeline,
+            depth_only_pipeline,
             overlay_pipeline,
             gloss_pipeline,
             batches,
+            depth_only_batches,
             overlay_batches,
             gloss_batches,
             sky,
@@ -899,6 +983,20 @@ impl TerrainRenderer {
             pass.set_vertex_buffer(0, batch.vertex_buffer.slice(..));
             pass.set_index_buffer(batch.index_buffer.slice(..), batch.index_format);
             pass.draw_indexed(0..batch.num_indices, 0, 0..1);
+        }
+
+        // Depth-only pass for groups whose -1 texture sentinel signals
+        // "carve a hole but occlude everything behind" (MatrixMapGroup.cpp:
+        // 593-606). Populating the depth buffer here keeps later water /
+        // object draws from showing through these triangles.
+        if !self.depth_only_batches.is_empty() {
+            pass.set_pipeline(&self.depth_only_pipeline);
+            for batch in &self.depth_only_batches {
+                pass.set_bind_group(0, &batch.bind_group, &[]);
+                pass.set_vertex_buffer(0, batch.vertex_buffer.slice(..));
+                pass.set_index_buffer(batch.index_buffer.slice(..), batch.index_format);
+                pass.draw_indexed(0..batch.num_indices, 0, 0..1);
+            }
         }
 
         // Per-group visibility mask, matches CMatrixMap::m_VisibleGroups

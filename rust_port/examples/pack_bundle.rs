@@ -1,5 +1,10 @@
 //! Pack CMAP + textures into a single asset bundle for WASM.
 //! Resolves missing extensions by trying .png and .dds in the pkg.
+//!
+//! Usage: `cargo run --example pack_bundle -- <map-name>`  (default: `atoll`).
+//! Bare names resolve to `MATRIX/MAP/<NAME>.CMAP`. The output lands at
+//! `assets/<name>.bundle`, matching the `?bundle=<url>` query the WASM loader
+//! accepts.
 use matrixgame_rs::assets::bundle::AssetBundle;
 use matrixgame_rs::assets::pkg_reader::PkgArchive;
 use matrixgame_rs::assets::storage::Storage;
@@ -10,8 +15,25 @@ fn main() {
     let pkg_data = std::fs::read("../Data/robots.pkg").unwrap();
     let pkg = PkgArchive::from_bytes(pkg_data).unwrap();
 
-    let map_name = "MATRIX/MAP/ATOLL.CMAP";
-    let cmap_data = pkg.read_file(map_name).unwrap();
+    let requested = std::env::args().nth(1).unwrap_or_else(|| "atoll".into());
+    let short_name = requested
+        .trim()
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("")
+        .trim_end_matches(".cmap")
+        .trim_end_matches(".CMAP")
+        .to_lowercase();
+    let map_name = if requested.contains('/') || requested.contains('\\') {
+        requested.replace('\\', "/").to_uppercase()
+    } else {
+        format!("MATRIX/MAP/{}.CMAP", requested.to_uppercase())
+    };
+    println!("Packing map: {}", map_name);
+
+    let cmap_data = pkg
+        .read_file(&map_name)
+        .unwrap_or_else(|e| panic!("could not read {}: {}", map_name, e));
     let stor = Storage::from_bytes(&cmap_data).unwrap();
 
     let mut bundle = AssetBundle::new();
@@ -202,6 +224,25 @@ fn main() {
     let mut vo_count = 0;
     let mut obj_tex_count = 0;
     let mut vo_tex_seen = std::collections::HashSet::<String>::new();
+
+    let try_pack_texture =
+        |bundle: &mut AssetBundle,
+         seen: &mut std::collections::HashSet<String>,
+         t: &str|
+         -> bool {
+            if !seen.insert(t.to_string()) {
+                return false;
+            }
+            let k = t.to_uppercase();
+            for cand in [k.clone(), format!("{}.DDS", k), format!("{}.PNG", k)] {
+                if let Ok(data) = pkg.read_file(&cand) {
+                    bundle.add(t, data);
+                    return true;
+                }
+            }
+            false
+        };
+
     for type_id in &obj_types {
         if (*type_id as usize) >= strings.arrays_count() {
             continue;
@@ -211,13 +252,19 @@ fn main() {
             continue;
         };
         let vo_key = paths.vo_path.to_uppercase();
-        if let Ok(data) = pkg.read_file(&vo_key) {
-            bundle.add(&paths.vo_path, data);
-            vo_count += 1;
-        } else {
-            eprintln!("  MISS vo: {}", paths.vo_path);
-            continue;
-        }
+        let vo_bytes = match pkg.read_file(&vo_key) {
+            Ok(data) => {
+                bundle.add(&paths.vo_path, data.clone());
+                vo_count += 1;
+                data
+            }
+            Err(_) => {
+                eprintln!("  MISS vo: {}", paths.vo_path);
+                continue;
+            }
+        };
+
+        // Top-level (id-string) material textures.
         for t in [
             paths.material.diffuse.as_ref(),
             paths.material.gloss.as_ref(),
@@ -227,15 +274,39 @@ fn main() {
         .into_iter()
         .flatten()
         {
-            if !vo_tex_seen.insert(t.clone()) {
-                continue;
+            if try_pack_texture(&mut bundle, &mut vo_tex_seen, t) {
+                obj_tex_count += 1;
             }
-            let k = t.to_uppercase();
-            for cand in [k.clone(), format!("{}.DDS", k), format!("{}.PNG", k)] {
-                if let Ok(data) = pkg.read_file(&cand) {
-                    bundle.add(t, data);
+        }
+
+        // Per-surface materials carried inside the VO's own surfs/texs table.
+        // `objects.rs` merges these with the top-level paths in
+        // `build_per_surface_frame_ranges` → `parse_material_spec_with_prefix`,
+        // so the bundle must include their textures too. Without this, VOs
+        // with multi-material surfaces show untextured / fallback colors.
+        let Ok(vo) = vo_loader::parse_vo(&vo_bytes) else {
+            continue;
+        };
+        let object_dir = paths
+            .vo_path
+            .rsplit_once('/')
+            .map(|(dir, _)| format!("{dir}/"));
+        for surface in &vo.surfaces {
+            let Some(spec) = surface.texture_ref.as_deref() else {
+                continue;
+            };
+            let m = vo_loader::parse_material_spec_with_prefix(spec, object_dir.as_deref());
+            for t in [
+                m.diffuse.as_ref(),
+                m.gloss.as_ref(),
+                m.back.as_ref(),
+                m.mask.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if try_pack_texture(&mut bundle, &mut vo_tex_seen, t) {
                     obj_tex_count += 1;
-                    break;
                 }
             }
         }
@@ -245,12 +316,39 @@ fn main() {
         vo_count, obj_tex_count
     );
 
+    // Pack sibling `.txt` files so the alpha-test override path in
+    // `vo_loader::resolve_alpha_test_with_txt` (which ports
+    // Texture.cpp:113-136) works in the WASM build. There are ~119 of these
+    // in robots.pkg, ~25 bytes each — trivial overhead. We add every .txt we
+    // can find under the keys the loader will actually request (mixed-case
+    // normalized paths) by looking at every bundled texture and probing for
+    // a sibling.
+    let texture_keys: Vec<String> = bundle.list_files().iter().map(|s| s.to_string()).collect();
+    let mut txt_count = 0;
+    for key in &texture_keys {
+        let txt_key = match key.rsplit_once('.') {
+            Some((stem, _)) => format!("{stem}.txt"),
+            None => format!("{key}.txt"),
+        };
+        if bundle.read_file(&txt_key).is_some() {
+            continue;
+        }
+        let pkg_key = txt_key.to_uppercase();
+        if let Ok(data) = pkg.read_file(&pkg_key) {
+            bundle.add(&txt_key, data);
+            txt_count += 1;
+        }
+    }
+    println!("  alpha-test txt siblings: {} packed", txt_count);
+
     let bytes = bundle.to_bytes();
     std::fs::create_dir_all("assets").ok();
-    std::fs::write("assets/atoll.bundle", &bytes).unwrap();
+    let out_path = format!("assets/{}.bundle", short_name);
+    std::fs::write(&out_path, &bytes).unwrap();
     println!(
-        "\nPacked {} textures + CMAP into assets/atoll.bundle ({:.1} MB)",
+        "\nPacked {} textures + CMAP into {} ({:.1} MB)",
         tex_count,
+        out_path,
         bytes.len() as f64 / 1024.0 / 1024.0
     );
 }

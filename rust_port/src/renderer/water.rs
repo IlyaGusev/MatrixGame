@@ -209,9 +209,9 @@ struct WaterPreset {
 /// missing — the original dereferences `g_MatrixData->BlockGet(PAR_SOURCE_WATER)`
 /// unconditionally (MatrixWater.cpp:44, 213), so a missing block is a fatal
 /// configuration error, not a viewer fallback.
-fn resolve_water_preset(matrix_data: Option<&Storage>, water_name: &str) -> Option<WaterPreset> {
-    let stor = matrix_data?;
-    let water_root = stor.block_record("da", "Water")?;
+fn resolve_water_preset(matrix_data: &Storage, water_name: &str) -> Option<WaterPreset> {
+    let water_root = matrix_data.block_record("da", "Water")?;
+    let stor = matrix_data;
 
     let (resolved_name, preset_record) = match stor.block_record(&water_root, water_name) {
         Some(rec) => (water_name.to_string(), rec),
@@ -245,7 +245,7 @@ impl Water {
         config: &wgpu::SurfaceConfiguration,
         map: &GameMap,
         stor: &Storage,
-        matrix_data: Option<&Storage>,
+        matrix_data: &Storage,
         read_texture: &dyn Fn(&str) -> Option<Vec<u8>>,
     ) -> Option<Self> {
         let groups_buf = stor.get_buf("groups", "Data")?;
