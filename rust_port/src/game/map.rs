@@ -61,6 +61,14 @@ pub struct GameMap {
     pub ambient_color: u32,
     pub terrain2object_influence: f32,
     pub terrain2object_target_color: u32,
+    /// Foamline tint — DATA_INSHOREWAVECOLOR, used by the inshore wave pass
+    /// (MatrixMapPrepare.cpp:1183, MatrixWater.cpp:160).
+    pub inshorewave_color: u32,
+    /// Precomputed inshore wave spawn points, one list per map group in
+    /// row-major order. Loaded from `inshores/{X,Y,NX,NY}` in the CMAP
+    /// (MatrixMapPrepare.cpp:1386-1417). Groups without water get an empty
+    /// vec. `pos` is uncentered world coords, `dir` points toward land.
+    pub inshore_prespawns: Vec<Vec<InshorePreSpawn>>,
     pub macro_texture_path: Option<String>,
     pub macro_texture_size: i32,   // m_MacrotextureSize from "SIM" param
     pub points: Vec<CompilePoint>, // (size_x+1) * (size_y+1) points
@@ -74,6 +82,14 @@ pub struct GameMap {
     pub group_max_z_land: Vec<f32>,
     pub group_w: usize,
     pub group_h: usize,
+}
+
+/// Precomputed shoreline wave spawn point. Ports SPreInshorewave fields
+/// (MatrixWater.hpp — see MatrixMapPrepare.cpp:1397-1414 for the load path).
+#[derive(Debug, Clone, Copy)]
+pub struct InshorePreSpawn {
+    pub pos: [f32; 2],
+    pub dir: [f32; 2],
 }
 
 /// A static object placement — ports the per-instance fields of DATA_OBJECTS
@@ -165,6 +181,8 @@ impl GameMap {
             find_property_int(prop_names, prop_values, "AmbientColor").unwrap_or(0x808080) as u32;
         let mut terrain2object_influence =
             find_property_float(prop_names, prop_values, "Influence").unwrap_or(0.0);
+        let inshorewave_color = find_property_int(prop_names, prop_values, "InshorewaveColor")
+            .unwrap_or(0x008080) as u32;
         let terrain2object_target_color = if terrain2object_influence > 0.0 {
             0xFFFFFF
         } else if terrain2object_influence < 0.0 {
@@ -284,6 +302,14 @@ impl GameMap {
         let (group_max_z_land, group_w, group_h) =
             compute_group_max_z_land(&points, &units, size_x, size_y);
 
+        let inshore_prespawns = load_inshore_prespawns(&stor, group_w, group_h);
+        let total_inshores: usize = inshore_prespawns.iter().map(|v| v.len()).sum();
+        log::info!(
+            "map: loaded {} inshore wave spawn points across {} groups",
+            total_inshores,
+            inshore_prespawns.iter().filter(|v| !v.is_empty()).count()
+        );
+
         Ok(Self {
             size_x,
             size_y,
@@ -303,6 +329,8 @@ impl GameMap {
             ambient_color,
             terrain2object_influence,
             terrain2object_target_color,
+            inshorewave_color,
+            inshore_prespawns,
             macro_texture_path,
             macro_texture_size,
             points,
@@ -822,6 +850,56 @@ fn dilate_max(src: &[f32], w: usize, h: usize, radius: i32) -> Vec<f32> {
 /// Each column is a flat buffer of N elements (one per object), accessed as row 0.
 /// The `Height` column, when present, is an offset above interpolated terrain z at
 /// the object's (x, y); otherwise `Z` is used directly.
+/// Loads per-group shoreline wave spawn points from the CMAP's `inshores`
+/// record (four parallel float columns `X`, `Y`, `NX`, `NY` — one array per
+/// group, row-major). Ports MatrixMapPrepare.cpp:1386-1417 + the original
+/// `CMatrixMapGroup::InitInshoreWaves` that stores (pos, dir) for later
+/// wave spawning.
+///
+/// If any column is missing we return an empty list per group — the map
+/// either has `DisableInshore` set or was built without inshore data.
+fn load_inshore_prespawns(
+    stor: &Storage,
+    group_w: usize,
+    group_h: usize,
+) -> Vec<Vec<InshorePreSpawn>> {
+    let total = group_w * group_h;
+    let empty = vec![Vec::new(); total];
+    let (Some(bx), Some(by), Some(bnx), Some(bny)) = (
+        stor.get_buf("inshores", "X"),
+        stor.get_buf("inshores", "Y"),
+        stor.get_buf("inshores", "NX"),
+        stor.get_buf("inshores", "NY"),
+    ) else {
+        return empty;
+    };
+    if bx.arrays_count() < total {
+        return empty;
+    }
+
+    let read_f32 = |b: &[u8], i: usize| -> f32 {
+        f32::from_le_bytes([b[i * 4], b[i * 4 + 1], b[i * 4 + 2], b[i * 4 + 3]])
+    };
+
+    let mut out = Vec::with_capacity(total);
+    for gi in 0..total {
+        let xs = bx.get_bytes(gi);
+        let ys = by.get_bytes(gi);
+        let nxs = bnx.get_bytes(gi);
+        let nys = bny.get_bytes(gi);
+        let count = xs.len().min(ys.len()).min(nxs.len()).min(nys.len()) / 4;
+        let mut list = Vec::with_capacity(count);
+        for i in 0..count {
+            list.push(InshorePreSpawn {
+                pos: [read_f32(xs, i), read_f32(ys, i)],
+                dir: [read_f32(nxs, i), read_f32(nys, i)],
+            });
+        }
+        out.push(list);
+    }
+    out
+}
+
 fn load_objects(
     stor: &Storage,
     points: &[CompilePoint],

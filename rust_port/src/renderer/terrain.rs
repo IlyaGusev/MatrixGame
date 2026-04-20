@@ -566,7 +566,15 @@ impl TerrainRenderer {
             super::objects::ObjectsRenderer::new(device, queue, config, map, stor, read_texture);
 
         // Water (MatrixWater.cpp)
-        let water = super::water::Water::new(device, queue, config, map, stor, read_texture);
+        let water = super::water::Water::new(
+            device,
+            queue,
+            config,
+            map,
+            stor,
+            matrix_data,
+            read_texture,
+        );
         let point_lights = PointLightRenderer::new(device, config);
 
         // Pipelines

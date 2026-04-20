@@ -177,6 +177,12 @@ fn main() {
             "Matrix/Textures/Water/MIRRORPURPLE",
             "MATRIX/TEXTURES/WATER/MIRRORPURPLE.DDS",
         ),
+        (
+            // Shoreline foam quad texture — referenced by the Sky/Water
+            // configs in robots.dat under `Water/*/inshore`.
+            "Matrix/Textures/Water/inshorewave",
+            "MATRIX/TEXTURES/WATER/INSHOREWAVE.DDS",
+        ),
     ];
     for (key, pkg_path) in &water_files {
         if let Ok(data) = pkg.read_file(pkg_path) {
