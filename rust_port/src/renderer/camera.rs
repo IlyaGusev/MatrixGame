@@ -20,6 +20,8 @@
 
 use glam::{Mat4, Vec2, Vec3};
 
+use crate::assets::storage::Storage;
+
 /// MatrixCamera.hpp defines `CAM_HFOV = 60°`, but the original feeds that
 /// value to `D3DXMatrixPerspectiveFovLH`, which takes a vertical FOV.
 const CAM_FOV: f32 = 60.0 * std::f32::consts::PI / 180.0;
@@ -31,6 +33,11 @@ const CAM_FOV: f32 = 60.0 * std::f32::consts::PI / 180.0;
 pub const MAX_VIEW_DISTANCE: f32 = 4000.0;
 
 /// Strategy camera parameters (MatrixConfig.cpp:226-249).
+///
+/// These are the defaults the original hard-codes in `CMatrixConfig::SetDefaults`.
+/// `apply_camera_config` overwrites any field that appears under
+/// `Camera/Strategy` in `robots.dat` — matches MatrixConfig.cpp:1011-1050.
+#[derive(Clone, Copy)]
 struct CamParam {
     rot_speed_x: f32,   // pitch speed (rad/ms)
     rot_speed_z: f32,   // yaw speed (rad/ms)
@@ -44,7 +51,7 @@ struct CamParam {
     move_speed: f32,  // pan speed (world units/ms)
 }
 
-const STRATEGY_PARAMS: CamParam = CamParam {
+const STRATEGY_DEFAULTS: CamParam = CamParam {
     rot_speed_x: 0.0005,
     rot_speed_z: 0.001,
     rot_angle_min: 60.0 * std::f32::consts::PI / 180.0,
@@ -90,6 +97,13 @@ pub struct Camera {
     map_cy: f32,
     strategy_init_angle: f32,
 
+    // Mode + global params, seeded from STRATEGY_DEFAULTS and optionally
+    // patched by apply_camera_config (robots.dat `Camera/Strategy` block).
+    params: CamParam,
+    /// `g_Config.m_CamBaseAngleZ` — yaw offset added on top of the map's
+    /// `m_CameraAngle` when entering strategy mode (MatrixCamera.cpp:696).
+    base_angle_z: f32,
+
     // Terrain sampler: uncentered (x, y) world coords → terrain z.
     sample_terrain: Option<Box<dyn Fn(f32, f32) -> f32 + Send + Sync>>,
     sample_ground: Option<Box<dyn Fn(f32, f32) -> f32 + Send + Sync>>,
@@ -106,11 +120,11 @@ const ACT_ROT_DOWN: u32 = 1 << 7;
 
 impl Camera {
     pub fn new(aspect: f32) -> Self {
-        let p = &STRATEGY_PARAMS;
+        let p = STRATEGY_DEFAULTS;
         Self {
             angle_z: 0.0,
-            angle_x: lerp_ang(p.angle_param),
-            dist: lerp_dist(1.0),
+            angle_x: lerp_ang(&p, p.angle_param),
+            dist: lerp_dist(&p, 1.0),
             link_point: Vec3::ZERO,
             xy_strategy: [0.0, 0.0],
             ang_strategy: 0.0,
@@ -127,9 +141,69 @@ impl Camera {
             map_cx: 0.0,
             map_cy: 0.0,
             strategy_init_angle: 0.0,
+            params: p,
+            base_angle_z: 0.0,
             sample_terrain: None,
             sample_ground: None,
         }
+    }
+
+    /// Port of MatrixConfig.cpp:1011-1050. Overwrites any camera param found
+    /// in `robots.dat` → `Camera` / `Camera/Strategy`; missing keys keep their
+    /// hardcoded defaults. Call before `init_strategy_angle` so the base yaw
+    /// offset is picked up when the map's camera angle is applied.
+    pub fn apply_camera_config(&mut self, matrix_data: &Storage) {
+        let Some(cam_rec) = matrix_data.block_record("da", "Camera") else {
+            return;
+        };
+
+        // Top-level Camera params. We only care about the two the strategy
+        // camera actually consumes — InRobotForward0/1 are arcade-mode only.
+        if let Some(v) = parse_f32(matrix_data.block_param(&cam_rec, "CamBaseAngleZ")) {
+            self.base_angle_z = v.to_radians();
+        }
+        if let Some(v) = parse_f32(matrix_data.block_param(&cam_rec, "CamMoveSpeed")) {
+            self.params.move_speed = v;
+        }
+
+        // Strategy sub-block. Angle keys are in degrees; RotAngleMin is capped
+        // at 94° in the original to prevent the pitch going past straight-up.
+        if let Some(strat_rec) = matrix_data.block_record(&cam_rec, "Strategy") {
+            if let Some(v) = parse_f32(matrix_data.block_param(&strat_rec, "CamRotSpeedX")) {
+                self.params.rot_speed_x = v;
+            }
+            if let Some(v) = parse_f32(matrix_data.block_param(&strat_rec, "CamRotSpeedZ")) {
+                self.params.rot_speed_z = v;
+            }
+            if let Some(v) = parse_f32(matrix_data.block_param(&strat_rec, "CamMouseWheelStep")) {
+                self.params.wheel_step = v;
+            }
+            if let Some(v) = parse_f32(matrix_data.block_param(&strat_rec, "CamRotAngleMin")) {
+                self.params.rot_angle_min = v.min(94.0).to_radians();
+            }
+            if let Some(v) = parse_f32(matrix_data.block_param(&strat_rec, "CamRotAngleMax")) {
+                self.params.rot_angle_max = v.to_radians();
+            }
+            if let Some(v) = parse_f32(matrix_data.block_param(&strat_rec, "CamDistMin")) {
+                self.params.dist_min = v;
+            }
+            if let Some(v) = parse_f32(matrix_data.block_param(&strat_rec, "CamDistMax")) {
+                self.params.dist_max = v;
+            }
+            if let Some(v) = parse_f32(matrix_data.block_param(&strat_rec, "CamAngleParam")) {
+                self.params.angle_param = v;
+            }
+            if let Some(v) = parse_f32(matrix_data.block_param(&strat_rec, "CamHeight")) {
+                self.params.height = v;
+            }
+        }
+
+        // Re-seed state derived from the params: default pitch param, default
+        // zoom, and the clamped working values.
+        self.angle_param = self.params.angle_param;
+        self.dist_param = 1.0;
+        self.angle_x = lerp_ang(&self.params, self.angle_param);
+        self.dist = lerp_dist(&self.params, self.dist_param);
     }
 
     pub fn set_map(&mut self, world_width: f32, world_height: f32) {
@@ -147,9 +221,11 @@ impl Camera {
     }
 
     pub fn init_strategy_angle(&mut self, angle: f32) {
-        self.strategy_init_angle = angle;
-        self.ang_strategy = angle;
-        self.angle_z = angle;
+        // MatrixCamera.cpp:696 — strategy yaw is `CamBaseAngleZ + map.CameraAngle`.
+        let combined = self.base_angle_z + angle;
+        self.strategy_init_angle = combined;
+        self.ang_strategy = combined;
+        self.angle_z = combined;
     }
 
     pub fn set_xy_strategy(&mut self, pos: [f32; 2]) {
@@ -168,7 +244,7 @@ impl Camera {
 
     /// Ports RotateByMouse (MatrixCamera.hpp:238-248).
     pub fn rotate_by_mouse(&mut self, dx: f32, dy: f32) {
-        let p = &STRATEGY_PARAMS;
+        let p = &self.params;
         self.ang_strategy += p.rot_speed_z * dx * 10.0;
         self.angle_param -= p.rot_speed_x * dy * 5.0;
         self.angle_param = self.angle_param.clamp(0.0, 1.0);
@@ -177,7 +253,7 @@ impl Camera {
     /// Ports ZoomInStep/OutStep (MatrixCamera.hpp:275-289). `notches` is an
     /// integer-ish wheel delta (positive = zoom in, shrinks distance).
     pub fn zoom(&mut self, notches: f32) {
-        self.dist_param -= STRATEGY_PARAMS.wheel_step * notches;
+        self.dist_param -= self.params.wheel_step * notches;
         self.dist_param = self.dist_param.clamp(0.25, 4.0);
     }
 
@@ -203,14 +279,14 @@ impl Camera {
     }
 
     pub fn on_key(&mut self, key: KeyAction, pressed: bool) {
-        let p = &STRATEGY_PARAMS;
+        let p = &self.params;
         if let KeyAction::ResetAngles = key {
             if pressed {
                 self.ang_strategy = self.strategy_init_angle;
                 self.angle_param = p.angle_param;
                 self.angle_z = self.strategy_init_angle;
-                self.angle_x = lerp_ang(p.angle_param);
-                self.dist = lerp_dist(self.dist_param);
+                self.angle_x = lerp_ang(p, p.angle_param);
+                self.dist = lerp_dist(p, self.dist_param);
             }
             return;
         }
@@ -236,13 +312,13 @@ impl Camera {
 
     /// Ports CMatrixCamera::Takt (MatrixCamera.cpp:933-1130) for strategy mode.
     pub fn takt(&mut self, dt_ms: f32) {
-        let p = &STRATEGY_PARAMS;
+        let p = &self.params;
 
         self.link_point.x = self.xy_strategy[0] - self.map_cx;
         self.link_point.y = self.xy_strategy[1] - self.map_cy;
         self.angle_z = self.ang_strategy;
-        self.angle_x = lerp_ang(self.angle_param);
-        self.dist = lerp_dist(self.dist_param);
+        self.angle_x = lerp_ang(p, self.angle_param);
+        self.dist = lerp_dist(p, self.dist_param);
         let bias = self
             .sample_terrain
             .as_ref()
@@ -525,13 +601,18 @@ impl Camera {
     }
 }
 
-fn lerp_ang(param: f32) -> f32 {
-    let p = &STRATEGY_PARAMS;
+fn lerp_ang(p: &CamParam, param: f32) -> f32 {
     p.rot_angle_min + (p.rot_angle_max - p.rot_angle_min) * param
 }
-fn lerp_dist(param: f32) -> f32 {
-    let p = &STRATEGY_PARAMS;
+fn lerp_dist(p: &CamParam, param: f32) -> f32 {
     p.dist_min + (p.dist_max - p.dist_min) * param
+}
+
+/// Parse a numeric robots.dat parameter. The original uses `GetDouble()`,
+/// which accepts the same numeric grammar Rust's `parse::<f32>` does; any
+/// blank/missing value falls through to the hardcoded default.
+fn parse_f32(raw: Option<String>) -> Option<f32> {
+    raw.and_then(|s| s.trim().parse::<f32>().ok())
 }
 
 #[derive(Clone, Copy)]

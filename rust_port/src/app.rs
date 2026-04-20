@@ -67,6 +67,7 @@ impl ApplicationHandler for App {
 
             let map = Arc::new(map);
             let mut camera = Camera::new(gfx.config.width as f32 / gfx.config.height as f32);
+            camera.apply_camera_config(&matrix_data);
             camera.set_map(map.world_width(), map.world_height());
             camera.set_aspect(gfx.config.width as f32, gfx.config.height as f32);
             camera.init_strategy_angle(map.camera_angle);
@@ -127,6 +128,7 @@ impl ApplicationHandler for App {
                 let map = Arc::new(map);
 
                 let mut camera = Camera::new(gfx.config.width as f32 / gfx.config.height as f32);
+                camera.apply_camera_config(&matrix_data);
                 camera.set_map(map.world_width(), map.world_height());
                 camera.set_aspect(gfx.config.width as f32, gfx.config.height as f32);
                 camera.init_strategy_angle(map.camera_angle);
