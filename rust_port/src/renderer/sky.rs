@@ -13,6 +13,7 @@ use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3, Vec4};
 use wgpu::util::DeviceExt;
 
+use crate::assets::storage::Storage;
 use crate::game::common::unpack_rgb;
 use crate::renderer::camera::Camera;
 use crate::renderer::texture::{
@@ -30,15 +31,11 @@ const SH2_FRAC: f32 = 0.07;
 /// perspective so skybox walls project onto the frustum exactly once per face.
 const SKY_HFOV: f32 = std::f32::consts::PI / 3.0;
 
-/// Sky faces are stacked vertically in a single 1024x1024 panoramic texture
-/// (Fore / Rite / Back / Left from top to bottom). Matches the layout used by
-/// all shipped sky textures (verified on `Matrix/Textures/Sky/blue_moon.dds`).
-const FACE_UV_RANGES: [(f32, f32); 4] = [
-    (0.00, 0.25), // Fore
-    (0.25, 0.50), // Rite
-    (0.50, 0.75), // Back
-    (0.75, 1.00), // Left
-];
+/// Sky face names in the order the Rust port's skybox geometry expects them:
+/// Fore (+Y), Rite (+X), Back (-Y), Left (-X). Matches the C++ SKY_FORE /
+/// SKY_RITE / SKY_BACK / SKY_LEFT enum ordering (MatrixMap.cpp:2071-2098)
+/// and the `Sky` block key names in `cfg/robots/data.txt`.
+const FACE_CONFIG_KEYS: [&str; 4] = ["Fore", "Right", "Back", "Left"];
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
@@ -94,6 +91,7 @@ impl Sky {
         water_color_rgba: u32,
         sky_name: &str,
         sky_angle: f32,
+        matrix_data: Option<&Storage>,
         read_texture: &dyn Fn(&str) -> Option<Vec<u8>>,
     ) -> Self {
         let sky_color = unpack_rgb(sky_color_rgba);
@@ -109,7 +107,17 @@ impl Sky {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         });
 
-        let skybox = load_skybox(device, queue, config, sky_name, sky_angle, read_texture);
+        let sky_cfg = matrix_data
+            .and_then(|stor| resolve_sky_config(stor, sky_name))
+            .or_else(|| {
+                log::warn!(
+                    "sky: no config for '{}' in robots.dat; skybox disabled",
+                    sky_name
+                );
+                None
+            });
+        let skybox = sky_cfg
+            .and_then(|cfg| load_skybox(device, queue, config, &cfg, sky_angle, read_texture));
 
         Self {
             gradient_pipeline,
@@ -328,13 +336,18 @@ fn load_skybox(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     config: &wgpu::SurfaceConfiguration,
-    sky_name: &str,
+    cfg: &SkyConfig,
     sky_angle: f32,
     read_texture: &dyn Fn(&str) -> Option<Vec<u8>>,
 ) -> Option<Skybox> {
-    let cfg = resolve_sky_texture(sky_name)?;
-    let data = read_texture(cfg.texture)?;
+    // All four faces point at the same texture in every shipped Sky block
+    // (only the UV rectangle differs). Load the Fore face's texture and
+    // sample the other faces' UV strips from the same atlas.
+    let texture_path = &cfg.faces[0].texture;
+    let data = read_texture(texture_path)?;
     let rgba = decode_texture_bytes(&data)?;
+    let tex_w = rgba.width() as f32;
+    let tex_h = rgba.height() as f32;
     // Skybox textures are low-res panoramics — mipmap them so the horizon band
     // filters cleanly when tilted.
     let texture_view = if rgba.width() >= 4 && rgba.height() >= 4 {
@@ -446,7 +459,7 @@ fn load_skybox(
         cache: None,
     });
 
-    let verts = build_skybox_vertices();
+    let verts = build_skybox_vertices(cfg, tex_w, tex_h);
     let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("Skybox VB"),
         contents: bytemuck::cast_slice(&verts),
@@ -482,7 +495,7 @@ fn load_skybox(
 
     log::info!(
         "skybox: loaded '{}' (angle = {:.3} + {:.3} rad, drift = {:.6} rad/ms)",
-        cfg.texture,
+        texture_path,
         cfg.base_angle,
         sky_angle,
         cfg.delta_angle
@@ -499,112 +512,149 @@ fn load_skybox(
 }
 
 struct SkyConfig {
-    texture: &'static str,
     /// Static yaw in radians, matches the `Angle` parameter of a `Sky` block
     /// in `cfg/robots/data.txt` (converted via `GRAD2RAD` by the original).
     base_angle: f32,
     /// Yaw rate in radians per millisecond, matches `DeltaAngle`.
     delta_angle: f32,
+    /// Per-face texture + UV rect (one entry per FACE_CONFIG_KEYS index).
+    faces: [SkyFaceConfig; 4],
 }
 
-/// Hardcoded sky config table. Without a parser for `cfg/robots/data.txt`'s
-/// `Sky` block, we map each known `SkyName` to a panoramic texture shipped in
-/// `Matrix/Textures/Sky/`. `Default` picks a neutral blue sky. Falls back to
-/// `None` for unknown names (the viewer then draws gradient only).
-///
-/// `delta_angle` defaults to a gentle drift — ~0.023 rad/sec
-/// (≈ 1.3°/sec) for skies with visible clouds, faster for stars (celestial
-/// rotation reads as overt motion). Zero for skies with no distinguishable
-/// features.
-fn resolve_sky_texture(sky_name: &str) -> Option<SkyConfig> {
-    let (texture, delta_angle) = match sky_name.to_ascii_lowercase().as_str() {
-        "default" | "blue" => ("Matrix/Textures/Sky/blue", 0.000023),
-        "blue_moon" => ("Matrix/Textures/Sky/blue_moon", 0.000018),
-        "stars" => ("Matrix/Textures/Sky/stars", 0.000040),
-        "mars" => ("Matrix/Textures/Sky/mars", 0.000020),
-        "alien_blue" => ("Matrix/Textures/Sky/alien_blue", 0.000025),
-        "dark_green" => ("Matrix/Textures/Sky/dark_green", 0.000020),
-        "black" => ("Matrix/Textures/Sky/black", 0.0),
-        _ => return None,
+struct SkyFaceConfig {
+    /// Texture path with `/` separators (relative to pkg root).
+    texture: String,
+    /// Normalized UV rectangle (u0, v0, u1, v1). `v1` may exceed 1.0 for the
+    /// Right face — the original relies on CLAMP addressing, which pins the
+    /// extra strip to the texture edge.
+    uv: [f32; 4],
+}
+
+/// Parse a `Sky` block from the serialized `robots.dat` BlockPar. `stor` is
+/// the root CStorage, `sky_name` is the `SkyName` property on the map (e.g.
+/// `Default`, `BlueMoon`). Returns `None` if the sky block is missing — the
+/// caller then draws the gradient pass only.
+fn resolve_sky_config(stor: &Storage, sky_name: &str) -> Option<SkyConfig> {
+    let sky_root = stor.block_record("da", "Sky")?;
+    let sky_rec = stor.block_record(&sky_root, sky_name)?;
+
+    let parse_deg = |s: Option<String>| -> f32 {
+        s.and_then(|v| v.parse::<f32>().ok())
+            .map(|d| d.to_radians())
+            .unwrap_or(0.0)
     };
+    let base_angle = parse_deg(stor.block_param(&sky_rec, "Angle"));
+    let delta_angle = parse_deg(stor.block_param(&sky_rec, "DeltaAngle"));
+
+    let faces = std::array::from_fn(|i| {
+        let raw = stor
+            .block_param(&sky_rec, FACE_CONFIG_KEYS[i])
+            .unwrap_or_default();
+        parse_face(&raw)
+    });
+
     Some(SkyConfig {
-        texture,
-        base_angle: 0.0,
+        base_angle,
         delta_angle,
+        faces,
     })
 }
 
-fn build_skybox_vertices() -> Vec<BoxVertex> {
+/// Parse a face entry of the form `<path>,<u0>,<v0>,<u1>,<v1>` where the UV
+/// components are pixel offsets into the underlying texture. Falls back to a
+/// full-texture quad if the string is empty or malformed.
+///
+/// The shipped skies all use 1024-wide/tall panoramic textures, but we don't
+/// have the image dimensions at parse time. The original C++ divides by
+/// `tex->GetSizeX()/Y()` after load (MatrixMapPrepare.cpp:1160). We defer
+/// that division and keep the raw ints here, normalising later once we've
+/// decoded the texture.
+fn parse_face(raw: &str) -> SkyFaceConfig {
+    let mut parts = raw.splitn(5, ',');
+    let path = parts.next().unwrap_or("").trim().replace('\\', "/");
+    let mut uv = [0.0_f32, 0.0, 1.0, 1.0];
+    for slot in &mut uv {
+        if let Some(p) = parts.next() {
+            if let Ok(v) = p.trim().parse::<f32>() {
+                *slot = v;
+            }
+        }
+    }
+    SkyFaceConfig { texture: path, uv }
+}
+
+fn build_skybox_vertices(cfg: &SkyConfig, tex_w: f32, tex_h: f32) -> Vec<BoxVertex> {
     // Z-up world-space cube centered on the camera: Y is forward, X is right,
     // Z is up (matches the rest of the port's coordinate system).
     //
-    // Each face is one horizontal panoramic strip; v=0 is the zenith, v=v1 is
-    // the horizon. geo_dn is chosen so the horizon row sits ~flush with the
-    // ground plane when the camera is near z=0. Original uses
-    // `2*(1-cut_dn)-1` with `cut_dn≈0.525`; we approximate with a fixed
-    // value matching the common case (camera near sea level).
+    // Each face is one horizontal panoramic strip sampled from the face's
+    // configured UV rectangle. `geo_dn` (the horizon row) is chosen so the
+    // bottom of each face sits ~flush with the ground plane when the camera
+    // is near z=0; the original uses `2*(1-cut_dn)-1` with `cut_dn≈0.525`
+    // (MatrixMap.cpp:2064-2067), which we approximate with a fixed value.
     let top_z = 1.0_f32;
-    let bot_z = -0.05_f32; // geo_dn for z≈0 camera.
-    let (u0, u1) = (0.0_f32, 1.0_f32);
+    let bot_z = -0.05_f32;
+
+    // Face corner positions, indexed by FACE_CONFIG_KEYS: Fore, Right, Back, Left.
+    let positions: [[[f32; 3]; 4]; 4] = [
+        // Fore: +Y wall (tl, tr, bl, br).
+        [
+            [-1.0, 1.0, top_z],
+            [1.0, 1.0, top_z],
+            [-1.0, 1.0, bot_z],
+            [1.0, 1.0, bot_z],
+        ],
+        // Right: +X wall.
+        [
+            [1.0, 1.0, top_z],
+            [1.0, -1.0, top_z],
+            [1.0, 1.0, bot_z],
+            [1.0, -1.0, bot_z],
+        ],
+        // Back: -Y wall.
+        [
+            [1.0, -1.0, top_z],
+            [-1.0, -1.0, top_z],
+            [1.0, -1.0, bot_z],
+            [-1.0, -1.0, bot_z],
+        ],
+        // Left: -X wall.
+        [
+            [-1.0, -1.0, top_z],
+            [-1.0, 1.0, top_z],
+            [-1.0, -1.0, bot_z],
+            [-1.0, 1.0, bot_z],
+        ],
+    ];
+
+    // The face quads only span the top ~half of a unit cube vertically (top_z
+    // to bot_z), so the bottom UV must shrink to match. The original solves
+    // this with `v1 = (v1-v0)*cut_dn + v0` (MatrixMap.cpp:2072), where
+    // `cut_dn = (1-geo_dn)/2`. Skipping this scale pushes the bottom vertex
+    // past v=1.0 on the Right face (config v1=1198/1024=1.17), which clamps
+    // to the last texture row and smears a near-white horizon strip.
+    let cut_dn = (1.0 - bot_z) * 0.5;
 
     let mut verts = Vec::with_capacity(24);
-
-    // Fore face: +Y wall.
-    let (v0, v1) = FACE_UV_RANGES[0];
-    push_face(
-        &mut verts,
-        [-1.0, 1.0, top_z],
-        [1.0, 1.0, top_z],
-        [-1.0, 1.0, bot_z],
-        [1.0, 1.0, bot_z],
-        [u0, v0],
-        [u1, v0],
-        [u0, v1],
-        [u1, v1],
-    );
-
-    // Rite face: +X wall, world goes from y=-1 at +X forward-right corner,
-    // wrapping to y=+1 (same direction as Fore continues).
-    let (v0, v1) = FACE_UV_RANGES[1];
-    push_face(
-        &mut verts,
-        [1.0, 1.0, top_z],
-        [1.0, -1.0, top_z],
-        [1.0, 1.0, bot_z],
-        [1.0, -1.0, bot_z],
-        [u0, v0],
-        [u1, v0],
-        [u0, v1],
-        [u1, v1],
-    );
-
-    // Back face: -Y wall, continuing the panorama rightward.
-    let (v0, v1) = FACE_UV_RANGES[2];
-    push_face(
-        &mut verts,
-        [1.0, -1.0, top_z],
-        [-1.0, -1.0, top_z],
-        [1.0, -1.0, bot_z],
-        [-1.0, -1.0, bot_z],
-        [u0, v0],
-        [u1, v0],
-        [u0, v1],
-        [u1, v1],
-    );
-
-    // Left face: -X wall.
-    let (v0, v1) = FACE_UV_RANGES[3];
-    push_face(
-        &mut verts,
-        [-1.0, -1.0, top_z],
-        [-1.0, 1.0, top_z],
-        [-1.0, -1.0, bot_z],
-        [-1.0, 1.0, bot_z],
-        [u0, v0],
-        [u1, v0],
-        [u0, v1],
-        [u1, v1],
-    );
+    for i in 0..4 {
+        let [u0, v0, u1, v1] = cfg.faces[i].uv;
+        let nu0 = u0 / tex_w;
+        let nu1 = u1 / tex_w;
+        let nv0 = v0 / tex_h;
+        let nv1 = nv0 + (v1 / tex_h - nv0) * cut_dn;
+        let p = &positions[i];
+        push_face(
+            &mut verts,
+            p[0],
+            p[1],
+            p[2],
+            p[3],
+            [nu0, nv0],
+            [nu1, nv0],
+            [nu0, nv1],
+            [nu1, nv1],
+        );
+    }
 
     verts
 }

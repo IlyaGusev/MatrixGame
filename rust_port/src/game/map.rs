@@ -475,9 +475,16 @@ impl GameMap {
         (r << 16) | (g << 8) | b
     }
 
-    /// Port of `CMatrixMap::GetNormal` — bilinearly interpolates point normals.
-    /// Returns Z-up world-space normal at `(wx, wy)`.
-    pub fn get_normal(&self, wx: f32, wy: f32) -> [f32; 3] {
+    /// Port of `CMatrixMap::GetNormal` (MatrixMap.cpp:636) — bilinearly
+    /// interpolates point normals with two opt-in special cases:
+    ///
+    /// * Bridge cells derive their normal from finite differences of `GetZ`
+    ///   (half a cell apart in each axis) so decals sit on the bridge plane
+    ///   rather than the terrain below.
+    /// * When `check_water` is true and any of the four surrounding heightmap
+    ///   points dip below sea level, we return straight up so shore surfaces
+    ///   flatten out instead of following submerged normals.
+    pub fn get_normal(&self, wx: f32, wy: f32, check_water: bool) -> [f32; 3] {
         let scaled_x = wx / GLOBAL_SCALE;
         let scaled_y = wy / GLOBAL_SCALE;
         let x = scaled_x.floor() as i32;
@@ -488,8 +495,31 @@ impl GameMap {
         }
 
         let unit = self.unit(x as usize, y as usize);
-        if unit.flags & CELLFLAG_FLAT != 0 || unit.flags & CELLFLAG_WATER != 0 {
+        if unit.flags & CELLFLAG_FLAT != 0 {
             return [0.0, 0.0, 1.0];
+        }
+
+        if unit.flags & CELLFLAG_BRIDGE != 0 {
+            let half = GLOBAL_SCALE * 0.5;
+            let nx = self.get_z(wx - half, wy) - self.get_z(wx + half, wy);
+            let ny = self.get_z(wx, wy - half) - self.get_z(wx, wy + half);
+            let nz = GLOBAL_SCALE;
+            let len = (nx * nx + ny * ny + nz * nz).sqrt().max(1e-6);
+            return [nx / len, ny / len, nz / len];
+        }
+
+        if unit.flags & CELLFLAG_WATER != 0 {
+            return [0.0, 0.0, 1.0];
+        }
+
+        if check_water {
+            let p00 = self.point(x as usize, y as usize);
+            let p10 = self.point(x as usize + 1, y as usize);
+            let p01 = self.point(x as usize, y as usize + 1);
+            let p11 = self.point(x as usize + 1, y as usize + 1);
+            if p00.z < 0.0 || p10.z < 0.0 || p01.z < 0.0 || p11.z < 0.0 {
+                return [0.0, 0.0, 1.0];
+            }
         }
 
         let kx = scaled_x - x as f32;

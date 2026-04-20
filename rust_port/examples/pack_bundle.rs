@@ -17,6 +17,16 @@ fn main() {
     let mut bundle = AssetBundle::new();
     bundle.add("map.cmap", cmap_data.clone());
 
+    // Global game data (Sky / Water / Side / ... block par tree).
+    // Optional — the renderer falls back to defaults if missing.
+    match std::fs::read("../Data/robots.dat") {
+        Ok(data) => {
+            println!("  robots.dat ({} bytes)", data.len());
+            bundle.add("robots.dat", data);
+        }
+        Err(e) => eprintln!("  skip robots.dat: {}", e),
+    }
+
     let strings = stor.get_buf("strings", "String").unwrap();
     let mut tex_count = 0;
     let mut extra_paths: Vec<String> = Vec::new();

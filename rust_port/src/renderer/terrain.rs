@@ -120,6 +120,7 @@ impl TerrainRenderer {
         config: &wgpu::SurfaceConfiguration,
         map: &GameMap,
         stor: &Storage,
+        matrix_data: Option<&Storage>,
         read_texture: &dyn Fn(&str) -> Option<Vec<u8>>,
     ) -> Self {
         let tex_union_dim = map.tex_union_dim;
@@ -745,6 +746,7 @@ impl TerrainRenderer {
             map.water_color,
             &map.sky_name,
             map.sky_angle,
+            matrix_data,
             read_texture,
         );
         let clear_color = wgpu::Color {

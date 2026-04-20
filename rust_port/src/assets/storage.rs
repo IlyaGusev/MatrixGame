@@ -183,6 +183,27 @@ impl Storage {
         self.items.get(&(record.to_string(), item.to_string()))
     }
 
+    /// Resolve a child BlockPar by name. BlockPars are serialized as
+    /// `StoreBlockPar` (CStorage.cpp:481): columns "2" hold child block
+    /// names, "3" the unique record name each child lives under. Returns
+    /// the record name of the matching child, or `None` if no child with
+    /// that name exists in `record`.
+    pub fn block_record(&self, record: &str, block_name: &str) -> Option<String> {
+        let names = self.get_buf(record, "2")?;
+        let records = self.get_buf(record, "3")?;
+        let idx = names.find_as_wstr(block_name)?;
+        Some(records.get_as_wstr(idx))
+    }
+
+    /// Read a scalar BlockPar parameter. Columns "0" and "1" hold parameter
+    /// keys and string values respectively (CStorage.cpp:494-502).
+    pub fn block_param(&self, record: &str, key: &str) -> Option<String> {
+        let keys = self.get_buf(record, "0")?;
+        let values = self.get_buf(record, "1")?;
+        let idx = keys.find_as_wstr(key)?;
+        Some(values.get_as_wstr(idx))
+    }
+
     /// Print all record/item keys and their array counts.
     pub fn dump_structure(&self) {
         let mut keys: Vec<_> = self.items.keys().collect();

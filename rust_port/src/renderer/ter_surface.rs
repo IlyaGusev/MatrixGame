@@ -201,7 +201,7 @@ pub fn build_surface_overlays(
             });
 
             if gloss_path.is_some() {
-                let n = map.get_normal(px + disp_x, py + disp_y);
+                let n = map.get_normal(px + disp_x, py + disp_y, false);
                 gloss_verts.push(GlossVertex {
                     position: [world_x, world_y, world_z],
                     normal: n,

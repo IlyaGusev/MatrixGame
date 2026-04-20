@@ -63,7 +63,7 @@ impl ApplicationHandler for App {
         {
             let gfx = pollster::block_on(GfxContext::new(window.clone()));
 
-            let (map, stor, pkg) = load_map();
+            let (map, stor, matrix_data, pkg) = load_map();
 
             let map = Arc::new(map);
             let mut camera = Camera::new(gfx.config.width as f32 / gfx.config.height as f32);
@@ -98,6 +98,7 @@ impl ApplicationHandler for App {
                 &gfx.config,
                 &map,
                 &stor,
+                matrix_data.as_ref(),
                 &tex_reader,
             );
             let point_lights = PointLightSystem::new(&map);
@@ -123,7 +124,7 @@ impl ApplicationHandler for App {
             wasm_bindgen_futures::spawn_local(async move {
                 let mut gfx = GfxContext::new(win.clone()).await;
 
-                let (map, stor, bundle) = load_map_async().await;
+                let (map, stor, matrix_data, bundle) = load_map_async().await;
                 let map = Arc::new(map);
 
                 let mut camera = Camera::new(gfx.config.width as f32 / gfx.config.height as f32);
@@ -150,6 +151,7 @@ impl ApplicationHandler for App {
                     &gfx.config,
                     &map,
                     &stor,
+                    matrix_data.as_ref(),
                     &tex_reader,
                 );
                 let point_lights = PointLightSystem::new(&map);
@@ -329,11 +331,13 @@ impl ApplicationHandler for App {
     }
 }
 
-/// Load map — native reads from pkg, returns map + storage + pkg for texture loading.
+/// Load map — native reads from pkg, returns map + map storage + global
+/// matrix data storage (robots.dat) + pkg for texture loading.
 #[cfg(not(target_arch = "wasm32"))]
 fn load_map() -> (
     GameMap,
     crate::assets::storage::Storage,
+    Option<crate::assets::storage::Storage>,
     Option<crate::assets::pkg_reader::PkgArchive>,
 ) {
     use crate::assets::pkg_reader::PkgArchive;
@@ -362,16 +366,43 @@ fn load_map() -> (
     let cmap_data = pkg.read_file(map_name).expect("failed to read CMAP");
     let stor = Storage::from_bytes(&cmap_data).expect("failed to parse CStorage");
     let map = GameMap::from_cmap_bytes(&cmap_data).expect("failed to parse CMAP");
-    (map, stor, Some(pkg))
+
+    // Load robots.dat alongside the pkg. This is the serialized global
+    // BlockPar tree (Sky/Water/Side/...). Optional — missing file just
+    // disables the skybox/water config lookups.
+    let dat_candidates = ["../Data/robots.dat", "Data/robots.dat", "../../Data/robots.dat"];
+    let matrix_data = dat_candidates
+        .iter()
+        .find(|c| std::path::Path::new(c).exists())
+        .and_then(|path| match std::fs::read(path) {
+            Ok(bytes) => match Storage::from_bytes(&bytes) {
+                Ok(s) => {
+                    log::info!("loaded matrix data: {}", path);
+                    Some(s)
+                }
+                Err(e) => {
+                    log::warn!("failed to parse {}: {}", path, e);
+                    None
+                }
+            },
+            Err(e) => {
+                log::warn!("failed to read {}: {}", path, e);
+                None
+            }
+        });
+
+    (map, stor, matrix_data, Some(pkg))
 }
 
 #[cfg(target_arch = "wasm32")]
 async fn load_map_async() -> (
     GameMap,
     crate::assets::storage::Storage,
+    Option<crate::assets::storage::Storage>,
     crate::assets::bundle::AssetBundle,
 ) {
     use crate::assets::bundle::AssetBundle;
+    use crate::assets::storage::Storage;
 
     let bundle_data = crate::assets::loader::load_bytes("assets/atoll.bundle")
         .await
@@ -382,10 +413,23 @@ async fn load_map_async() -> (
         .read_file("map.cmap")
         .expect("no map.cmap in bundle")
         .to_vec();
-    let stor =
-        crate::assets::storage::Storage::from_bytes(&cmap_data).expect("failed to parse CStorage");
+    let stor = Storage::from_bytes(&cmap_data).expect("failed to parse CStorage");
     let map = GameMap::from_cmap_bytes(&cmap_data).expect("failed to parse CMAP");
-    (map, stor, bundle)
+
+    let matrix_data = bundle.read_file("robots.dat").and_then(|bytes| {
+        match Storage::from_bytes(bytes) {
+            Ok(s) => {
+                log::info!("loaded matrix data from bundle (robots.dat)");
+                Some(s)
+            }
+            Err(e) => {
+                log::warn!("failed to parse bundled robots.dat: {}", e);
+                None
+            }
+        }
+    });
+
+    (map, stor, matrix_data, bundle)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
