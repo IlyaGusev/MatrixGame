@@ -19,7 +19,7 @@ fn main() {
                         is_png
                     );
                     if let Some(img) = decode_texture_bytes(data) {
-                        let n = (img.width() * img.height()) as u32;
+                        let n = img.width() * img.height();
                         let lo = img.pixels().filter(|p| p.0[3] < 128).count() as u32;
                         let hi = n - lo;
                         println!(
@@ -65,7 +65,7 @@ fn main() {
         for p in img.pixels() {
             alpha_hist[(p.0[3] as usize) / 32] += 1;
         }
-        let total = (img.width() * img.height()) as u32;
+        let total = img.width() * img.height();
         println!("  decoded: {}x{}", img.width(), img.height());
         println!("  alpha histogram (buckets of 32):");
         for (i, &c) in alpha_hist.iter().enumerate() {

@@ -99,12 +99,7 @@ impl DataBuf {
 
     /// Find index of array matching a UTF-16LE string (for ST_WCHAR buffers).
     pub fn find_as_wstr(&self, val: &str) -> Option<usize> {
-        for i in 0..self.arrays.len() {
-            if self.get_as_wstr(i) == val {
-                return Some(i);
-            }
-        }
-        None
+        (0..self.arrays.len()).find(|&i| self.get_as_wstr(i) == val)
     }
 }
 
@@ -144,7 +139,7 @@ impl Storage {
 
             for _ in 0..item_count {
                 let item_name = read_wstr(buf, &mut rpos)?;
-                let mut item_type = read_u32(buf, &mut rpos)?;
+                let item_type = read_u32(buf, &mut rpos)?;
                 let data_size = read_u32(buf, &mut rpos)? as usize;
 
                 if rpos + data_size > buf.len() {
@@ -157,7 +152,6 @@ impl Storage {
                 }
 
                 let item_data = if item_type & ST_COMPRESSED != 0 {
-                    item_type &= !ST_COMPRESSED;
                     zl_decompress_all(&buf[rpos..rpos + data_size])?
                 } else {
                     buf[rpos..rpos + data_size].to_vec()

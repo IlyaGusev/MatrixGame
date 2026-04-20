@@ -22,8 +22,8 @@ use crate::renderer::camera::Camera;
 use crate::renderer::ter_surface::{
     build_surface_overlays, GlossOverlayBatch, GlossResources, GlossVertex, OverlayBatch,
 };
-use crate::renderer::water::visible_groups_mask;
 use crate::renderer::texture::*;
+use crate::renderer::water::visible_groups_mask;
 
 /// Bottom vertex — ports SMatrixMapVertexBottom.
 #[repr(C)]
@@ -142,10 +142,9 @@ impl TerrainRenderer {
         let cx = map.world_width() * 0.5;
         let cy = map.world_height() * 0.5;
 
-        let mut batches_by_tex: std::collections::HashMap<
-            u32,
-            (Vec<Vertex>, Vec<u32>, Vec<(usize, usize)>),
-        > = std::collections::HashMap::new();
+        type TerrainBatchParts = (Vec<Vertex>, Vec<u32>, Vec<(usize, usize)>);
+        let mut batches_by_tex: std::collections::HashMap<u32, TerrainBatchParts> =
+            std::collections::HashMap::new();
 
         if let Some(grp) = groups_buf {
             for gi in 0..grp.arrays_count() {
@@ -260,8 +259,12 @@ impl TerrainRenderer {
                     let base = verts.len() as u32;
                     verts.extend_from_slice(&vertices);
                     coords.extend_from_slice(&point_coords);
-                    for i in geom.idx_offset..geom.idx_offset + geom.idx_count {
-                        idxs.push(base + all_indices[i] as u32);
+                    for &index in all_indices
+                        .iter()
+                        .skip(geom.idx_offset)
+                        .take(geom.idx_count)
+                    {
+                        idxs.push(base + index as u32);
                     }
                 }
             }
@@ -453,8 +456,8 @@ impl TerrainRenderer {
         // Reflection texture for the gloss pass — falls back to a warm highlight
         // if the asset isn't found (matches TEXTURE_PATH_REFLECTION from
         // StringConstants.hpp:124).
-        let reflection_view = if let Some(rgba) = read_texture("Matrix/Textures/reflection")
-            .and_then(|data| decode_texture_bytes(&data))
+        let reflection_view = if let Some(rgba) =
+            read_texture("Matrix/Textures/reflection").and_then(|data| decode_texture_bytes(&data))
         {
             create_texture_from_rgba_mipped(device, queue, &rgba, 6)
         } else {
@@ -567,15 +570,8 @@ impl TerrainRenderer {
             super::objects::ObjectsRenderer::new(device, queue, config, map, stor, read_texture);
 
         // Water (MatrixWater.cpp)
-        let water = super::water::Water::new(
-            device,
-            queue,
-            config,
-            map,
-            stor,
-            matrix_data,
-            read_texture,
-        );
+        let water =
+            super::water::Water::new(device, queue, config, map, stor, matrix_data, read_texture);
         let point_lights = PointLightRenderer::new(device, config);
 
         // Pipelines
@@ -828,6 +824,7 @@ impl TerrainRenderer {
         self.point_lights.sync(device, map, point_lights);
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn render(
         &mut self,
         _device: &wgpu::Device,

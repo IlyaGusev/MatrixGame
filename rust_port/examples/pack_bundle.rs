@@ -127,7 +127,7 @@ fn main() {
                 let macro_path = vals.get_as_wstr(idx);
                 let file_part = macro_path
                     .split('\\')
-                    .last()
+                    .next_back()
                     .unwrap_or("")
                     .split('?')
                     .next()

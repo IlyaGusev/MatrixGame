@@ -26,17 +26,19 @@ fn main() {
     let mut bmp_cache: HashMap<usize, image::RgbaImage> = HashMap::new();
 
     let load_src = |id: usize, cache: &mut HashMap<usize, image::RgbaImage>| {
-        if !cache.contains_key(&id) && id < strings.arrays_count() {
-            let path = strings
-                .get_as_wstr(id)
-                .split('?')
-                .next()
-                .unwrap_or("")
-                .replace('\\', "/");
-            let pkg_key = path.to_uppercase();
-            if let Ok(data) = pkg.read_file(&pkg_key) {
-                if let Ok(img) = image::load_from_memory(&data) {
-                    cache.insert(id, img.to_rgba8());
+        if let std::collections::hash_map::Entry::Vacant(entry) = cache.entry(id) {
+            if id < strings.arrays_count() {
+                let path = strings
+                    .get_as_wstr(id)
+                    .split('?')
+                    .next()
+                    .unwrap_or("")
+                    .replace('\\', "/");
+                let pkg_key = path.to_uppercase();
+                if let Ok(data) = pkg.read_file(&pkg_key) {
+                    if let Ok(img) = image::load_from_memory(&data) {
+                        entry.insert(img.to_rgba8());
+                    }
                 }
             }
         }
@@ -58,11 +60,11 @@ fn main() {
 
         let union_size = tex_union_dim * tex_union_dim;
 
-        for k in 0..un.len().min(union_size) {
-            if un[k] < 0 {
+        for (k, &bot_idx_raw) in un.iter().enumerate().take(un.len().min(union_size)) {
+            if bot_idx_raw < 0 {
                 continue;
             }
-            let bot_idx = un[k] as usize;
+            let bot_idx = bot_idx_raw as usize;
             if bot_idx >= botc.arrays_count() {
                 continue;
             }
@@ -93,11 +95,11 @@ fn main() {
                 let ibm = bot[bi + 1] as usize;
                 bi += 2;
 
-                if !bmp_cache.contains_key(&ibm) {
+                if let std::collections::hash_map::Entry::Vacant(entry) = bmp_cache.entry(ibm) {
                     if let Some(bmp_buf) = bmpc {
                         if ibm < bmp_buf.arrays_count() {
                             if let Ok(img) = image::load_from_memory(bmp_buf.get_bytes(ibm)) {
-                                bmp_cache.insert(ibm, img.to_rgba8());
+                                entry.insert(img.to_rgba8());
                             }
                         }
                     }

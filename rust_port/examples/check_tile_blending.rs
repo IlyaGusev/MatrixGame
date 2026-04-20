@@ -21,8 +21,8 @@ fn main() {
     // Check tiles at positions (1,1), (1,2), (2,1), (2,2) — four meeting at boundary
     let dim = 16;
     for (label, k) in [
-        ("(1,1)", 1 * dim + 1),
-        ("(1,2)", 1 * dim + 2),
+        ("(1,1)", dim + 1),
+        ("(1,2)", dim + 2),
         ("(2,1)", 2 * dim + 1),
         ("(2,2)", 2 * dim + 2),
     ] {

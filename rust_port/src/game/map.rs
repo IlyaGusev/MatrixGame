@@ -178,8 +178,7 @@ impl GameMap {
             .unwrap_or_else(|| "Default".to_string());
         // DATA_SKYANGLE is an offset in radians applied on top of the sky
         // config block's base angle (MatrixMapPrepare.cpp:1170-1174).
-        let sky_angle =
-            find_property_float(prop_names, prop_values, "SkyAngle").unwrap_or(0.0);
+        let sky_angle = find_property_float(prop_names, prop_values, "SkyAngle").unwrap_or(0.0);
         let water_name = prop_names
             .find_as_wstr("WaterName")
             .map(|idx| prop_values.get_as_wstr(idx))
@@ -318,10 +317,7 @@ impl GameMap {
         let (group_max_z_land, group_w, group_h) =
             compute_group_max_z_land(&points, &units, size_x, size_y);
 
-        let min_z = points
-            .iter()
-            .map(|p| p.z)
-            .fold(f32::INFINITY, f32::min);
+        let min_z = points.iter().map(|p| p.z).fold(f32::INFINITY, f32::min);
         let group_bounds = compute_group_bounds(&points, size_x, size_y, group_w, group_h);
 
         let inshore_prespawns = load_inshore_prespawns(&stor, group_w, group_h);
@@ -613,8 +609,6 @@ impl GameMap {
     }
 }
 
-const CELLFLAG_DOWN: u8 = 1 << 5;
-
 /// Ports PointCalcNormals (MatrixMapPrepare.cpp:20-105).
 /// For each point, computes normal from cross products of 4 adjacent triangles.
 fn compute_normals(points: &[CompilePoint], size_x: usize, size_y: usize) -> Vec<PointNormal> {
@@ -857,8 +851,8 @@ fn compute_group_max_z_land(
     size_y: usize,
 ) -> (Vec<f32>, usize, usize) {
     let gs = MAP_GROUP_SIZE as usize;
-    let gw = (size_x + gs - 1) / gs;
-    let gh = (size_y + gs - 1) / gs;
+    let gw = size_x.div_ceil(gs);
+    let gh = size_y.div_ceil(gs);
     let stride = size_x + 1;
     let mut out = vec![0.0f32; gw * gh];
 
@@ -887,33 +881,6 @@ fn compute_group_max_z_land(
         }
     }
     (out, gw, gh)
-}
-
-/// Morphological max-dilation: each cell becomes the max of itself and its
-/// neighbors within `radius` cells. Used to expand per-group max-z so a single
-/// lookup covers the camera's eye offset.
-fn dilate_max(src: &[f32], w: usize, h: usize, radius: i32) -> Vec<f32> {
-    let mut out = vec![0.0f32; w * h];
-    for gy in 0..h {
-        for gx in 0..w {
-            let mut m = 0.0f32;
-            for dy in -radius..=radius {
-                for dx in -radius..=radius {
-                    let nx = gx as i32 + dx;
-                    let ny = gy as i32 + dy;
-                    if nx < 0 || ny < 0 || nx >= w as i32 || ny >= h as i32 {
-                        continue;
-                    }
-                    let v = src[ny as usize * w + nx as usize];
-                    if v > m {
-                        m = v;
-                    }
-                }
-            }
-            out[gy * w + gx] = m;
-        }
-    }
-    out
 }
 
 /// Parses DATA_OBJECTS columns from the CMAP (MatrixMapPrepare.cpp:513-576).

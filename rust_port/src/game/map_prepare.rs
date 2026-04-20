@@ -41,7 +41,7 @@ pub fn build_tex_union_atlases(
                     cache: &mut HashMap<usize, image::RgbaImage>,
                     strings: &crate::assets::storage::DataBuf,
                     read_texture: &dyn Fn(&str) -> Option<Vec<u8>>| {
-        if !cache.contains_key(&id) {
+        if let std::collections::hash_map::Entry::Vacant(entry) = cache.entry(id) {
             if id < strings.arrays_count() {
                 let path = strings
                     .get_as_wstr(id)
@@ -52,7 +52,7 @@ pub fn build_tex_union_atlases(
                     .to_string();
                 if let Some(data) = read_texture(&path) {
                     if let Ok(img) = image::load_from_memory(&data) {
-                        cache.insert(id, img.to_rgba8());
+                        entry.insert(img.to_rgba8());
                     }
                 }
             }
@@ -75,11 +75,11 @@ pub fn build_tex_union_atlases(
             .collect();
 
         // Pass 1: fill slots with base texture + overlay blending
-        for k in 0..un.len().min(union_size) {
-            if un[k] < 0 {
+        for (k, &bot_idx_raw) in un.iter().enumerate().take(un.len().min(union_size)) {
+            if bot_idx_raw < 0 {
                 continue;
             }
-            let bot_idx = un[k] as usize;
+            let bot_idx = bot_idx_raw as usize;
             if bot_idx >= botc.arrays_count() {
                 continue;
             }
@@ -109,12 +109,12 @@ pub fn build_tex_union_atlases(
                 bi += 2;
 
                 let ibm_idx = ibm as usize;
-                if !bmp_cache.contains_key(&ibm_idx) {
+                if let std::collections::hash_map::Entry::Vacant(entry) = bmp_cache.entry(ibm_idx) {
                     if let Some(bmp_buf) = bmpc {
                         if ibm_idx < bmp_buf.arrays_count() {
                             let png_data = bmp_buf.get_bytes(ibm_idx);
                             if let Ok(img) = image::load_from_memory(png_data) {
-                                bmp_cache.insert(ibm_idx, img.to_rgba8());
+                                entry.insert(img.to_rgba8());
                             }
                         }
                     }

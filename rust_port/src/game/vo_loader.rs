@@ -251,10 +251,9 @@ fn resolve_texture_name(raw: &str, prefix: Option<&str>) -> Option<String> {
         return None;
     }
     let normalized = name.trim_start_matches(".\\").replace('\\', "/");
-    if normalized.contains('/') || prefix.is_none() {
-        Some(normalized)
-    } else {
-        Some(format!("{}{}", prefix.unwrap(), normalized))
+    match prefix {
+        Some(prefix) if !normalized.contains('/') => Some(format!("{prefix}{normalized}")),
+        _ => Some(normalized),
     }
 }
 
@@ -411,8 +410,10 @@ fn parse_frames(stor: &Storage, indices: &[u16]) -> Vec<VoFrame> {
             );
         }
 
-        let surfaces: Vec<VoSurfaceMesh> =
-            surfs.into_iter().filter(|s| !s.indices.is_empty()).collect();
+        let surfaces: Vec<VoSurfaceMesh> = surfs
+            .into_iter()
+            .filter(|s| !s.indices.is_empty())
+            .collect();
 
         frames.push(VoFrame {
             bounds_min,

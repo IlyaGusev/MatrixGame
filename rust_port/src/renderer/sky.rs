@@ -23,7 +23,7 @@ use crate::renderer::texture::{
 /// MAX_VIEW_DISTANCE from MatrixCamera.cpp:13.
 const MAX_VIEW_DISTANCE: f32 = 4000.0;
 /// SH1 = g_ScreenY * 0.270416... (MatrixMap.cpp:2144).
-const SH1_FRAC: f32 = 0.270416666666667;
+const SH1_FRAC: f32 = 0.270_416_68;
 /// SH2 = g_ScreenY * 0.07 (MatrixMap.cpp:2145).
 const SH2_FRAC: f32 = 0.07;
 
@@ -83,6 +83,7 @@ struct Skybox {
 }
 
 impl Sky {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -100,10 +101,12 @@ impl Sky {
         let gradient_pipeline = build_gradient_pipeline(device, config);
         let gradient_vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Sky Gradient VB"),
-            contents: bytemuck::cast_slice(&[GradientVertex {
-                position: [0.0, 0.0],
-                color: [0.0; 4],
-            }; 10]),
+            contents: bytemuck::cast_slice(
+                &[GradientVertex {
+                    position: [0.0, 0.0],
+                    color: [0.0; 4],
+                }; 10],
+            ),
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         });
 
@@ -222,7 +225,11 @@ impl Sky {
                 color: water_opaque,
             },
         ];
-        queue.write_buffer(&self.gradient_vertex_buffer, 0, bytemuck::cast_slice(&verts));
+        queue.write_buffer(
+            &self.gradient_vertex_buffer,
+            0,
+            bytemuck::cast_slice(&verts),
+        );
 
         pass.set_pipeline(&self.gradient_pipeline);
         pass.set_vertex_buffer(0, self.gradient_vertex_buffer.slice(..));
@@ -232,14 +239,8 @@ impl Sky {
 }
 
 impl Skybox {
-    fn render<'a>(
-        &'a self,
-        queue: &wgpu::Queue,
-        pass: &mut wgpu::RenderPass<'a>,
-        camera: &Camera,
-    ) {
-        let sky_view_proj =
-            build_sky_view_proj(camera, self.base_angle + self.current_angle);
+    fn render<'a>(&'a self, queue: &wgpu::Queue, pass: &mut wgpu::RenderPass<'a>, camera: &Camera) {
+        let sky_view_proj = build_sky_view_proj(camera, self.base_angle + self.current_angle);
         queue.write_buffer(
             &self.uniform_buffer,
             0,
@@ -636,13 +637,12 @@ fn build_skybox_vertices(cfg: &SkyConfig, tex_w: f32, tex_h: f32) -> Vec<BoxVert
     let cut_dn = (1.0 - bot_z) * 0.5;
 
     let mut verts = Vec::with_capacity(24);
-    for i in 0..4 {
+    for (i, p) in positions.iter().enumerate() {
         let [u0, v0, u1, v1] = cfg.faces[i].uv;
         let nu0 = u0 / tex_w;
         let nu1 = u1 / tex_w;
         let nv0 = v0 / tex_h;
         let nv1 = nv0 + (v1 / tex_h - nv0) * cut_dn;
-        let p = &positions[i];
         push_face(
             &mut verts,
             p[0],
@@ -789,4 +789,3 @@ struct VOut {
     return vec4<f32>(textureSample(t, s, in.uv).rgb, 1.0);
 }
 "#;
-

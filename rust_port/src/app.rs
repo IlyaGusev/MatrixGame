@@ -289,7 +289,7 @@ impl ApplicationHandler for App {
                 state.terrain.takt(
                     dt * 1000.0,
                     &state.map,
-                    &mut state.point_lights,
+                    &state.point_lights,
                     &state.camera,
                     &state.gfx.device,
                     &state.gfx.queue,
@@ -372,7 +372,11 @@ fn load_map() -> (
     // Load robots.dat alongside the pkg. This is the serialized global
     // BlockPar tree (Sky/Water/Side/...). Optional — missing file just
     // disables the skybox/water config lookups.
-    let dat_candidates = ["../Data/robots.dat", "Data/robots.dat", "../../Data/robots.dat"];
+    let dat_candidates = [
+        "../Data/robots.dat",
+        "Data/robots.dat",
+        "../../Data/robots.dat",
+    ];
     let matrix_data = dat_candidates
         .iter()
         .find(|c| std::path::Path::new(c).exists())
@@ -418,18 +422,19 @@ async fn load_map_async() -> (
     let stor = Storage::from_bytes(&cmap_data).expect("failed to parse CStorage");
     let map = GameMap::from_cmap_bytes(&cmap_data).expect("failed to parse CMAP");
 
-    let matrix_data = bundle.read_file("robots.dat").and_then(|bytes| {
-        match Storage::from_bytes(bytes) {
-            Ok(s) => {
-                log::info!("loaded matrix data from bundle (robots.dat)");
-                Some(s)
-            }
-            Err(e) => {
-                log::warn!("failed to parse bundled robots.dat: {}", e);
-                None
-            }
-        }
-    });
+    let matrix_data =
+        bundle
+            .read_file("robots.dat")
+            .and_then(|bytes| match Storage::from_bytes(bytes) {
+                Ok(s) => {
+                    log::info!("loaded matrix data from bundle (robots.dat)");
+                    Some(s)
+                }
+                Err(e) => {
+                    log::warn!("failed to parse bundled robots.dat: {}", e);
+                    None
+                }
+            });
 
     (map, stor, matrix_data, bundle)
 }

@@ -134,7 +134,10 @@ impl AnimState {
     }
 
     fn current_anim_frame_count(&self) -> usize {
-        self.animations.get(self.anim).map(|a| a.frames.len()).unwrap_or(0)
+        self.animations
+            .get(self.anim)
+            .map(|a| a.frames.len())
+            .unwrap_or(0)
     }
 
     fn anim_frame_time(&self, slot: usize) -> i32 {
@@ -191,7 +194,9 @@ impl AnimState {
                 self.frame_slot = fcnt - 1;
                 break;
             }
-            self.time_next = self.time_next.saturating_add(self.anim_frame_time(self.frame_slot));
+            self.time_next = self
+                .time_next
+                .saturating_add(self.anim_frame_time(self.frame_slot));
         }
         if old_frame != self.frame_slot {
             self.vo_frame = self.anim_frame_index(self.frame_slot);
@@ -1446,12 +1451,8 @@ fn resolve_texture(
     if let Some(cached) = cache.get(path) {
         return Some(cached.clone());
     }
-    let Some(data) = read_texture(path) else {
-        return None;
-    };
-    let Some(rgba) = decode_texture_bytes(&data) else {
-        return None;
-    };
+    let data = read_texture(path)?;
+    let rgba = decode_texture_bytes(&data)?;
     let view = create_texture_from_rgba(device, queue, &rgba);
     cache.insert(path.clone(), view.clone());
     Some(view)

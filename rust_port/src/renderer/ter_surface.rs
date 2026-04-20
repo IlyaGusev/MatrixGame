@@ -84,6 +84,7 @@ pub struct GlossResources<'a> {
     pub reflection_sampler: &'a wgpu::Sampler,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn build_surface_overlays(
     device: &wgpu::Device,
     queue: &wgpu::Queue,

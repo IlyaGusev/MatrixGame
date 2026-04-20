@@ -509,6 +509,8 @@ mod tests {
             tex_union_dim: 16,
             water_color: 0,
             sky_color: 0,
+            sky_name: String::new(),
+            sky_angle: 0.0,
             water_name: String::new(),
             water_normal_len: 1.0,
             light_main_color: 0,
@@ -518,6 +520,8 @@ mod tests {
             ambient_color: 0,
             terrain2object_influence: 0.0,
             terrain2object_target_color: 0,
+            inshorewave_color: 0,
+            inshore_prespawns: vec![Vec::new()],
             macro_texture_path: None,
             macro_texture_size: 1,
             points: vec![
@@ -575,6 +579,11 @@ mod tests {
             group_max_z_land: vec![0.0],
             group_w: 1,
             group_h: 1,
+            min_z: 0.0,
+            group_bounds: vec![crate::game::map::GroupBounds {
+                min_z: 0.0,
+                max_z: 0.0,
+            }],
         }
     }
 

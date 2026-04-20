@@ -10,6 +10,12 @@ pub struct AssetBundle {
     files: HashMap<String, Vec<u8>>,
 }
 
+impl Default for AssetBundle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AssetBundle {
     /// Create an empty bundle for writing.
     pub fn new() -> Self {

@@ -204,18 +204,15 @@ impl Camera {
 
     pub fn on_key(&mut self, key: KeyAction, pressed: bool) {
         let p = &STRATEGY_PARAMS;
-        match key {
-            KeyAction::ResetAngles => {
-                if pressed {
-                    self.ang_strategy = self.strategy_init_angle;
-                    self.angle_param = p.angle_param;
-                    self.angle_z = self.strategy_init_angle;
-                    self.angle_x = lerp_ang(p.angle_param);
-                    self.dist = lerp_dist(self.dist_param);
-                }
-                return;
+        if let KeyAction::ResetAngles = key {
+            if pressed {
+                self.ang_strategy = self.strategy_init_angle;
+                self.angle_param = p.angle_param;
+                self.angle_z = self.strategy_init_angle;
+                self.angle_x = lerp_ang(p.angle_param);
+                self.dist = lerp_dist(self.dist_param);
             }
-            _ => {}
+            return;
         }
         let bit = match key {
             KeyAction::MoveLeft => ACT_MOVE_LEFT,
@@ -480,9 +477,7 @@ impl Camera {
     pub fn frustum_planes(&self) -> [[f32; 4]; 4] {
         let m = self.view_proj().to_cols_array();
         // Row-vectors of the matrix (glam stores column-major, so m[col*4+row]).
-        let row = |r: usize| {
-            [m[0 * 4 + r], m[1 * 4 + r], m[2 * 4 + r], m[3 * 4 + r]]
-        };
+        let row = |r: usize| [m[r], m[4 + r], m[8 + r], m[12 + r]];
         let r0 = row(0);
         let r1 = row(1);
         let r3 = row(3);

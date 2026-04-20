@@ -18,11 +18,11 @@ fn main() {
         .collect();
 
     let mut overlay_counts = std::collections::HashMap::new();
-    for k in 0..un.len().min(256) {
-        if un[k] < 0 {
+    for &bot_idx_raw in un.iter().take(un.len().min(256)) {
+        if bot_idx_raw < 0 {
             continue;
         }
-        let bot_raw = botc.get_bytes(un[k] as usize);
+        let bot_raw = botc.get_bytes(bot_idx_raw as usize);
         let bot: Vec<i32> = bot_raw
             .chunks_exact(4)
             .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))

@@ -24,12 +24,16 @@ fn main() {
             println!("  not found");
             continue;
         };
-        for key in ["Angle", "DeltaAngle", "Fore", "Right", "Back", "Left", "Reflection"] {
-            println!(
-                "  {} = {:?}",
-                key,
-                stor.block_param(&rec, key).as_deref()
-            );
+        for key in [
+            "Angle",
+            "DeltaAngle",
+            "Fore",
+            "Right",
+            "Back",
+            "Left",
+            "Reflection",
+        ] {
+            println!("  {} = {:?}", key, stor.block_param(&rec, key).as_deref());
         }
     }
 }

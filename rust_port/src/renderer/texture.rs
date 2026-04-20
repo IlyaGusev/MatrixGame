@@ -29,8 +29,8 @@ fn decode_dds(data: &[u8]) -> Option<image::RgbaImage> {
         return None;
     };
 
-    let bw = ((width + 3) / 4) as usize;
-    let bh = ((height + 3) / 4) as usize;
+    let bw = width.div_ceil(4) as usize;
+    let bh = height.div_ceil(4) as usize;
     let mut img = image::RgbaImage::new(width, height);
 
     for by in 0..bh {
@@ -80,9 +80,9 @@ fn decode_dds(data: &[u8]) -> Option<image::RgbaImage> {
                     | (pixel_data[block_start + 5] as u64) << 24
                     | (pixel_data[block_start + 6] as u64) << 32
                     | (pixel_data[block_start + 7] as u64) << 40;
-                for p in 0..16 {
+                for (p, color) in colors.iter_mut().enumerate() {
                     let idx = ((bits >> (p * 3)) & 7) as usize;
-                    colors[p][3] = alpha_lut[idx];
+                    color[3] = alpha_lut[idx];
                 }
             }
 

@@ -1,4 +1,5 @@
-use matrixgame_rs::assets::{pkg_reader::PkgArchive, storage::Storage};
+use matrixgame_rs::assets::pkg_reader::PkgArchive;
+use matrixgame_rs::assets::storage::Storage;
 use matrixgame_rs::game::common::{CELLFLAG_BRIDGE, CELLFLAG_FLAT};
 use matrixgame_rs::game::map::GameMap;
 
@@ -16,13 +17,12 @@ fn main() {
         .find(|f| f.ends_with(".CMAP"))
         .expect("no CMAP");
     println!("loading {}", cmap_name);
-    let cmap = pkg.read_file(&cmap_name).unwrap();
+    let cmap = pkg.read_file(cmap_name).unwrap();
     let map = GameMap::from_cmap_bytes(&cmap).unwrap();
 
     println!("map {}x{}", map.size_x, map.size_y);
     println!("objects: {}", map.objects.len());
 
-    use matrixgame_rs::assets::storage::Storage;
     use matrixgame_rs::game::vo_loader;
     let stor = Storage::from_bytes(&cmap).unwrap();
     let strings = stor.get_buf("strings", "String").unwrap();
@@ -46,13 +46,19 @@ fn main() {
         };
         match vo_loader::parse_vo(&data) {
             Ok(m) => {
+                let tri_count: usize = m.surfaces.iter().map(|s| s.indices.len() / 3).sum();
+                let texture_refs: Vec<_> = m
+                    .surfaces
+                    .iter()
+                    .filter_map(|s| s.texture_ref.as_deref())
+                    .collect();
                 println!(
                     "  OK   {:>3} -> {} ({} verts, {} tris, tex={:?})",
                     t,
                     paths.vo_path,
                     m.vertices.len(),
-                    m.indices.len() / 3,
-                    m.texture_ref
+                    tri_count,
+                    texture_refs
                 );
                 parsed_ok += 1;
             }

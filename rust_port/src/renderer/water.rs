@@ -83,7 +83,6 @@ pub struct Water {
     fog_color: [f32; 4],
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
-    num_indices: u32,
 
     ocean_vertex_buffer: wgpu::Buffer,
     ocean_index_buffer: wgpu::Buffer,
@@ -103,12 +102,9 @@ pub struct Water {
     accum_ms: f32,
     angle: i32,
     phase_offsets: [u16; WATER_SIZE * WATER_SIZE],
-    map_group_w: i32,
-    map_group_h: i32,
     map_half_w: f32,
     map_half_h: f32,
     group_world: f32,
-    has_group: std::collections::HashSet<(i32, i32)>,
 
     inshore: Option<InshoreSystem>,
 }
@@ -343,10 +339,10 @@ impl Water {
             });
         }
 
-        let map_group_w = ((map.size_x as f32 + MAP_GROUP_SIZE as f32 - 1.0)
+        let _map_group_w = ((map.size_x as f32 + MAP_GROUP_SIZE as f32 - 1.0)
             / MAP_GROUP_SIZE as f32)
             .ceil() as i32;
-        let map_group_h = ((map.size_y as f32 + MAP_GROUP_SIZE as f32 - 1.0)
+        let _map_group_h = ((map.size_y as f32 + MAP_GROUP_SIZE as f32 - 1.0)
             / MAP_GROUP_SIZE as f32)
             .ceil() as i32;
         let group_world = MAP_GROUP_SIZE as f32 * GLOBAL_SCALE;
@@ -689,7 +685,6 @@ impl Water {
             fog_color,
             vertex_buffer,
             index_buffer,
-            num_indices: all_idxs.len() as u32,
             ocean_vertex_buffer,
             ocean_index_buffer,
             ocean_num_indices: 0,
@@ -706,12 +701,9 @@ impl Water {
             accum_ms: 0.0,
             angle: 0,
             phase_offsets,
-            map_group_w,
-            map_group_h,
             map_half_w: map.world_width() * 0.5,
             map_half_h: map.world_height() * 0.5,
             group_world,
-            has_group,
             inshore,
         })
     }
@@ -1117,10 +1109,22 @@ pub(crate) fn visible_groups_mask(camera: &Camera, map: &GameMap) -> Vec<bool> {
     let pos = {
         let p3 = camera.frustum_bounds_on_plane_zup(map.min_z);
         [
-            glam::Vec2::new(p3[0].x + map.world_width() * 0.5, p3[0].y + map.world_height() * 0.5),
-            glam::Vec2::new(p3[1].x + map.world_width() * 0.5, p3[1].y + map.world_height() * 0.5),
-            glam::Vec2::new(p3[2].x + map.world_width() * 0.5, p3[2].y + map.world_height() * 0.5),
-            glam::Vec2::new(p3[3].x + map.world_width() * 0.5, p3[3].y + map.world_height() * 0.5),
+            glam::Vec2::new(
+                p3[0].x + map.world_width() * 0.5,
+                p3[0].y + map.world_height() * 0.5,
+            ),
+            glam::Vec2::new(
+                p3[1].x + map.world_width() * 0.5,
+                p3[1].y + map.world_height() * 0.5,
+            ),
+            glam::Vec2::new(
+                p3[2].x + map.world_width() * 0.5,
+                p3[2].y + map.world_height() * 0.5,
+            ),
+            glam::Vec2::new(
+                p3[3].x + map.world_width() * 0.5,
+                p3[3].y + map.world_height() * 0.5,
+            ),
         ]
     };
     // frustum_bounds_on_plane_zup returns CENTERED render-space coords (same
@@ -1210,9 +1214,7 @@ fn check_candidate(
     for edge in 0..4 {
         let a = pos[(edge + 3) & 3];
         let b = pos[edge];
-        let any_inside = corners
-            .iter()
-            .any(|&c| !point_line_catch(a, b, c));
+        let any_inside = corners.iter().any(|&c| !point_line_catch(a, b, c));
         if !any_inside {
             return false;
         }
@@ -1338,11 +1340,7 @@ impl InshoreSystem {
         }
 
         self.ensure_instance_capacity(device, instances.len());
-        queue.write_buffer(
-            &self.instance_buffer,
-            0,
-            bytemuck::cast_slice(&instances),
-        );
+        queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(&instances));
         queue.write_buffer(
             &self.uniform_buffer,
             0,
@@ -1548,10 +1546,22 @@ fn build_inshore_system(
     // Static quad VB — 4 verts forming a triangle strip over [-1,-1]..[1,1].
     // Matches SInshorewave::PrepareVB (MatrixWater.cpp:50-78) vertex layout.
     let verts = [
-        InshoreVertex { position: [-1.0, -1.0, 0.0], uv: [0.0, 0.0] },
-        InshoreVertex { position: [1.0, -1.0, 0.0], uv: [1.0, 0.0] },
-        InshoreVertex { position: [-1.0, 1.0, 0.0], uv: [0.0, 1.0] },
-        InshoreVertex { position: [1.0, 1.0, 0.0], uv: [1.0, 1.0] },
+        InshoreVertex {
+            position: [-1.0, -1.0, 0.0],
+            uv: [0.0, 0.0],
+        },
+        InshoreVertex {
+            position: [1.0, -1.0, 0.0],
+            uv: [1.0, 0.0],
+        },
+        InshoreVertex {
+            position: [-1.0, 1.0, 0.0],
+            uv: [0.0, 1.0],
+        },
+        InshoreVertex {
+            position: [1.0, 1.0, 0.0],
+            uv: [1.0, 1.0],
+        },
     ];
     let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("Inshore VB"),
@@ -1585,18 +1595,42 @@ fn build_inshore_system(
                     array_stride: std::mem::size_of::<InshoreVertex>() as u64,
                     step_mode: wgpu::VertexStepMode::Vertex,
                     attributes: &[
-                        wgpu::VertexAttribute { offset: 0, shader_location: 0, format: wgpu::VertexFormat::Float32x3 },
-                        wgpu::VertexAttribute { offset: 12, shader_location: 1, format: wgpu::VertexFormat::Float32x2 },
+                        wgpu::VertexAttribute {
+                            offset: 0,
+                            shader_location: 0,
+                            format: wgpu::VertexFormat::Float32x3,
+                        },
+                        wgpu::VertexAttribute {
+                            offset: 12,
+                            shader_location: 1,
+                            format: wgpu::VertexFormat::Float32x2,
+                        },
                     ],
                 },
                 wgpu::VertexBufferLayout {
                     array_stride: std::mem::size_of::<InshoreInstance>() as u64,
                     step_mode: wgpu::VertexStepMode::Instance,
                     attributes: &[
-                        wgpu::VertexAttribute { offset: 0,  shader_location: 2, format: wgpu::VertexFormat::Float32x2 }, // x_axis
-                        wgpu::VertexAttribute { offset: 8,  shader_location: 3, format: wgpu::VertexFormat::Float32x2 }, // y_axis
-                        wgpu::VertexAttribute { offset: 16, shader_location: 4, format: wgpu::VertexFormat::Float32x3 }, // translation
-                        wgpu::VertexAttribute { offset: 32, shader_location: 5, format: wgpu::VertexFormat::Float32x4 }, // color
+                        wgpu::VertexAttribute {
+                            offset: 0,
+                            shader_location: 2,
+                            format: wgpu::VertexFormat::Float32x2,
+                        }, // x_axis
+                        wgpu::VertexAttribute {
+                            offset: 8,
+                            shader_location: 3,
+                            format: wgpu::VertexFormat::Float32x2,
+                        }, // y_axis
+                        wgpu::VertexAttribute {
+                            offset: 16,
+                            shader_location: 4,
+                            format: wgpu::VertexFormat::Float32x3,
+                        }, // translation
+                        wgpu::VertexAttribute {
+                            offset: 32,
+                            shader_location: 5,
+                            format: wgpu::VertexFormat::Float32x4,
+                        }, // color
                     ],
                 },
             ],
