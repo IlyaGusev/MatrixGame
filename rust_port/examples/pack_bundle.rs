@@ -153,33 +153,34 @@ fn main() {
         }
     }
 
-    // Add water textures under the paths the renderer actually asks for
-    // (matching resolve_water_preset in renderer/water.rs).
+    // Water textures. Key names match the paths the `Water/*` BlockPar in
+    // robots.dat returns (MatrixWater.cpp:215-216), so `resolve_water_preset`
+    // in renderer/water.rs can look them up directly under the WASM bundle's
+    // case-sensitive HashMap.
     let water_files = [
         ("Matrix/Textures/Water/1", "MATRIX/TEXTURES/WATER/1.DDS"),
         (
-            "Matrix/Textures/Water/MIRROR",
+            "Matrix/Textures/Water/mirror",
             "MATRIX/TEXTURES/WATER/MIRROR.DDS",
         ),
         (
-            "Matrix/Textures/Water/1BLACK",
+            "Matrix/Textures/Water/1black",
             "MATRIX/TEXTURES/WATER/1BLACK.DDS",
         ),
         (
-            "Matrix/Textures/Water/MIRRORBLACK",
+            "Matrix/Textures/Water/mirrorblack",
             "MATRIX/TEXTURES/WATER/MIRRORBLACK.DDS",
         ),
         (
-            "Matrix/Textures/Water/1PURPLE",
+            "Matrix/Textures/Water/1purple",
             "MATRIX/TEXTURES/WATER/1PURPLE.DDS",
         ),
         (
-            "Matrix/Textures/Water/MIRRORPURPLE",
+            "Matrix/Textures/Water/mirrorpurple",
             "MATRIX/TEXTURES/WATER/MIRRORPURPLE.DDS",
         ),
         (
-            // Shoreline foam quad texture — referenced by the Sky/Water
-            // configs in robots.dat under `Water/*/inshore`.
+            // Shoreline foam quad — `Water/*/inshore` in robots.dat.
             "Matrix/Textures/Water/inshorewave",
             "MATRIX/TEXTURES/WATER/INSHOREWAVE.DDS",
         ),

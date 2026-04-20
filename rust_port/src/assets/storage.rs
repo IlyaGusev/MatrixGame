@@ -204,6 +204,19 @@ impl Storage {
         Some(values.get_as_wstr(idx))
     }
 
+    /// Fetch the first child BlockPar's `(name, record)`, mirroring the
+    /// fallback behaviour the original uses when a named lookup fails
+    /// (e.g. MatrixMapPrepare.cpp:1218 `m_WaterName = BlockGet(PAR_...)
+    /// ->BlockGetName(0)`). Returns `None` when the record has no children.
+    pub fn first_block(&self, record: &str) -> Option<(String, String)> {
+        let names = self.get_buf(record, "2")?;
+        let records = self.get_buf(record, "3")?;
+        if names.arrays_count() == 0 {
+            return None;
+        }
+        Some((names.get_as_wstr(0), records.get_as_wstr(0)))
+    }
+
     /// Print all record/item keys and their array counts.
     pub fn dump_structure(&self) {
         let mut keys: Vec<_> = self.items.keys().collect();

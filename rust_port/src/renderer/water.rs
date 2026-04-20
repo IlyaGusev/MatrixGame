@@ -195,27 +195,58 @@ struct WaterDraw {
 }
 
 struct WaterPreset {
-    water_path: &'static str,
-    mirror_path: &'static str,
+    /// Preset name actually resolved (may differ from `map.water_name` if we
+    /// fell back to the first configured preset).
+    resolved_name: String,
+    water_path: String,
+    mirror_path: String,
 }
 
-fn resolve_water_preset(water_name: &str) -> WaterPreset {
-    let lower = water_name.to_ascii_lowercase();
-    if lower.contains("black") {
-        WaterPreset {
-            water_path: "Matrix/Textures/Water/1BLACK",
-            mirror_path: "Matrix/Textures/Water/MIRRORBLACK",
-        }
-    } else if lower.contains("purple") {
-        WaterPreset {
-            water_path: "Matrix/Textures/Water/1PURPLE",
-            mirror_path: "Matrix/Textures/Water/MIRRORPURPLE",
-        }
-    } else {
-        WaterPreset {
-            water_path: "Matrix/Textures/Water/1",
-            mirror_path: "Matrix/Textures/Water/MIRROR",
-        }
+/// Port of `MatrixMapPrepare.cpp:1208-1219` + `MatrixWater.cpp:213-216`:
+/// look up `Water/<water_name>` in the serialized BlockPar tree and read
+/// its `water` / `mirror` params. Falls back to the first configured preset
+/// when the named one is absent (matches the original's
+/// `m_WaterName = BlockGet(PAR_SOURCE_WATER)->BlockGetName(0)` rescue), and
+/// to the shipped `water_blue` paths when no BlockPar data is available at
+/// all (e.g. robots.dat missing on native).
+fn resolve_water_preset(matrix_data: Option<&Storage>, water_name: &str) -> WaterPreset {
+    let fallback = || WaterPreset {
+        resolved_name: water_name.to_string(),
+        water_path: "Matrix/Textures/Water/1".to_string(),
+        mirror_path: "Matrix/Textures/Water/MIRROR".to_string(),
+    };
+
+    let Some(stor) = matrix_data else {
+        return fallback();
+    };
+    let Some(water_root) = stor.block_record("da", "Water") else {
+        return fallback();
+    };
+
+    let (resolved_name, preset_record) = match stor.block_record(&water_root, water_name) {
+        Some(rec) => (water_name.to_string(), rec),
+        None => match stor.first_block(&water_root) {
+            Some((name, rec)) => {
+                log::warn!(
+                    "water: preset '{}' not in Water block; falling back to '{}'",
+                    water_name,
+                    name
+                );
+                (name, rec)
+            }
+            None => return fallback(),
+        },
+    };
+
+    let fix_path = |p: Option<String>| p.map(|s| s.replace('\\', "/"));
+    let water_path = fix_path(stor.block_param(&preset_record, "water"))
+        .unwrap_or_else(|| "Matrix/Textures/Water/1".to_string());
+    let mirror_path = fix_path(stor.block_param(&preset_record, "mirror"))
+        .unwrap_or_else(|| "Matrix/Textures/Water/MIRROR".to_string());
+    WaterPreset {
+        resolved_name,
+        water_path,
+        mirror_path,
     }
 }
 
@@ -240,7 +271,7 @@ impl Water {
         let ld = map.light_main_dir;
         let light_dir = [ld[0], ld[1], ld[2], 0.0];
         let water_scale = GLOBAL_SCALE * MAP_GROUP_SIZE as f32 / WATER_SIZE as f32;
-        let water_preset = resolve_water_preset(&map.water_name);
+        let water_preset = resolve_water_preset(matrix_data, &map.water_name);
 
         let mut water_groups: Vec<(i32, i32)> = Vec::new();
         for gi in 0..groups_buf.arrays_count() {
@@ -338,13 +369,14 @@ impl Water {
                 .unwrap_or_else(|| super::texture::create_solid_texture(device, queue, fb))
         };
         log::info!(
-            "water: preset='{}' water='{}' mirror='{}'",
+            "water: requested='{}' resolved='{}' water='{}' mirror='{}'",
             map.water_name,
+            water_preset.resolved_name,
             water_preset.water_path,
             water_preset.mirror_path
         );
-        let water_tex = load_tex(water_preset.water_path, [30, 80, 120, 255]);
-        let mirror_tex = load_tex(water_preset.mirror_path, [100, 120, 140, 128]);
+        let water_tex = load_tex(&water_preset.water_path, [30, 80, 120, 255]);
+        let mirror_tex = load_tex(&water_preset.mirror_path, [100, 120, 140, 128]);
 
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Water VB"),
