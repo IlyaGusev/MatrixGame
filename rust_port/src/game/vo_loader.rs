@@ -143,6 +143,142 @@ pub fn parse_vo(data: &[u8]) -> Result<VoMesh> {
     })
 }
 
+/// One sub-mesh declared inside a `.cvo` (CVectorObjectGroup) file. Ports
+/// `CVectorObjectGroupUnit` (VectorObject.hpp:~1900) — the fields we populate
+/// are a subset: the model path, a material built from the block's
+/// `Texture*` params, and the optional id/link bookkeeping the original uses
+/// for frame-matrix hierarchies.
+///
+/// `link` follows `CVectorObjectGroup::Load` (VectorObject.cpp:2491, 2527-2549):
+/// a raw `Link=<name_or_id>,<matrix_id>` string split by comma. We keep the
+/// raw text so the consumer can resolve it after all units are loaded (same
+/// two-pass order as the original).
+#[derive(Clone, Debug)]
+pub struct CvoUnit {
+    /// Sub-block name (`BlockGetName(i)` in the C++). Empty for anonymous
+    /// `{ ... }` blocks — also seen in shipped `b0.cvo`.
+    pub name: String,
+    pub id: Option<i32>,
+    pub model_path: String,
+    pub material: MaterialSpec,
+    pub link_raw: Option<String>,
+}
+
+/// Parsed contents of a `.cvo` file. Ports `CVectorObjectGroup` in
+/// VectorObject.cpp:2415-2553: one `CvoUnit` per top-level block, in source
+/// order. Caller is expected to load each `model_path` via `parse_vo`.
+#[derive(Clone, Debug, Default)]
+pub struct CvoGroup {
+    pub units: Vec<CvoUnit>,
+}
+
+/// Ports `CVectorObjectGroup::Load` (VectorObject.cpp:2415-2553). We mirror
+/// the `CacheReplaceFileNameAndExt` path-stitching (CWStr.cpp): `Model`,
+/// `Texture`, `TextureGloss`, `TextureMask`, `TextureBack` values are
+/// resolved relative to the `.cvo` file's directory. The `?Trans` suffix is
+/// honored exactly like `parse_material_spec` does for regular VO specs.
+///
+/// `cvo_path` is the archive path of the .cvo so we can derive the directory
+/// for asset siblings. `bytes` is the raw file contents.
+pub fn parse_cvo(cvo_path: &str, bytes: &[u8]) -> CvoGroup {
+    let bp = crate::assets::blockpar_text::BlockPar::parse_bytes(bytes);
+    let dir = cvo_path
+        .rsplit_once('/')
+        .map(|(d, _)| format!("{d}/"))
+        .unwrap_or_default();
+
+    let mut units = Vec::new();
+    for entry in bp.entries() {
+        let crate::assets::blockpar_text::Entry::Block { name, block, .. } = entry else {
+            continue;
+        };
+
+        // Model=<rel path>  — drops any `?...` suffix before path stitching
+        // (VectorObject.cpp:2466-2469).
+        let model_raw = block.par_get_ne("Model").unwrap_or("").trim();
+        let model_clean = model_raw.split('?').next().unwrap_or("").trim();
+        if model_clean.is_empty() {
+            continue;
+        }
+        let model_path = join_cvo_sibling(&dir, model_clean);
+
+        let diffuse = block
+            .par_get_ne("Texture")
+            .and_then(|v| resolve_cvo_texture(v, &dir));
+        let gloss = block
+            .par_get_ne("TextureGloss")
+            .and_then(|v| resolve_cvo_texture(v, &dir));
+        let mask = block
+            .par_get_ne("TextureMask")
+            .and_then(|v| resolve_cvo_texture(v, &dir));
+        // `CVectorObjectGroup::Load` (VectorObject.cpp:2493) explicitly clears
+        // TextureBack when TextureMask is absent, so do the same here.
+        let back = if mask.is_some() {
+            block
+                .par_get_ne("TextureBack")
+                .and_then(|v| resolve_cvo_texture(v, &dir))
+        } else {
+            None
+        };
+        let scroll = block
+            .par_get_ne("TextureBackScroll")
+            .map(parse_scroll)
+            .unwrap_or([0.0, 0.0]);
+        let alpha_test = block
+            .par_get_ne("Texture")
+            .is_some_and(has_trans_suffix);
+
+        let id = block
+            .par_get_ne("Id")
+            .and_then(|v| v.trim().parse::<i32>().ok());
+        let link_raw = block.par_get_ne("Link").map(|s| s.to_string());
+
+        units.push(CvoUnit {
+            name: name.clone(),
+            id,
+            model_path,
+            material: MaterialSpec {
+                diffuse,
+                gloss,
+                back,
+                mask,
+                scroll,
+                alpha_test,
+            },
+            link_raw,
+        });
+    }
+
+    CvoGroup { units }
+}
+
+fn join_cvo_sibling(dir: &str, name: &str) -> String {
+    // Normalize backslashes and collapse `./` prefix like the original's
+    // `CacheReplaceFileNameAndExt` does implicitly (CWStr.cpp).
+    let n = name.trim().trim_start_matches(".\\").replace('\\', "/");
+    if n.contains('/') {
+        n
+    } else {
+        format!("{dir}{n}")
+    }
+}
+
+fn resolve_cvo_texture(raw: &str, dir: &str) -> Option<String> {
+    // CVO texture paths come without an extension (e.g. `b0_1`, `platform`).
+    // Strip any `?Trans`/other suffix, prefix with the CVO directory; the
+    // caller's asset-read closure handles extension resolution (.dds/.png)
+    // the same way it does for regular object textures.
+    let clean = raw.trim().trim_end_matches('\0');
+    if clean.is_empty() || clean == "." {
+        return None;
+    }
+    let base = clean.split('?').next().unwrap_or("").trim();
+    if base.is_empty() {
+        return None;
+    }
+    Some(join_cvo_sibling(dir, base))
+}
+
 /// Resolve an object Id string (from `strings/String`, '*'-delimited) into a
 /// VO file path and texture path. Returns `None` if empty.
 ///

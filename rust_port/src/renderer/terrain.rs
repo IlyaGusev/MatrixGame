@@ -110,6 +110,7 @@ pub struct TerrainRenderer {
     clear_color: wgpu::Color,
     fog_color: [f32; 4],
     objects: Option<super::objects::ObjectsRenderer>,
+    buildings: Option<super::buildings::BuildingsRenderer>,
     point_lights: PointLightRenderer,
     water: Option<super::water::Water>,
     uniform_buffer: wgpu::Buffer,
@@ -609,6 +610,9 @@ impl TerrainRenderer {
         // Decorative objects (palms / rocks / etc.)
         let objects =
             super::objects::ObjectsRenderer::new(device, queue, config, map, stor, read_texture);
+        // Starting buildings from the CMAP `buildings/*` table.
+        let buildings =
+            super::buildings::BuildingsRenderer::new(device, queue, config, map, read_texture);
 
         // Water (MatrixWater.cpp)
         let water =
@@ -862,6 +866,7 @@ impl TerrainRenderer {
             gloss_uniform_buffer,
             depth_texture,
             last_point_light_revision: 0,
+            buildings,
         }
     }
 
@@ -903,6 +908,9 @@ impl TerrainRenderer {
         }
         if let Some(objects) = &mut self.objects {
             objects.takt(dt_ms, queue, map, point_lights);
+        }
+        if let Some(buildings) = &mut self.buildings {
+            buildings.takt(dt_ms, queue, map, point_lights);
         }
         self.sky.takt(dt_ms);
         self.point_lights.sync(device, map, point_lights);
@@ -1048,6 +1056,12 @@ impl TerrainRenderer {
         // Decorative objects plus their projected shadow pass.
         if let Some(objects) = &self.objects {
             objects.render(queue, &mut pass, camera, view_proj);
+        }
+        // Starting buildings — drawn after objects so their shadow projection
+        // (when we add it) can overlay object silhouettes the way the original
+        // does (MatrixMap.cpp DrawLandscape ordering).
+        if let Some(buildings) = &self.buildings {
+            buildings.render(queue, &mut pass, camera, view_proj);
         }
 
         // Visible additive point-light pass on terrain-conforming geometry.

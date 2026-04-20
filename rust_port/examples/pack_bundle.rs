@@ -316,6 +316,103 @@ fn main() {
         vo_count, obj_tex_count
     );
 
+    // Pack each distinct building kind's CVO + every sub-VO + their textures.
+    // Mirrors the renderer's load path in `renderer/buildings.rs`: for each
+    // `BuildingInstance`, it fetches `Matrix/Building/bN.cvo`, parses it, and
+    // reads each unit's `Model` + Texture*. The bundle needs all those assets
+    // (plus the VO's own embedded surface texture) under their original keys.
+    let mut building_kinds: std::collections::BTreeSet<u8> = std::collections::BTreeSet::new();
+    for b in &map.buildings {
+        building_kinds.insert(b.kind);
+    }
+    let mut cvo_count = 0;
+    let mut sub_vo_count = 0;
+    let mut building_tex_count = 0;
+    for kind in &building_kinds {
+        let name = match kind {
+            0 => "b0",
+            1 => "b1",
+            2 => "b2",
+            3 => "b3",
+            4 => "b4",
+            5 => "b5",
+            _ => continue,
+        };
+        let cvo_path = format!("Matrix/Building/{}.cvo", name);
+        let cvo_key = cvo_path.to_uppercase();
+        let cvo_bytes = match pkg.read_file(&cvo_key) {
+            Ok(data) => {
+                bundle.add(&cvo_path, data.clone());
+                cvo_count += 1;
+                data
+            }
+            Err(e) => {
+                eprintln!("  MISS cvo: {} ({e})", cvo_path);
+                continue;
+            }
+        };
+        let group = vo_loader::parse_cvo(&cvo_path, &cvo_bytes);
+        for unit in &group.units {
+            let vo_key = unit.model_path.to_uppercase();
+            let vo_bytes = match pkg.read_file(&vo_key) {
+                Ok(data) => {
+                    bundle.add(&unit.model_path, data.clone());
+                    sub_vo_count += 1;
+                    data
+                }
+                Err(_) => {
+                    eprintln!("  MISS building sub-vo: {}", unit.model_path);
+                    continue;
+                }
+            };
+
+            // CVO-level textures.
+            for t in [
+                unit.material.diffuse.as_ref(),
+                unit.material.gloss.as_ref(),
+                unit.material.back.as_ref(),
+                unit.material.mask.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if try_pack_texture(&mut bundle, &mut vo_tex_seen, t) {
+                    building_tex_count += 1;
+                }
+            }
+            // VO's own embedded surface-texture fallback — the renderer uses
+            // this when a CVO unit omits `Texture=`.
+            if let Ok(vo) = vo_loader::parse_vo(&vo_bytes) {
+                let dir = unit
+                    .model_path
+                    .rsplit_once('/')
+                    .map(|(d, _)| format!("{d}/"));
+                for s in &vo.surfaces {
+                    if let Some(spec) = s.texture_ref.as_deref() {
+                        let m = vo_loader::parse_material_spec_with_prefix(spec, dir.as_deref());
+                        for t in [
+                            m.diffuse.as_ref(),
+                            m.gloss.as_ref(),
+                            m.back.as_ref(),
+                            m.mask.as_ref(),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        {
+                            if try_pack_texture(&mut bundle, &mut vo_tex_seen, t) {
+                                building_tex_count += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    println!(
+        "  buildings: {} cvo files, {} sub-vos, {} textures packed",
+        cvo_count, sub_vo_count, building_tex_count
+    );
+
     // Pack sibling `.txt` files so the alpha-test override path in
     // `vo_loader::resolve_alpha_test_with_txt` (which ports
     // Texture.cpp:113-136) works in the WASM build. There are ~119 of these

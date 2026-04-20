@@ -75,6 +75,12 @@ pub struct GameMap {
     pub normals: Vec<PointNormal>, // same size, computed from heights
     pub units: Vec<MapUnit>,       // size_x * size_y cells, ports SMatrixMapUnit GetZ data
     pub objects: Vec<ObjectInstance>, // palms / rocks / decorative scenery placements
+    /// Starting buildings from the `buildings/*` CMAP table
+    /// (MatrixMapPrepare.cpp:621-694). Each entry carries the fields needed to
+    /// construct a `CMatrixBuilding`; geometry resolution happens at render
+    /// time via the building's `EBuildingType` → `Matrix\Building\bN.cvo`
+    /// mapping (MatrixObjectBuilding.cpp:158-163).
+    pub buildings: Vec<BuildingInstance>,
     /// Per-group max LAND z, size = group_w * group_h.
     /// Ports GetGroupMaxZLand (MatrixMap.hpp:759): returns 0 for empty groups /
     /// groups whose max is negative. Used by the camera to keep the link-point
@@ -136,6 +142,33 @@ pub struct ObjectShadow {
 pub struct ObjectShadowVertex {
     pub position: [f32; 3],
     pub uv: [f32; 2],
+}
+
+/// A starting-building placement — ports the per-row fields of DATA_BUILDINGS
+/// (MatrixMapPrepare.cpp:621-694). Position is uncentered world space; the
+/// renderer applies the map-center offset like it does for objects. `build_z`
+/// is the terrain floor height at `(x, y)` — `m_BuildZ` in
+/// `CMatrixBuilding::OnLoad` (MatrixObjectBuilding.cpp:1029), which falls back
+/// to the water-level trace when the cell is submerged.
+#[derive(Debug, Clone)]
+pub struct BuildingInstance {
+    pub x: f32,
+    pub y: f32,
+    pub build_z: f32,
+    /// Raw quantized angle from the CMAP (0..=3): 0°/90°/180°/270° around the
+    /// Z axis. Ports the fixed rotation table in `CMatrixBuilding::RNeed`
+    /// (MatrixObjectBuilding.cpp:120-137).
+    pub angle: u8,
+    /// 1..8 — team color. 255 is the "ruins" sentinel that
+    /// MatrixMapPrepare.cpp:648-668 treats as a static ruin mesh instead of a
+    /// live building; we skip those in this loader (the ruins branch would
+    /// need `Matrix\Building\ruins\bN[p].vo` loading).
+    pub side: u8,
+    /// `EBuildingType` — 0=Base, 1=Titan, 2=Plasma, 3=Electronic, 4=Energy,
+    /// 5=Repair (MatrixObjectBuilding.hpp:59-69).
+    pub kind: u8,
+    pub shadow_kind: u8,
+    pub shadow_size: i32,
 }
 
 impl GameMap {
@@ -310,6 +343,12 @@ impl GameMap {
         let objects = load_objects(&stor, &points, &normals, size_x, size_y);
         log::info!("map: loaded {} decorative objects", objects.len());
 
+        // Ports MatrixMapPrepare.cpp:621-694 (RS_BUILDINGS step). We need the
+        // per-cell units computed above so the floor-z fallback matches
+        // `CMatrixBuilding::OnLoad`'s `GetZ` lookup.
+        let buildings = load_buildings(&stor, &units, size_x, size_y);
+        log::info!("map: loaded {} starting buildings", buildings.len());
+
         // No dilation: the stored per-group max is the max of THIS group's
         // land-cell corner z only. Dilation used to smear mountain height
         // into neighboring water groups, pushing the camera up while over
@@ -355,6 +394,7 @@ impl GameMap {
             normals,
             units,
             objects,
+            buildings,
             group_max_z_land,
             group_w,
             group_h,
@@ -1037,6 +1077,98 @@ fn load_objects(
                     .and_then(|buf| parse_object_shadow(buf, i, points, normals, size_x, size_y)),
             }
         })
+        .collect()
+}
+
+/// Ports the `RS_BUILDINGS` step of `CMatrixMap::ReloadDynamics`
+/// (MatrixMapPrepare.cpp:621-694). We skip the `side==255` ruin-replacement
+/// branch: those aren't live buildings, they spawn static ruin meshes via
+/// `InitAsBaseRuins`, which the port doesn't wire up yet.
+fn load_buildings(
+    stor: &Storage,
+    units: &[MapUnit],
+    size_x: usize,
+    size_y: usize,
+) -> Vec<BuildingInstance> {
+    let (Some(cx), Some(cy), Some(cside), Some(ckind), Some(cshadow), Some(cshsz), Some(cang)) = (
+        stor.get_buf("buildings", "X"),
+        stor.get_buf("buildings", "Y"),
+        stor.get_buf("buildings", "Side"),
+        stor.get_buf("buildings", "Kind"),
+        stor.get_buf("buildings", "Shadow"),
+        stor.get_buf("buildings", "ShadowSize"),
+        stor.get_buf("buildings", "Angle"),
+    ) else {
+        return Vec::new();
+    };
+    if cx.arrays_count() == 0 {
+        return Vec::new();
+    }
+
+    let xs = read_f32_array(cx.get_bytes(0));
+    let ys = read_f32_array(cy.get_bytes(0));
+    let sides = cside.get_bytes(0);
+    let kinds = ckind.get_bytes(0);
+    let shadows = cshadow.get_bytes(0);
+    let shszs = read_i32_array(cshsz.get_bytes(0));
+    let angles = cang.get_bytes(0);
+
+    let n = xs.len().min(ys.len()).min(sides.len());
+
+    // Floor-z lookup matches `CMatrixMap::GetZ` (MatrixMap.cpp:1020-1062) as
+    // pointed to from `CMatrixBuilding::OnLoad` (MatrixObjectBuilding.cpp:
+    // 1029). Below WATER_LEVEL the original traces down from z=1000 until it
+    // hits the geometry; we defer that to the caller or just clamp to 0.
+    let get_z = |wx: f32, wy: f32| -> f32 {
+        let sx = wx / GLOBAL_SCALE;
+        let sy = wy / GLOBAL_SCALE;
+        let ix = sx.floor() as i32;
+        let iy = sy.floor() as i32;
+        if ix < 0 || iy < 0 || ix >= size_x as i32 || iy >= size_y as i32 {
+            return 0.0;
+        }
+        let u = units[iy as usize * size_x + ix as usize];
+        if u.flags & crate::game::common::CELLFLAG_FLAT != 0 {
+            return u.a1;
+        }
+        let lx = wx - ix as f32 * GLOBAL_SCALE;
+        let ly = wy - iy as f32 * GLOBAL_SCALE;
+        if ly < lx {
+            u.a1 * lx + u.b1 * ly + u.c1
+        } else {
+            u.a2 * lx + u.b2 * ly + u.c2
+        }
+    };
+
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let side = *sides.get(i).unwrap_or(&0);
+        if side == 255 {
+            // Ruin replacement (MatrixMapPrepare.cpp:648-668) — not a live
+            // building, skip for now.
+            continue;
+        }
+        let x = xs[i];
+        let y = ys[i];
+        let build_z = get_z(x, y).max(0.0);
+        out.push(BuildingInstance {
+            x,
+            y,
+            build_z,
+            angle: *angles.get(i).unwrap_or(&0),
+            side,
+            kind: *kinds.get(i).unwrap_or(&0),
+            shadow_kind: *shadows.get(i).unwrap_or(&0),
+            shadow_size: shszs.get(i).copied().unwrap_or(128),
+        });
+    }
+    out
+}
+
+fn read_i32_array(bytes: &[u8]) -> Vec<i32> {
+    bytes
+        .chunks_exact(4)
+        .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
 }
 
