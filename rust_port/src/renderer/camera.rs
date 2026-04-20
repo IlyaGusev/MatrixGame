@@ -335,9 +335,19 @@ impl Camera {
         let cz = self.angle_z.cos();
         let sx = self.angle_x.sin();
         let cx = self.angle_x.cos();
+        // Place the camera on the +Y side of the link point at angle_z=0,
+        // matching the original's matView construction. Solving `p * matView
+        // = 0` for `matView = Rz(-yaw) * Rx(pitch) * T(0,0,-dist)` (with the
+        // Y+Z column negations from MatrixCamera.cpp:742-745) gives eye =
+        // (lp.x - sin(yaw)*cos(pitch)*dist, lp.y + cos(yaw)*cos(pitch)*dist,
+        // lp.z + sin(pitch)*dist). The previous formula had the X and Y
+        // offsets negated, putting the camera on the opposite side of the
+        // link point — invisible on symmetric maps (atoll), but on training
+        // it appeared as a left-right mirror since every asymmetric feature
+        // showed from the wrong side.
         let mut eye = Vec3::new(
-            lp.x + sz * cx * self.dist,
-            lp.y - cz * cx * self.dist,
+            lp.x - sz * cx * self.dist,
+            lp.y + cz * cx * self.dist,
             lp.z + sx * self.dist,
         );
         if let Some(sample_ground) = &self.sample_ground {
@@ -401,7 +411,10 @@ impl Camera {
         if xy.length_squared() < 1e-8 {
             let s = self.angle_z.sin();
             let c = self.angle_z.cos();
-            Vec2::new(-s, c)
+            // Negated from the old (-s, c) to match the new eye orientation —
+            // at angle_z=0 the camera now sits at +Y and looks -Y, so the
+            // bottom-frustum projection should point -Y.
+            Vec2::new(s, -c)
         } else {
             xy.normalize()
         }
