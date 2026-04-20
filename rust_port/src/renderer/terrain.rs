@@ -793,6 +793,7 @@ impl TerrainRenderer {
         dt_ms: f32,
         map: &GameMap,
         point_lights: &PointLightSystem,
+        camera: &Camera,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
     ) {
@@ -817,7 +818,7 @@ impl TerrainRenderer {
         }
 
         if let Some(water) = &mut self.water {
-            water.takt(dt_ms, device, queue);
+            water.takt(dt_ms, device, queue, camera, map);
         }
         if let Some(objects) = &mut self.objects {
             objects.takt(dt_ms, queue, map, point_lights);

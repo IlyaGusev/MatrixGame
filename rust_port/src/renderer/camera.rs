@@ -471,6 +471,50 @@ impl Camera {
             (far - eye).normalize_or_zero()
         })
     }
+
+    /// Extract the Left/Right/Top/Bottom frustum plane equations (Ax+By+Cz+D=0
+    /// form, points inside satisfy `Ax+By+Cz+D >= 0`) from `view_proj` using
+    /// the standard Gribb-Hartmann trick. Near/Far are omitted — matches the
+    /// original's SPlane set which drops those planes too (MatrixCamera.hpp:
+    /// 413-420, `IsInFrustum(mins,maxs)` only tests L/R/T/B).
+    pub fn frustum_planes(&self) -> [[f32; 4]; 4] {
+        let m = self.view_proj().to_cols_array();
+        // Row-vectors of the matrix (glam stores column-major, so m[col*4+row]).
+        let row = |r: usize| {
+            [m[0 * 4 + r], m[1 * 4 + r], m[2 * 4 + r], m[3 * 4 + r]]
+        };
+        let r0 = row(0);
+        let r1 = row(1);
+        let r3 = row(3);
+        let add = |a: [f32; 4], b: [f32; 4]| [a[0] + b[0], a[1] + b[1], a[2] + b[2], a[3] + b[3]];
+        let sub = |a: [f32; 4], b: [f32; 4]| [a[0] - b[0], a[1] - b[1], a[2] - b[2], a[3] - b[3]];
+        let normalize = |p: [f32; 4]| -> [f32; 4] {
+            let n = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt().max(1e-8);
+            [p[0] / n, p[1] / n, p[2] / n, p[3] / n]
+        };
+        [
+            normalize(add(r3, r0)), // Left:  r3 + r0
+            normalize(sub(r3, r0)), // Right: r3 - r0
+            normalize(sub(r3, r1)), // Top:   r3 - r1
+            normalize(add(r3, r1)), // Bottom:r3 + r1
+        ]
+    }
+
+    /// 3D AABB vs camera frustum. Returns true if the box is not entirely
+    /// outside any of the 4 side planes. Matches CMatrixCamera::IsInFrustum
+    /// (MatrixCamera.hpp:413) which also skips near/far planes.
+    pub fn is_box_in_frustum(&self, min: Vec3, max: Vec3) -> bool {
+        for plane in self.frustum_planes() {
+            // Pick the box corner farthest in the plane's positive direction.
+            let px = if plane[0] >= 0.0 { max.x } else { min.x };
+            let py = if plane[1] >= 0.0 { max.y } else { min.y };
+            let pz = if plane[2] >= 0.0 { max.z } else { min.z };
+            if plane[0] * px + plane[1] * py + plane[2] * pz + plane[3] < 0.0 {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 fn lerp_ang(param: f32) -> f32 {

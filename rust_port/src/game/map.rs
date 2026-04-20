@@ -82,6 +82,22 @@ pub struct GameMap {
     pub group_max_z_land: Vec<f32>,
     pub group_w: usize,
     pub group_h: usize,
+    /// Global minimum heightmap z — the plane `CalcMapGroupVisibility`
+    /// projects the frustum corner rays onto (MatrixVisiCalc.cpp:567).
+    pub min_z: f32,
+    /// Per-group axis-aligned vertical extents, row-major. Corresponds to
+    /// CMatrixMapGroup::{m_minz, m_maxz} (MatrixMapGroup.hpp:103); fed into
+    /// the 3D frustum-AABB test for the IsInFrustum fallback branch.
+    pub group_bounds: Vec<GroupBounds>,
+}
+
+/// Ports CMatrixMapGroup's bounding-Z pair — used by the camera frustum
+/// visibility check to decide whether a group's 3D footprint intersects the
+/// view frustum. For empty / all-water groups the values are `(0, 0)`.
+#[derive(Debug, Clone, Copy)]
+pub struct GroupBounds {
+    pub min_z: f32,
+    pub max_z: f32,
 }
 
 /// Precomputed shoreline wave spawn point. Ports SPreInshorewave fields
@@ -302,6 +318,12 @@ impl GameMap {
         let (group_max_z_land, group_w, group_h) =
             compute_group_max_z_land(&points, &units, size_x, size_y);
 
+        let min_z = points
+            .iter()
+            .map(|p| p.z)
+            .fold(f32::INFINITY, f32::min);
+        let group_bounds = compute_group_bounds(&points, size_x, size_y, group_w, group_h);
+
         let inshore_prespawns = load_inshore_prespawns(&stor, group_w, group_h);
         let total_inshores: usize = inshore_prespawns.iter().map(|v| v.len()).sum();
         log::info!(
@@ -340,6 +362,8 @@ impl GameMap {
             group_max_z_land,
             group_w,
             group_h,
+            min_z,
+            group_bounds,
         })
     }
 
@@ -780,6 +804,52 @@ fn cross(a: &[f32; 3], b: &[f32; 3]) -> [f32; 3] {
 
 /// Per-group max land z, clamped to 0 (ports GetGroupMaxZLand + CMatrixMapGroup
 /// max-z tracking; negative underwater groups report 0 like the original).
+/// Collect each group's min/max heightmap z — CMatrixMapGroup::m_minz/m_maxz
+/// in the original (MatrixMapGroup.cpp:254-346). Covers every corner of every
+/// cell inside the group rectangle; empty groups (off-map edge fragments)
+/// fall through as `(0, 0)`.
+fn compute_group_bounds(
+    points: &[CompilePoint],
+    size_x: usize,
+    size_y: usize,
+    group_w: usize,
+    group_h: usize,
+) -> Vec<GroupBounds> {
+    let gs = MAP_GROUP_SIZE as usize;
+    let stride = size_x + 1;
+    let mut out = Vec::with_capacity(group_w * group_h);
+    for gy in 0..group_h {
+        for gx in 0..group_w {
+            let x0 = gx * gs;
+            let y0 = gy * gs;
+            let x1 = (x0 + gs).min(size_x);
+            let y1 = (y0 + gs).min(size_y);
+            let mut mn = f32::INFINITY;
+            let mut mx = f32::NEG_INFINITY;
+            for py in y0..=y1 {
+                for px in x0..=x1 {
+                    let z = points[py * stride + px].z;
+                    if z < mn {
+                        mn = z;
+                    }
+                    if z > mx {
+                        mx = z;
+                    }
+                }
+            }
+            if !mn.is_finite() {
+                mn = 0.0;
+                mx = 0.0;
+            }
+            out.push(GroupBounds {
+                min_z: mn,
+                max_z: mx,
+            });
+        }
+    }
+    out
+}
+
 fn compute_group_max_z_land(
     points: &[CompilePoint],
     units: &[MapUnit],

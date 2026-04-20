@@ -679,9 +679,21 @@ impl Water {
         })
     }
 
-    pub fn takt(&mut self, dt_ms: f32, _device: &wgpu::Device, queue: &wgpu::Queue) {
+    pub fn takt(
+        &mut self,
+        dt_ms: f32,
+        _device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        camera: &Camera,
+        map: &GameMap,
+    ) {
         if let Some(inshore) = self.inshore.as_mut() {
-            inshore.takt(dt_ms);
+            // CMatrixMap::Takt (MatrixMap.cpp:2505-2510) only iterates
+            // `m_VisibleGroups` — we replay the same check here via a full
+            // port of CalcMapGroupVisibility/CheckCandidate so off-screen
+            // waves freeze mid-animation instead of churning.
+            let visible = visible_groups_mask(camera, map);
+            inshore.takt(dt_ms, &visible, map.group_w);
         }
 
         self.accum_ms += dt_ms;
@@ -1056,6 +1068,142 @@ fn point_in_convex_quad(p: glam::Vec2, quad: &[glam::Vec2; 4]) -> bool {
     true
 }
 
+/// Port of CMatrixMap::CalcMapGroupVisibility (MatrixVisiCalc.cpp:534-779),
+/// scoped to producing a `visible[group_index] -> bool` mask. Rebuilds the
+/// four ground-plane frustum points (`frustum_bounds_on_plane_zup` already
+/// implements pos[0..3] construction with horizon + disp correction), walks
+/// groups inside the quad's bounding box, and runs the original
+/// CheckCandidate test: does the 2D group rect touch the projected quad, or
+/// does the group's 3D AABB pass the frustum plane test?
+fn visible_groups_mask(camera: &Camera, map: &GameMap) -> Vec<bool> {
+    let mut out = vec![false; map.group_w * map.group_h];
+    let pos = {
+        let p3 = camera.frustum_bounds_on_plane_zup(map.min_z);
+        [
+            glam::Vec2::new(p3[0].x + map.world_width() * 0.5, p3[0].y + map.world_height() * 0.5),
+            glam::Vec2::new(p3[1].x + map.world_width() * 0.5, p3[1].y + map.world_height() * 0.5),
+            glam::Vec2::new(p3[2].x + map.world_width() * 0.5, p3[2].y + map.world_height() * 0.5),
+            glam::Vec2::new(p3[3].x + map.world_width() * 0.5, p3[3].y + map.world_height() * 0.5),
+        ]
+    };
+    // frustum_bounds_on_plane_zup returns CENTERED render-space coords (same
+    // as WaterInstance.x0). The original CalcMapGroupVisibility works in
+    // uncentered world space. Shifting by half-map once here keeps the
+    // rest of the math in uncentered coords, matching C++ directly.
+
+    let group_world = MAP_GROUP_SIZE as f32 * GLOBAL_SCALE;
+    let (mut min_x, mut max_x, mut min_y, mut max_y) = (pos[0].x, pos[0].x, pos[0].y, pos[0].y);
+    for p in &pos[1..] {
+        min_x = min_x.min(p.x);
+        max_x = max_x.max(p.x);
+        min_y = min_y.min(p.y);
+        max_y = max_y.max(p.y);
+    }
+    let iminx = ((min_x / group_world).floor() as i32 - 1).max(0);
+    let imaxx = ((max_x / group_world) as i32 + 1).min(map.group_w as i32 - 1);
+    let iminy = ((min_y / group_world).floor() as i32 - 1).max(0);
+    let imaxy = ((max_y / group_world) as i32 + 1).min(map.group_h as i32 - 1);
+
+    // Prebuild frustum planes once — CheckCandidate falls back to 3D AABB
+    // test when the 2D quad check fails. Plane normals pack as Ax+By+Cz+D.
+    let planes = camera.frustum_planes();
+    let cx = map.world_width() * 0.5;
+    let cy = map.world_height() * 0.5;
+
+    for gy in iminy..=imaxy {
+        for gx in iminx..=imaxx {
+            let gi = gy as usize * map.group_w + gx as usize;
+            let bounds = map.group_bounds[gi];
+            let p0 = glam::Vec2::new(gx as f32 * group_world, gy as f32 * group_world);
+            let p1 = p0 + glam::Vec2::splat(group_world);
+            if check_candidate(&pos, p0, p1, bounds, &planes, cx, cy) {
+                out[gi] = true;
+            }
+        }
+    }
+    out
+}
+
+/// Port of CMatrixMap::CheckCandidate (MatrixVisiCalc.cpp:470-531).
+///
+/// Quick-out if any projected frustum point lands inside the group rect; then
+/// a 4-edge PointLineCatch walk checking whether any group corner is on the
+/// right side of every quad edge (i.e. inside the convex projected polygon);
+/// finally a 3D AABB-vs-frustum-planes test. `pos` is in uncentered world
+/// space so the group rect and frustum planes both share that coordinate
+/// frame — we translate AABB corners by (-cx, -cy) before the plane test
+/// since camera.frustum_planes() is derived from the centered view_proj.
+fn check_candidate(
+    pos: &[glam::Vec2; 4],
+    p0: glam::Vec2,
+    p1: glam::Vec2,
+    bounds: crate::game::map::GroupBounds,
+    planes: &[[f32; 4]; 4],
+    cx: f32,
+    cy: f32,
+) -> bool {
+    // Step 1: frustum projection point inside group rect?
+    for pt in pos {
+        if pt.x >= p0.x && pt.x <= p1.x && pt.y >= p0.y && pt.y <= p1.y {
+            return true;
+        }
+    }
+
+    // Step 2: separating-axis test against the projected quad's 4 edges.
+    // For every edge walk, if every one of the rect's 4 corners lies on the
+    // OUTSIDE side of that edge, the rect is separated from the quad and we
+    // can early-out as invisible. Mirrors the goto-driven loop in
+    // MatrixVisiCalc.cpp:481-502 (edges walked as (3,0), (0,1), (1,2), (2,3)
+    // via `i0 = NPOS-1; i1 = 0; ... i0 = i1++`). Only if NO edge separates
+    // does the routine fall through to IsInFrustum.
+    //
+    // The original comment on `PointLineCatch` (Math3D.hpp:137) claims it
+    // returns "true if on the right side", but that is right-side in D3D's
+    // left-handed XY plane. Our Z-up right-handed math has `cross > 0` = LEFT
+    // side. Since pos[] is walked LT→RT→RB→LB which is *clockwise* in our
+    // coord frame, the interior of the quad sits on the side where `cross <
+    // 0`. Flip the `PointLineCatch` result so "inside" corresponds to the
+    // polygon's interior for both coord conventions.
+    let corners = [
+        p0,
+        p1,
+        glam::Vec2::new(p0.x, p1.y),
+        glam::Vec2::new(p1.x, p0.y),
+    ];
+    for edge in 0..4 {
+        let a = pos[(edge + 3) & 3];
+        let b = pos[edge];
+        let any_inside = corners
+            .iter()
+            .any(|&c| !point_line_catch(a, b, c));
+        if !any_inside {
+            return false;
+        }
+    }
+
+    // Step 3: full 3D AABB vs. frustum plane set. camera.frustum_planes is in
+    // centered render space, so translate the box there.
+    let min = glam::Vec3::new(p0.x - cx, p0.y - cy, bounds.min_z);
+    let max = glam::Vec3::new(p1.x - cx, p1.y - cy, bounds.max_z);
+    for plane in planes {
+        let px = if plane[0] >= 0.0 { max.x } else { min.x };
+        let py = if plane[1] >= 0.0 { max.y } else { min.y };
+        let pz = if plane[2] >= 0.0 { max.z } else { min.z };
+        if plane[0] * px + plane[1] * py + plane[2] * pz + plane[3] < 0.0 {
+            return false;
+        }
+    }
+    true
+}
+
+/// Math3D.hpp PointLineCatch — true iff `p` lies on the right side of the
+/// directed segment (s -> e), or exactly on the segment line.
+fn point_line_catch(s: glam::Vec2, e: glam::Vec2, p: glam::Vec2) -> bool {
+    let d1 = e - s;
+    let d2 = p - e;
+    d1.x * d2.y - d1.y * d2.x > 0.0
+}
+
 fn segments_intersect(a0: glam::Vec2, a1: glam::Vec2, b0: glam::Vec2, b1: glam::Vec2) -> bool {
     fn orient(a: glam::Vec2, b: glam::Vec2, c: glam::Vec2) -> f32 {
         (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
@@ -1070,16 +1218,20 @@ fn segments_intersect(a0: glam::Vec2, a1: glam::Vec2, b0: glam::Vec2, b1: glam::
 
 impl InshoreSystem {
     /// Per-tick wave advancement. Direct port of CMatrixMapGroup::GraphicTakt
-    /// (MatrixMapGroup.cpp:752-789) applied to every group: bump `t`, scale
-    /// up, retire finished waves, and try to spawn one new wave into a free
-    /// prespawn slot (at most INSHOREWAVES_CNT = 7 active per group).
-    fn takt(&mut self, dt_ms: f32) {
+    /// (MatrixMapGroup.cpp:752-789). Groups flagged false in `visible` are
+    /// skipped entirely, so their waves pause mid-animation — this mirrors
+    /// CMatrixMap::Takt walking `m_VisibleGroups` only.
+    fn takt(&mut self, dt_ms: f32, visible: &[bool], group_w: usize) {
         // Original caps per-step advance at 0.5 to keep long frames from
         // skipping the entire fade window in one shot (MatrixMapGroup.cpp:762).
         let time = (INSHORE_SPEED * dt_ms).min(0.5);
 
         for (gi, waves) in self.active_waves.iter_mut().enumerate() {
             let prespawns = &mut self.prespawns[gi];
+            if visible.get(gi).copied() != Some(true) {
+                continue;
+            }
+            let _ = group_w; // kept for symmetry with caller; prespawn layout already matches
             let mut i = 0;
             while i < waves.len() {
                 waves[i].t += time * waves[i].speed;

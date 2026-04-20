@@ -290,6 +290,7 @@ impl ApplicationHandler for App {
                     dt * 1000.0,
                     &state.map,
                     &mut state.point_lights,
+                    &state.camera,
                     &state.gfx.device,
                     &state.gfx.queue,
                 ); // water animation + dynamic object tint updates
