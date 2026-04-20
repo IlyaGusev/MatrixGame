@@ -78,6 +78,11 @@ struct ShadowProjUniform {
 struct ShadowTextureUniform {
     u_row: [f32; 4],
     v_row: [f32; 4],
+    /// `.x != 0` ⇒ TF_ALPHATEST is set on the surface being rasterized.
+    /// The shadow-gen fragment shader uses this to decide whether to
+    /// discard based on the diffuse alpha (obj_shadow,
+    /// MatrixSkinManager.cpp:188-201).
+    alpha_test: [u32; 4],
 }
 
 struct MeshBatch {
@@ -217,6 +222,11 @@ struct ShadowBatch {
 struct SurfaceShadowSource {
     indices: Vec<u32>,
     diffuse_view: wgpu::TextureView,
+    /// Mirrors `TF_ALPHATEST` on the diffuse texture. `obj_shadow`
+    /// (MatrixSkinManager.cpp:185-202) only enables alpha test for
+    /// shadow rasterization when this is set; otherwise the shadow
+    /// silhouette is opaque `D3DTA_TFACTOR`.
+    alpha_test: bool,
 }
 
 /// Flattened per-surface view across all VO frames. `concat_indices` holds
@@ -517,6 +527,18 @@ impl ObjectsRenderer {
                     contents: bytemuck::cast_slice(&surface.concat_indices),
                     usage: wgpu::BufferUsages::INDEX,
                 });
+                // Resolve the full alpha-test flag for this surface's diffuse
+                // texture: start from the `?Trans` suffix parsed by
+                // `MaterialSpec`, then let the sibling `.txt`'s `AlphaTest`
+                // key override (Texture.cpp:113-136).
+                let alpha_test = match material.diffuse.as_deref() {
+                    Some(path) => vo_loader::resolve_alpha_test_with_txt(
+                        path,
+                        material.alpha_test,
+                        read_texture,
+                    ),
+                    None => false,
+                };
                 let mat_uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("Objects Material UB"),
                     contents: bytemuck::bytes_of(&MaterialUniform {
@@ -524,7 +546,7 @@ impl ObjectsRenderer {
                             material.gloss.is_some() as u32,
                             material.back.is_some() as u32,
                             material.mask.is_some() as u32,
-                            0,
+                            alpha_test as u32,
                         ],
                         scroll: [material.scroll[0], material.scroll[1], 0.0, 0.0],
                     }),
@@ -591,6 +613,7 @@ impl ObjectsRenderer {
                 shadow_surfaces.push(SurfaceShadowSource {
                     indices: frame0_indices,
                     diffuse_view: diffuse_view.clone(),
+                    alpha_test,
                 });
             }
 
@@ -877,7 +900,9 @@ fn create_shadow_gen_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
         entries: &[
             wgpu::BindGroupLayoutEntry {
                 binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
+                // Fragment needs it too for the TF_ALPHATEST gate
+                // (`u.alpha_test.x` in SHADOW_TEXTURE_SHADER).
+                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
@@ -1248,11 +1273,6 @@ fn build_shadow_texture(
     texture_size: u32,
 ) -> Option<wgpu::TextureView> {
     let projection = shadow_texture_projection(obj, shadow, map)?;
-    let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("Object Shadow Texture UB"),
-        contents: bytemuck::bytes_of(&projection),
-        usage: wgpu::BufferUsages::UNIFORM,
-    });
     let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("Object Shadow Source VB"),
         contents: bytemuck::cast_slice(vertices),
@@ -1325,6 +1345,17 @@ fn build_shadow_texture(
                 label: Some("Object Shadow Source IB"),
                 contents: bytemuck::cast_slice(&surface.indices),
                 usage: wgpu::BufferUsages::INDEX,
+            });
+            // Per-surface UB so each surface carries its own TF_ALPHATEST
+            // bit alongside the shared projection rows.
+            let surface_uniform = ShadowTextureUniform {
+                alpha_test: [surface.alpha_test as u32, 0, 0, 0],
+                ..projection
+            };
+            let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Object Shadow Texture UB"),
+                contents: bytemuck::bytes_of(&surface_uniform),
+                usage: wgpu::BufferUsages::UNIFORM,
             });
             let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("Object Shadow Texture BG"),
@@ -1404,6 +1435,7 @@ fn shadow_texture_projection(
     Some(ShadowTextureUniform {
         u_row: u_row.to_array(),
         v_row: v_row.to_array(),
+        alpha_test: [0, 0, 0, 0],
     })
 }
 
@@ -1517,7 +1549,12 @@ struct VOut {
 
 @fragment fn fs_main(in: VOut) -> @location(0) vec4<f32> {
     let tex = textureSample(t_diffuse, s_diffuse, in.uv);
-    if (tex.a < 0.5) { discard; }
+    // Match the C++ alpha-test behavior (3g.cpp:662-664 +
+    // MatrixSkinManager.cpp:188,1285,1312,1334,1568,1588): discard only when
+    // the diffuse is TF_ALPHATEST, and use the engine default alpha ref
+    // `0x08 / 255` with D3DCMP_GREATEREQUAL (so pixels with alpha >= 8/255
+    // pass). `m.flags.w` carries the TF_ALPHATEST bit resolved at load time.
+    if (m.flags.w != 0u && tex.a < 8.0 / 255.0) { discard; }
 
     let n = normalize(in.normal);
     let l = normalize(-u.light_dir.xyz);
@@ -1583,6 +1620,11 @@ const SHADOW_TEXTURE_SHADER: &str = r#"
 struct U {
     u_row: vec4<f32>,
     v_row: vec4<f32>,
+    // .x != 0 ⇒ TF_ALPHATEST on the surface being baked. When not set, the
+    // original passes D3DTA_TFACTOR through the alpha stage, which produces
+    // a fully opaque silhouette regardless of the diffuse's alpha channel
+    // (MatrixSkinManager.cpp:195-201).
+    alpha_test: vec4<u32>,
 };
 @group(0) @binding(0) var<uniform> u: U;
 @group(0) @binding(1) var t_diffuse: texture_2d<f32>;
@@ -1609,7 +1651,14 @@ struct VOut {
 
 @fragment fn fs_main(in: VOut) -> @location(0) vec4<f32> {
     let tex = textureSample(t_diffuse, s_diffuse, in.uv);
-    if (tex.a < 0.5) { discard; }
-    return vec4<f32>(1.0, 1.0, 1.0, tex.a);
+    // Discard only for TF_ALPHATEST diffuses, and with the engine default
+    // alpha ref of 8/255 (3g.cpp:662-664). Non-alpha-test surfaces render
+    // as a solid silhouette — the shadow density is carried by alpha=1.0
+    // so the projected shadow pass picks the full footprint.
+    if (u.alpha_test.x != 0u) {
+        if (tex.a < 8.0 / 255.0) { discard; }
+        return vec4<f32>(1.0, 1.0, 1.0, tex.a);
+    }
+    return vec4<f32>(1.0, 1.0, 1.0, 1.0);
 }
 "#;

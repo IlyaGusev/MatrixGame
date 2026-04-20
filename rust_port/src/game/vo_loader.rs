@@ -81,6 +81,12 @@ pub struct MaterialSpec {
     pub back: Option<String>,
     pub mask: Option<String>,
     pub scroll: [f32; 2],
+    /// True when the diffuse texture's `ParseFlags` call would set
+    /// `TF_ALPHATEST` (Texture.cpp:96-152). We set it eagerly from the
+    /// `?Trans` suffix (Texture.cpp:108); the sibling `.txt` `AlphaTest`
+    /// override (Texture.cpp:131-136) is applied later via
+    /// `resolve_alpha_test_with_txt`, which needs asset I/O.
+    pub alpha_test: bool,
 }
 
 pub fn parse_vo(data: &[u8]) -> Result<VoMesh> {
@@ -192,6 +198,7 @@ pub fn resolve_paths(id_string: &str) -> Option<ResolvedObjectPaths> {
             .get(5)
             .and_then(|t| resolve_texture_name(t, Some(&path))),
         scroll: parts.get(6).map(|t| parse_scroll(t)).unwrap_or([0.0, 0.0]),
+        alpha_test: parts.get(2).is_some_and(|t| has_trans_suffix(t)),
     };
     let shadow = parts
         .get(7)
@@ -221,6 +228,7 @@ pub fn parse_material_spec_with_prefix(spec: &str, prefix: Option<&str>) -> Mate
         back: parts.get(2).and_then(|t| resolve_texture_name(t, prefix)),
         mask: parts.get(3).and_then(|t| resolve_texture_name(t, prefix)),
         scroll: parts.get(4).map(|t| parse_scroll(t)).unwrap_or([0.0, 0.0]),
+        alpha_test: parts.first().is_some_and(|t| has_trans_suffix(t)),
     }
 }
 
@@ -228,8 +236,14 @@ pub fn merge_materials(base: &MaterialSpec, overlay: Option<&MaterialSpec>) -> M
     let Some(overlay) = overlay else {
         return base.clone();
     };
+    // alpha_test tracks the diffuse that actually wins the merge.
+    let (diffuse, alpha_test) = if overlay.diffuse.is_some() {
+        (overlay.diffuse.clone(), overlay.alpha_test)
+    } else {
+        (base.diffuse.clone(), base.alpha_test)
+    };
     MaterialSpec {
-        diffuse: overlay.diffuse.clone().or_else(|| base.diffuse.clone()),
+        diffuse,
         gloss: overlay.gloss.clone().or_else(|| base.gloss.clone()),
         back: overlay.back.clone().or_else(|| base.back.clone()),
         mask: overlay.mask.clone().or_else(|| base.mask.clone()),
@@ -238,6 +252,78 @@ pub fn merge_materials(base: &MaterialSpec, overlay: Option<&MaterialSpec>) -> M
         } else {
             base.scroll
         },
+        alpha_test,
+    }
+}
+
+/// Ports the `?Trans` flag detection inside `CBaseTexture::ParseFlags`
+/// (Texture.cpp:102-111). The raw texture spec is `path?Opt1?Opt2?...`; any
+/// `Trans` option sets `TF_ALPHATEST`. Other options (`Alpha`, `Compressed`)
+/// don't affect alpha-test.
+///
+/// The comparison in the original is `tstr == L"Trans"` via `CWStr::Equal`
+/// (CWStr.cpp:678-684), which is a memcmp — i.e. case-sensitive. We mirror
+/// that: `?trans` (lowercase) would NOT set the flag in the real engine, so
+/// it mustn't here either.
+fn has_trans_suffix(raw: &str) -> bool {
+    let raw = raw.trim().trim_end_matches('\0');
+    let mut parts = raw.split('?');
+    parts.next(); // the actual path — skip
+    parts.any(|opt| opt.trim() == "Trans")
+}
+
+/// Ports the sibling `.txt` override pass of `CBaseTexture::ParseFlags`
+/// (Texture.cpp:113-136). The original reads `<basename>.txt` next to each
+/// texture (via `CacheReplaceFileExt`) and, if present, applies
+/// `AlphaTest = 0` / `AlphaTest = <anything else>` to the flag chosen from
+/// the `?Trans` suffix.
+///
+/// The original explicitly skips `pinguin.txt` and `robotarget.txt`
+/// (Texture.cpp:121-124): those files carry unrelated block content that
+/// would spuriously set the alpha-test flag. We mirror that guard.
+///
+/// `read_file` is the port's asset-lookup callback (the same one that
+/// resolves textures / VO files). It can return `None` when the sibling
+/// `.txt` doesn't exist, which is the common case.
+pub fn resolve_alpha_test_with_txt(
+    diffuse_path: &str,
+    suffix_flag: bool,
+    read_file: &dyn Fn(&str) -> Option<Vec<u8>>,
+) -> bool {
+    let txt_path = replace_extension(diffuse_path, "txt");
+    // Substring match to mirror the original's `tstr.Find(L"pinguin.txt") >= 0`
+    // guard (Texture.cpp:121-124). `CWStr::Find` (CWStr.cpp:489-506) is a
+    // case-sensitive byte scan, so match the casing of the excluded files
+    // verbatim.
+    if txt_path.contains("pinguin.txt") || txt_path.contains("robotarget.txt") {
+        return suffix_flag;
+    }
+    let Some(bytes) = read_file(&txt_path) else {
+        return suffix_flag;
+    };
+    let bp = crate::assets::blockpar_text::BlockPar::parse_bytes(&bytes);
+    // The C++ branch gates on `!tstr.IsEmpty()` (Texture.cpp:132), so both an
+    // absent key and an empty value leave the suffix flag alone. Only a
+    // non-empty value overrides: "0" clears, anything else sets.
+    match bp.par_get_ne("AlphaTest") {
+        Some(v) => {
+            let trimmed = v.trim();
+            if trimmed.is_empty() {
+                suffix_flag
+            } else if trimmed == "0" {
+                false
+            } else {
+                true
+            }
+        }
+        None => suffix_flag,
+    }
+}
+
+fn replace_extension(path: &str, new_ext: &str) -> String {
+    match path.rsplit_once('.') {
+        Some((stem, _)) => format!("{stem}.{new_ext}"),
+        None => format!("{path}.{new_ext}"),
     }
 }
 
