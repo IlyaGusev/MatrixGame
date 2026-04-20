@@ -1401,29 +1401,48 @@ fn kscale(k: f32, k1: f32, k2: f32) -> f32 {
     }
 }
 
-/// Deterministic LCG mirroring the shape of Math3D.hpp's FRND family. We
-/// don't need parity with the C++ RNG stream — only the spatial and temporal
-/// jitter character — but we keep the output in [0, 1) for `frnd`.
-fn lcg_u32(state: &mut u32) -> u32 {
-    *state = state.wrapping_mul(1664525).wrapping_add(1013904223);
-    *state
+/// Seed mirroring `srand((unsigned)time(NULL))` (MatrixGame.cpp:90). The
+/// original seeds once at app start; we seed once per `InshoreSystem` so the
+/// stream is fresh per map load but not reproducible frame-to-frame.
+fn inshore_rng_seed() -> u32 {
+    crate::platform::now_secs() as u32
+}
+
+/// MSVC CRT `rand()` — the engine links against this, so `FRND`/`FSRND`/
+/// `IRND` (Math3D.hpp:25-28) ultimately pull from this 15-bit stream.
+/// Formula from MS CRT: `seed = seed*214013 + 2531011; return (seed >> 16) & 0x7fff`.
+const RAND_MAX: u32 = 0x7fff;
+
+fn msvc_rand(state: &mut u32) -> u32 {
+    *state = state.wrapping_mul(214013).wrapping_add(2531011);
+    (*state >> 16) & RAND_MAX
+}
+
+/// `RND(0, x)` from Math3D.hpp:25 — uniform double in `[0, x]`. All the
+/// jitter helpers below fan out from this so the distribution matches the
+/// original: 15-bit granularity, inclusive upper bound.
+fn rnd(state: &mut u32, x: f64) -> f64 {
+    (msvc_rand(state) as f64) * (1.0 / RAND_MAX as f64) * x.abs()
 }
 
 fn frnd(state: &mut u32, x: f32) -> f32 {
-    let r = (lcg_u32(state) >> 8) as f32 / ((1u32 << 24) as f32);
-    r * x
+    rnd(state, x as f64) as f32
 }
 
 fn fsrnd(state: &mut u32, x: f32) -> f32 {
     frnd(state, 2.0 * x) - x
 }
 
+/// `IRND(n) = Double2Int(RND(0, n - 0.55))` (Math3D.hpp:28). `Double2Int`
+/// uses x87 `fistp` with the default round-to-nearest-even mode, so port
+/// to `round_ties_even` rather than `as u32` (truncation) or `round()`
+/// (round-half-away-from-zero) — both would shift the distribution.
 fn irnd(state: &mut u32, n: u32) -> u32 {
     if n == 0 {
-        0
-    } else {
-        lcg_u32(state) % n
+        return 0;
     }
+    let r = rnd(state, n as f64 - 0.55).round_ties_even();
+    (r as i64).clamp(0, (n - 1) as i64) as u32
 }
 
 /// Build the per-group prespawn pool + pipeline. Reads the inshore texture
@@ -1658,7 +1677,7 @@ fn build_inshore_system(
         bind_group,
         prespawns,
         active_waves,
-        rng: 0x9E3779B9,
+        rng: inshore_rng_seed(),
         color_rgb: [cr, cg, cb],
         map_half_w: map.world_width() * 0.5,
         map_half_h: map.world_height() * 0.5,
