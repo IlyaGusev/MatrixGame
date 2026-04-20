@@ -122,7 +122,7 @@ pub fn parse_vo(data: &[u8]) -> Result<VoMesh> {
         indices.push(u16::from_le_bytes([ib[off], ib[off + 1]]));
     }
 
-    let frames = parse_frames(&stor, &indices);
+    let frames = parse_frames(&stor, &indices).context("parsing VO frames")?;
     let animations = parse_animations(&stor);
     let surfaces = frames
         .first()
@@ -307,23 +307,12 @@ const SVO_UNION_SIZE: usize = 24;
 /// SVOFrameIndex size — two i32 (VectorObject.hpp:252).
 const SVO_FRAME_INDEX_SIZE: usize = 8;
 
-/// Fallback frame used when a VO has no frame metadata (or the storage is
-/// malformed). All indices land in a single untextured surface so the mesh
-/// still renders at identity pose.
-fn fallback_frame(indices: &[u16], tex0: Option<String>) -> VoFrame {
-    VoFrame {
-        bounds_min: [0.0; 3],
-        bounds_max: [0.0; 3],
-        geo_center: [0.0; 3],
-        radius: 0.0,
-        surfaces: vec![VoSurfaceMesh {
-            indices: indices.iter().map(|&i| i as u32).collect(),
-            texture_ref: tex0,
-        }],
-    }
-}
-
-fn parse_frames(stor: &Storage, indices: &[u16]) -> Vec<VoFrame> {
+/// Ports VectorObject.cpp:260-344. The original unconditionally reads
+/// `frames/data`, `frames/unions`, and `unions/data` (VectorObject.cpp:263-280,
+/// 335-342) — a missing or undersized buffer there was a hard failure, not a
+/// point where the engine synthesized a stand-in pose. We mirror that: if the
+/// metadata isn't usable, the VO is rejected.
+fn parse_frames(stor: &Storage, indices: &[u16]) -> Result<Vec<VoFrame>> {
     let mut texture_refs: Vec<Option<String>> = Vec::new();
     if let Some(buf) = stor.get_buf("surfs", "texs") {
         for i in 0..buf.arrays_count() {
@@ -333,22 +322,35 @@ fn parse_frames(stor: &Storage, indices: &[u16]) -> Vec<VoFrame> {
         }
     }
     let surface_count = texture_refs.len().max(1);
-    let tex0 = texture_refs.first().cloned().flatten();
 
-    let Some(frame_data) = stor.get_buf("frames", "data").map(|b| b.get_bytes(0)) else {
-        return vec![fallback_frame(indices, tex0)];
-    };
-    let Some(frame_unions) = stor.get_buf("frames", "unions").map(|b| b.get_bytes(0)) else {
-        return vec![fallback_frame(indices, tex0)];
-    };
-    let Some(unions_data) = stor.get_buf("unions", "data").map(|b| b.get_bytes(0)) else {
-        return vec![fallback_frame(indices, tex0)];
-    };
-    if frame_data.len() < SVO_KADR_SIZE
-        || frame_unions.len() < 4
-        || unions_data.len() < SVO_UNION_SIZE
-    {
-        return vec![fallback_frame(indices, tex0)];
+    let frame_data = stor
+        .get_buf("frames", "data")
+        .map(|b| b.get_bytes(0))
+        .context("missing frames/data")?;
+    let frame_unions = stor
+        .get_buf("frames", "unions")
+        .map(|b| b.get_bytes(0))
+        .context("missing frames/unions")?;
+    let unions_data = stor
+        .get_buf("unions", "data")
+        .map(|b| b.get_bytes(0))
+        .context("missing unions/data")?;
+    if frame_data.len() < SVO_KADR_SIZE {
+        anyhow::bail!(
+            "frames/data too small: {} bytes (need >= {})",
+            frame_data.len(),
+            SVO_KADR_SIZE
+        );
+    }
+    if frame_unions.len() < 4 {
+        anyhow::bail!("frames/unions too small: {} bytes", frame_unions.len());
+    }
+    if unions_data.len() < SVO_UNION_SIZE {
+        anyhow::bail!(
+            "unions/data too small: {} bytes (need >= {})",
+            unions_data.len(),
+            SVO_UNION_SIZE
+        );
     }
 
     let frame_count = frame_data.len() / SVO_KADR_SIZE;
@@ -424,11 +426,14 @@ fn parse_frames(stor: &Storage, indices: &[u16]) -> Vec<VoFrame> {
         });
     }
 
-    if frames.is_empty() || frames.iter().all(|f| f.surfaces.is_empty()) {
-        return vec![fallback_frame(indices, tex0)];
+    if frames.is_empty() {
+        anyhow::bail!("frames/data parsed to zero frames");
+    }
+    if frames.iter().all(|f| f.surfaces.is_empty()) {
+        anyhow::bail!("no frame has any populated surface");
     }
 
-    frames
+    Ok(frames)
 }
 
 fn parse_animations(stor: &Storage) -> Vec<VoAnimation> {
