@@ -23,6 +23,14 @@ pub async fn load_bytes(path: &str) -> anyhow::Result<Vec<u8>> {
             .map_err(|e| anyhow::anyhow!("{e:?}"))?;
 
         let response: Response = response.dyn_into().unwrap();
+        if !response.ok() {
+            anyhow::bail!(
+                "fetch {}: HTTP {} {}",
+                path,
+                response.status(),
+                response.status_text()
+            );
+        }
         let buffer = JsFuture::from(response.array_buffer().unwrap())
             .await
             .map_err(|e| anyhow::anyhow!("{e:?}"))?;
