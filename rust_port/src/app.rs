@@ -13,6 +13,7 @@ use crate::game::map::GameMap;
 use crate::game::world::World;
 use crate::renderer::camera::Camera;
 use crate::renderer::context::GfxContext;
+use crate::renderer::minimap::Minimap;
 use crate::renderer::terrain::TerrainRenderer;
 struct AppState {
     window: Arc<Window>,
@@ -20,6 +21,7 @@ struct AppState {
     map: Arc<GameMap>,
     point_lights: PointLightSystem,
     terrain: TerrainRenderer,
+    minimap: Minimap,
     camera: Camera,
     game: World,
     last_time: f64,
@@ -102,6 +104,15 @@ impl ApplicationHandler for App {
                 &tex_reader,
             );
             let point_lights = PointLightSystem::new(&map);
+            let mut minimap = Minimap::new(
+                &gfx.device,
+                &gfx.queue,
+                gfx.config.format,
+                &map,
+                &matrix_data,
+                &tex_reader,
+            );
+            minimap.set_angle(-map.camera_angle);
 
             *self.state.borrow_mut() = Some(AppState {
                 window,
@@ -109,6 +120,7 @@ impl ApplicationHandler for App {
                 map,
                 point_lights,
                 terrain,
+                minimap,
                 camera,
                 game: World::new(),
                 last_time: crate::platform::now_secs(),
@@ -156,6 +168,15 @@ impl ApplicationHandler for App {
                     &tex_reader,
                 );
                 let point_lights = PointLightSystem::new(&map);
+                let mut minimap = Minimap::new(
+                    &gfx.device,
+                    &gfx.queue,
+                    gfx.config.format,
+                    &map,
+                    &matrix_data,
+                    &tex_reader,
+                );
+                minimap.set_angle(-map.camera_angle);
 
                 // Force resize to match actual canvas dimensions
                 let size = win.inner_size();
@@ -181,6 +202,7 @@ impl ApplicationHandler for App {
                     map,
                     point_lights,
                     terrain,
+                    minimap,
                     camera,
                     game: World::new(),
                     last_time: crate::platform::now_secs(),
@@ -297,6 +319,16 @@ impl ApplicationHandler for App {
                     &state.gfx.queue,
                 ); // water animation + dynamic object tint updates
 
+                // Bake the minimap background the first time — ports
+                // CMinimap::RenderBackground (called once at map load). Must
+                // be its own submission so `queue.write_buffer` doesn't get
+                // clobbered by the main render's VP write.
+                state.minimap.bake_background(
+                    &state.gfx.device,
+                    &state.gfx.queue,
+                    &mut state.terrain,
+                    &state.map,
+                );
                 match state.gfx.begin_frame() {
                     Ok((output, view, mut encoder)) => {
                         let vp = state.camera.view_proj();
@@ -311,6 +343,35 @@ impl ApplicationHandler for App {
                             vm,
                             &state.map,
                         );
+                        {
+                            let mut pass =
+                                encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                    label: Some("Minimap Pass"),
+                                    color_attachments: &[Some(
+                                        wgpu::RenderPassColorAttachment {
+                                            view: &view,
+                                            resolve_target: None,
+                                            depth_slice: None,
+                                            ops: wgpu::Operations {
+                                                load: wgpu::LoadOp::Load,
+                                                store: wgpu::StoreOp::Store,
+                                            },
+                                        },
+                                    )],
+                                    depth_stencil_attachment: None,
+                                    timestamp_writes: None,
+                                    occlusion_query_set: None,
+                                    multiview_mask: None,
+                                });
+                            state.minimap.render(
+                                &state.gfx.queue,
+                                &mut pass,
+                                state.gfx.config.width as f32,
+                                state.gfx.config.height as f32,
+                                &state.map,
+                                &state.camera,
+                            );
+                        }
                         state.gfx.end_frame(output, encoder);
                     }
                     Err(wgpu::SurfaceError::Lost) => {

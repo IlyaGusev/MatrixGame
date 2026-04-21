@@ -236,6 +236,13 @@ impl Camera {
         self.xy_strategy = pos;
     }
 
+    /// Uncentered world XY of the strategy link point — equivalent to
+    /// `CMatrixCamera::GetXYStrategy()` (MatrixCamera.hpp). Used by the
+    /// minimap to recenter every frame per MatrixMap.cpp:1261.
+    pub fn strategy_xy(&self) -> (f32, f32) {
+        (self.xy_strategy[0], self.xy_strategy[1])
+    }
+
     pub fn set_terrain_sampler(&mut self, f: Box<dyn Fn(f32, f32) -> f32 + Send + Sync>) {
         self.sample_terrain = Some(f);
     }

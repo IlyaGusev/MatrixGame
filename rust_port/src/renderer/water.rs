@@ -950,6 +950,118 @@ impl Water {
         }
     }
 
+    /// All-tiles water pass for the minimap bake. Mirrors both water loops in
+    /// CMinimap::RenderBackground:
+    ///   - Solid loop (MatrixMinimap.cpp:1055-1071): iterates every tile in
+    ///     the fsz×fsz square centered on the map and draws ocean water.
+    ///   - Alpha loop (MatrixMinimap.cpp:1086-1112): draws per-group alpha
+    ///     water over every recorded group regardless of visibility.
+    /// Uses the wave lattice at its current animation phase — matches the
+    /// original, which runs the bake at map load before animation has started
+    /// (lattice = initial phase offsets).
+    pub fn bake_minimap_all<'a>(
+        &'a mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        pass: &mut wgpu::RenderPass<'a>,
+        view_proj: glam::Mat4,
+    ) {
+        queue.write_buffer(
+            &self.uniform_buffer,
+            0,
+            bytemuck::bytes_of(&WaterUniforms {
+                view_proj: view_proj.to_cols_array_2d(),
+                // Ortho top-down view has no camera-space reflection vector;
+                // identity keeps the mirror term neutral, matching the flat
+                // pre-baked look of the original.
+                normal_mat: glam::Mat4::IDENTITY.to_cols_array_2d(),
+                water_color: self.water_color,
+                light_color: self.light_color,
+                light_dir: self.light_dir,
+                params: [1.0, 0.0, 0.0, 0.0],
+                fog_color: self.fog_color,
+                fog_params: [FOG_START, FOG_END, 0.0, 0.0],
+            }),
+        );
+
+        // Enumerate every water tile in the fsz × fsz square centered on the
+        // map — matches the manual double loop in MatrixMinimap.cpp:1059-1070.
+        let group_w = self.group_world;
+        let sz_tiles = ((self.map_half_w * 2.0).max(self.map_half_h * 2.0) / group_w).ceil() as i32;
+        let tiles_per_side = sz_tiles;
+        let x0_tile = ((self.map_half_w * 2.0 - tiles_per_side as f32 * group_w) * 0.5)
+            - self.map_half_w;
+        let y0_tile = ((self.map_half_h * 2.0 - tiles_per_side as f32 * group_w) * 0.5)
+            - self.map_half_h;
+        let mut ocean = Vec::with_capacity((tiles_per_side * tiles_per_side) as usize);
+        let mut fill = Vec::new();
+        for gy in 0..tiles_per_side {
+            for gx in 0..tiles_per_side {
+                let x0 = x0_tile + gx as f32 * group_w;
+                let y0 = y0_tile + gy as f32 * group_w;
+                // Decide ocean vs. fill based on whether an on-map group
+                // record exists (same split as `collect_visible_solid_tiles`
+                // so the real-z vs depth-pinned shader choice matches).
+                let wx_idx = ((x0 + self.map_half_w) / group_w).round() as i32;
+                let wy_idx = ((y0 + self.map_half_h) / group_w).round() as i32;
+                if self.has_group.contains(&(wx_idx, wy_idx)) {
+                    fill.push(WaterInstance { x0, y0 });
+                } else {
+                    ocean.push(WaterInstance { x0, y0 });
+                }
+            }
+        }
+
+        let (lattice_z, lattice_normals) =
+            build_wave_lattice(self.angle, self.water_normal_len, &self.phase_offsets);
+
+        // Solid ocean pass — fills every tile outside on-map groups, including
+        // everything beyond the map extent.
+        if !ocean.is_empty() {
+            self.ensure_ocean_capacity(device, ocean.len());
+            let verts =
+                build_instance_vertices(&ocean, &lattice_z, &lattice_normals, self.water_scale);
+            let idxs = build_instance_indices(ocean.len());
+            self.ocean_num_indices = idxs.len() as u32;
+            queue.write_buffer(&self.ocean_vertex_buffer, 0, bytemuck::cast_slice(&verts));
+            queue.write_buffer(&self.ocean_index_buffer, 0, bytemuck::cast_slice(&idxs));
+            pass.set_pipeline(&self.solid_pipeline);
+            pass.set_bind_group(0, &self.solid_bind_group, &[]);
+            pass.set_vertex_buffer(0, self.ocean_vertex_buffer.slice(..));
+            pass.set_index_buffer(self.ocean_index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..self.ocean_num_indices, 0, 0..1);
+        }
+
+        // Depth-pinned shoreline fill — same as the main render.
+        if !fill.is_empty() {
+            self.ensure_fill_capacity(device, fill.len());
+            let verts =
+                build_instance_vertices(&fill, &lattice_z, &lattice_normals, self.water_scale);
+            let idxs = build_instance_indices(fill.len());
+            self.fill_num_indices = idxs.len() as u32;
+            queue.write_buffer(&self.fill_vertex_buffer, 0, bytemuck::cast_slice(&verts));
+            queue.write_buffer(&self.fill_index_buffer, 0, bytemuck::cast_slice(&idxs));
+            pass.set_pipeline(&self.fill_pipeline);
+            pass.set_bind_group(0, &self.solid_bind_group, &[]);
+            pass.set_vertex_buffer(0, self.fill_vertex_buffer.slice(..));
+            pass.set_index_buffer(self.fill_index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..self.fill_num_indices, 0, 0..1);
+        }
+
+        // Per-group alpha water (MatrixMinimap.cpp:1086-1112).
+        pass.set_pipeline(&self.pipeline);
+        pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+        pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+        for draw in &self.water_draws {
+            pass.set_bind_group(0, &draw.bind_group, &[]);
+            pass.draw_indexed(
+                draw.index_start..(draw.index_start + draw.index_count),
+                0,
+                0..1,
+            );
+        }
+    }
+
     fn ensure_ocean_capacity(&mut self, device: &wgpu::Device, instance_count: usize) {
         if instance_count <= self.ocean_capacity_instances {
             return;

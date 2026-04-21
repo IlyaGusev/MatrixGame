@@ -1072,6 +1072,127 @@ impl TerrainRenderer {
             water.render(_device, &mut pass, queue, camera, view_proj, view_mat);
         }
     }
+
+    /// Ports `CMinimap::RenderBackground` (MatrixMinimap.cpp:855-1199).
+    ///
+    /// Renders the landscape orthographically from above into `color_view` /
+    /// `depth_view`. Matches the original pass set it calls via
+    /// `DrawLandscape(true)` + `DrawLandscapeSurfaces(true)` + water alpha:
+    /// opaque bottom → depth-only → surfaces → gloss → per-group water alpha.
+    /// Sky, objects, buildings, point lights are intentionally skipped — the
+    /// original sets `MMFLAG_DISABLE_DRAW_OBJECT_LIGHTS` for the bake and
+    /// stamps buildings via `RenderObjectToBackground` separately.
+    pub fn bake_minimap(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        queue: &wgpu::Queue,
+        color_view: &wgpu::TextureView,
+        depth_view: &wgpu::TextureView,
+        view_proj: glam::Mat4,
+        clear_color: wgpu::Color,
+    ) {
+        // Repoint both uniform buffers at the orthographic VP. `normal_mat`
+        // for gloss is left at identity since the ortho top-down view has no
+        // meaningful camera-space reflection direction — matches the flat
+        // look of RenderBackground's pass.
+        queue.write_buffer(
+            &self.uniform_buffer,
+            0,
+            bytemuck::bytes_of(&Uniforms {
+                view_proj: view_proj.to_cols_array_2d(),
+                fog_color: self.fog_color,
+                fog_params: [FOG_START, FOG_END, 0.0, 0.0],
+            }),
+        );
+        if !self.gloss_batches.is_empty() {
+            queue.write_buffer(
+                &self.gloss_uniform_buffer,
+                0,
+                bytemuck::bytes_of(&GlossUniforms {
+                    view_proj: view_proj.to_cols_array_2d(),
+                    normal_mat: glam::Mat4::IDENTITY.to_cols_array_2d(),
+                    fog_color: self.fog_color,
+                    fog_params: [FOG_START, FOG_END, 0.0, 0.0],
+                }),
+            );
+        }
+
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Minimap Bake"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: color_view,
+                resolve_target: None,
+                depth_slice: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(clear_color),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: depth_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+
+        // Bottom (opaque terrain).
+        pass.set_pipeline(&self.pipeline);
+        for batch in &self.batches {
+            pass.set_bind_group(0, &batch.bind_group, &[]);
+            pass.set_vertex_buffer(0, batch.vertex_buffer.slice(..));
+            pass.set_index_buffer(batch.index_buffer.slice(..), batch.index_format);
+            pass.draw_indexed(0..batch.num_indices, 0, 0..1);
+        }
+
+        // Depth-only sentinel batches (MatrixMapGroup.cpp:593-606).
+        if !self.depth_only_batches.is_empty() {
+            pass.set_pipeline(&self.depth_only_pipeline);
+            for batch in &self.depth_only_batches {
+                pass.set_bind_group(0, &batch.bind_group, &[]);
+                pass.set_vertex_buffer(0, batch.vertex_buffer.slice(..));
+                pass.set_index_buffer(batch.index_buffer.slice(..), batch.index_format);
+                pass.draw_indexed(0..batch.num_indices, 0, 0..1);
+            }
+        }
+
+        // Surface overlays — no visibility culling, the whole map is in view.
+        if !self.overlay_batches.is_empty() {
+            pass.set_pipeline(&self.overlay_pipeline);
+            for batch in &self.overlay_batches {
+                let draw = &batch.draw;
+                pass.set_bind_group(0, &draw.bind_group, &[]);
+                pass.set_vertex_buffer(0, draw.vertex_buffer.slice(..));
+                pass.set_index_buffer(draw.index_buffer.slice(..), draw.index_format);
+                pass.draw_indexed(0..draw.num_indices, 0, 0..1);
+            }
+        }
+
+        // Gloss.
+        if !self.gloss_batches.is_empty() {
+            pass.set_pipeline(&self.gloss_pipeline);
+            for batch in &self.gloss_batches {
+                let draw = &batch.draw;
+                pass.set_bind_group(0, &draw.bind_group, &[]);
+                pass.set_vertex_buffer(0, draw.vertex_buffer.slice(..));
+                pass.set_index_buffer(draw.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+                pass.draw_indexed(0..draw.num_indices, 0, 0..1);
+            }
+        }
+
+        // Water solid + fill + alpha — fills the non-terrain area inside the
+        // fsz×fsz ortho footprint with proper animated water, matching the
+        // double loop in RenderBackground (MatrixMinimap.cpp:1055-1112).
+        if let Some(water) = &mut self.water {
+            water.bake_minimap_all(device, queue, &mut pass, view_proj);
+        }
+    }
 }
 
 /// Terrain shader — ports TerBotM (MatrixRenderPipeline.cpp:1198-1213).

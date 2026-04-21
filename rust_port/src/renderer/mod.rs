@@ -1,6 +1,7 @@
 pub mod buildings;
 pub mod camera;
 pub mod context;
+pub mod minimap;
 pub mod objects;
 pub mod particles;
 pub mod pipeline;
