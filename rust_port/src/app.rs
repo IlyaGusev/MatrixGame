@@ -257,10 +257,10 @@ impl ApplicationHandler for App {
                 let action =
                     match event.physical_key {
                         PhysicalKey::Code(KeyCode::ArrowUp) | PhysicalKey::Code(KeyCode::KeyW) => {
-                            Some(KeyAction::MoveBack)
+                            Some(KeyAction::MoveForward)
                         }
                         PhysicalKey::Code(KeyCode::ArrowDown)
-                        | PhysicalKey::Code(KeyCode::KeyS) => Some(KeyAction::MoveForward),
+                        | PhysicalKey::Code(KeyCode::KeyS) => Some(KeyAction::MoveBack),
                         PhysicalKey::Code(KeyCode::ArrowLeft)
                         | PhysicalKey::Code(KeyCode::KeyA) => Some(KeyAction::MoveLeft),
                         PhysicalKey::Code(KeyCode::ArrowRight)

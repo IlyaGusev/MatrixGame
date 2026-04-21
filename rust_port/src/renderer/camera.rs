@@ -368,8 +368,10 @@ impl Camera {
         if move_bits != 0 {
             let speed = p.move_speed * dt_ms;
             let dir = self.bottom_plane_xy_dir() * speed;
-            let ldir = Vec2::new(-dir.y, dir.x);
-            let rdir = Vec2::new(dir.y, -dir.x);
+            // lDir/rDir match MatrixCamera.cpp:1076-1077 (left = 90° CW
+            // rotation of `dir`; right = 90° CCW).
+            let ldir = Vec2::new(dir.y, -dir.x);
+            let rdir = Vec2::new(-dir.y, dir.x);
             let tdir = dir;
             let bdir = -dir;
             if move_bits & ACT_MOVE_LEFT != 0 {
@@ -485,7 +487,10 @@ impl Camera {
         };
         let lb = sample_corner(-1.0);
         let rb = sample_corner(1.0);
-        let n = rb.cross(lb).normalize_or_zero();
+        // Match MatrixCamera.cpp:791: bottom plane inward normal = LB × RB.
+        // The previous `rb × lb` flipped the sign of `dir`, which the keyboard
+        // bindings and the `ldir/rdir` formulas were silently compensating for.
+        let n = lb.cross(rb).normalize_or_zero();
         let xy = Vec2::new(n.x, -n.z);
         if xy.length_squared() < 1e-8 {
             let s = self.angle_z.sin();
