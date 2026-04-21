@@ -112,6 +112,13 @@ fn main() {
     // Minimap icon atlas (CMinimap::Init reads sub-rects from the Minimap
     // block in robots.dat).
     extra_paths.push("Matrix/Textures/Minimap/radarIcons".to_string());
+    // UI skin atlases — the "if" record in robots.dat references these by
+    // name for every panel/button sub-rect. Minimap.rs currently uses
+    // interface1 for the MiniM panel; pack 2/3 too so the rest of the HUD
+    // can be ported without a second bundle bump.
+    extra_paths.push("Matrix/Iface/interface1".to_string());
+    extra_paths.push("Matrix/Iface/interface2".to_string());
+    extra_paths.push("Matrix/Iface/interface3".to_string());
     // Sky panorama textures referenced by the hardcoded sky config table in
     // `renderer/sky.rs::resolve_sky_texture`. Pack all of them so every sky
     // name resolves regardless of which map is loaded next.

@@ -34,18 +34,22 @@ use crate::renderer::texture::{create_texture_from_rgba, decode_texture_bytes};
 /// Matches `MINIMAP_SIZE` in MatrixMinimap.hpp:14.
 const TEX_SIZE: u32 = 512;
 
-/// Pixel dimensions from `CInterface.cpp:557`:
-///   SetOutParams(m_xPos+13, m_yPos+51, 145, 145, ...)
-/// The outer panel is anchored bottom-left of a 1024×768 design; the minimap
-/// sits 13 px from the panel's left edge and 51 px from its top edge.
-///
-/// The C++ engine never scales the UI with resolution — 145 px on a 1024×768
-/// base becomes a pinhead on a 4K monitor. We scale every UI pixel value by
-/// `screen_h / DESIGN_HEIGHT_PX` so the minimap keeps the same fraction of
-/// screen height the 1024×768 original had (~19%).
+/// Layout constants in the SR2 1024×768 base design, pulled from the "if"
+/// record in robots.dat (MiniM block → mmp/Static + CInterface.cpp:557):
+///   MiniM.xPos = 0, MiniM.yPos = 559 (bottom-anchored)
+///   Static mmp.xSize/ySize = 176×209 — this is the panel art's display size
+///   Minimap landscape renders at (xPos+13, yPos+51, 145, 145) inside mmp
 const MINIMAP_SIZE_PX: f32 = 145.0;
 const MINIMAP_OFFSET_X: f32 = 13.0;
-const MINIMAP_OFFSET_FROM_BOTTOM: f32 = 147.0;
+/// Y-offset from the top of the MiniM parent panel — matches `m_yPos + 51`
+/// at CInterface.cpp:557 (panel-local).
+const MINIMAP_OFFSET_Y_IN_PANEL: f32 = 51.0;
+const MINIMAP_PANEL_W: f32 = 176.0;
+const MINIMAP_PANEL_H: f32 = 209.0;
+/// Panel Y in the 1024×768 base (MiniM.yPos from robots.dat). With the
+/// bottom-anchor rule at CInterface.cpp:180-183 the final Y becomes
+/// `screen_h - (768 - 559) = screen_h - 209`.
+const MINIMAP_PANEL_Y_BASE: f32 = 559.0;
 const DESIGN_HEIGHT_PX: f32 = 768.0;
 
 /// `MINIMAP_CAM_COLOR = 0xFF30FFFF` (MatrixMinimap.cpp:19), D3DCOLOR ARGB.
@@ -74,12 +78,43 @@ struct IconUv {
     v1: f32,
 }
 
+/// Static image sub-rect parsed from a UI block's sNormal* params.
+/// (sNormalX, sNormalY, display_w, display_h, texture_w, texture_h).
+/// UV normalization matches CIFaceElement.cpp:60-66.
+#[derive(Copy, Clone, Default)]
+struct SubRect {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    tex_w: f32,
+    tex_h: f32,
+}
+impl SubRect {
+    fn to_uv(self) -> IconUv {
+        IconUv {
+            u0: self.x / self.tex_w,
+            v0: self.y / self.tex_h,
+            u1: (self.x + self.w) / self.tex_w,
+            v1: (self.y + self.h) / self.tex_h,
+        }
+    }
+}
+
 pub struct Minimap {
     tex_pipeline: wgpu::RenderPipeline,
     line_pipeline: wgpu::RenderPipeline,
     bg_bind: wgpu::BindGroup,
     icon_bind: wgpu::BindGroup,
+    panel_bind: wgpu::BindGroup,
     white_bind: wgpu::BindGroup,
+
+    /// Parsed layout for the `mmp` static inside the `MiniM` panel block of
+    /// robots.dat → "if" record. Source rect is in `interface1` pixel coords;
+    /// we normalize at render time by the atlas dimensions.
+    panel_src: SubRect,
+    /// Normalized (u0,v0,u1,v1) for the MiniM panel art on `interface1`.
+    panel_uv: IconUv,
 
     // Dynamic per-frame vertex streams.
     quad_vbuf: wgpu::Buffer, // TriangleList, grows via write_buffer
@@ -299,6 +334,31 @@ impl Minimap {
             .unwrap_or(icon_base);
         let _ = default_w; // silence unused warning
 
+        // ── Panel art from robots.dat `if` / MiniM / Static `mmp` ──────────
+        // Sub-rect layout mirrors CIFaceElement.cpp:60-66: u = xTexPos / tex_w,
+        // sub size = element's xSize × ySize.
+        let panel_src = parse_mmp_static(matrix_data).unwrap_or(SubRect {
+            x: 0.0,
+            y: 88.0,
+            w: 176.0,
+            h: 209.0,
+            tex_w: 512.0,
+            tex_h: 512.0,
+        });
+        let panel_path = "Matrix/Iface/interface1";
+        let panel_rgba = read_texture(panel_path)
+            .and_then(|bytes| decode_texture_bytes(&bytes))
+            .unwrap_or_else(|| {
+                log::warn!(
+                    "minimap: {} not found in bundle/pkg; falling back to solid frame",
+                    panel_path
+                );
+                image::RgbaImage::from_pixel(1, 1, image::Rgba([16, 18, 28, 235]))
+            });
+        let panel_view = create_texture_from_rgba(device, queue, &panel_rgba);
+        let panel_bind = make_bind(&panel_view, "minimap panel bind");
+        let panel_uv = panel_src.to_uv();
+
         // ── Pipelines ───────────────────────────────────────────────────────
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("minimap shader"),
@@ -398,6 +458,9 @@ impl Minimap {
             bg_depth_tex,
             _white_tex: white_tex,
             icon_bind,
+            panel_bind,
+            panel_src,
+            panel_uv,
             icon_base,
             icon_factory,
             icon_point,
@@ -629,16 +692,24 @@ impl Minimap {
             return;
         }
 
-        // Pin to bottom-left per the UI layout (CInterface.cpp:557):
-        //   (m_xPos + 13, m_yPos + 51, 145, 145)
-        // with the bottom anchor rule at CInterface.cpp:180-183, scaled by
-        // (screen_h / 768) so the design-pixel layout doesn't shrink to
-        // invisibility on modern resolutions.
+        // Port of the `if/MiniM` panel layout from robots.dat + the bottom-
+        // anchor rule at CInterface.cpp:176-183:
+        //   MiniM.xPos = 0, MiniM.yPos = 559 in 1024×768 base
+        //   → final (0, screen_h - (768 - 559)) = (0, screen_h - 209).
+        // The minimap landscape renders at panel-local (+13, +51, 145, 145)
+        // from CInterface.cpp:557's `SetOutParams(xPos+13, yPos+51, 145,145)`.
+        // Every pixel value scales by `screen_h / 768` so the 1024×768 design
+        // doesn't shrink to invisibility on modern resolutions.
         let ui_scale = screen_h / DESIGN_HEIGHT_PX;
+        let panel_w = MINIMAP_PANEL_W * ui_scale;
+        let panel_h = MINIMAP_PANEL_H * ui_scale;
+        let panel_x = 0.0;
+        let panel_y =
+            screen_h - (DESIGN_HEIGHT_PX - MINIMAP_PANEL_Y_BASE) * ui_scale;
         self.size_x = MINIMAP_SIZE_PX * ui_scale;
         self.size_y = MINIMAP_SIZE_PX * ui_scale;
-        self.pos_x = MINIMAP_OFFSET_X * ui_scale;
-        self.pos_y = screen_h - MINIMAP_OFFSET_FROM_BOTTOM * ui_scale;
+        self.pos_x = panel_x + MINIMAP_OFFSET_X * ui_scale;
+        self.pos_y = panel_y + MINIMAP_OFFSET_Y_IN_PANEL * ui_scale;
 
         // MatrixMap.cpp:1261: `SetOutParams(m_Camera.GetXYStrategy())` is
         // called every frame, so the minimap is always centered on what the
@@ -647,59 +718,37 @@ impl Minimap {
         let (cx, cy) = camera.strategy_xy();
         self.center = [cx, cy];
 
-        // Frame + background. Layout in `quad_vbuf` is:
-        //   [ 0.. 6] outer frame (dark panel, behind everything)
-        //   [ 6..12] inner frame (bright inset, 1 px ring around the bg)
-        //   [12..18] minimap background (landscape bake)
-        //   [18..  ] building markers
-        // The original draws its panel art as part of the UI image (authored
-        // in `Matrix/Iface/interface*.png`, positioned by a .gpi layout file
-        // we don't have in robots.pkg), so we synthesize a two-tone frame in
-        // code. Thickness scales with the UI to keep proportions consistent.
-        let frame_outer_t = (4.0 * ui_scale).max(2.0);
-        let frame_inner_t = (1.0 * ui_scale).max(1.0);
-        let frame_outer_color = [0.05, 0.07, 0.11, 0.92]; // near-black panel
-        let frame_inner_color = [0.75, 0.82, 0.90, 1.0]; // pale inset highlight
-        let outer_rect = [
-            self.pos_x - frame_outer_t,
-            self.pos_y - frame_outer_t,
-            self.size_x + frame_outer_t * 2.0,
-            self.size_y + frame_outer_t * 2.0,
-        ];
-        let inner_rect = [
-            self.pos_x - frame_inner_t,
-            self.pos_y - frame_inner_t,
-            self.size_x + frame_inner_t * 2.0,
-            self.size_y + frame_inner_t * 2.0,
-        ];
-
-        let mut head = [MMVertex::default(); 18];
-        // Outer panel quad.
-        fill_rect_quad(
+        // Quad layout in `quad_vbuf`:
+        //   [ 0.. 6] MiniM panel art (`mmp` sub-rect of interface1)
+        //   [ 6..12] landscape background (bake output)
+        //   [12..  ] building markers
+        //
+        // The original draws every UI element through CIFaceElement as
+        // textured pre-transformed quads; we emit the same two quads here
+        // with the sub-rect UVs pulled from robots.dat.
+        let mut head = [MMVertex::default(); 12];
+        // MiniM panel art quad (at panel_x, panel_y, panel_w × panel_h).
+        fill_uv_rect_quad(
             &mut head[0..6],
-            outer_rect,
-            frame_outer_color,
+            [panel_x, panel_y, panel_w, panel_h],
+            self.panel_uv,
+            [1.0, 1.0, 1.0, 1.0],
             screen_w,
             screen_h,
         );
-        // Inner highlight quad.
-        fill_rect_quad(
-            &mut head[6..12],
-            inner_rect,
-            frame_inner_color,
-            screen_w,
-            screen_h,
-        );
-        // Minimap background (with rotation + delta math from before_draw).
+        // Minimap landscape quad (with rotation + delta math from before_draw).
         let bg_verts = self.before_draw();
         for (i, v) in bg_verts.iter().enumerate() {
-            head[12 + i] = MMVertex {
+            head[6 + i] = MMVertex {
                 pos: pixel_to_clip(v.pos, screen_w, screen_h),
                 uv: v.uv,
                 color: v.color,
             };
         }
         queue.write_buffer(&self.quad_vbuf, 0, bytemuck::cast_slice(&head));
+        // `panel_src` is loaded at construction; we keep it around so future
+        // layout changes can reference the raw sub-rect without reparsing.
+        let _ = self.panel_src;
 
         // Building markers. Mirrors MatrixMinimap.cpp:700-762 — kind 0 = Base
         // → MMT_BASE (radius MINIMAP_BUILDING_BASE_R=8), all other kinds use
@@ -738,7 +787,7 @@ impl Minimap {
         if !markers_clip.is_empty() {
             queue.write_buffer(
                 &self.quad_vbuf,
-                (18 * std::mem::size_of::<MMVertex>()) as u64,
+                (12 * std::mem::size_of::<MMVertex>()) as u64,
                 bytemuck::cast_slice(&markers_clip),
             );
         }
@@ -773,20 +822,19 @@ impl Minimap {
         pass.set_pipeline(&self.tex_pipeline);
         pass.set_vertex_buffer(0, self.quad_vbuf.slice(..));
 
-        // 1) Outer frame panel (dark) + inner inset (bright) — sampled from
-        //    the 1×1 white texture so the vertex color is what shows.
-        pass.set_bind_group(0, &self.white_bind, &[]);
-        pass.draw(0..12, 0..1);
+        // 1) MiniM panel art from interface1 (sub-rect `mmp`).
+        pass.set_bind_group(0, &self.panel_bind, &[]);
+        pass.draw(0..6, 0..1);
 
-        // 2) Landscape background quad (textured).
+        // 2) Landscape background quad (bake output).
         pass.set_bind_group(0, &self.bg_bind, &[]);
-        pass.draw(12..18, 0..1);
+        pass.draw(6..12, 0..1);
 
         // 3) Building markers — sampled from the icon atlas so each sprite
         //    uses its real UV sub-rect from `radarIcons.dds`.
         if !markers_clip.is_empty() {
             pass.set_bind_group(0, &self.icon_bind, &[]);
-            pass.draw(18..(18 + markers_clip.len() as u32), 0..1);
+            pass.draw(12..(12 + markers_clip.len() as u32), 0..1);
         }
 
         // 4) Camera frustum outline (line strip).
@@ -802,25 +850,31 @@ fn pixel_to_clip(px: [f32; 2], sw: f32, sh: f32) -> [f32; 2] {
     [2.0 * px[0] / sw - 1.0, 1.0 - 2.0 * px[1] / sh]
 }
 
-/// Fill a 6-vertex slot with a solid-colored pixel-space rect
-/// (`[x, y, w, h]`, top-left origin). UVs point at (0.5, 0.5) so the 1×1
-/// white texture multiplies into the color as-is. Written into `dst` in the
-/// same triangle order as the other minimap quads (BL / TL / TR + BL / TR / BR).
-fn fill_rect_quad(dst: &mut [MMVertex], rect: [f32; 4], color: [f32; 4], sw: f32, sh: f32) {
+/// Fill a 6-vertex slot with a textured pixel-space rect (`[x, y, w, h]`,
+/// top-left origin) mapped to a sub-rect of the currently-bound texture.
+/// Triangle order: BL / TL / TR + BL / TR / BR, matching CIFaceElement.cpp:
+/// 74-79 when it emits its pre-transformed triangle strip.
+fn fill_uv_rect_quad(
+    dst: &mut [MMVertex],
+    rect: [f32; 4],
+    uv: IconUv,
+    color: [f32; 4],
+    sw: f32,
+    sh: f32,
+) {
     let [x, y, w, h] = rect;
     let to_clip = |p: [f32; 2]| pixel_to_clip(p, sw, sh);
-    let uv = [0.5, 0.5];
-    let v = |p: [f32; 2]| MMVertex {
+    let v = |p: [f32; 2], uv: [f32; 2]| MMVertex {
         pos: to_clip(p),
         uv,
         color,
     };
-    dst[0] = v([x, y + h]);
-    dst[1] = v([x, y]);
-    dst[2] = v([x + w, y]);
-    dst[3] = v([x, y + h]);
-    dst[4] = v([x + w, y]);
-    dst[5] = v([x + w, y + h]);
+    dst[0] = v([x, y + h], [uv.u0, uv.v1]);
+    dst[1] = v([x, y], [uv.u0, uv.v0]);
+    dst[2] = v([x + w, y], [uv.u1, uv.v0]);
+    dst[3] = v([x, y + h], [uv.u0, uv.v1]);
+    dst[4] = v([x + w, y], [uv.u1, uv.v0]);
+    dst[5] = v([x + w, y + h], [uv.u1, uv.v1]);
 }
 
 /// Pixel-space rect parsed from a `Minimap` blockpar value, before we know
@@ -842,6 +896,48 @@ impl PxRect {
             v1: (self.y + self.h) / atlas_h,
         }
     }
+}
+
+/// Resolve the `if / MiniM / Static {Name=mmp}` sub-rect — the panel art
+/// that frames the minimap on screen. Ports CInterface.cpp:545-596 reading
+/// `sNormalX`, `sNormalY`, `xSize`, `ySize`, `sNormalWidth`, `sNormalHeight`.
+fn parse_mmp_static(matrix_data: &Storage) -> Option<SubRect> {
+    let minim = matrix_data.block_record("if", "MiniM")?;
+    // Walk children of MiniM; find the Static whose "Name" param equals "mmp".
+    let names = matrix_data.get_buf(&minim, "2")?;
+    let records = matrix_data.get_buf(&minim, "3")?;
+    for i in 0..names.arrays_count() {
+        if names.get_as_wstr(i) == "Static" {
+            let child = records.get_as_wstr(i);
+            if matrix_data
+                .block_param(&child, "Name")
+                .as_deref()
+                == Some("mmp")
+            {
+                let x = parse_f32_param(matrix_data, &child, "sNormalX")?;
+                let y = parse_f32_param(matrix_data, &child, "sNormalY")?;
+                let w = parse_f32_param(matrix_data, &child, "xSize")?;
+                let h = parse_f32_param(matrix_data, &child, "ySize")?;
+                let tw = parse_f32_param(matrix_data, &child, "sNormalWidth")?;
+                let th = parse_f32_param(matrix_data, &child, "sNormalHeight")?;
+                return Some(SubRect {
+                    x,
+                    y,
+                    w,
+                    h,
+                    tex_w: tw,
+                    tex_h: th,
+                });
+            }
+        }
+    }
+    None
+}
+
+fn parse_f32_param(matrix_data: &Storage, rec: &str, key: &str) -> Option<f32> {
+    matrix_data
+        .block_param(rec, key)
+        .and_then(|s| s.trim().parse::<f32>().ok())
 }
 
 /// Parse the `Minimap` block from robots.dat. Each entry's value is a
