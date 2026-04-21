@@ -38,13 +38,15 @@ const TEX_SIZE: u32 = 512;
 ///   SetOutParams(m_xPos+13, m_yPos+51, 145, 145, ...)
 /// The outer panel is anchored bottom-left of a 1024×768 design; the minimap
 /// sits 13 px from the panel's left edge and 51 px from its top edge.
+///
+/// The C++ engine never scales the UI with resolution — 145 px on a 1024×768
+/// base becomes a pinhead on a 4K monitor. We scale every UI pixel value by
+/// `screen_h / DESIGN_HEIGHT_PX` so the minimap keeps the same fraction of
+/// screen height the 1024×768 original had (~19%).
 const MINIMAP_SIZE_PX: f32 = 145.0;
-/// Offset from bottom-left of the screen in the base 1024×768 layout:
-///   x = panel_x + 13, y = panel_y + 51, panel_y ≈ 570 in 768-space.
-/// With the right/bottom anchoring rule in CInterface.cpp:176-183, the
-/// final position becomes (13, screen_h - (768 - 621)) = (13, screen_h - 147).
 const MINIMAP_OFFSET_X: f32 = 13.0;
 const MINIMAP_OFFSET_FROM_BOTTOM: f32 = 147.0;
+const DESIGN_HEIGHT_PX: f32 = 768.0;
 
 /// `MINIMAP_CAM_COLOR = 0xFF30FFFF` (MatrixMinimap.cpp:19), D3DCOLOR ARGB.
 const MINIMAP_CAM_COLOR: [f32; 4] = [48.0 / 255.0, 1.0, 1.0, 1.0];
@@ -629,9 +631,14 @@ impl Minimap {
 
         // Pin to bottom-left per the UI layout (CInterface.cpp:557):
         //   (m_xPos + 13, m_yPos + 51, 145, 145)
-        // with the bottom anchor rule at CInterface.cpp:180-183.
-        self.pos_x = MINIMAP_OFFSET_X;
-        self.pos_y = screen_h - MINIMAP_OFFSET_FROM_BOTTOM;
+        // with the bottom anchor rule at CInterface.cpp:180-183, scaled by
+        // (screen_h / 768) so the design-pixel layout doesn't shrink to
+        // invisibility on modern resolutions.
+        let ui_scale = screen_h / DESIGN_HEIGHT_PX;
+        self.size_x = MINIMAP_SIZE_PX * ui_scale;
+        self.size_y = MINIMAP_SIZE_PX * ui_scale;
+        self.pos_x = MINIMAP_OFFSET_X * ui_scale;
+        self.pos_y = screen_h - MINIMAP_OFFSET_FROM_BOTTOM * ui_scale;
 
         // MatrixMap.cpp:1261: `SetOutParams(m_Camera.GetXYStrategy())` is
         // called every frame, so the minimap is always centered on what the
@@ -640,33 +647,77 @@ impl Minimap {
         let (cx, cy) = camera.strategy_xy();
         self.center = [cx, cy];
 
-        // Background first, two triangles.
+        // Frame + background. Layout in `quad_vbuf` is:
+        //   [ 0.. 6] outer frame (dark panel, behind everything)
+        //   [ 6..12] inner frame (bright inset, 1 px ring around the bg)
+        //   [12..18] minimap background (landscape bake)
+        //   [18..  ] building markers
+        // The original draws its panel art as part of the UI image (authored
+        // in `Matrix/Iface/interface*.png`, positioned by a .gpi layout file
+        // we don't have in robots.pkg), so we synthesize a two-tone frame in
+        // code. Thickness scales with the UI to keep proportions consistent.
+        let frame_outer_t = (4.0 * ui_scale).max(2.0);
+        let frame_inner_t = (1.0 * ui_scale).max(1.0);
+        let frame_outer_color = [0.05, 0.07, 0.11, 0.92]; // near-black panel
+        let frame_inner_color = [0.75, 0.82, 0.90, 1.0]; // pale inset highlight
+        let outer_rect = [
+            self.pos_x - frame_outer_t,
+            self.pos_y - frame_outer_t,
+            self.size_x + frame_outer_t * 2.0,
+            self.size_y + frame_outer_t * 2.0,
+        ];
+        let inner_rect = [
+            self.pos_x - frame_inner_t,
+            self.pos_y - frame_inner_t,
+            self.size_x + frame_inner_t * 2.0,
+            self.size_y + frame_inner_t * 2.0,
+        ];
+
+        let mut head = [MMVertex::default(); 18];
+        // Outer panel quad.
+        fill_rect_quad(
+            &mut head[0..6],
+            outer_rect,
+            frame_outer_color,
+            screen_w,
+            screen_h,
+        );
+        // Inner highlight quad.
+        fill_rect_quad(
+            &mut head[6..12],
+            inner_rect,
+            frame_inner_color,
+            screen_w,
+            screen_h,
+        );
+        // Minimap background (with rotation + delta math from before_draw).
         let bg_verts = self.before_draw();
-        let mut bg_clip = [MMVertex::default(); 6];
         for (i, v) in bg_verts.iter().enumerate() {
-            bg_clip[i] = MMVertex {
+            head[12 + i] = MMVertex {
                 pos: pixel_to_clip(v.pos, screen_w, screen_h),
                 uv: v.uv,
                 color: v.color,
             };
         }
-        queue.write_buffer(&self.quad_vbuf, 0, bytemuck::cast_slice(&bg_clip));
+        queue.write_buffer(&self.quad_vbuf, 0, bytemuck::cast_slice(&head));
 
         // Building markers. Mirrors MatrixMinimap.cpp:700-762 — kind 0 = Base
         // → MMT_BASE (radius MINIMAP_BUILDING_BASE_R=8), all other kinds use
         // MMT_FACTORY (radius MINIMAP_BUILDING_R=8). Tint is `m_Color & alpha
-        // | GetSideColorMM(side)`.
+        // | GetSideColorMM(side)`. Radii scale with UI so sprites stay
+        // proportional to the enlarged minimap rect.
+        let marker_r = 8.0 * ui_scale;
         let mut markers: Vec<MMVertex> = Vec::with_capacity(map.buildings.len() * 6);
         for b in &map.buildings {
             let px_px = self.world_to_map(b.x, b.y);
             let px_px = self.apply_rotation(px_px);
-            let (icon, r) = if b.kind == 0 {
-                (self.icon_base, 8.0)
+            let icon = if b.kind == 0 {
+                self.icon_base
             } else {
-                (self.icon_factory, 8.0)
+                self.icon_factory
             };
             let color = side_color_mm(b.side);
-            Self::push_marker(&mut markers, px_px, r, icon, color);
+            Self::push_marker(&mut markers, px_px, marker_r, icon, color);
         }
         // Clamp to capacity so we never overrun the vertex buffer.
         let max_marker_verts = self
@@ -687,7 +738,7 @@ impl Minimap {
         if !markers_clip.is_empty() {
             queue.write_buffer(
                 &self.quad_vbuf,
-                (6 * std::mem::size_of::<MMVertex>()) as u64,
+                (18 * std::mem::size_of::<MMVertex>()) as u64,
                 bytemuck::cast_slice(&markers_clip),
             );
         }
@@ -719,20 +770,26 @@ impl Minimap {
         queue.write_buffer(&self.line_vbuf, 0, bytemuck::cast_slice(&loop_verts));
 
         // ── Draws ──
-        // 1) Background quad (textured)
         pass.set_pipeline(&self.tex_pipeline);
-        pass.set_bind_group(0, &self.bg_bind, &[]);
         pass.set_vertex_buffer(0, self.quad_vbuf.slice(..));
-        pass.draw(0..6, 0..1);
 
-        // 2) Building markers — sampled from the icon atlas (bind `icon_bind`)
-        //    so each sprite uses its real UV sub-rect from `radarIcons.dds`.
+        // 1) Outer frame panel (dark) + inner inset (bright) — sampled from
+        //    the 1×1 white texture so the vertex color is what shows.
+        pass.set_bind_group(0, &self.white_bind, &[]);
+        pass.draw(0..12, 0..1);
+
+        // 2) Landscape background quad (textured).
+        pass.set_bind_group(0, &self.bg_bind, &[]);
+        pass.draw(12..18, 0..1);
+
+        // 3) Building markers — sampled from the icon atlas so each sprite
+        //    uses its real UV sub-rect from `radarIcons.dds`.
         if !markers_clip.is_empty() {
             pass.set_bind_group(0, &self.icon_bind, &[]);
-            pass.draw(6..(6 + markers_clip.len() as u32), 0..1);
+            pass.draw(18..(18 + markers_clip.len() as u32), 0..1);
         }
 
-        // 3) Camera frustum outline (line strip)
+        // 4) Camera frustum outline (line strip).
         pass.set_pipeline(&self.line_pipeline);
         pass.set_bind_group(0, &self.white_bind, &[]);
         pass.set_vertex_buffer(0, self.line_vbuf.slice(..));
@@ -743,6 +800,27 @@ impl Minimap {
 /// Map top-left-origin pixel position → clip space (Y-up in clip).
 fn pixel_to_clip(px: [f32; 2], sw: f32, sh: f32) -> [f32; 2] {
     [2.0 * px[0] / sw - 1.0, 1.0 - 2.0 * px[1] / sh]
+}
+
+/// Fill a 6-vertex slot with a solid-colored pixel-space rect
+/// (`[x, y, w, h]`, top-left origin). UVs point at (0.5, 0.5) so the 1×1
+/// white texture multiplies into the color as-is. Written into `dst` in the
+/// same triangle order as the other minimap quads (BL / TL / TR + BL / TR / BR).
+fn fill_rect_quad(dst: &mut [MMVertex], rect: [f32; 4], color: [f32; 4], sw: f32, sh: f32) {
+    let [x, y, w, h] = rect;
+    let to_clip = |p: [f32; 2]| pixel_to_clip(p, sw, sh);
+    let uv = [0.5, 0.5];
+    let v = |p: [f32; 2]| MMVertex {
+        pos: to_clip(p),
+        uv,
+        color,
+    };
+    dst[0] = v([x, y + h]);
+    dst[1] = v([x, y]);
+    dst[2] = v([x + w, y]);
+    dst[3] = v([x, y + h]);
+    dst[4] = v([x + w, y]);
+    dst[5] = v([x + w, y + h]);
 }
 
 /// Pixel-space rect parsed from a `Minimap` blockpar value, before we know
