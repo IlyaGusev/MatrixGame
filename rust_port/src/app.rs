@@ -314,6 +314,11 @@ impl ApplicationHandler for App {
                 state.camera.on_mouse_move(cx, cy);
             }
 
+            WindowEvent::CursorLeft { .. } => {
+                state.cursor = [-1.0, -1.0];
+                state.camera.on_cursor_left();
+            }
+
             WindowEvent::MouseWheel { delta, .. } => {
                 // Each wheel notch = one ZoomInStep/OutStep call.
                 use winit::event::MouseScrollDelta;

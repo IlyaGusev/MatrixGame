@@ -64,11 +64,9 @@ const STRATEGY_DEFAULTS: CamParam = CamParam {
     move_speed: 1.05,
 };
 
-// MatrixFormGame.hpp:9 sets MOUSE_BORDER=4, which works on native Windows
-// where the cursor reaches exact edge pixels. In the browser, DPR rounding
-// plus window-chrome quirks often keep the cursor ~10–15 physical pixels
-// short of the left/right/bottom edges, so a tighter threshold never fires.
-const MOUSE_EDGE: f32 = 16.0;
+// MatrixFormGame.hpp:9 sets MOUSE_BORDER=4. Keep a slightly larger margin
+// to tolerate browser DPR rounding, but small enough to stay out of the way.
+const MOUSE_EDGE: f32 = 8.0;
 
 pub struct Camera {
     // Current (rendered) state — for strategy mode this equals the target state;
@@ -287,6 +285,12 @@ impl Camera {
 
     pub fn on_mouse_wheel(&mut self, notches: f32) {
         self.zoom(notches);
+    }
+
+    /// Mark the cursor as outside the window so edge-pan stops firing.
+    /// The existing in-bounds guard in `takt` then skips the pan.
+    pub fn on_cursor_left(&mut self) {
+        self.cursor = [-1.0, -1.0];
     }
 
     pub fn on_key(&mut self, key: KeyAction, pressed: bool) {
