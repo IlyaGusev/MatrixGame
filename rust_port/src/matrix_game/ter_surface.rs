@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
-use super::terrain::{DrawBatch, Vertex};
+use super::map_group::{DrawBatch, Vertex};
 use crate::matrix_lib::base::storage::Storage;
 use crate::matrix_game::common::{rd_f32, rd_i32, rd_u16, rd_u32};
 use crate::matrix_game::map::GameMap;

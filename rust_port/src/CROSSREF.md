@@ -46,7 +46,8 @@ Form, Helper, Math3D, ShadowProj, ShadowStencil.
 | matrix_game/camera.rs         | MatrixCamera.cpp                  |
 | matrix_game/common.rs         | Common.hpp                        |
 | matrix_game/form_game.rs      | MatrixFormGame.cpp (+ MatrixGame.cpp entry glue) |
-| matrix_game/map.rs            | MatrixMap.cpp                     |
+| matrix_game/map.rs            | MatrixMap.cpp (map data + `MapRenderer` draw orchestration)|
+| matrix_game/map_group.rs      | MatrixMapGroup.cpp (BuildBottom + BuildWater — merged across groups by texture; see header) |
 | matrix_game/map_prepare.rs    | MatrixMapPrepare.cpp              |
 | matrix_game/minimap.rs        | MatrixMinimap.cpp                 |
 | matrix_game/object.rs         | MatrixObject.cpp (OBJECT_TYPE_MAPOBJECT — decorative static)|
@@ -55,7 +56,6 @@ Form, Helper, Math3D, ShadowProj, ShadowStencil.
 | matrix_game/render_pipeline.rs| MatrixRenderPipeline.cpp          |
 | matrix_game/sky.rs            | DrawSky in MatrixMap.cpp + skybox parts |
 | matrix_game/ter_surface.rs    | MatrixTerSurface.cpp              |
-| matrix_game/terrain.rs        | MatrixMapGroup.cpp (BuildBottom + draw) — will split in Stage 2 part 2 |
 | matrix_game/units.rs          | (stub — will become MatrixRobot.cpp etc.) |
 | matrix_game/water.rs          | MatrixWater.cpp + BuildWater in MatrixMapGroup.cpp + WaterAlpha_t3 in MatrixRenderPipeline.cpp — will split in Stage 2 part 2 |
 | matrix_game/world.rs          | (no direct equivalent — top-level game state) |
@@ -129,7 +129,7 @@ not embedded as raw-string constants.
 | shaders/object_shadow_texture.wgsl   | matrix_game/object.rs            |
 | shaders/sky_gradient.wgsl            | matrix_game/sky.rs               |
 | shaders/sky_skybox.wgsl              | matrix_game/sky.rs               |
-| shaders/terrain.wgsl                 | matrix_game/terrain.rs           |
-| shaders/terrain_gloss.wgsl           | matrix_game/terrain.rs           |
+| shaders/terrain.wgsl                 | matrix_game/map.rs (MapRenderer) |
+| shaders/terrain_gloss.wgsl           | matrix_game/map.rs (MapRenderer) |
 | shaders/water.wgsl                   | matrix_game/water.rs             |
 | shaders/water_inshore.wgsl           | matrix_game/water.rs             |

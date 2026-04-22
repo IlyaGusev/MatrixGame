@@ -297,60 +297,25 @@ impl Water {
             }
         };
 
-        let mut water_groups: Vec<(i32, i32)> = Vec::new();
-        for gi in 0..groups_buf.arrays_count() {
-            let raw = groups_buf.get_bytes(gi);
-            if raw.len() < 4 {
-                continue;
-            }
-            let gx = u16::from_le_bytes([raw[0], raw[1]]) as i32;
-            let gy = u16::from_le_bytes([raw[2], raw[3]]) as i32;
-            let w = MAP_GROUP_SIZE.min(map.size_x as i32 - gx);
-            let h = MAP_GROUP_SIZE.min(map.size_y as i32 - gy);
-            let mut min_z = f32::INFINITY;
-            for py in 0..=h {
-                for px in 0..=w {
-                    min_z = min_z.min(map.point((gx + px) as usize, (gy + py) as usize).z);
-                }
-            }
-            if min_z < 0.0 {
-                water_groups.push((gx, gy));
-            }
-        }
+        // BuildWater (MatrixMapGroup.cpp:366-452). Helpers live in
+        // `map_group.rs` so per-group build code stays in one place.
+        let water_groups =
+            crate::matrix_game::map_group::water_bearing_groups(stor, map);
         if water_groups.is_empty() {
             return None;
         }
 
-        let up_level: f32 = -1.0;
-        let down_level: f32 = -20.1;
-        let alpha_step = MAP_GROUP_SIZE as f32 * GLOBAL_SCALE / WATER_ALPHA_SIZE as f32;
-        let mut alpha_images = Vec::with_capacity(water_groups.len());
-
-        for &(gx, gy) in &water_groups {
-            let group_x0 = gx as f32 * GLOBAL_SCALE;
-            let group_y0 = gy as f32 * GLOBAL_SCALE;
-            let mut alpha_image =
-                image::GrayImage::new(WATER_ALPHA_SIZE as u32, WATER_ALPHA_SIZE as u32);
-
-            for j in 0..WATER_ALPHA_SIZE {
-                for i in 0..WATER_ALPHA_SIZE {
-                    let wx = (i as f32 + 0.5) * alpha_step + group_x0;
-                    let wy = (j as f32 + 0.5) * alpha_step + group_y0;
-                    let wz = sample_height_for_water(map, wx, wy);
-
-                    let zz: u8 = if wz < down_level {
-                        255
-                    } else if wz > up_level {
-                        0
-                    } else {
-                        (255.0 - ((wz - down_level) / (up_level - down_level) * 255.0)) as u8
-                    };
-
-                    alpha_image.put_pixel(i as u32, j as u32, image::Luma([zz]));
-                }
-            }
-            alpha_images.push(alpha_image);
-        }
+        let alpha_images: Vec<image::GrayImage> = water_groups
+            .iter()
+            .map(|&(gx, gy)| {
+                crate::matrix_game::map_group::build_water_alpha_image(
+                    map,
+                    gx as f32 * GLOBAL_SCALE,
+                    gy as f32 * GLOBAL_SCALE,
+                    WATER_ALPHA_SIZE,
+                )
+            })
+            .collect();
 
         let mut water_instances = Vec::new();
         for &(gx, gy) in &water_groups {
@@ -1187,32 +1152,6 @@ impl Water {
         }
         (ocean, fill)
     }
-}
-
-fn sample_height_for_water(map: &GameMap, wx: f32, wy: f32) -> f32 {
-    let scaledx = wx / GLOBAL_SCALE;
-    let scaledy = wy / GLOBAL_SCALE;
-    let ix = scaledx as i32;
-    let iy = scaledy as i32;
-
-    if ix >= 0 && iy >= 0 && ix < map.size_x as i32 && iy < map.size_y as i32 {
-        let unit = map.unit(ix as usize, iy as usize);
-        if unit.flags & crate::matrix_game::common::CELLFLAG_BRIDGE != 0 {
-            let kx = scaledx - ix as f32;
-            let ky = scaledy - iy as f32;
-
-            let z0 = map.point(ix as usize, iy as usize).z;
-            let z1 = map.point(ix as usize + 1, iy as usize).z;
-            let z2 = map.point(ix as usize, iy as usize + 1).z;
-            let z3 = map.point(ix as usize + 1, iy as usize + 1).z;
-
-            let top = z0 + (z1 - z0) * kx;
-            let bottom = z2 + (z3 - z2) * kx;
-            return top + (bottom - top) * ky;
-        }
-    }
-
-    map.get_z(wx, wy)
 }
 
 fn build_phase_offsets() -> [u16; WATER_SIZE * WATER_SIZE] {

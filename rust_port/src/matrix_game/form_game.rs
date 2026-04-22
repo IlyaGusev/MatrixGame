@@ -14,13 +14,13 @@ use crate::matrix_game::world::World;
 use crate::matrix_game::camera::Camera;
 use crate::gfx::context::GfxContext;
 use crate::matrix_game::minimap::Minimap;
-use crate::matrix_game::terrain::TerrainRenderer;
+use crate::matrix_game::map::MapRenderer;
 struct AppState {
     window: Arc<Window>,
     gfx: GfxContext,
     map: Arc<GameMap>,
     point_lights: PointLightSystem,
-    terrain: TerrainRenderer,
+    terrain: MapRenderer,
     minimap: Minimap,
     camera: Camera,
     game: World,
@@ -95,7 +95,7 @@ impl ApplicationHandler for App {
                 }
                 None
             };
-            let terrain = TerrainRenderer::new(
+            let terrain = MapRenderer::new(
                 &gfx.device,
                 &gfx.queue,
                 &gfx.config,
@@ -160,7 +160,7 @@ impl ApplicationHandler for App {
 
                 let tex_reader =
                     |path: &str| -> Option<Vec<u8>> { bundle.read_file(path).map(|s| s.to_vec()) };
-                let mut terrain = TerrainRenderer::new(
+                let mut terrain = MapRenderer::new(
                     &gfx.device,
                     &gfx.queue,
                     &gfx.config,

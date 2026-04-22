@@ -2,7 +2,7 @@
 //!
 //! Ported pieces:
 //!   - Background: offscreen orthographic landscape render into a 512×512
-//!     texture at init (`bake_background` → `TerrainRenderer::bake_minimap`),
+//!     texture at init (`bake_background` → `MapRenderer::bake_minimap`),
 //!     mirroring `CMinimap::RenderBackground` (MatrixMinimap.cpp:855-1199).
 //!   - World→map / map→world transforms with center + scale (pan/zoom
 //!     "button" API in MatrixMinimap.hpp:137-169) and optional rotation
@@ -26,7 +26,7 @@ use wgpu::util::DeviceExt;
 use crate::matrix_lib::base::storage::Storage;
 use crate::matrix_game::map::{GameMap, GLOBAL_SCALE};
 use crate::matrix_game::camera::Camera;
-use crate::matrix_game::terrain::TerrainRenderer;
+use crate::matrix_game::map::MapRenderer;
 use crate::matrix_lib::three_g::texture::{create_texture_from_rgba, decode_texture_bytes};
 
 /// Matches `MINIMAP_SIZE` in MatrixMinimap.hpp:14.
@@ -242,7 +242,7 @@ impl Minimap {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            // Matches surface format so `TerrainRenderer::bake_minimap` can
+            // Matches surface format so `MapRenderer::bake_minimap` can
             // reuse its color pipeline targets without a second pipeline.
             format: surface_format,
             usage: wgpu::TextureUsages::TEXTURE_BINDING
@@ -647,7 +647,7 @@ impl Minimap {
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        terrain: &mut TerrainRenderer,
+        terrain: &mut MapRenderer,
         map: &GameMap,
     ) {
         if self.baked {
