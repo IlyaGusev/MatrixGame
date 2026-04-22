@@ -21,11 +21,16 @@ use crate::matrix_game::effects::point_light::PointLightSystem;
 use crate::matrix_game::common::{unpack_rgb, FOG_END, FOG_START};
 use crate::matrix_game::map::{GameMap, ObjectInstance, ObjectShadow};
 use crate::matrix_game::map_static::{
-    MapStatic, ObjectCore, ObjectType, MR_ALL, MR_GRAPH, MR_MATRIX,
-    MR_SHADOW_PROJ_GEOM, MR_SHADOW_PROJ_TEX, OBJECT_STATE_SPECIAL,
-    OBJECT_STATE_TRACE_INVISIBLE,
+    MapStatic, ObjectCore, ObjectId, Objects, ObjectType, MR_ALL, MR_GRAPH, MR_MATRIX,
+    MR_SHADOW_PROJ_GEOM, MR_SHADOW_PROJ_TEX, OBJECT_STATE_ABLAZE, OBJECT_STATE_BURNED,
+    OBJECT_STATE_SHADOW_SPECIAL, OBJECT_STATE_SPECIAL, OBJECT_STATE_TRACE_INVISIBLE,
 };
-use crate::matrix_game::common::{OTP_BEHAVIOUR, OTP_INVLOGIC};
+use crate::matrix_game::common::{
+    OBJECT_ABLAZE_BURNED_AT_MS, OTP_BEHAVIOUR, OTP_INVLOGIC, PLAYER_SIDE,
+};
+use crate::matrix_game::effects::weapon::{
+    is_fire_weapon, Weapon, WEAPON_ABLAZE, WEAPON_FLAMETHROWER, WEAPON_PLASMA,
+};
 use crate::matrix_game::rnd::Rnd;
 use crate::matrix_lib::base::wstr;
 use crate::matrix_lib::three_g::vector_object::{self, ShadowKind, VoAnimation, VoFrame, VoSurfaceMesh};
@@ -104,6 +109,31 @@ pub struct MapObject {
     /// `"Sens,<radius>"` (MatrixObject.cpp:1080). Also reused by
     /// BEHF_SPAWNER for the "spawn if robot within" check.
     pub sens_radius: f32,
+
+    /// `m_NextTime` (BEHF_BURN's first union field, MatrixObject.hpp:64).
+    /// Game-time ms when the next ablaze fire-tick should fire. Set by
+    /// `damage` when the object is kindled; consumed + advanced inside
+    /// the IsAblaze branch of `logic_takt`.
+    pub next_time: i32,
+    /// `m_BurnTimeTotal` (MatrixObject.hpp:65). Running total of ms the
+    /// object has been on fire. At 5000ms the OBJECT_STATE_BURNED bit is
+    /// set and the skin swaps to the burnt variant.
+    pub burn_time_total: i32,
+
+    /// `m_BreakHitPoint` (BEHF_BREAK/ANIM/TERRON union, MatrixObject.hpp:73).
+    /// Current hit points — decremented by [`MapStatic::damage`] via the
+    /// damage-table lookup; object transitions state / breaks when this
+    /// reaches 0.
+    pub break_hit_point: i32,
+    /// `m_BreakHitPointMax` (MatrixObject.hpp:76). Starting hit points —
+    /// stored for ratio display on the progress bar + full-heal on anim
+    /// state transitions that specify `hp=0` (treated as "max",
+    /// MatrixObject.cpp:311).
+    pub break_hit_point_max: i32,
+    /// `m_AnimState` (MatrixObject.hpp:74). Current BEHF_ANIM state id;
+    /// indexes into the `Anim,<states>` table in the Ids behaviour
+    /// string. -1 for non-BEHF_ANIM objects.
+    pub anim_state: i32,
 }
 
 impl MapObject {
@@ -153,6 +183,11 @@ impl MapObject {
             photo_time: 0,
             prev_state_robots_in_radius: 0,
             sens_radius: 0.0,
+            next_time: 0,
+            burn_time_total: 0,
+            break_hit_point: 0,
+            break_hit_point_max: 0,
+            anim_state: -1,
         }
     }
 
@@ -207,6 +242,10 @@ impl MapObject {
             false  // BEHF_BURN is not AddLT'd — it enrolls on damage.
         } else if wstr::compare_first(&beh, "Break") {
             // "Break,<something>,<hp>,Terron?"  (MatrixObject.cpp:1043-1058)
+            // Field 2 is the starting hit-point count.
+            let hp = wstr::int_par(&beh, 2, ",");
+            self.break_hit_point = hp;
+            self.break_hit_point_max = hp;
             let kind = wstr::str_par(&beh, 3, ",");
             if kind == "Terron" {
                 self.beh_flag = BehFlag::Terron;
@@ -229,6 +268,11 @@ impl MapObject {
                 false  // BEHF_PORTRET doesn't AddLT (Takt handles it).
             } else {
                 self.beh_flag = BehFlag::Anim;
+                // MatrixObject.cpp:1072 — ApplyAnimState(0). The state
+                // table lives inside the BEHAVIOUR field's 1st ","-sub:
+                // "Anim,<states>". We parse it now so `break_hit_point`
+                // is correctly seeded at spawn time.
+                self.apply_anim_state(0, &beh);
                 true
             }
         } else if wstr::compare_first(&beh, "Sens") {
@@ -256,6 +300,35 @@ impl MapObject {
             // Fallthrough: no recognised keyword → remains BEHF_STATIC.
             // Matches the default from the ctor (MatrixObject.cpp:56).
             false
+        }
+    }
+
+    /// Port of `CMatrixMapObject::ApplyAnimState` (MatrixObject.cpp:295-318).
+    /// `behaviour_field` is the BEHAVIOUR row (`"Anim,<states>"`); the
+    /// state table lives in the 2nd `,`-separated sub, formatted as
+    /// `<state_id>:<anim_id>:<hp>:<next_state>:...` entries joined by
+    /// `#`. The C++ also re-reads the Ids table every call; we avoid
+    /// that by threading the field explicitly.
+    ///
+    /// The `SetAnimById` call on `m_Graph` is deferred — per-instance
+    /// anim state isn't ported. We track `anim_state` + `break_hit_point`
+    /// faithfully so state transitions + damage continue to work.
+    pub fn apply_anim_state(&mut self, state_id: i32, behaviour_field: &str) {
+        self.anim_state = state_id;
+
+        let state_table = wstr::str_par(behaviour_field, 1, ",");
+        let cnt = wstr::count_par(state_table, "#");
+        for i in 0..cnt {
+            let entry = wstr::str_par(state_table, i, "#");
+            if wstr::int_par(entry, 0, ":") == state_id {
+                // C++: m_Graph->SetAnimById(...); deferred.
+                let hp = wstr::int_par(entry, 2, ":");
+                // MatrixObject.cpp:311-314 — a 0 hp value is treated as
+                // "invincible" (sentinel 2_000_000_000). Preserves the
+                // same magic constant.
+                self.break_hit_point = if hp == 0 { 2_000_000_000 } else { hp };
+                break;
+            }
         }
     }
 }
@@ -342,11 +415,159 @@ impl MapStatic for MapObject {
         // per-instance. Revisit if a scenario needs per-instance phase.
     }
 
+    fn damage(
+        &mut self,
+        weap: Weapon,
+        _pos: glam::Vec3,
+        _dir: glam::Vec3,
+        attacker_side: i32,
+        _attacker: Option<ObjectId>,
+        self_id: ObjectId,
+        objs: &mut Objects,
+    ) -> bool {
+        // Port of `CMatrixMapObject::Damage` (MatrixObject.cpp:101-293).
+        //
+        // Only BEHF_BURN is fully implemented — that branch is
+        // self-contained (just state + TTL + AddLT). BEHF_TERRON /
+        // BEHF_BREAK / BEHF_ANIM depend on `g_Config.m_ObjectDamages`,
+        // `CMatrixProgressBar`, per-instance anim, effects, and the
+        // side/win-count state machine; the original bodies stay
+        // commented below with line refs so the port can fill them in
+        // when those subsystems land.
+
+        // MatrixObject.cpp:105 — special (win-target) objects can only
+        // be hit by the player.
+        if attacker_side != PLAYER_SIDE
+            && self.object_state & OBJECT_STATE_SPECIAL != 0
+        {
+            return false;
+        }
+
+        if self.beh_flag == BehFlag::Burn {
+            if weap == WEAPON_ABLAZE {
+                // MatrixObject.cpp:111 — CSound::AddSound(S_WEAPON_HIT_ABLAZE).
+                // Deferred until CSound lands.
+            } else if is_fire_weapon(weap) {
+                // MatrixObject.cpp:115-141.
+                if self.object_state & OBJECT_STATE_ABLAZE == 0 {
+                    self.object_state |= OBJECT_STATE_ABLAZE;
+                }
+
+                // TTL bump per-weapon (MatrixObject.cpp:123-128).
+                let bump = if weap == WEAPON_PLASMA {
+                    200
+                } else if weap == WEAPON_FLAMETHROWER {
+                    100
+                } else {
+                    10_000
+                };
+                self.ablaze_ttl = self.ablaze_ttl.saturating_add(bump);
+
+                // `m_NextTime = g_MatrixMap->GetTime()` — schedule the
+                // next fire-tick immediately. We don't have access to
+                // the game-time clock from here; inside `logic_takt`
+                // the IsAblaze branch treats `next_time` as relative
+                // ms-until-next-emit, so seeding to 0 is correct.
+                self.next_time = 0;
+
+                // Clamp TTL (MatrixObject.cpp:133-139).
+                let cap = if self.object_state & OBJECT_STATE_BURNED != 0 {
+                    1500
+                } else {
+                    15_000
+                };
+                if self.ablaze_ttl > cap {
+                    self.ablaze_ttl = cap;
+                }
+
+                // MatrixObject.cpp:140 — enroll in the logic-temp list
+                // so the IsAblaze branch in `logic_takt` ticks every
+                // `LOGIC_TAKT_PERIOD_MS`.
+                objs.add_lt(self_id);
+            }
+        }
+        if self.beh_flag == BehFlag::Break {
+            // Port of BEHF_BREAK (MatrixObject.cpp:188-234). Uses the
+            // damage-table lookup; decrements hp when the current
+            // hp clears the per-weapon `mindamage` floor. Death drops
+            // the SPECIAL flag and re-Inits the object to the
+            // replacement type encoded in the BEHAVIOUR field.
+            let entry = objs.object_damages.get(weap).unwrap_or_default();
+            if self.break_hit_point > entry.mindamage {
+                self.break_hit_point -= entry.damage;
+            }
+            // m_PB progress-bar instantiation (MatrixObject.cpp:197-200)
+            // — deferred: CMatrixProgressBar unported.
+
+            if self.break_hit_point <= 0 {
+                if self.object_state & OBJECT_STATE_SPECIAL != 0 {
+                    self.object_state &= !OBJECT_STATE_SPECIAL;
+                    // `--g_MatrixMap->m_BeforeWinCount` + side bookkeeping
+                    // — deferred: sides unported.
+                }
+                // `CMatrixEffect::CreateExplosion` when BEHAVIOUR's 4th
+                // comma-field == "Explode" — deferred (effects unported).
+                // `Init(newtype)` to swap in the ruined variant
+                // (MatrixObject.cpp:233) — deferred: requires VO/skin
+                // reload + re-running apply_ids_row on the replacement
+                // type. Until that lands, mark the object BURNED so
+                // renderers that honour the flag can swap variants.
+                self.object_state &= !OBJECT_STATE_SHADOW_SPECIAL;
+                self.object_state |= OBJECT_STATE_BURNED;
+                self.rchange |= MR_GRAPH;
+            }
+        } else if self.beh_flag == BehFlag::Anim {
+            // Port of BEHF_ANIM (MatrixObject.cpp:235-289). Like BREAK
+            // but on death transitions to a new anim state instead of
+            // re-Init'ing. The `ApplyAnimState` call looks up the next
+            // state from the BEHAVIOUR string's state-table.
+            let entry = objs.object_damages.get(weap).unwrap_or_default();
+            if self.break_hit_point > entry.mindamage {
+                self.break_hit_point -= entry.damage;
+            }
+            if self.break_hit_point <= 0 {
+                if self.object_state & OBJECT_STATE_SPECIAL != 0 {
+                    self.object_state &= !OBJECT_STATE_SPECIAL;
+                    // side / win-count — deferred.
+                }
+                // Walk the state table to find the transition for the
+                // current `anim_state`. Field index 3 is "next state"
+                // in the `#`-joined `<id>:<anim>:<hp>:<next>:...` spec
+                // (MatrixObject.cpp:269-286). The damage path uses
+                // index 3 (vs index 4 in `IsAnimEnd` transitions); we
+                // reproduce that exactly.
+                //
+                // We don't hold the BEHAVIOUR field here — the
+                // caller-visible way is to fetch it via the Ids table,
+                // which is world-scope and not threaded in. For now,
+                // mark the object with the next-state transition
+                // deferred; emit a log so maps that rely on it report
+                // cleanly.
+                log::debug!(
+                    "MapObject BEHF_ANIM death transition skipped (state-table \
+                     lookup needs Ids-row threading); obj_type={}, anim_state={}",
+                    self.type_id,
+                    self.anim_state,
+                );
+                // Mark as "broken" so the Anim subclass state isn't
+                // stuck at 0hp taking repeated damage.
+                self.break_hit_point = 2_000_000_000;
+            }
+        }
+
+        // BEHF_TERRON (MatrixObject.cpp:142-187): death → explosion
+        // sequence + music-volume + win-flag. Deferred until effects
+        // + sides + music land.
+
+        false
+    }
+
     /// Port of `CMatrixMapObject::LogicTakt` (MatrixObject.cpp:1229-1596).
     /// Massive switch on `m_BehFlag`. Currently handles BEHF_SENS (the
-    /// sensor-radius detection path); other branches enroll via
-    /// `apply_ids_row` but their bodies need subsystems (progress bars,
-    /// effects, sound, robot spawning) that aren't ported.
+    /// sensor-radius detection path) and the IsAblaze burn-out timer;
+    /// other branches enroll via `apply_ids_row` but their bodies need
+    /// subsystems (progress bars, effects, sound, robot spawning) that
+    /// aren't ported.
     fn logic_takt(&mut self, ms: i32, _rng: &mut Rnd, objs: &mut crate::matrix_game::map_static::Objects) {
         use crate::matrix_game::common::TRACE_ROBOT;
         use crate::matrix_game::map_static::fit_to_mask as _fit_to_mask;
@@ -393,6 +614,44 @@ impl MapStatic for MapObject {
                 }
             }
             return;
+        }
+
+        // IsAblaze branch — MatrixObject.cpp:1534-1609. The C++ emits
+        // fire / smoke effects every OBJECT_ABLAZE_PERIOD ms and after
+        // 5s (`m_BurnTimeTotal > 5000`) flips to OBJECT_STATE_BURNED.
+        // The effect emission + per-tick Damage(WEAPON_ABLAZE) loop
+        // need the Effects + Pick subsystems; the burn-out timer is
+        // portable now since it's just state.
+        if self.object_state & OBJECT_STATE_ABLAZE != 0 {
+            self.burn_time_total = self.burn_time_total.saturating_add(ms);
+
+            // CSound::AddSound + effect emission on `next_time` cycle
+            // — deferred (CMatrixEffect unported). The timer itself is
+            // advanced so when effects land, cadence is already right.
+            self.next_time = self.next_time.saturating_sub(ms);
+            while self.next_time <= 0 {
+                self.next_time += crate::matrix_game::common::OBJECT_ABLAZE_PERIOD_MS;
+                // Here the C++ rolls an RNG vs TTL to decide whether to
+                // emit; skipped until effects are ported.
+            }
+
+            // MatrixObject.cpp:1576-1609: 5s after ignition, flip to
+            // BURNED. The original also swaps the skin & possibly the
+            // VO (for "Burn,Type,..." variants); those depend on the
+            // skin manager and VO loader per-instance which aren't
+            // ported.
+            if self.object_state & OBJECT_STATE_BURNED == 0
+                && self.burn_time_total > OBJECT_ABLAZE_BURNED_AT_MS
+            {
+                self.object_state |= OBJECT_STATE_BURNED;
+                // `rchange |= MR_GRAPH` in C++ — triggers a skin swap
+                // on the next `r_need` pass.
+                self.rchange |= MR_GRAPH;
+            }
+            // No early return: logic_takt continues so BEHF_STATIC
+            // ablaze objects still get whatever shared behaviour runs
+            // below. (Currently nothing; placeholder for future
+            // additions.)
         }
 
         // BEHF_STATIC: empty — subclass isn't on the logic-temp list.
@@ -2008,6 +2267,217 @@ mod tests {
             "post-second-toggle timer must land in 3000..=5000, got {}",
             o.photo_time,
         );
+    }
+
+    #[test]
+    fn damage_on_static_object_is_noop() {
+        // Non-BEHF_BURN objects ignore damage (MatrixObject.cpp:107 branch
+        // guard). Confirms the fall-through of the switch.
+        use crate::matrix_game::effects::weapon::WEAPON_BIGBOOM;
+        use crate::matrix_game::map_static::{MapStatic, ObjectId, Objects};
+        let mut objs = Objects::new();
+        let id = objs.spawn(Box::new(MapObject::from_instance(&inst())));
+        let dropped = objs.apply_damage(id, WEAPON_BIGBOOM, glam::Vec3::ZERO, glam::Vec3::Z, 2, None);
+        assert!(!dropped);
+        let o = objs.get(id).unwrap();
+        assert_eq!(o.object_state() & OBJECT_STATE_ABLAZE, 0);
+        assert!(!objs.in_lt(id));
+    }
+
+    #[test]
+    fn damage_burn_marks_ablaze_caps_ttl_and_enrolls_in_logic_list() {
+        use crate::matrix_game::effects::weapon::{
+            WEAPON_BIGBOOM, WEAPON_FLAMETHROWER, WEAPON_PLASMA,
+        };
+        use crate::matrix_game::map_static::Objects;
+        let mut rng = Rnd::new(1);
+
+        // BEHF_BURN object via apply_ids_row.
+        let mut o = MapObject::from_instance(&inst());
+        assert!(!o.apply_ids_row("path*vo*tex******Burn,Tex,Burn01", &mut rng, || {}));
+        assert_eq!(o.beh_flag, BehFlag::Burn);
+
+        let mut objs = Objects::new();
+        let id = objs.spawn(Box::new(o));
+
+        // WEAPON_BIGBOOM (fire-type) kindles with +10_000 TTL.
+        assert!(!objs.apply_damage(id, WEAPON_BIGBOOM, glam::Vec3::ZERO, glam::Vec3::Z, PLAYER_SIDE, None));
+        let o = objs.get(id).unwrap();
+        assert_ne!(o.object_state() & OBJECT_STATE_ABLAZE, 0);
+        assert_eq!(o.ablaze_ttl(), 10_000);
+        assert!(objs.in_lt(id), "BEHF_BURN objects AddLT on first damage");
+
+        // Another hit with WEAPON_FLAMETHROWER: +100 to TTL.
+        assert!(!objs.apply_damage(id, WEAPON_FLAMETHROWER, glam::Vec3::ZERO, glam::Vec3::Z, PLAYER_SIDE, None));
+        assert_eq!(objs.get(id).unwrap().ablaze_ttl(), 10_100);
+
+        // WEAPON_PLASMA: +200.
+        assert!(!objs.apply_damage(id, WEAPON_PLASMA, glam::Vec3::ZERO, glam::Vec3::Z, PLAYER_SIDE, None));
+        // Unburned cap = 15_000; the stacked TTL is 10_300 < cap.
+        assert_eq!(objs.get(id).unwrap().ablaze_ttl(), 10_300);
+
+        // Big hits stack TTL up to the unburned cap.
+        for _ in 0..5 {
+            objs.apply_damage(id, WEAPON_BIGBOOM, glam::Vec3::ZERO, glam::Vec3::Z, PLAYER_SIDE, None);
+        }
+        assert_eq!(objs.get(id).unwrap().ablaze_ttl(), 15_000);
+    }
+
+    #[test]
+    fn break_damage_decrements_hp_and_flips_burned_on_death() {
+        // BEHF_BREAK object with 500hp. WEAPON_GUN (idx=8) deals 100 /
+        // floor 0. Three hits leave 200, fourth kills.
+        use crate::matrix_game::config::{ObjectDamages, WeaponDamage};
+        use crate::matrix_game::effects::weapon::{WEAPON_GUN, weap_to_index};
+        use crate::matrix_game::map_static::Objects;
+
+        let mut rng = Rnd::new(1);
+        let mut o = MapObject::from_instance(&inst());
+        assert!(o.apply_ids_row(
+            "path*vo*tex******Break,1,500,Normal",
+            &mut rng, || {},
+        ));
+        assert_eq!(o.beh_flag, BehFlag::Break);
+        assert_eq!(o.break_hit_point, 500);
+        assert_eq!(o.break_hit_point_max, 500);
+
+        let mut objs = Objects::new();
+        objs.object_damages.table[weap_to_index(WEAPON_GUN).unwrap()] =
+            WeaponDamage { damage: 100, mindamage: 0 };
+        let id = objs.spawn(Box::new(o));
+
+        // 500 → 400 → 300 → 200 → 100 → ≤0
+        for expected in [400, 300, 200, 100] {
+            objs.apply_damage(id, WEAPON_GUN, glam::Vec3::ZERO, glam::Vec3::Z, PLAYER_SIDE, None);
+            let obj = objs.get(id).unwrap();
+            let mo = unsafe { &*(obj as *const dyn MapStatic as *const MapObject) };
+            assert_eq!(mo.break_hit_point, expected);
+            assert_eq!(mo.object_state() & OBJECT_STATE_BURNED, 0);
+        }
+
+        // 5th hit drops to ≤0 → BURNED flag, MR_Graph dirty.
+        objs.apply_damage(id, WEAPON_GUN, glam::Vec3::ZERO, glam::Vec3::Z, PLAYER_SIDE, None);
+        let obj = objs.get(id).unwrap();
+        let mo = unsafe { &*(obj as *const dyn MapStatic as *const MapObject) };
+        assert!(mo.break_hit_point <= 0);
+        assert_ne!(mo.object_state() & OBJECT_STATE_BURNED, 0);
+        assert_ne!(mo.rchange() & MR_GRAPH, 0);
+    }
+
+    #[test]
+    fn break_damage_respects_mindamage_floor() {
+        // Hit-points above mindamage get decremented; below/equal they
+        // don't — matches MatrixObject.cpp:191 (`if hp > mindamage`).
+        use crate::matrix_game::config::{ObjectDamages, WeaponDamage};
+        use crate::matrix_game::effects::weapon::{WEAPON_GUN, weap_to_index};
+        use crate::matrix_game::map_static::Objects;
+
+        let mut rng = Rnd::new(1);
+        let mut o = MapObject::from_instance(&inst());
+        o.apply_ids_row("path*vo*tex******Break,1,30,Normal", &mut rng, || {});
+
+        let mut objs = Objects::new();
+        // Big damage but a 50-point floor — won't go below 50.
+        objs.object_damages.table[weap_to_index(WEAPON_GUN).unwrap()] =
+            WeaponDamage { damage: 20, mindamage: 50 };
+        let id = objs.spawn(Box::new(o));
+
+        // Starting hp 30 ≤ mindamage 50 → no decrement, no death.
+        objs.apply_damage(id, WEAPON_GUN, glam::Vec3::ZERO, glam::Vec3::Z, PLAYER_SIDE, None);
+        let obj = objs.get(id).unwrap();
+        let mo = unsafe { &*(obj as *const dyn MapStatic as *const MapObject) };
+        assert_eq!(mo.break_hit_point, 30, "mindamage floor prevents hp drop");
+        assert_eq!(mo.object_state() & OBJECT_STATE_BURNED, 0);
+    }
+
+    #[test]
+    fn apply_anim_state_parses_hp_from_state_table() {
+        // "Anim,0:5:100#1:3:50#2:7:0" — apply state=0 → hp 100,
+        // state=1 → hp 50, state=2 → hp=0 treated as invincible.
+        let mut o = MapObject::from_instance(&inst());
+        o.apply_anim_state(0, "Anim,0:5:100#1:3:50#2:7:0");
+        assert_eq!(o.anim_state, 0);
+        assert_eq!(o.break_hit_point, 100);
+
+        o.apply_anim_state(1, "Anim,0:5:100#1:3:50#2:7:0");
+        assert_eq!(o.anim_state, 1);
+        assert_eq!(o.break_hit_point, 50);
+
+        o.apply_anim_state(2, "Anim,0:5:100#1:3:50#2:7:0");
+        assert_eq!(o.anim_state, 2);
+        assert_eq!(o.break_hit_point, 2_000_000_000, "hp=0 → invincible sentinel");
+
+        // Missing state: state_id stays set, hp left as-is.
+        let prev = o.break_hit_point;
+        o.apply_anim_state(99, "Anim,0:5:100#1:3:50#2:7:0");
+        assert_eq!(o.anim_state, 99);
+        assert_eq!(o.break_hit_point, prev);
+    }
+
+    #[test]
+    fn anim_behaviour_seeds_state_zero_at_spawn() {
+        // BEHF_ANIM's Init path calls ApplyAnimState(0), so a fresh
+        // Anim object should have anim_state=0 + hp from the state-0
+        // entry (MatrixObject.cpp:1072).
+        let mut rng = Rnd::new(1);
+        let mut o = MapObject::from_instance(&inst());
+        assert!(o.apply_ids_row(
+            "path*vo*tex******Anim,0:1:300#1:2:150",
+            &mut rng, || {},
+        ));
+        assert_eq!(o.beh_flag, BehFlag::Anim);
+        assert_eq!(o.anim_state, 0);
+        assert_eq!(o.break_hit_point, 300);
+    }
+
+    #[test]
+    fn damage_ignored_when_attacker_is_not_player_for_special_object() {
+        // MatrixObject.cpp:105 — SPECIAL objects are player-only targets.
+        use crate::matrix_game::effects::weapon::WEAPON_BIGBOOM;
+        use crate::matrix_game::map_static::Objects;
+        let mut rng = Rnd::new(1);
+
+        let mut o = MapObject::from_instance(&inst());
+        o.apply_ids_row("path*vo*tex******+Burn,Tex,Burn01", &mut rng, || {});
+        assert_eq!(o.beh_flag, BehFlag::Burn);
+        assert_ne!(o.object_state & OBJECT_STATE_SPECIAL, 0);
+
+        let mut objs = Objects::new();
+        let id = objs.spawn(Box::new(o));
+        // Enemy AI side 2 cannot hit a SPECIAL object.
+        objs.apply_damage(id, WEAPON_BIGBOOM, glam::Vec3::ZERO, glam::Vec3::Z, 2, None);
+        assert_eq!(objs.get(id).unwrap().object_state() & OBJECT_STATE_ABLAZE, 0);
+        // But player (side 1) can.
+        objs.apply_damage(id, WEAPON_BIGBOOM, glam::Vec3::ZERO, glam::Vec3::Z, PLAYER_SIDE, None);
+        assert_ne!(objs.get(id).unwrap().object_state() & OBJECT_STATE_ABLAZE, 0);
+    }
+
+    #[test]
+    fn ablaze_logic_takt_flips_burned_flag_after_5s() {
+        use crate::matrix_game::effects::weapon::WEAPON_BIGBOOM;
+        use crate::matrix_game::world::World;
+        let mut world = World::with_seed(1);
+
+        let mut o = MapObject::from_instance(&inst());
+        o.apply_ids_row("path*vo*tex******Burn,Tex,Burn01", &mut Rnd::new(1), || {});
+        let id = world.objects.spawn(Box::new(o));
+
+        // Kindle: adds OBJECT_STATE_ABLAZE, enrolls in LT, TTL=10_000.
+        world.objects.apply_damage(
+            id, WEAPON_BIGBOOM, glam::Vec3::ZERO, glam::Vec3::Z, PLAYER_SIDE, None,
+        );
+
+        // Drive 4s of game-time — still not burned.
+        world.takt(4000);
+        let o = world.objects.get(id).unwrap();
+        assert_ne!(o.object_state() & OBJECT_STATE_ABLAZE, 0, "still ablaze at 4s");
+        assert_eq!(o.object_state() & OBJECT_STATE_BURNED, 0, "not yet burned at 4s");
+
+        // Drive another 1.5s to cross the 5000ms mark.
+        world.takt(1500);
+        let o = world.objects.get(id).unwrap();
+        assert_ne!(o.object_state() & OBJECT_STATE_BURNED, 0,
+            "BURNED flag latched after 5s of ablaze accumulation");
     }
 
     #[test]

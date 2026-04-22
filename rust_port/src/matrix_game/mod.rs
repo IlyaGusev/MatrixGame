@@ -6,6 +6,7 @@
 
 pub mod camera;
 pub mod common;
+pub mod config;
 pub mod effects;
 pub mod form_game;
 pub mod interface;

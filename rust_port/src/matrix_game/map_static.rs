@@ -25,6 +25,7 @@ use crate::matrix_game::common::{
     TRACE_BUILDING, TRACE_CANNON, TRACE_FLYER, TRACE_OBJECT, TRACE_ROBOT,
     TRACE_SKIP_INVISIBLE,
 };
+use crate::matrix_game::config::ObjectDamages;
 use crate::matrix_game::rnd::Rnd;
 
 // ── Resource-change bits (MR_*) (MatrixMapStatic.hpp:17-25) ──────────────
@@ -153,6 +154,28 @@ pub trait MapStatic {
     fn free_dynamic_resources(&mut self) {}
     fn side(&self) -> i32 { -1 }
     fn need_repair(&self) -> bool { false }
+
+    /// Port of `virtual bool Damage(EWeapon, pos, dir, attacker_side,
+    /// attacker)` (MatrixMapStatic.hpp:464). Returns true iff the
+    /// damage caused *this* object to be removed from play (C++
+    /// `Damage` returns `true` only when `Init` reset mid-call, per
+    /// comment at MatrixObject.cpp:1572). Default: ignore.
+    ///
+    /// `objs` is the arena sans this object's slot — same contract as
+    /// `takt`/`logic_takt`. Callees use it to enroll themselves into
+    /// the logic-temp list (AddLT) or spawn effects.
+    fn damage(
+        &mut self,
+        _weap: crate::matrix_game::effects::weapon::Weapon,
+        _pos: Vec3,
+        _dir: Vec3,
+        _attacker_side: i32,
+        _attacker: Option<ObjectId>,
+        _self_id: ObjectId,
+        _objs: &mut Objects,
+    ) -> bool {
+        false
+    }
 }
 
 // ── Helper predicates on &dyn MapStatic (matches `IsRobot()` etc.) ─────
@@ -261,6 +284,12 @@ pub struct Objects {
     /// guard in `ProceedLogic` (MatrixMapStatic.cpp:350). Filled in when
     /// sides land; `None` means the guard is inactive.
     pub arcaded_object: Option<ObjectId>,
+
+    /// Port of `g_Config.m_ObjectDamages` (MatrixConfig.hpp:574). The
+    /// per-weapon damage table used by MapObject's Damage branches.
+    /// Lives on `Objects` because it's a shared world-level resource
+    /// that damage callees need from inside the take-the-box pattern.
+    pub object_damages: ObjectDamages,
 }
 
 impl Default for Objects {
@@ -278,6 +307,7 @@ impl Objects {
             last_lt: None,
             next_logic_object: None,
             arcaded_object: None,
+            object_damages: ObjectDamages::default(),
         }
     }
 
@@ -327,6 +357,21 @@ impl Objects {
             .unwrap_or(false)
     }
 
+    /// Like [`is_valid`] but returns true even when the slot's box is
+    /// temporarily checked out (take-the-box pattern in
+    /// `proceed_logic`/`graphic_takt`/`apply_damage`). List-membership
+    /// ops (`add_lt`/`del_lt`/`in_lt`) must use this so a takt body
+    /// can self-`add_lt` via the passed `&mut Objects` — matching the
+    /// C++ where `this->AddLT()` works from inside one of its own
+    /// methods. External read access (`get`/`get_mut`) keeps the
+    /// stricter check to preserve the "object not accessible" tombstone.
+    fn gen_matches(&self, id: ObjectId) -> bool {
+        self.slots
+            .get(id.index as usize)
+            .map(|s| s.generation == id.generation)
+            .unwrap_or(false)
+    }
+
     pub fn len(&self) -> usize {
         self.slots.len() - self.free.len()
     }
@@ -353,7 +398,9 @@ impl Objects {
         slot.obj.as_deref_mut()
     }
 
-    /// Ports `InLT` (MatrixMapStatic.hpp:440).
+    /// Ports `InLT` (MatrixMapStatic.hpp:440). Works even while the
+    /// object's box is checked out by a takt driver — the list
+    /// membership flag lives on the slot, not in the box.
     pub fn in_lt(&self, id: ObjectId) -> bool {
         self.slots
             .get(id.index as usize)
@@ -361,9 +408,11 @@ impl Objects {
             .unwrap_or(false)
     }
 
-    /// Ports `AddLT` (MatrixMapStatic.hpp:441). Idempotent.
+    /// Ports `AddLT` (MatrixMapStatic.hpp:441). Idempotent. Uses
+    /// `gen_matches` (not `is_valid`) so self-enroll during a takt
+    /// body works even though the slot's box is currently checked out.
     pub fn add_lt(&mut self, id: ObjectId) {
-        if !self.is_valid(id) || self.in_lt(id) {
+        if !self.gen_matches(id) || self.in_lt(id) {
             return;
         }
         // LIST_ADD(this, m_FirstLogicTemp, m_LastLogicTemp,
@@ -533,6 +582,37 @@ impl Objects {
         skip: Option<ObjectId>,
     ) -> bool {
         self.find_objects(pos, radius, oscale, mask, skip, |_, _| Control::Break)
+    }
+
+    /// External entry point for `CMatrixMapStatic::Damage(...)`. Uses the
+    /// take-the-box pattern so `damage()` receives `&mut Objects` as the
+    /// arena-sans-self, allowing the callee to `add_lt` itself (the
+    /// BEHF_BURN enrollment) or query other objects.
+    ///
+    /// Returns whatever the subclass `damage` returned — `true` means
+    /// "this object was reset / removed mid-call" (the only case where
+    /// the original returns true; see MatrixObject.cpp:1572).
+    pub fn apply_damage(
+        &mut self,
+        target: ObjectId,
+        weap: crate::matrix_game::effects::weapon::Weapon,
+        pos: Vec3,
+        dir: Vec3,
+        attacker_side: i32,
+        attacker: Option<ObjectId>,
+    ) -> bool {
+        let mut boxed = match self.slots.get_mut(target.index as usize)
+            .and_then(|s| if s.generation == target.generation { s.obj.take() } else { None })
+        {
+            Some(b) => b,
+            None => return false,
+        };
+        let result = boxed.damage(weap, pos, dir, attacker_side, attacker, target, self);
+        let slot = &mut self.slots[target.index as usize];
+        if slot.generation == target.generation && slot.obj.is_none() {
+            slot.obj = Some(boxed);
+        }
+        result
     }
 
     /// Ports the per-object pass inside `CMatrixMapStatic::SortEndGraphicTakt`

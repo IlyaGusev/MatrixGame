@@ -8,6 +8,7 @@
 //! takt (`CMatrixMap::Takt`) aren't part of scope A/B — they land when
 //! sides + the full map takt arrive.
 
+use crate::matrix_game::config::ObjectDamages;
 use crate::matrix_game::map::GameMap;
 use crate::matrix_game::map_static::{ObjectId, Objects};
 use crate::matrix_game::object::MapObject;
@@ -86,6 +87,16 @@ impl World {
             return;
         }
         self.objects.graphic_takt(step_ms, &mut self.rng);
+    }
+
+    /// Load `g_Config.m_ObjectDamages` from `robots.dat`
+    /// (MatrixConfig.cpp:591-607). Missing / malformed data falls back
+    /// to the zero-initialized table (same semantics as the C++
+    /// `memset` at :593). Safe to call multiple times; subsequent
+    /// calls overwrite.
+    pub fn load_config(&mut self, matrix_data: &Storage) {
+        self.objects.object_damages =
+            ObjectDamages::from_matrix_data(matrix_data).unwrap_or_default();
     }
 
     /// Populate the arena with one [`MapObject`] per decorative object

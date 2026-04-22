@@ -116,6 +116,7 @@ impl ApplicationHandler for App {
             minimap.set_angle(-map.camera_angle);
 
             let mut game = World::new();
+            game.load_config(&matrix_data);
             let (_ids, stats) = game.spawn_map_objects(&map, &stor);
             log::info!(
                 "world: spawned {} map objects (static={}, burn={}, break={}, anim={}, sens={}, spawner={}, terron={}, portret={}, special={})",

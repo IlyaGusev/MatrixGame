@@ -64,6 +64,20 @@ pub const OTP_BEHAVIOUR:      usize = 8;
 pub const OTP_BIAS:           usize = 9;
 pub const OTP_INVLOGIC:       usize = 10;
 
+/// Side IDs — MatrixSide.hpp:16. Side 0 is neutral/world-owned; side 1
+/// is the player; higher numbers are AI-controlled factions.
+pub const PLAYER_SIDE: i32 = 1;
+
+/// Ablaze tick period (MatrixMapStatic.hpp:93): the CMatrixMapObject
+/// ablaze logic emits a fire/smoke effect every 90ms of sim time.
+pub const OBJECT_ABLAZE_PERIOD_MS: i32 = 90;
+
+/// Total ablaze time before an object is marked BURNED
+/// (MatrixObject.cpp:1580). After 5 seconds of being ablaze, the
+/// object transitions to the burned-out state and loses the ablaze
+/// flag on its next TTL expiry.
+pub const OBJECT_ABLAZE_BURNED_AT_MS: i32 = 5000;
+
 // ── Binary read helpers ─────────────────────────────────────────────────────
 
 pub fn rd_u32(d: &[u8], o: &mut usize) -> u32 {

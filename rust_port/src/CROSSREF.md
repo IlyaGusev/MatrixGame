@@ -47,6 +47,7 @@ Form, Helper, Math3D, ShadowProj, ShadowStencil.
 |-------------------------------|-----------------------------------|
 | matrix_game/camera.rs         | MatrixCamera.cpp                  |
 | matrix_game/common.rs         | Common.hpp                        |
+| matrix_game/config.rs         | MatrixConfig.cpp (damage tables only; gamma/keybind/sound deferred) |
 | matrix_game/form_game.rs      | MatrixFormGame.cpp (+ MatrixGame.cpp entry glue) |
 | matrix_game/map.rs            | MatrixMap.cpp (map data + `MapRenderer` draw orchestration)|
 | matrix_game/map_group.rs      | MatrixMapGroup.cpp (BuildBottom + BuildWater — merged across groups by texture; see header) |
@@ -77,6 +78,7 @@ MatrixVisiCalc, DevConsole, StringConstants.
 | Rust file                               | Original                        |
 |-----------------------------------------|---------------------------------|
 | matrix_game/effects/point_light.rs      | MatrixEffectPointLight.cpp      |
+| matrix_game/effects/weapon.rs           | MatrixEffectWeapon.hpp (EWeapon enum constants only; effect class deferred) |
 
 Not yet ported: MatrixEffect (base), BigBoom, Billboard, Dust,
 ElevatorField, Explosion, FirePlasma, Flame, Konus, LandscapeSpot,
