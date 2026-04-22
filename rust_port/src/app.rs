@@ -193,7 +193,13 @@ impl ApplicationHandler for App {
                 if size.width > 0 && size.height > 0 {
                     gfx.resize(size.width, size.height);
                     terrain.resize(&gfx.device, &gfx.config);
-                    camera.set_aspect(size.width as f32, size.height as f32);
+                    // set_aspect mirrors the *surface* size so cursor (which
+                    // we rescale from winit coords on the fly) and edge-pan
+                    // thresholds share the same coord system.
+                    camera.set_aspect(
+                        gfx.config.width as f32,
+                        gfx.config.height as f32,
+                    );
                 }
 
                 *state_slot.borrow_mut() = Some(AppState {
@@ -233,9 +239,10 @@ impl ApplicationHandler for App {
                 if size.width > 0 && size.height > 0 {
                     state.gfx.resize(size.width, size.height);
                     state.terrain.resize(&state.gfx.device, &state.gfx.config);
-                    state
-                        .camera
-                        .set_aspect(size.width as f32, size.height as f32);
+                    state.camera.set_aspect(
+                        state.gfx.config.width as f32,
+                        state.gfx.config.height as f32,
+                    );
                 }
             }
 
@@ -251,14 +258,42 @@ impl ApplicationHandler for App {
                     let pressed = btn_state == ElementState::Pressed;
                     let [x, y] = state.cursor;
                     state.camera.on_rotate_button(pressed, x, y);
+                } else if button == MouseButton::Left
+                    && btn_state == ElementState::Pressed
+                {
+                    // Minimap click-to-teleport. Ports CMinimap::ButtonClick
+                    // + CalcMinimap2World (MatrixMinimap.cpp:1356-1379): if
+                    // the cursor is on the minimap rect, map pixel → world
+                    // and feed it to `m_Camera.SetXYStrategy`.
+                    let [cx, cy] = state.cursor;
+                    if let Some(tgt) = state.minimap.click_to_world(cx, cy) {
+                        state.camera.set_xy_strategy(tgt);
+                    }
                 }
             }
 
             WindowEvent::CursorMoved { position, .. } => {
-                state.cursor = [position.x as f32, position.y as f32];
-                state
-                    .camera
-                    .on_mouse_move(position.x as f32, position.y as f32);
+                // winit reports cursor in its own "physical" coord system
+                // (CSS × DPR). When the surface is clamped to
+                // `max_texture_dimension_2d` (2048 on WebGL2) but the viewport
+                // is larger, surface coords are a *subset* of winit coords —
+                // rendering and hit-tests use the smaller surface coords, so
+                // rescale cursor to the surface coord system here.
+                let win_size = state.window.inner_size();
+                let sx = if win_size.width > 0 {
+                    state.gfx.config.width as f64 / win_size.width as f64
+                } else {
+                    1.0
+                };
+                let sy = if win_size.height > 0 {
+                    state.gfx.config.height as f64 / win_size.height as f64
+                } else {
+                    1.0
+                };
+                let cx = (position.x * sx) as f32;
+                let cy = (position.y * sy) as f32;
+                state.cursor = [cx, cy];
+                state.camera.on_mouse_move(cx, cy);
             }
 
             WindowEvent::MouseWheel { delta, .. } => {

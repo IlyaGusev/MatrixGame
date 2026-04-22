@@ -597,6 +597,55 @@ impl Minimap {
         [cx + c * dx - s * dy, cy + s * dx + c * dy]
     }
 
+    /// Inverse of `apply_rotation` — minimap-space screen point rotated back
+    /// into un-rotated minimap space. Mirrors `D3DXMatrixInverse(&ri, &m_Rotation)`
+    /// followed by `D3DXVec2TransformCoord(&pos, &in, &ri)` at
+    /// MatrixMinimap.cpp:258-259.
+    fn inverse_rotation(&self, p: [f32; 2]) -> [f32; 2] {
+        if self.angle == 0.0 {
+            return p;
+        }
+        let cx = self.pos_x + self.size_x * 0.5;
+        let cy = self.pos_y + self.size_y * 0.5;
+        let (s, c) = (-self.angle).sin_cos();
+        let dx = p[0] - cx;
+        let dy = p[1] - cy;
+        [cx + c * dx - s * dy, cy + s * dx + c * dy]
+    }
+
+    /// Port of `CMinimap::Map2World` (MatrixMinimap.cpp:250-274). Takes a
+    /// screen-pixel point on the minimap and returns the world-space XY the
+    /// camera would need for its link point to show that spot.
+    fn map_to_world(&self, mx: f32, my: f32) -> [f32; 2] {
+        let p = self.inverse_rotation([mx, my]);
+        let sz = self.map_sx.max(self.map_sy) as f32;
+        let fsz = GLOBAL_SCALE * sz;
+        let fx = (p[0] - self.delta[0] - self.pos_x - self.size_x * 0.5) * fsz / self.size_x;
+        let fy = (p[1] - self.delta[1] - self.pos_y - self.size_y * 0.5) * fsz / self.size_y;
+        let half_w = self.map_sx as f32 * GLOBAL_SCALE * 0.5;
+        let half_h = self.map_sy as f32 * GLOBAL_SCALE * 0.5;
+        [
+            (fx - self.center[0] + half_w) / self.scale + self.center[0],
+            (fy - self.center[1] + half_h) / self.scale + self.center[1],
+        ]
+    }
+
+    /// Port of `CMinimap::CalcMinimap2World` + `ButtonClick`
+    /// (MatrixMinimap.cpp:1356-1379). Returns `Some(world_xy)` when the
+    /// cursor is inside the minimap rect; the caller passes that straight
+    /// to `camera.set_xy_strategy(tgt)` — the same two-line op the original
+    /// performs at MatrixMinimap.cpp:1361.
+    pub fn click_to_world(&self, cursor_x: f32, cursor_y: f32) -> Option<[f32; 2]> {
+        if cursor_x < self.pos_x
+            || cursor_y < self.pos_y
+            || cursor_x > self.pos_x + self.size_x
+            || cursor_y > self.pos_y + self.size_y
+        {
+            return None;
+        }
+        Some(self.map_to_world(cursor_x, cursor_y))
+    }
+
     /// Port of `CMinimap::BeforeDraw` (MatrixMinimap.cpp:182-248) — computes
     /// `m_Delta` so the map square stays pinned to the minimap rect when the
     /// world is scaled, then emits the four corner vertices.
