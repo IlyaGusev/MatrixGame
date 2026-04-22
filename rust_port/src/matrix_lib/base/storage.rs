@@ -38,7 +38,18 @@ impl DataBuf {
         }
         let alloc_table_disp = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize;
         let arrays_count = u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]) as usize;
-        let element_size = i32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]) as usize;
+        // `element_size` is an `i32` in the original `CDataBuf` header, so a
+        // corrupted or hostile file can ship a negative value that would wrap
+        // to a huge `usize` under a silent cast. Shipped data never uses
+        // negatives, so anything below zero is an error, not a sentinel.
+        let element_size_i32 = i32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]);
+        if element_size_i32 < 0 {
+            bail!(
+                "DataBuf element_size is negative ({element_size_i32}); \
+                 file is corrupt or uses an unsupported layout"
+            );
+        }
+        let element_size = element_size_i32 as usize;
 
         let mut arrays = Vec::with_capacity(arrays_count);
         for i in 0..arrays_count {
@@ -305,4 +316,34 @@ fn zl_decompress_all(data: &[u8]) -> Result<Vec<u8>> {
     }
 
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn databuf_rejects_negative_element_size() {
+        let mut raw = Vec::with_capacity(12);
+        raw.extend_from_slice(&12u32.to_le_bytes()); // alloc_table_disp
+        raw.extend_from_slice(&0u32.to_le_bytes()); // arrays_count
+        raw.extend_from_slice(&(-1i32).to_le_bytes()); // element_size
+        let err = match DataBuf::parse(&raw) {
+            Ok(_) => panic!("negative element_size must error"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("element_size is negative"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn databuf_accepts_zero_element_size() {
+        let mut raw = Vec::with_capacity(12);
+        raw.extend_from_slice(&12u32.to_le_bytes());
+        raw.extend_from_slice(&0u32.to_le_bytes());
+        raw.extend_from_slice(&0i32.to_le_bytes());
+        assert!(DataBuf::parse(&raw).is_ok(), "zero element_size should parse");
+    }
 }
