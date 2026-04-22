@@ -35,15 +35,21 @@
   </div>
 
   <script type="module">
-    import init from "./pkg/matrixgame_rs.js?v=75";
+    import init from "./pkg/matrixgame_rs.js?v=77";
 
 
     const MAX = 2048; // WebGL max texture dimension
     const canvas = document.getElementById("game-canvas");
 
     function resize() {
-      canvas.width  = Math.min(window.innerWidth,  MAX);
-      canvas.height = Math.min(window.innerHeight, MAX);
+      // Clamp proportionally so the backing-buffer aspect matches the CSS
+      // display aspect. Clamping each dimension independently stretches the
+      // displayed canvas (square content becomes a rectangle).
+      const iw = window.innerWidth;
+      const ih = window.innerHeight;
+      const s = Math.min(1, MAX / Math.max(iw, ih));
+      canvas.width  = Math.max(1, Math.floor(iw * s));
+      canvas.height = Math.max(1, Math.floor(ih * s));
     }
     resize();
     window.addEventListener("resize", resize);

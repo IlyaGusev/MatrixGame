@@ -55,17 +55,16 @@ impl GfxContext {
             .copied()
             .unwrap_or(caps.formats[0]);
 
+        let (cfg_w, cfg_h) = clamp_proportional(
+            size.width,
+            size.height,
+            device.limits().max_texture_dimension_2d,
+        );
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
-            width: size
-                .width
-                .max(1)
-                .min(device.limits().max_texture_dimension_2d),
-            height: size
-                .height
-                .max(1)
-                .min(device.limits().max_texture_dimension_2d),
+            width: cfg_w,
+            height: cfg_h,
             present_mode: wgpu::PresentMode::AutoVsync,
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
@@ -83,8 +82,9 @@ impl GfxContext {
 
     pub fn resize(&mut self, width: u32, height: u32) {
         let max = self.device.limits().max_texture_dimension_2d;
-        self.config.width = width.max(1).min(max);
-        self.config.height = height.max(1).min(max);
+        let (w, h) = clamp_proportional(width, height, max);
+        self.config.width = w;
+        self.config.height = h;
         self.surface.configure(&self.device, &self.config);
     }
 
@@ -114,4 +114,18 @@ impl GfxContext {
         self.queue.submit(std::iter::once(encoder.finish()));
         output.present();
     }
+}
+
+/// Scale `(w, h)` down proportionally so neither dimension exceeds `max`.
+/// Clamping each dimension independently distorts aspect ratio — the browser
+/// stretches the smaller-backing-buffer canvas to its full CSS size, which
+/// squashes or elongates square content.
+fn clamp_proportional(w: u32, h: u32, max: u32) -> (u32, u32) {
+    let w = w.max(1);
+    let h = h.max(1);
+    let max = max.max(1);
+    let s = (max as f64 / w.max(h) as f64).min(1.0);
+    let out_w = ((w as f64) * s).floor().max(1.0) as u32;
+    let out_h = ((h as f64) * s).floor().max(1.0) as u32;
+    (out_w, out_h)
 }
