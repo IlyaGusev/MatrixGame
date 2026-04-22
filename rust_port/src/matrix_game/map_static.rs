@@ -25,7 +25,7 @@ use crate::matrix_game::common::{
     TRACE_BUILDING, TRACE_CANNON, TRACE_FLYER, TRACE_OBJECT, TRACE_ROBOT,
     TRACE_SKIP_INVISIBLE,
 };
-use crate::matrix_game::config::ObjectDamages;
+use crate::matrix_game::config::{BuildingDamages, ObjectDamages};
 use crate::matrix_game::rnd::Rnd;
 
 // ── Resource-change bits (MR_*) (MatrixMapStatic.hpp:17-25) ──────────────
@@ -301,6 +301,10 @@ pub struct Objects {
     /// Lives on `Objects` because it's a shared world-level resource
     /// that damage callees need from inside the take-the-box pattern.
     pub object_damages: ObjectDamages,
+    /// Port of `g_Config.m_BuildingDamages` + `m_BuildingHitPoints`
+    /// (MatrixConfig.cpp:507-535). Same shape as `object_damages` plus
+    /// a per-EBuildingType max-HP vector.
+    pub building_damages: BuildingDamages,
 }
 
 impl Default for Objects {
@@ -319,6 +323,7 @@ impl Objects {
             next_logic_object: None,
             arcaded_object: None,
             object_damages: ObjectDamages::default(),
+            building_damages: BuildingDamages::default(),
         }
     }
 

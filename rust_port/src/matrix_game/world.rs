@@ -8,7 +8,7 @@
 //! takt (`CMatrixMap::Takt`) aren't part of scope A/B — they land when
 //! sides + the full map takt arrive.
 
-use crate::matrix_game::config::ObjectDamages;
+use crate::matrix_game::config::{BuildingDamages, ObjectDamages};
 use crate::matrix_game::map::GameMap;
 use crate::matrix_game::map_static::{ObjectId, Objects};
 use crate::matrix_game::object::MapObject;
@@ -98,6 +98,8 @@ impl World {
     pub fn load_config(&mut self, matrix_data: &Storage) {
         self.objects.object_damages =
             ObjectDamages::from_matrix_data(matrix_data).unwrap_or_default();
+        self.objects.building_damages =
+            BuildingDamages::from_matrix_data(matrix_data).unwrap_or_default();
     }
 
     /// Populate the arena with one [`MapObject`] per decorative object
@@ -173,7 +175,20 @@ impl World {
     pub fn spawn_buildings(&mut self, map: &GameMap) -> Vec<ObjectId> {
         let mut ids = Vec::with_capacity(map.buildings.len());
         for inst in &map.buildings {
-            let b = Building::from_instance(inst);
+            let mut b = Building::from_instance(inst);
+            // Seed max HP from the loaded `Weapons/Damages/Building/HITPOINT`
+            // table. Indexed by `EBuildingType`. Falls back to 0 when
+            // robots.dat hasn't been loaded — tests can bypass with
+            // explicit `init_max_hitpoint` calls.
+            let kind_idx = b.kind as usize;
+            let hp = self.objects.building_damages
+                .hitpoint
+                .get(kind_idx)
+                .copied()
+                .unwrap_or(0);
+            if hp > 0 {
+                b.init_max_hitpoint(hp as f32);
+            }
             let id = self.objects.spawn(Box::new(b));
             self.objects.add_lt(id);
             ids.push(id);

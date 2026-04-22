@@ -2343,7 +2343,7 @@ mod tests {
 
         let mut objs = Objects::new();
         objs.object_damages.table[weap_to_index(WEAPON_GUN).unwrap()] =
-            WeaponDamage { damage: 100, mindamage: 0 };
+            WeaponDamage { damage: 100, mindamage: 0, friend_damage: 0 };
         let id = objs.spawn(Box::new(o));
 
         // 500 → 400 → 300 → 200 → 100 → ≤0
@@ -2379,7 +2379,7 @@ mod tests {
         let mut objs = Objects::new();
         // Big damage but a 50-point floor — won't go below 50.
         objs.object_damages.table[weap_to_index(WEAPON_GUN).unwrap()] =
-            WeaponDamage { damage: 20, mindamage: 50 };
+            WeaponDamage { damage: 20, mindamage: 50, friend_damage: 0 };
         let id = objs.spawn(Box::new(o));
 
         // Starting hp 30 ≤ mindamage 50 → no decrement, no death.

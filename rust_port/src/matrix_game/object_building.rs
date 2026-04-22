@@ -22,7 +22,7 @@ use glam::{Mat3, Vec4};
 use wgpu::util::DeviceExt;
 
 use crate::matrix_game::effects::point_light::PointLightSystem;
-use crate::matrix_game::common::{unpack_rgb, FOG_END, FOG_START};
+use crate::matrix_game::common::{unpack_rgb, FOG_END, FOG_START, PLAYER_SIDE};
 use crate::matrix_game::map::{BuildingInstance, GameMap};
 use crate::matrix_game::map_static::{
     MapStatic, ObjectCore, ObjectId, Objects, ObjectType, MR_ALL,
@@ -171,6 +171,25 @@ pub struct Building {
     /// ObjectId so a freed robot reads as `None` through the arena's
     /// tombstone — matches C++ `m_Capturer->m_Object == NULL` check.
     pub capturer: Option<ObjectId>,
+
+    /// `m_NextExplosionTime` / `m_NextExplosionTimeSound` — union's
+    /// DIP branch (MatrixObjectBuilding.hpp:159-161). Game-time ms
+    /// when the next explosion effect / sound should fire during the
+    /// multi-second DIP sequence. Set by `damage` on death; consumed
+    /// by `logic_takt`'s DIP branch.
+    pub next_explosion_time: i32,
+    pub next_explosion_time_sound: i32,
+
+    /// `m_ShowHitpointTime` (MatrixObjectBuilding.hpp:227). Ms left on
+    /// the health-bar overlay; reseeded to HITPOINT_SHOW_TIME_MS on
+    /// every hit. Decays to 0 inside `logic_takt`.
+    pub show_hitpoint_time: i32,
+
+    /// `m_BaseFloor` progress in [0, 1] — 0 = fully closed (base below
+    /// ground), 1 = fully opened (platform raised). Animated by the
+    /// BASE_OPENING / BASE_CLOSING state machine at `BASE_FLOOR_SPEED`
+    /// per ms (MatrixObjectBuilding.cpp:812-833).
+    pub base_floor_progress: f32,
 }
 
 impl Building {
@@ -218,7 +237,22 @@ impl Building {
             shadow_type: 0,                    // SHADOW_OFF sentinel; CMAP sets
             shadow_size: 128,                  // MatrixObjectBuilding.cpp:40
             capturer: None,                    // MatrixObjectBuilding.cpp:48
+            next_explosion_time: 0,
+            next_explosion_time_sound: 0,
+            show_hitpoint_time: 0,
+            // MatrixObjectBuilding.cpp:43 seeds BASE_CLOSING + default
+            // base_floor at 0.2 from the ctor; the actual progress
+            // value starts at 0 and animates toward 0 on the first
+            // logic tick of a freshly-spawned building.
+            base_floor_progress: 0.0,
         }
+    }
+
+    /// Entry-point for `CMatrixBuilding::ShowHitpoint` (MatrixObjectBuilding.hpp:272).
+    /// Resets the health-bar overlay timer. Called by the attacker's
+    /// weapon effect when it connects.
+    pub fn show_hitpoint(&mut self) {
+        self.show_hitpoint_time = crate::matrix_game::common::HITPOINT_SHOW_TIME_MS;
     }
 
     /// Port of `InitMaxHitpoint(hp)` (MatrixObjectBuilding.hpp:273). Seeds
@@ -311,17 +345,176 @@ impl MapStatic for Building {
     /// ported. Structure preserved so the body lands in-place later.
     fn takt(&mut self, _cms: i32, _rng: &mut Rnd, _objs: &mut Objects) {}
 
-    /// Port of `CMatrixBuilding::LogicTakt` (MatrixObjectBuilding.cpp:495-899).
-    /// State-machine driver for BASE_OPENING → OPENED (≈2.5s), OPENED
-    /// → CLOSED, DIP explosion cycle, capture progress, resource
-    /// payouts, turret spawning, ... all require effects / sound /
-    /// sides / per-side resources. Skeleton here — the real body
-    /// arrives with those subsystems.
-    fn logic_takt(&mut self, _cms: i32, _rng: &mut Rnd, _objs: &mut Objects) {}
+    /// Port of `CMatrixBuilding::LogicTakt` (MatrixObjectBuilding.cpp:495-891).
+    ///
+    /// Currently ported: under-attack + show-hitpoint countdown timers
+    /// (non-DIP branch), and the `m_BaseFloor` BASE_OPENING/CLOSING
+    /// animation for BUILDING_BASE (MatrixObjectBuilding.cpp:810-833).
+    ///
+    /// Deferred: capture / capture-rollback / capture-candidate loop,
+    /// per-side resource payouts, `m_BS.TickTimer` (build-stack), the
+    /// DIP explosion sequence (HP<0 → emit periodic explosions →
+    /// replace with ruins), `m_GGraph` per-unit matrix updates
+    /// (requires per-instance mesh state).
+    fn logic_takt(&mut self, cms: i32, _rng: &mut Rnd, _objs: &mut Objects) {
+        use crate::matrix_game::common::BASE_FLOOR_SPEED;
+
+        // Pre-DIP pass: countdowns + capture/resource. Capture and
+        // resources are still deferred; the countdowns are portable.
+        if !matches!(self.state, BaseState::Dip | BaseState::DipExploded) {
+            // MatrixObjectBuilding.cpp:529 — under-attack warning
+            // timer decays; floor at 0.
+            self.under_attack_time = (self.under_attack_time - cms).max(0);
+
+            // MatrixObjectBuilding.cpp:531-535 — health-bar overlay.
+            if self.show_hitpoint_time > 0 {
+                self.show_hitpoint_time = (self.show_hitpoint_time - cms).max(0);
+            }
+
+            // Capture / resource payout — deferred until sides land.
+            // TODO: `FindObjects(CAPTURE_RADIUS, TRACE_ROBOT)` +
+            // `Capture(robot)` state machine (MatrixObjectBuilding.cpp:
+            // 539-594), `m_ResourcePeriod` per-kind payout
+            // (:605-667).
+        }
+
+        // DIP explosion sequence (MatrixObjectBuilding.cpp:672-808) —
+        // deferred. The HP<0 branch decrements HP by `cms` and emits
+        // periodic explosions + sounds; ruin replacement uses
+        // `StaticAdd<CMatrixMapObject>` + `AddEffectSpawner`, both
+        // unported.
+
+        // BUILDING_BASE platform animation (MatrixObjectBuilding.cpp:
+        // 810-854). Runs for BASE buildings only — the other kinds
+        // have no open/close animation.
+        if self.kind == BuildingType::Base {
+            let old = self.base_floor_progress;
+
+            if self.state == BaseState::Opening {
+                self.base_floor_progress += BASE_FLOOR_SPEED * cms as f32;
+                if self.base_floor_progress >= 1.0 {
+                    self.base_floor_progress = 1.0;
+                    self.state = BaseState::Opened;
+                }
+            }
+            if self.state == BaseState::Closing {
+                self.base_floor_progress -= BASE_FLOOR_SPEED * cms as f32;
+                if self.base_floor_progress <= 0.0 {
+                    self.base_floor_progress = 0.0;
+                    self.state = BaseState::Closed;
+                }
+            }
+
+            // When the progress changed, the C++ also nudges the
+            // sub-unit matrices on `m_GGraph` (platform + door
+            // translations) and flags `MR_Matrix` dirty. Those
+            // per-unit matrices live on the render-side
+            // CVectorObjectGroup in the Rust port; flag
+            // `MR_MATRIX` so the next `r_need` rebuilds the object
+            // transform (even though the per-unit nudges are still
+            // deferred).
+            if (self.base_floor_progress - old).abs() > f32::EPSILON {
+                self.rchange |= crate::matrix_game::map_static::MR_MATRIX;
+            }
+        }
+    }
+
+    /// Port of `CMatrixBuilding::Damage` (MatrixObjectBuilding.cpp:254-344).
+    ///
+    /// Implements: already-DIP early-out, friendly-fire detection,
+    /// WEAPON_REPAIR heal path, `mindamage`-floored HP decrement with
+    /// `friend_damage` column selection, HP≤0 → BASE → DIP transition
+    /// with explosion-sequence timers primed at 0.
+    ///
+    /// Deferred: difficulty scaling (k_damage_enemy_to_player /
+    /// k_friendly_fire), sound effects, per-side kill-stat increments,
+    /// effect-spawner cleanup (`RemoveEffectSpawnerByObject`),
+    /// `ReleaseMe` side-resource unbinding, and the progress-bar
+    /// update on HP change.
+    ///
+    /// Returns `true` iff the call destroyed the building (matches the
+    /// original's contract used by attacker-side code to stop tracking
+    /// a now-dead target).
+    fn damage(
+        &mut self,
+        weap: crate::matrix_game::effects::weapon::Weapon,
+        _pos: glam::Vec3,
+        _dir: glam::Vec3,
+        attacker_side: i32,
+        _attacker: Option<ObjectId>,
+        _self_id: ObjectId,
+        objs: &mut Objects,
+    ) -> bool {
+        use crate::matrix_game::effects::weapon::WEAPON_REPAIR;
+
+        // MatrixObjectBuilding.cpp:258 — already dying? ignore.
+        if matches!(self.state, BaseState::Dip | BaseState::DipExploded) {
+            return true;
+        }
+
+        // Friendly-fire iff the attacker has a side and matches ours
+        // (side 0 = neutral / world — not flagged as friendly).
+        let friendly_fire = attacker_side != 0 && attacker_side == self.side;
+
+        let entry = objs.building_damages.get(weap).unwrap_or_default();
+
+        if weap == WEAPON_REPAIR {
+            // MatrixObjectBuilding.cpp:265-276 — REPAIR restores HP,
+            // clamped to max. friendly_fire selects the `friend_damage`
+            // column (which in MatrixConfig defaults to `damage` when
+            // absent).
+            let amount = if friendly_fire { entry.friend_damage } else { entry.damage };
+            self.hit_point = (self.hit_point + amount as f32).min(self.hit_point_max);
+            // m_PB.Modify — progress bar unported.
+            return false;
+        }
+
+        // `damagek` — difficulty scaling; unported. The C++ drops down
+        // to 1.0 when either the attacker is on our side or we're not
+        // the player, which handles every non-player target. Only
+        // enemy-vs-player uses the scale factor.
+        let damagek = 1.0f32;
+
+        // MatrixObjectBuilding.cpp:281-292.
+        if self.hit_point > entry.mindamage as f32 {
+            let base = if friendly_fire { entry.friend_damage } else { entry.damage };
+            self.hit_point -= damagek * base as f32;
+            // m_PB.Modify — progress bar unported; we still reseed the
+            // hp-bar overlay timer so the UI linger-behaviour is right.
+            self.show_hitpoint();
+        }
+
+        // MatrixObjectBuilding.cpp:294-304 — under-attack warning sound.
+        // Deferred (sound not ported); the timer itself tracks enemy hits.
+        if self.side == PLAYER_SIDE && !friendly_fire {
+            self.under_attack_time = UNDER_ATTACK_IDLE_TIME_MS;
+        }
+
+        // MatrixObjectBuilding.cpp:308-341 — death transition.
+        if self.hit_point <= 0.0 {
+            // Sound + kill-stat bookkeeping deferred.
+            self.hit_point = -1.0;
+            self.state = BaseState::Dip;
+            // Schedule the first explosion to fire on the next logic
+            // takt that reads the DIP state (logic_takt's DIP branch
+            // still needs effects). `0` = "fire as soon as possible".
+            self.next_explosion_time = 0;
+            self.next_explosion_time_sound = 0;
+            return true;
+        }
+
+        false
+    }
 
     fn side(&self) -> i32 { self.side }
     fn need_repair(&self) -> bool { self.hit_point < self.hit_point_max }
 }
+
+/// `UNDER_ATTACK_IDLE_TIME` (MatrixMapStatic.hpp:43). After any enemy
+/// hit on a player-owned building, the "under attack" flag stays lit
+/// for 120 seconds so the warning sound doesn't retrigger on every
+/// bullet.
+pub const UNDER_ATTACK_IDLE_TIME_MS: i32 = 120_000;
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
@@ -1049,6 +1242,254 @@ mod tests {
         assert_eq!(b.state, BaseState::Closing);
         b.open();
         assert_eq!(b.state, BaseState::Opening);
+    }
+
+    #[test]
+    fn damage_decrements_hp_and_transitions_to_dip_on_death() {
+        use crate::matrix_game::config::WeaponDamage;
+        use crate::matrix_game::effects::weapon::{WEAPON_GUN, weap_to_index};
+
+        let mut b = Building::from_instance(&inst(0, PLAYER_SIDE as u8));
+        b.init_max_hitpoint(300.0);
+        let mut objs = Objects::new();
+        objs.building_damages.table[weap_to_index(WEAPON_GUN).unwrap()] =
+            WeaponDamage { damage: 100, mindamage: 0, friend_damage: 50 };
+        let id = objs.spawn(Box::new(b));
+
+        // 3 hits of 100 damage, enemy side → HP 0, transitions to DIP
+        // (3rd hit tips to exactly 0.0 which is `<=0` in the branch).
+        for _ in 0..3 {
+            objs.apply_damage(id, WEAPON_GUN, glam::Vec3::ZERO, glam::Vec3::Z, 2, None);
+        }
+        let got = objs.get(id).unwrap();
+        let mb = unsafe { &*(got as *const dyn MapStatic as *const Building) };
+        assert_eq!(mb.state, BaseState::Dip);
+        assert_eq!(mb.hit_point, -1.0);
+        assert_eq!(mb.next_explosion_time, 0);
+    }
+
+    #[test]
+    fn damage_to_dip_building_is_noop_and_returns_true() {
+        let mut b = Building::from_instance(&inst(0, PLAYER_SIDE as u8));
+        b.init_max_hitpoint(100.0);
+        b.state = BaseState::Dip;
+        let mut objs = Objects::new();
+        let id = objs.spawn(Box::new(b));
+
+        let died = objs.apply_damage(
+            id,
+            crate::matrix_game::effects::weapon::WEAPON_BIGBOOM,
+            glam::Vec3::ZERO, glam::Vec3::Z, 2, None,
+        );
+        assert!(died, "already-DIP returns true without modifying state");
+        let got = objs.get(id).unwrap();
+        let mb = unsafe { &*(got as *const dyn MapStatic as *const Building) };
+        assert_eq!(mb.hit_point, 100.0, "HP untouched");
+    }
+
+    #[test]
+    fn friendly_fire_selects_friend_damage_column() {
+        // Same-side attacker deals `friend_damage` instead of `damage`.
+        use crate::matrix_game::config::WeaponDamage;
+        use crate::matrix_game::effects::weapon::{WEAPON_BIGBOOM, weap_to_index};
+
+        let mut b = Building::from_instance(&inst(0, 2));   // side 2 (enemy AI)
+        b.init_max_hitpoint(1000.0);
+        let mut objs = Objects::new();
+        objs.building_damages.table[weap_to_index(WEAPON_BIGBOOM).unwrap()] =
+            WeaponDamage { damage: 500, mindamage: 0, friend_damage: 100 };
+        let id = objs.spawn(Box::new(b));
+
+        // Same-side attacker (side 2) — friend_damage=100.
+        objs.apply_damage(id, WEAPON_BIGBOOM, glam::Vec3::ZERO, glam::Vec3::Z, 2, None);
+        let mb = unsafe { &*(objs.get(id).unwrap() as *const dyn MapStatic as *const Building) };
+        assert_eq!(mb.hit_point, 900.0);
+
+        // Enemy attacker (different non-zero side) — full damage=500.
+        objs.apply_damage(id, WEAPON_BIGBOOM, glam::Vec3::ZERO, glam::Vec3::Z, 3, None);
+        let mb = unsafe { &*(objs.get(id).unwrap() as *const dyn MapStatic as *const Building) };
+        assert_eq!(mb.hit_point, 400.0);
+    }
+
+    #[test]
+    fn weapon_repair_heals_up_to_max() {
+        // WEAPON_REPAIR adds HP rather than removing it. Clamps at max.
+        use crate::matrix_game::config::WeaponDamage;
+        use crate::matrix_game::effects::weapon::{WEAPON_REPAIR, weap_to_index};
+
+        let mut b = Building::from_instance(&inst(0, PLAYER_SIDE as u8));
+        b.init_max_hitpoint(200.0);
+        b.hit_point = 50.0;
+        let mut objs = Objects::new();
+        objs.building_damages.table[weap_to_index(WEAPON_REPAIR).unwrap()] =
+            WeaponDamage { damage: 80, mindamage: 0, friend_damage: 80 };
+        let id = objs.spawn(Box::new(b));
+
+        objs.apply_damage(id, WEAPON_REPAIR, glam::Vec3::ZERO, glam::Vec3::Z, PLAYER_SIDE, None);
+        let mb = unsafe { &*(objs.get(id).unwrap() as *const dyn MapStatic as *const Building) };
+        assert_eq!(mb.hit_point, 130.0);
+
+        // Over-heal clamps to max.
+        objs.apply_damage(id, WEAPON_REPAIR, glam::Vec3::ZERO, glam::Vec3::Z, PLAYER_SIDE, None);
+        let mb = unsafe { &*(objs.get(id).unwrap() as *const dyn MapStatic as *const Building) };
+        assert_eq!(mb.hit_point, 200.0, "clamped at hit_point_max");
+    }
+
+    #[test]
+    fn under_attack_timer_latches_on_enemy_hits_only() {
+        use crate::matrix_game::config::WeaponDamage;
+        use crate::matrix_game::effects::weapon::{WEAPON_GUN, weap_to_index};
+
+        let mut b = Building::from_instance(&inst(0, PLAYER_SIDE as u8));
+        b.init_max_hitpoint(1000.0);
+        let mut objs = Objects::new();
+        objs.building_damages.table[weap_to_index(WEAPON_GUN).unwrap()] =
+            WeaponDamage { damage: 20, mindamage: 0, friend_damage: 10 };
+        let id = objs.spawn(Box::new(b));
+
+        // Friendly-fire: no warning.
+        objs.apply_damage(id, WEAPON_GUN, glam::Vec3::ZERO, glam::Vec3::Z, PLAYER_SIDE, None);
+        let mb = unsafe { &*(objs.get(id).unwrap() as *const dyn MapStatic as *const Building) };
+        assert_eq!(mb.under_attack_time, 0);
+
+        // Enemy fire: warning latches.
+        objs.apply_damage(id, WEAPON_GUN, glam::Vec3::ZERO, glam::Vec3::Z, 2, None);
+        let mb = unsafe { &*(objs.get(id).unwrap() as *const dyn MapStatic as *const Building) };
+        assert_eq!(mb.under_attack_time, UNDER_ATTACK_IDLE_TIME_MS);
+    }
+
+    #[test]
+    fn opening_base_completes_and_latches_at_opened() {
+        use crate::matrix_game::world::World;
+        let mut w = World::with_seed(1);
+        let mut b = Building::from_instance(&inst(0, PLAYER_SIDE as u8));
+        b.init_max_hitpoint(500.0);
+        b.open();
+        assert_eq!(b.state, BaseState::Opening);
+        assert_eq!(b.base_floor_progress, 0.0);
+        let id = w.objects.spawn(Box::new(b));
+        w.objects.add_lt(id);
+
+        // BASE_FLOOR_SPEED=0.0008/ms → 1250ms to reach 1.0. 1000ms → 0.8.
+        w.takt(1000);
+        let got = w.objects.get(id).unwrap();
+        let mb = unsafe { &*(got as *const dyn MapStatic as *const Building) };
+        assert!((mb.base_floor_progress - 0.8).abs() < 1e-3,
+            "base_floor_progress after 1s should be 0.8, got {}", mb.base_floor_progress);
+        assert_eq!(mb.state, BaseState::Opening);
+
+        // Another 500ms pushes past 1.0 and latches at Opened.
+        w.takt(500);
+        let got = w.objects.get(id).unwrap();
+        let mb = unsafe { &*(got as *const dyn MapStatic as *const Building) };
+        assert_eq!(mb.base_floor_progress, 1.0);
+        assert_eq!(mb.state, BaseState::Opened);
+    }
+
+    #[test]
+    fn closing_base_completes_and_latches_at_closed() {
+        use crate::matrix_game::world::World;
+        let mut w = World::with_seed(1);
+        let mut b = Building::from_instance(&inst(0, PLAYER_SIDE as u8));
+        b.init_max_hitpoint(500.0);
+        b.base_floor_progress = 1.0;
+        b.close();
+        assert_eq!(b.state, BaseState::Closing);
+        let id = w.objects.spawn(Box::new(b));
+        w.objects.add_lt(id);
+
+        // 1250ms to close fully. 1000ms → 0.2.
+        w.takt(1000);
+        let got = w.objects.get(id).unwrap();
+        let mb = unsafe { &*(got as *const dyn MapStatic as *const Building) };
+        assert!((mb.base_floor_progress - 0.2).abs() < 1e-3);
+        assert_eq!(mb.state, BaseState::Closing);
+
+        w.takt(500);
+        let got = w.objects.get(id).unwrap();
+        let mb = unsafe { &*(got as *const dyn MapStatic as *const Building) };
+        assert_eq!(mb.base_floor_progress, 0.0);
+        assert_eq!(mb.state, BaseState::Closed);
+    }
+
+    #[test]
+    fn non_base_kinds_do_not_animate_base_floor() {
+        // BUILDING_TITAN etc. have no open/close animation — state
+        // transitions issued via open()/close() stay in Opening/Closing
+        // because the animation block is gated on kind==Base.
+        use crate::matrix_game::world::World;
+        let mut w = World::with_seed(1);
+        let mut b = Building::from_instance(&inst(1, PLAYER_SIDE as u8));   // kind=Titan
+        b.init_max_hitpoint(500.0);
+        b.open();
+        let id = w.objects.spawn(Box::new(b));
+        w.objects.add_lt(id);
+
+        w.takt(2000);
+        let got = w.objects.get(id).unwrap();
+        let mb = unsafe { &*(got as *const dyn MapStatic as *const Building) };
+        assert_eq!(mb.base_floor_progress, 0.0);
+        assert_eq!(mb.state, BaseState::Opening, "state stays Opening for non-Base kinds");
+    }
+
+    #[test]
+    fn under_attack_timer_decays_to_zero() {
+        use crate::matrix_game::world::World;
+        let mut w = World::with_seed(1);
+        let mut b = Building::from_instance(&inst(0, PLAYER_SIDE as u8));
+        b.init_max_hitpoint(500.0);
+        b.under_attack_time = 1000;
+        let id = w.objects.spawn(Box::new(b));
+        w.objects.add_lt(id);
+
+        w.takt(400);
+        let got = w.objects.get(id).unwrap();
+        let mb = unsafe { &*(got as *const dyn MapStatic as *const Building) };
+        assert_eq!(mb.under_attack_time, 600);
+
+        w.takt(1000);
+        let got = w.objects.get(id).unwrap();
+        let mb = unsafe { &*(got as *const dyn MapStatic as *const Building) };
+        assert_eq!(mb.under_attack_time, 0, "clamped at zero, no negative drift");
+    }
+
+    #[test]
+    fn damage_resets_show_hitpoint_timer() {
+        use crate::matrix_game::common::HITPOINT_SHOW_TIME_MS;
+        use crate::matrix_game::config::WeaponDamage;
+        use crate::matrix_game::effects::weapon::{WEAPON_GUN, weap_to_index};
+
+        let mut b = Building::from_instance(&inst(0, PLAYER_SIDE as u8));
+        b.init_max_hitpoint(500.0);
+        let mut objs = Objects::new();
+        objs.building_damages.table[weap_to_index(WEAPON_GUN).unwrap()] =
+            WeaponDamage { damage: 50, mindamage: 0, friend_damage: 25 };
+        let id = objs.spawn(Box::new(b));
+
+        objs.apply_damage(id, WEAPON_GUN, glam::Vec3::ZERO, glam::Vec3::Z, 2, None);
+        let mb = unsafe { &*(objs.get(id).unwrap() as *const dyn MapStatic as *const Building) };
+        assert_eq!(mb.show_hitpoint_time, HITPOINT_SHOW_TIME_MS);
+    }
+
+    #[test]
+    fn timers_freeze_in_dip_state() {
+        // Dying buildings skip the pre-DIP block entirely (C++ guard
+        // at MatrixObjectBuilding.cpp:502).
+        use crate::matrix_game::world::World;
+        let mut w = World::with_seed(1);
+        let mut b = Building::from_instance(&inst(0, PLAYER_SIDE as u8));
+        b.init_max_hitpoint(500.0);
+        b.state = BaseState::Dip;
+        b.under_attack_time = 1000;
+        b.show_hitpoint_time = 500;
+        let id = w.objects.spawn(Box::new(b));
+        w.objects.add_lt(id);
+
+        w.takt(2000);
+        let got = w.objects.get(id).unwrap();
+        let mb = unsafe { &*(got as *const dyn MapStatic as *const Building) };
+        assert_eq!(mb.under_attack_time, 1000, "frozen in DIP");
+        assert_eq!(mb.show_hitpoint_time, 500, "frozen in DIP");
     }
 
     #[test]

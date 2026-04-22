@@ -78,6 +78,16 @@ pub const OBJECT_ABLAZE_PERIOD_MS: i32 = 90;
 /// flag on its next TTL expiry.
 pub const OBJECT_ABLAZE_BURNED_AT_MS: i32 = 5000;
 
+/// Hit-point bar linger time after a hit (MatrixMapStatic.hpp:98).
+/// A damaged object shows its hp bar for 1 second after each hit —
+/// resets on every subsequent damage call.
+pub const HITPOINT_SHOW_TIME_MS: i32 = 1000;
+
+/// Base-platform open/close speed (MatrixObjectBuilding.hpp:13). In
+/// units of `BaseFloor` per ms. `m_BaseFloor` ranges 0..1; speed
+/// 0.0008/ms → ~1.25 seconds for a full open or close.
+pub const BASE_FLOOR_SPEED: f32 = 0.0008;
+
 // ── Binary read helpers ─────────────────────────────────────────────────────
 
 pub fn rd_u32(d: &[u8], o: &mut usize) -> u32 {
