@@ -115,6 +115,18 @@ impl ApplicationHandler for App {
             );
             minimap.set_angle(-map.camera_angle);
 
+            let mut game = World::new();
+            let (_ids, stats) = game.spawn_map_objects(&map, &stor);
+            log::info!(
+                "world: spawned {} map objects (static={}, burn={}, break={}, anim={}, sens={}, spawner={}, terron={}, portret={}, special={})",
+                stats.total(), stats.r#static, stats.burn, stats.r#break, stats.anim,
+                stats.sens, stats.spawner, stats.terron, stats.portret, stats.special_win_target,
+            );
+            log::info!(
+                "world: {} map objects enrolled in logic-temp list at init",
+                game.objects.iter_logic().count(),
+            );
+
             *self.state.borrow_mut() = Some(AppState {
                 window,
                 gfx,
@@ -123,7 +135,7 @@ impl ApplicationHandler for App {
                 terrain,
                 minimap,
                 camera,
-                game: World::new(),
+                game,
                 last_time: crate::platform::now_secs(),
                 cursor: [-1.0, -1.0],
                 minimap_dragging: false,
@@ -204,6 +216,18 @@ impl ApplicationHandler for App {
                     );
                 }
 
+                let mut game = World::new();
+                let (_ids, stats) = game.spawn_map_objects(&map, &stor);
+                log::info!(
+                    "world: spawned {} map objects (static={}, burn={}, break={}, anim={}, sens={}, spawner={}, terron={}, portret={}, special={})",
+                    stats.total(), stats.r#static, stats.burn, stats.r#break, stats.anim,
+                    stats.sens, stats.spawner, stats.terron, stats.portret, stats.special_win_target,
+                );
+                log::info!(
+                    "world: {} map objects enrolled in logic-temp list at init",
+                    game.objects.iter_logic().count(),
+                );
+
                 *state_slot.borrow_mut() = Some(AppState {
                     window: win.clone(),
                     gfx,
@@ -212,7 +236,7 @@ impl ApplicationHandler for App {
                     terrain,
                     minimap,
                     camera,
-                    game: World::new(),
+                    game,
                     last_time: crate::platform::now_secs(),
                     cursor: [-1.0, -1.0],
                     minimap_dragging: false,
@@ -366,7 +390,15 @@ impl ApplicationHandler for App {
                 let now = crate::platform::now_secs();
                 let dt = (now - state.last_time) as f32;
                 state.last_time = now;
-                state.game.update(dt);
+                // Logic takt first (ports `CMatrixMapLogic::Takt`, which
+                // runs `ProceedLogic` before the graphic takt starts —
+                // MatrixLogic.cpp:2722-2761). Then per-object graphic
+                // takt (SortEndGraphicTakt, MatrixMapStatic.cpp:755-765).
+                // Camera / minimap / terrain takts mirror
+                // `CMatrixMap::Takt`'s remaining subsystem dispatches.
+                let step_ms = (dt * 1000.0).round() as i32;
+                state.game.takt(step_ms);
+                state.game.graphic_takt(step_ms);
                 state.camera.takt(dt * 1000.0); // camera update (ms)
                 state.minimap.takt(dt * 1000.0);
                 state.terrain.takt(

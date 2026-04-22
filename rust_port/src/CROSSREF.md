@@ -25,9 +25,11 @@ layer.
 | matrix_lib/base/blockpar.rs       | MatrixLib/Base/src/CBlockPar.cpp|
 | matrix_lib/base/pack.rs           | MatrixLib/Base/src/Pack.cpp     |
 | matrix_lib/base/storage.rs        | MatrixLib/Base/src/CStorage.cpp |
+| matrix_lib/base/wstr.rs           | MatrixLib/Base/src/CWStr.cpp (field parsers only: `GetStrPar`, `GetIntPar`, `GetDoublePar`, `GetCountPar`, `CompareFirst`) |
 
 Not yet ported: CBuf, CDWORDMap, CException, CFile, CHeap, CList,
-CMain, CRC32, CReminder, CStr, CWStr, Mem, Registry, Tracer.
+CMain, CRC32, CReminder, CStr, Mem, Registry, Tracer. (CWStr partial —
+only the read-only field-parsing helpers are in `wstr.rs`.)
 
 ## matrix_lib/three_g/ (MatrixLib/3G/)
 
@@ -49,16 +51,18 @@ Form, Helper, Math3D, ShadowProj, ShadowStencil.
 | matrix_game/map.rs            | MatrixMap.cpp (map data + `MapRenderer` draw orchestration)|
 | matrix_game/map_group.rs      | MatrixMapGroup.cpp (BuildBottom + BuildWater — merged across groups by texture; see header) |
 | matrix_game/map_prepare.rs    | MatrixMapPrepare.cpp              |
+| matrix_game/map_static.rs     | MatrixMapStatic.{cpp,hpp} (base class + ProceedLogic driver + Objects arena) |
 | matrix_game/minimap.rs        | MatrixMinimap.cpp                 |
-| matrix_game/object.rs         | MatrixObject.cpp (OBJECT_TYPE_MAPOBJECT — decorative static)|
+| matrix_game/object.rs         | MatrixObject.cpp (OBJECT_TYPE_MAPOBJECT — decorative rendering + `MapObject` game-object side)|
 | matrix_game/object_building.rs| MatrixObjectBuilding.cpp          |
 | matrix_game/particles.rs      | (stub — will split across Effects/) |
 | matrix_game/render_pipeline.rs| MatrixRenderPipeline.cpp          |
+| matrix_game/rnd.rs            | MatrixLogic.cpp `CMatrixMapLogic::Rnd` (Park–Miller LCG) |
 | matrix_game/sky.rs            | DrawSky in MatrixMap.cpp + skybox parts |
 | matrix_game/ter_surface.rs    | MatrixTerSurface.cpp              |
 | matrix_game/units.rs          | (stub — will become MatrixRobot.cpp etc.) |
 | matrix_game/water.rs          | MatrixWater.cpp + BuildWater in MatrixMapGroup.cpp + WaterAlpha_t3 in MatrixRenderPipeline.cpp — will split in Stage 2 part 2 |
-| matrix_game/world.rs          | (no direct equivalent — top-level game state) |
+| matrix_game/world.rs          | MatrixLogic.cpp `CMatrixMapLogic::Takt` (logic-takt decomposition only; sides/pathfinding deferred) |
 
 Not yet ported: MatrixConfig, MatrixCursor, MatrixDebugInfo,
 MatrixFlyer, MatrixInstantDraw, MatrixLoadProgress, MatrixLogic,

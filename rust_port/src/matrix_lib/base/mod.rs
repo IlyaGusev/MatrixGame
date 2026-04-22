@@ -4,3 +4,4 @@ pub mod bitmap;
 pub mod blockpar;
 pub mod pack;
 pub mod storage;
+pub mod wstr;

@@ -3,22 +3,405 @@
 //! Loads .vo meshes (matrix_lib/three_g/vector_object.rs) for each object type_id referenced by
 //! the map, then draws all instances of each type as one instanced draw call.
 //! Alpha-tested sampling handles foliage texture cutouts without z-ordering.
+//!
+//! Also hosts the `MapObject` game-object type — port of
+//! `CMatrixMapObject` (MatrixObject.{cpp,hpp}). Rendering-side batching
+//! (`ObjectsRenderer`, below) stays per-VO-type; the `MapObject` side
+//! holds per-instance logical state (behaviour, TTLs, UID) and plugs
+//! into the tick loop via the `MapStatic` trait.
 
 use std::collections::{BTreeMap, HashMap};
 
 use bytemuck::{Pod, Zeroable};
-use glam::{Mat3, Vec3, Vec4};
+use glam::{Mat3, Mat4, Vec3, Vec4};
 use wgpu::util::DeviceExt;
 
 use crate::matrix_lib::base::storage::Storage;
 use crate::matrix_game::effects::point_light::PointLightSystem;
 use crate::matrix_game::common::{unpack_rgb, FOG_END, FOG_START};
 use crate::matrix_game::map::{GameMap, ObjectInstance, ObjectShadow};
+use crate::matrix_game::map_static::{
+    MapStatic, ObjectCore, ObjectType, MR_ALL, MR_GRAPH, MR_MATRIX,
+    MR_SHADOW_PROJ_GEOM, MR_SHADOW_PROJ_TEX, OBJECT_STATE_SPECIAL,
+    OBJECT_STATE_TRACE_INVISIBLE,
+};
+use crate::matrix_game::common::{OTP_BEHAVIOUR, OTP_INVLOGIC};
+use crate::matrix_game::rnd::Rnd;
+use crate::matrix_lib::base::wstr;
 use crate::matrix_lib::three_g::vector_object::{self, ShadowKind, VoAnimation, VoFrame, VoSurfaceMesh};
 use crate::matrix_game::camera::Camera;
 use crate::matrix_lib::three_g::texture::{
     create_solid_texture, create_texture_from_rgba, decode_texture_bytes,
 };
+
+// ── Game-object side of CMatrixMapObject ────────────────────────────────
+//
+// Scope B: the struct + `MapStatic` trait impl. The member list matches
+// `MatrixObject.hpp:38-99` except fields tied to engine subsystems that
+// haven't been ported yet (m_Graph/m_ShadowStencil/m_ShadowProj render
+// state, the behaviour union's progress-bar pointers, spawner's
+// m_SpawnRobotCore). Those arrive with their owning subsystem.
+
+/// Ports `EBehFlag` (MatrixObject.hpp:10-23). Discriminants match the C++.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum BehFlag {
+    Static  = 0,
+    Burn    = 1,
+    Break   = 2,
+    Anim    = 3,
+    Sens    = 4,
+    Spawner = 5,
+    Terron  = 6,
+    Portret = 7,
+}
+
+/// Port of `CMatrixMapObject` (MatrixObject.hpp:27-167). Holds the
+/// per-instance logical state of one decorative / interactive map
+/// object. Rendering is handled separately by [`ObjectsRenderer`].
+pub struct MapObject {
+    core: ObjectCore,
+    rchange: u32,
+    object_state: u32,
+    ablaze_ttl: i32,
+    shorted_ttl: i32,
+
+    // Placement (MatrixObject.hpp:39-43)
+    pub angle_z: f32,
+    pub angle_x: f32,
+    pub angle_y: f32,
+    pub scale: f32,
+    pub tex_bias: f32,
+
+    /// `m_Type` — index into `g_MatrixMap->IdsGet(type)` string table.
+    pub type_id: i32,
+    pub uid: i32,
+
+    /// Parsed behaviour — derived from the Ids behaviour-string parser
+    /// when the side / Ids table is available. `Static` is the C++
+    /// fallthrough when no known keyword matched (MatrixObject.cpp:988).
+    pub beh_flag: BehFlag,
+
+    // --- Union-backed per-behaviour state (MatrixObject.hpp:61-93) ---
+    //
+    // C++ overlays three struct shapes on the same bytes; Rust doesn't
+    // have that without unsafe unions, so we keep the fields distinct.
+    // Adds only what ported behaviours currently touch; more land with
+    // their branches.
+
+    /// `m_Photo` (BEHF_PORTRET): 0 = mask variant, 1 = back variant
+    /// (MatrixObject.hpp:90). Toggled in `takt` on time-out.
+    pub photo: i32,
+    /// `m_PhotoTime` — ms until the next toggle. Counted down in takt.
+    pub photo_time: i32,
+
+    /// `m_PrevStateRobotsInRadius` (BEHF_SENS/SPAWNER/PORTRET, union
+    /// with BEHF_PORTRET's first field in C++). -1 = uninitialised,
+    /// 0 = idle, 1 = sensor triggered (robots nearby) — used to detect
+    /// rising/falling edges for anim-switch + sound (MatrixObject.hpp:84).
+    pub prev_state_robots_in_radius: i32,
+    /// `m_SensRadius` — the detection radius parsed out of
+    /// `"Sens,<radius>"` (MatrixObject.cpp:1080). Also reused by
+    /// BEHF_SPAWNER for the "spawn if robot within" check.
+    pub sens_radius: f32,
+}
+
+impl MapObject {
+    /// Build a `MapObject` at construction time from a map-placed
+    /// `ObjectInstance`. Ports the fragment of `CMatrixMapObject::Init`
+    /// that wires up transform + type_id + default BehFlag
+    /// (MatrixObject.cpp:36-62, :976-996). The `RChange(MR_Graph|…)`
+    /// on init line (:982) is reproduced by the `m_RChange(0xffffffff)`
+    /// default in [`ObjectCore`] + a redundant explicit set here to
+    /// mirror the original literally.
+    pub fn from_instance(inst: &ObjectInstance) -> Self {
+        let mut core = ObjectCore {
+            obj_type: ObjectType::MapObject,
+            ..Default::default()
+        };
+        // Seed `m_Matrix._41..43` with the placement so a later `r_need`
+        // call (not ported in scope B) can rebuild the full rotation
+        // around it — matches MatrixObject.cpp:382 which reads the
+        // translation out of the current matrix before rebuilding.
+        core.matrix.w_axis.x = inst.x;
+        core.matrix.w_axis.y = inst.y;
+        core.matrix.w_axis.z = inst.z;
+        // `m_Core->m_GeoCenter` is normally computed by `JoinToGroup`
+        // (MatrixMapStatic.cpp:160-178) from CalcBounds. Until that
+        // pipeline is ported, seed it from the placement so spatial
+        // queries (`FindObjects`) have a usable point. `radius` stays 0
+        // — the `radius * oscale` term in find_objects' distance test
+        // vanishes, reducing to pure point-in-radius semantics, which
+        // matches small-decoration expectations (palms, rocks).
+        core.geo_center = glam::Vec3::new(inst.x, inst.y, inst.z);
+
+        Self {
+            core,
+            rchange: MR_ALL,                  // m_RChange(0xffffffff)
+            object_state: 0,
+            ablaze_ttl: 0,
+            shorted_ttl: 0,
+            angle_z: inst.angle_z,
+            angle_x: inst.angle_x,
+            angle_y: inst.angle_y,
+            scale: inst.scale.max(0.0001),
+            tex_bias: -1.0,                   // MatrixObject.cpp:43
+            type_id: inst.type_id as i32,
+            uid: -1,                          // MatrixObject.cpp:61
+            beh_flag: BehFlag::Static,        // MatrixObject.cpp:56
+            photo: 0,
+            photo_time: 0,
+            prev_state_robots_in_radius: 0,
+            sens_radius: 0.0,
+        }
+    }
+
+    /// Drives this object's behaviour setup from the Ids row — port of
+    /// `CMatrixMapObject::Init` (MatrixObject.cpp:976-1096). The return
+    /// value mirrors the implicit "should the caller `AddLT()` this
+    /// object?" answer — true when `m_BehFlag != BEHF_STATIC &&
+    /// !BEHF_BURN`, since only those opt into logic-takts at init
+    /// (Burn is lazily enrolled when damage is taken).
+    ///
+    /// `ids_row` is the `*`-delimited string from `m_Ids[m_Type]`.
+    /// `on_before_win_inc` is a callback invoked when the row's
+    /// behaviour field starts with `+` (MatrixObject.cpp:1020-1026) —
+    /// the original bumps `g_MatrixMap->m_BeforeWinCount`. Callers that
+    /// don't care can pass a no-op.
+    pub fn apply_ids_row<F: FnMut()>(
+        &mut self,
+        ids_row: &str,
+        rng: &mut Rnd,
+        mut on_before_win_inc: F,
+    ) -> bool {
+        // OTP_INVLOGIC — trace invisibility bit
+        // (MatrixObject.cpp:1006-1016). Only honored when the row has at
+        // least that many `*`-parts, matching the `OTP_INVLOGIC < pcnt`
+        // guard in the original.
+        let pcnt = wstr::count_par(ids_row, "*");
+        if OTP_INVLOGIC < pcnt {
+            let invl = wstr::str_par(ids_row, OTP_INVLOGIC, "*");
+            if invl == "1" {
+                self.object_state |= OBJECT_STATE_TRACE_INVISIBLE;
+            } else {
+                self.object_state &= !OBJECT_STATE_TRACE_INVISIBLE;
+            }
+        }
+
+        let mut beh = wstr::str_par(ids_row, OTP_BEHAVIOUR, "*").to_string();
+
+        // '+' prefix → "special" object — death contributes to win
+        // condition (MatrixObject.cpp:1020-1026).
+        if beh.starts_with('+') {
+            beh.remove(0);
+            self.object_state |= OBJECT_STATE_SPECIAL;
+            on_before_win_inc();
+        }
+
+        if wstr::compare_first(&beh, "Burn") {
+            self.beh_flag = BehFlag::Burn;
+            // `m_NextTime / m_BurnTimeTotal / m_BurnSkinVis` zero-init —
+            // matches the defaults in our ctor. The `Tex`-variant burn
+            // skin load (MatrixObject.cpp:1035-1042) depends on the skin
+            // manager, still unported.
+            false  // BEHF_BURN is not AddLT'd — it enrolls on damage.
+        } else if wstr::compare_first(&beh, "Break") {
+            // "Break,<something>,<hp>,Terron?"  (MatrixObject.cpp:1043-1058)
+            let kind = wstr::str_par(&beh, 3, ",");
+            if kind == "Terron" {
+                self.beh_flag = BehFlag::Terron;
+            } else {
+                self.beh_flag = BehFlag::Break;
+            }
+            true
+        } else if wstr::compare_first(&beh, "Anim") {
+            // "Anim" or "AnimP" (Portret)
+            // (MatrixObject.cpp:1060-1075). The 5th char (index 4) was
+            // `temp[5]` in C++ — that 1-based indexing counts the `,`
+            // after "Anim", so we look at char index 4 in Rust.
+            if beh.chars().nth(4) == Some('P') {
+                self.beh_flag = BehFlag::Portret;
+                // MatrixObject.cpp:1066-1067 —
+                //   m_PhotoTime = g_MatrixMap->Rnd(1000,2000);
+                //   m_Photo = 0;
+                self.photo_time = rng.range(1000, 2000);
+                self.photo = 0;
+                false  // BEHF_PORTRET doesn't AddLT (Takt handles it).
+            } else {
+                self.beh_flag = BehFlag::Anim;
+                true
+            }
+        } else if wstr::compare_first(&beh, "Sens") {
+            // "Sens,<radius>" (MatrixObject.cpp:1076-1083).
+            self.beh_flag = BehFlag::Sens;
+            // `m_SensRadius` is parsed from the 2nd ","-separated field
+            // of the behaviour string (MatrixObject.cpp:1080).
+            self.sens_radius = wstr::double_par(&beh, 1, ",") as f32;
+            // -1 = uninitialised (first takt kicks the idle anim).
+            self.prev_state_robots_in_radius = -1;
+            // `SetAblazeTTL(101)` — the branch reuses the ablaze TTL
+            // field as a detection-period timer.
+            self.ablaze_ttl = 101;
+            true
+        } else if wstr::compare_first(&beh, "Spawn") {
+            // "Spawn,<radius>" (MatrixObject.cpp:1084-1092).
+            self.beh_flag = BehFlag::Spawner;
+            self.sens_radius = wstr::double_par(&beh, 1, ",") as f32;
+            self.prev_state_robots_in_radius = -1;
+            self.ablaze_ttl = 101; // absolute timer in C++ uses GetTime();
+                                   // the offset is what matters for the
+                                   // first-tick delay.
+            true
+        } else {
+            // Fallthrough: no recognised keyword → remains BEHF_STATIC.
+            // Matches the default from the ctor (MatrixObject.cpp:56).
+            false
+        }
+    }
+}
+
+impl MapStatic for MapObject {
+    fn core(&self) -> &ObjectCore { &self.core }
+    fn core_mut(&mut self) -> &mut ObjectCore { &mut self.core }
+    fn rchange(&self) -> u32 { self.rchange }
+    fn rchange_set(&mut self, b: u32) { self.rchange |= b; }
+    fn rchange_clear(&mut self, b: u32) { self.rchange &= !b; }
+    fn object_state(&self) -> u32 { self.object_state }
+    fn object_state_set(&mut self, b: u32) { self.object_state |= b; }
+    fn object_state_clear(&mut self, b: u32) { self.object_state &= !b; }
+    fn ablaze_ttl(&self) -> i32 { self.ablaze_ttl }
+    fn set_ablaze_ttl(&mut self, t: i32) { self.ablaze_ttl = t; }
+    fn shorted_ttl(&self) -> i32 { self.shorted_ttl }
+    fn set_shorted_ttl(&mut self, t: i32) { self.shorted_ttl = t; }
+
+    /// Port of `CMatrixMapObject::RNeed` (MatrixObject.cpp:374-669). The
+    /// full implementation rebuilds the world matrix, loads the
+    /// `CVectorObjectAnim`, builds stencil/projected shadows, and
+    /// re-renders the minimap patch. In scope B only the matrix branch
+    /// is ported — the others require cache/skin/shadow subsystems that
+    /// the Rust port doesn't yet have.
+    fn r_need(&mut self, need: u32) {
+        if need & self.rchange & MR_MATRIX != 0 {
+            self.rchange &= !MR_MATRIX;
+
+            // Preserve the current translation, rebuild rotation × scale.
+            let pos = self.core.matrix.w_axis.truncate();
+
+            let (sx, cx) = self.angle_x.sin_cos();
+            let (sy, cy) = self.angle_y.sin_cos();
+            let (sz, cz) = self.angle_z.sin_cos();
+            let rx = Mat3::from_cols_array(&[1.0, 0.0, 0.0, 0.0, cx, sx, 0.0, -sx, cx]);
+            let ry = Mat3::from_cols_array(&[cy, 0.0, -sy, 0.0, 1.0, 0.0, sy, 0.0, cy]);
+            let rz = Mat3::from_cols_array(&[cz, sz, 0.0, -sz, cz, 0.0, 0.0, 0.0, 1.0]);
+            let rot = rx * ry * rz * self.scale;
+
+            self.core.matrix = Mat4::from_cols(
+                rot.x_axis.extend(0.0),
+                rot.y_axis.extend(0.0),
+                rot.z_axis.extend(0.0),
+                pos.extend(1.0),
+            );
+            self.core.inv_matrix = self.core.matrix.inverse();
+
+            // `JoinToGroup()` at MatrixObject.cpp:416 — needs the map-group
+            // arena from `GameMap`; deferred with the group subsystem port.
+        }
+
+        // MR_GRAPH / MR_SHADOW_* / MR_MINIMAP branches all depend on
+        // `LoadObject` / `CVOShadowStencil` / `CMatrixShadowProj` /
+        // `CMinimap::RenderObjectToBackground`. Stubbed for scope B —
+        // clear the dirty bits so the next `r_need` doesn't spin on them.
+        if need & MR_GRAPH != 0 { self.rchange &= !MR_GRAPH; }
+        if need & MR_SHADOW_PROJ_GEOM != 0 { self.rchange &= !MR_SHADOW_PROJ_GEOM; }
+        if need & MR_SHADOW_PROJ_TEX != 0 { self.rchange &= !MR_SHADOW_PROJ_TEX; }
+    }
+
+    /// Port of `CMatrixMapObject::Takt` (MatrixObject.cpp:671-731). The
+    /// graphic takt.
+    fn takt(&mut self, cms: i32, rng: &mut Rnd, _objs: &mut crate::matrix_game::map_static::Objects) {
+        if self.beh_flag == BehFlag::Portret {
+            // MatrixObject.cpp:675-689 — photo toggle. `m_PhotoTime`
+            // counts down; at 0 the `m_Photo` bit flips and the timer
+            // reseeds with either a long (3000-5000ms) or short
+            // (100-200ms) interval depending on the new state. Also
+            // flags MR_Graph so the next `r_need` refreshes the
+            // mask/back skin swap.
+            self.photo_time -= cms;
+            if self.photo_time < 0 {
+                self.photo_time = if self.photo != 0 {
+                    rng.range(3000, 5000)
+                } else {
+                    rng.range(100, 200)
+                };
+                self.photo ^= 1;
+                self.rchange |= MR_GRAPH;
+            }
+        }
+        // `m_Graph->Takt(cms)` — per-instance animation tick. Animation
+        // currently runs once-per-VO-type in `ObjectsRenderer::takt`, not
+        // per-instance. Revisit if a scenario needs per-instance phase.
+    }
+
+    /// Port of `CMatrixMapObject::LogicTakt` (MatrixObject.cpp:1229-1596).
+    /// Massive switch on `m_BehFlag`. Currently handles BEHF_SENS (the
+    /// sensor-radius detection path); other branches enroll via
+    /// `apply_ids_row` but their bodies need subsystems (progress bars,
+    /// effects, sound, robot spawning) that aren't ported.
+    fn logic_takt(&mut self, ms: i32, _rng: &mut Rnd, objs: &mut crate::matrix_game::map_static::Objects) {
+        use crate::matrix_game::common::TRACE_ROBOT;
+        use crate::matrix_game::map_static::fit_to_mask as _fit_to_mask;
+        let _ = _fit_to_mask;  // keep import used even when SENS disabled
+
+        if self.beh_flag == BehFlag::Sens {
+            // Port of the BEHF_SENS branch (MatrixObject.cpp:1485-1532).
+            // `m_PrevStateRobotsInRadius < 0` → first tick: kick the
+            // idle animation. The Rust port doesn't have per-instance
+            // `m_Graph`, so the SetAnimById call is deferred; the
+            // state field carries the transition.
+            if self.prev_state_robots_in_radius < 0 {
+                self.prev_state_robots_in_radius = 0;
+                // C++: m_Graph->SetAnimById(behaviour.GetStrPar(1,",").GetIntPar(1,":"));
+                // Deferred — per-instance anim not ported.
+            }
+
+            // Timer countdown. On expiry, re-arm with +107ms (MatrixObject.cpp:1499).
+            self.ablaze_ttl -= ms;
+            if self.ablaze_ttl < 0 {
+                while self.ablaze_ttl < 0 {
+                    self.ablaze_ttl += 107;
+                }
+
+                let pos = glam::Vec2::new(self.core.matrix.w_axis.x, self.core.matrix.w_axis.y);
+                // Self-skip is implicit: our own slot is empty inside
+                // `logic_takt` (take-the-box pattern in proceed_logic),
+                // so find_objects cannot hit us. Passing `None` matches
+                // the C++ which also doesn't skip self here.
+                let robot_nearby = objs.any_object_in_radius(
+                    pos, self.sens_radius, 1.0, TRACE_ROBOT, None,
+                );
+
+                if robot_nearby {
+                    if self.prev_state_robots_in_radius == 0 {
+                        self.prev_state_robots_in_radius = 1;
+                        // SetAnimById(..., activate-clip) + CSound::AddSound —
+                        // deferred.
+                    }
+                } else if self.prev_state_robots_in_radius != 0 {
+                    self.prev_state_robots_in_radius = 0;
+                    // SetAnimById(..., deactivate-clip) + CSound::AddSound —
+                    // deferred.
+                }
+            }
+            return;
+        }
+
+        // BEHF_STATIC: empty — subclass isn't on the logic-temp list.
+        //
+        // BEHF_BREAK / BEHF_ANIM / BEHF_TERRON / BEHF_SPAWNER: bodies
+        // need progress bars / effects / sound / robot spawning.
+        // Each branch lands with its owning subsystem.
+    }
+}
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
@@ -1493,3 +1876,197 @@ fn resolve_texture(
 const OBJECTS_SHADER: &str = include_str!("../../shaders/object.wgsl");
 const SHADOW_SHADER: &str = include_str!("../../shaders/object_shadow.wgsl");
 const SHADOW_TEXTURE_SHADER: &str = include_str!("../../shaders/object_shadow_texture.wgsl");
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::matrix_game::map::ObjectInstance;
+
+    fn inst() -> ObjectInstance {
+        ObjectInstance {
+            x: 0.0, y: 0.0, z: 0.0,
+            angle_z: 0.0, angle_x: 0.0, angle_y: 0.0,
+            scale: 1.0, type_id: 0, shadow: None,
+        }
+    }
+
+    #[test]
+    fn empty_ids_row_leaves_static() {
+        let mut o = MapObject::from_instance(&inst());
+        let add_lt = o.apply_ids_row("", &mut Rnd::new(1), || {});
+        assert_eq!(o.beh_flag, BehFlag::Static);
+        assert!(!add_lt);
+    }
+
+    #[test]
+    fn burn_keyword_sets_burn_but_does_not_addlt() {
+        // BEHF_BURN is enrolled into the logic list lazily on damage
+        // (MatrixObject.cpp:107-140), not at init.
+        let row = "path*vo*tex******Burn,Tex,Burn01";
+        let mut o = MapObject::from_instance(&inst());
+        let add_lt = o.apply_ids_row(row, &mut Rnd::new(1), || {});
+        assert_eq!(o.beh_flag, BehFlag::Burn);
+        assert!(!add_lt);
+    }
+
+    #[test]
+    fn break_variant_terron_is_distinguished() {
+        let break_plain  = "path*vo*tex******Break,X,5000,Normal";
+        let break_terron = "path*vo*tex******Break,X,5000,Terron";
+        let mut a = MapObject::from_instance(&inst());
+        let mut b = MapObject::from_instance(&inst());
+        assert!(a.apply_ids_row(break_plain, &mut Rnd::new(1), || {}));
+        assert!(b.apply_ids_row(break_terron, &mut Rnd::new(1), || {}));
+        assert_eq!(a.beh_flag, BehFlag::Break);
+        assert_eq!(b.beh_flag, BehFlag::Terron);
+    }
+
+    #[test]
+    fn anim_vs_animp_split_on_fifth_char() {
+        let anim_plain = "path*vo*tex******Anim";
+        let animp      = "path*vo*tex******AnimP";
+        let mut a = MapObject::from_instance(&inst());
+        let mut p = MapObject::from_instance(&inst());
+        let a_lt = a.apply_ids_row(anim_plain, &mut Rnd::new(1), || {});
+        let p_lt = p.apply_ids_row(animp, &mut Rnd::new(1), || {});
+        assert_eq!(a.beh_flag, BehFlag::Anim);
+        assert!(a_lt, "Anim opts into AddLT");
+        assert_eq!(p.beh_flag, BehFlag::Portret);
+        assert!(!p_lt, "Portret is Takt-driven, not logic-temp");
+    }
+
+    #[test]
+    fn sens_and_spawn_seed_ablaze_ttl_as_timer() {
+        // The C++ repurposes `m_ObjectStateTTLAblaze` as the "next-tick"
+        // deadline in these branches (MatrixObject.cpp:1082, :1090).
+        let mut s = MapObject::from_instance(&inst());
+        assert!(s.apply_ids_row("path*vo*tex******Sens,120.5", &mut Rnd::new(1), || {}));
+        assert_eq!(s.beh_flag, BehFlag::Sens);
+        assert_eq!(s.ablaze_ttl, 101);
+
+        let mut sp = MapObject::from_instance(&inst());
+        assert!(sp.apply_ids_row("path*vo*tex******Spawn,80.0", &mut Rnd::new(1), || {}));
+        assert_eq!(sp.beh_flag, BehFlag::Spawner);
+        assert_eq!(sp.ablaze_ttl, 101);
+    }
+
+    #[test]
+    fn plus_prefix_marks_special_and_fires_callback() {
+        let row = "path*vo*tex******+Break,X,5000,Normal";
+        let mut o = MapObject::from_instance(&inst());
+        let mut bumps = 0;
+        let add_lt = o.apply_ids_row(row, &mut Rnd::new(1), || { bumps += 1; });
+        assert!(add_lt);
+        assert_eq!(o.beh_flag, BehFlag::Break);
+        assert_ne!(o.object_state & OBJECT_STATE_SPECIAL, 0);
+        assert_eq!(bumps, 1);
+    }
+
+    #[test]
+    fn invlogic_sets_trace_invisible_when_one() {
+        // 11 fields (10 stars) → index 10 = OTP_INVLOGIC = "1".
+        let row = "path*vo*tex********1";
+        let mut o = MapObject::from_instance(&inst());
+        o.apply_ids_row(row, &mut Rnd::new(1), || {});
+        assert_ne!(o.object_state & OBJECT_STATE_TRACE_INVISIBLE, 0);
+    }
+
+    #[test]
+    fn portret_photo_toggle_cycles_through_long_and_short_timers() {
+        // Portret object: apply_ids_row seeds photo_time with Rnd(1000,2000)
+        // (MatrixObject.cpp:1066). Each `takt(cms)` counts it down; on
+        // expiry (MatrixObject.cpp:675-689), the reseed reads the
+        // *pre-XOR* photo value, then flips it. So photo=0 → short
+        // (100-200ms) "looking" interval, photo=1 → long (3000-5000ms)
+        // "displayed" interval.
+        let mut rng = Rnd::new(42);
+        let mut o = MapObject::from_instance(&inst());
+        assert!(!o.apply_ids_row("path*vo*tex******AnimP", &mut rng, || {}));
+        assert_eq!(o.beh_flag, BehFlag::Portret);
+        assert!(o.photo_time >= 1000 && o.photo_time <= 2000);
+        assert_eq!(o.photo, 0);
+
+        // First expiry: photo was 0 → short reseed, then flip to 1.
+        let seed_time = o.photo_time + 1;
+        let mut empty_arena = crate::matrix_game::map_static::Objects::new();
+        o.takt(seed_time, &mut rng, &mut empty_arena);
+        assert_eq!(o.photo, 1, "photo flips on timer expiry");
+        assert!(
+            (100..=200).contains(&o.photo_time),
+            "post-first-toggle timer must land in 100..=200, got {}",
+            o.photo_time,
+        );
+        assert_ne!(o.rchange & MR_GRAPH, 0, "MR_Graph flagged for re-skin");
+
+        // Second expiry: photo was 1 → long reseed, then flip to 0.
+        o.rchange &= !MR_GRAPH;
+        let next = o.photo_time + 1;
+        o.takt(next, &mut rng, &mut empty_arena);
+        assert_eq!(o.photo, 0);
+        assert!(
+            (3000..=5000).contains(&o.photo_time),
+            "post-second-toggle timer must land in 3000..=5000, got {}",
+            o.photo_time,
+        );
+    }
+
+    #[test]
+    fn sens_logic_takt_transitions_on_nearby_robot() {
+        use crate::matrix_game::map_static::{MapStatic, ObjectType};
+        use crate::matrix_game::rnd::Rnd;
+        use crate::matrix_game::world::World;
+
+        // Build a world with one SENS mapobject at the origin and a
+        // "robot" (stub MapStatic with ObjectType::RobotAi) 30 units
+        // away — inside the 50-unit sens radius.
+        let mut world = World::with_seed(1);
+        let mut sensor = MapObject::from_instance(&inst());
+        sensor.apply_ids_row("path*vo*tex******Sens,50.0", &mut Rnd::new(1), || {});
+        assert_eq!(sensor.beh_flag, BehFlag::Sens);
+        assert_eq!(sensor.sens_radius, 50.0);
+        assert_eq!(sensor.prev_state_robots_in_radius, -1);
+        let sensor_id = world.objects.spawn(Box::new(sensor));
+        world.objects.add_lt(sensor_id);
+
+        let mut robot = MapObject::from_instance(&inst());
+        robot.core_mut().obj_type = ObjectType::RobotAi;
+        robot.core_mut().geo_center = glam::Vec3::new(30.0, 0.0, 0.0);
+        let robot_id = world.objects.spawn(Box::new(robot));
+
+        // Sensor's initial AblazeTTL is 101ms (seeded in apply_ids_row).
+        // Drive one logic takt of 210ms to drain the timer (fires the
+        // find_objects call).
+        world.takt(210);
+
+        // Inspect sensor state via downcast — MapObject is the concrete
+        // type behind the trait object.
+        let obj = world.objects.get(sensor_id).expect("sensor still live");
+        let mapobj = unsafe {
+            &*(obj as *const dyn MapStatic as *const MapObject)
+        };
+        assert_eq!(mapobj.prev_state_robots_in_radius, 1,
+            "sensor detected the robot and transitioned to state=1");
+
+        // Move robot outside the radius, takt again.
+        let robot_slot_obj = world.objects.get_mut(robot_id).unwrap();
+        robot_slot_obj.core_mut().geo_center = glam::Vec3::new(200.0, 0.0, 0.0);
+
+        world.takt(210);
+
+        let obj = world.objects.get(sensor_id).unwrap();
+        let mapobj = unsafe {
+            &*(obj as *const dyn MapStatic as *const MapObject)
+        };
+        assert_eq!(mapobj.prev_state_robots_in_radius, 0,
+            "sensor falls back to idle after robot leaves the radius");
+    }
+
+    #[test]
+    fn unknown_behaviour_keyword_falls_back_to_static() {
+        let row = "path*vo*tex******Gibberish,foo,bar";
+        let mut o = MapObject::from_instance(&inst());
+        let add_lt = o.apply_ids_row(row, &mut Rnd::new(1), || {});
+        assert_eq!(o.beh_flag, BehFlag::Static);
+        assert!(!add_lt);
+    }
+}
