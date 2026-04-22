@@ -26,6 +26,7 @@ struct AppState {
     game: World,
     last_time: f64,
     cursor: [f32; 2],
+    minimap_dragging: bool,
 }
 
 pub struct App {
@@ -125,6 +126,7 @@ impl ApplicationHandler for App {
                 game: World::new(),
                 last_time: crate::platform::now_secs(),
                 cursor: [-1.0, -1.0],
+                minimap_dragging: false,
             });
         }
 
@@ -213,6 +215,7 @@ impl ApplicationHandler for App {
                     game: World::new(),
                     last_time: crate::platform::now_secs(),
                     cursor: [-1.0, -1.0],
+                    minimap_dragging: false,
                 });
                 win.request_redraw();
                 hide_loading_overlay();
@@ -258,23 +261,26 @@ impl ApplicationHandler for App {
                     let pressed = btn_state == ElementState::Pressed;
                     let [x, y] = state.cursor;
                     state.camera.on_rotate_button(pressed, x, y);
-                } else if button == MouseButton::Left
-                    && btn_state == ElementState::Pressed
-                {
-                    // Left-click on the minimap dispatches to zoom-in /
-                    // zoom-out buttons (ports CMinimap::ButtonZoomIn/Out),
-                    // or teleports to the clicked world pos (ports
-                    // CMinimap::ButtonClick + CalcMinimap2World,
-                    // MatrixMinimap.cpp:1356-1379).
+                } else if button == MouseButton::Left {
                     use crate::renderer::minimap::MinimapClick;
                     let [cx, cy] = state.cursor;
-                    match state.minimap.click(cx, cy) {
-                        MinimapClick::Teleport(tgt) => {
-                            state.camera.set_xy_strategy(tgt);
+                    match btn_state {
+                        ElementState::Pressed => {
+                            match state.minimap.click(cx, cy) {
+                                MinimapClick::BeginDrag(tgt) => {
+                                    state.camera.set_xy_strategy(tgt);
+                                    state.minimap_dragging = true;
+                                }
+                                MinimapClick::ZoomIn
+                                | MinimapClick::ZoomOut
+                                | MinimapClick::None => {
+                                    state.minimap_dragging = false;
+                                }
+                            }
                         }
-                        MinimapClick::ZoomIn
-                        | MinimapClick::ZoomOut
-                        | MinimapClick::None => {}
+                        ElementState::Released => {
+                            state.minimap_dragging = false;
+                        }
                     }
                 }
             }
@@ -300,6 +306,11 @@ impl ApplicationHandler for App {
                 let cx = (position.x * sx) as f32;
                 let cy = (position.y * sy) as f32;
                 state.cursor = [cx, cy];
+                if state.minimap_dragging {
+                    if let Some(tgt) = state.minimap.click_to_world(cx, cy) {
+                        state.camera.set_xy_strategy(tgt);
+                    }
+                }
                 state.camera.on_mouse_move(cx, cy);
             }
 
@@ -352,6 +363,7 @@ impl ApplicationHandler for App {
                 state.last_time = now;
                 state.game.update(dt);
                 state.camera.takt(dt * 1000.0); // camera update (ms)
+                state.minimap.takt(dt * 1000.0);
                 state.terrain.takt(
                     dt * 1000.0,
                     &state.map,

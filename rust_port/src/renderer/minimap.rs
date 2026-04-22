@@ -8,6 +8,8 @@
 //!     "button" API in MatrixMinimap.hpp:137-169) and optional rotation
 //!     around the minimap center (MatrixMinimap.cpp:159-180, guarded by
 //!     `MINIMAP_SUPPORT_ROTATION`).
+//!   - Timed event overlays plus off-screen arrow indicators
+//!     (MatrixMinimap.cpp:332-395, 638-678).
 //!   - Building markers colored by side (MatrixMinimap.cpp:679-763).
 //!   - Camera frustum projected onto the water plane and drawn as a 4-line
 //!     LINESTRIP in `MINIMAP_CAM_COLOR` (MatrixMinimap.cpp:794-841).
@@ -15,12 +17,8 @@
 //!     with the bottom-anchor rule from `CInterface.cpp:176-183`.
 //!   - Per-frame `m_Center = camera.GetXYStrategy()` (MatrixMap.cpp:1261).
 //!
-//! Intentionally skipped (feature gaps, not fidelity):
-//!   - Events / ping overlays (MatrixMinimap.cpp:332-360, 638-678) — require
-//!     a live event system that hasn't been ported yet.
+//! Still intentionally skipped:
 //!   - In-robot `DrawRadar` — arcade mode isn't ported.
-//!   - Icon atlas from `robots.dat` `Minimap` block — solid squares stand in
-//!     for `MMT_BASE` / `MMT_FACTORY` sprites until the atlas loader lands.
 //!   - Disk-cached background PNG (irrelevant in-browser).
 
 use wgpu::util::DeviceExt;
@@ -64,6 +62,15 @@ const MINIMAP_MAX_SCALE: f32 = 3.0;
 /// Clamped to [MIN, MAX], so from 1.0 the reachable levels are 1.0, 1.8, 3.0.
 const MINIMAP_ZOOM_IN_FACTOR: f32 = 1.8;
 const MINIMAP_ZOOM_OUT_FACTOR: f32 = 0.5;
+const MINIMAP_MAX_EVENTS: usize = 32;
+const MINIMAP_EVENT_TTL_MS: f32 = 1000.0;
+const MINIMAP_EVENT_R1: f32 = 15.0;
+const MINIMAP_EVENT_R2: f32 = 1.0;
+const MINIMAP_FLASH_PERIOD_MS: f32 = 100.0;
+const MINIMAP_OUT_SCALE: f32 = 0.8;
+const MINIMAP_OUT_INDICATOR_R: f32 = 15.0;
+const MINIMAP_BUILDING_R: f32 = 8.0;
+const MINIMAP_BUILDING_BASE_R: f32 = 8.0;
 
 /// Water plane Z — from `renderer/water.rs`, matches `WATER_LEVEL` in the
 /// original. Used both for the heightmap bake (coast cutoff) and for the
@@ -110,10 +117,18 @@ struct Button {
     uv: IconUv,
 }
 
-/// Result of a minimap left-click — see `Minimap::click`.
+#[derive(Copy, Clone)]
+struct MinimapEvent {
+    pos_in_world: [f32; 2],
+    ttl: f32,
+    color1: u32,
+    color2: u32,
+}
+
+/// Result of a minimap left-press — see `Minimap::click`.
 pub enum MinimapClick {
     None,
-    Teleport([f32; 2]),
+    BeginDrag([f32; 2]),
     ZoomIn,
     ZoomOut,
 }
@@ -167,14 +182,20 @@ pub struct Minimap {
     /// (MatrixMinimap.hpp:101). Clamped to [MINIMAP_MIN_SCALE, MINIMAP_MAX_SCALE].
     tgt_scale: f32,
 
-    /// Sub-rects for MMT_BASE / MMT_FACTORY / MMT_POINT, parsed from the
+    /// Sub-rects for the icon atlas parsed from the `Minimap` block.
     /// `Minimap` block in robots.dat (MatrixMinimap.cpp:50-65).
+    icon_arrow: IconUv,
+    #[allow(dead_code)]
+    icon_flyer: IconUv,
+    #[allow(dead_code)]
+    icon_turret: IconUv,
+    #[allow(dead_code)]
+    icon_robot: IconUv,
     icon_base: IconUv,
     icon_factory: IconUv,
-    // Reserved for the event-ping overlay (MatrixMinimap.cpp:638-678);
-    // kept on the struct so bake code stays complete even before events land.
-    #[allow(dead_code)]
     icon_point: IconUv,
+    events: Vec<MinimapEvent>,
+    time_ms: f32,
 
     /// Set once `bake_background` has run. Matches the original's caching:
     /// `RenderBackground` runs once at map load; subsequent frames just sample
@@ -353,16 +374,37 @@ impl Minimap {
         let atlas_w = icons_rgba.width() as f32;
         let atlas_h = icons_rgba.height() as f32;
         let default_w = icon_tex_size as f32; // 128 or whatever the dat reports
+        let default_icon = IconUv {
+            u0: 0.0,
+            v0: 0.0,
+            u1: 1.0,
+            v1: 1.0,
+        };
+        let icon_arrow = icon_rects
+            .get("arrow")
+            .copied()
+            .map(|r| r.normalize(atlas_w, atlas_h))
+            .unwrap_or(default_icon);
+        let icon_flyer = icon_rects
+            .get("flyer")
+            .copied()
+            .map(|r| r.normalize(atlas_w, atlas_h))
+            .unwrap_or(default_icon);
+        let icon_turret = icon_rects
+            .get("turret")
+            .copied()
+            .map(|r| r.normalize(atlas_w, atlas_h))
+            .unwrap_or(default_icon);
+        let icon_robot = icon_rects
+            .get("robot")
+            .copied()
+            .map(|r| r.normalize(atlas_w, atlas_h))
+            .unwrap_or(default_icon);
         let icon_base = icon_rects
             .get("base")
             .copied()
             .map(|r| r.normalize(atlas_w, atlas_h))
-            .unwrap_or_else(|| IconUv {
-                u0: 0.0,
-                v0: 0.0,
-                u1: 1.0,
-                v1: 1.0,
-            });
+            .unwrap_or(default_icon);
         let icon_factory = icon_rects
             .get("factory")
             .copied()
@@ -480,7 +522,7 @@ impl Minimap {
         let line_pipeline =
             make_pipeline(wgpu::PrimitiveTopology::LineStrip, "minimap line pipeline");
 
-        let quad_capacity = 6 * 128; // 128 textured quads (bg + markers)
+        let quad_capacity = 6 * 256; // panel + bg + buttons + markers/events
         let quad_vbuf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("minimap quad vbuf"),
             size: (quad_capacity * std::mem::size_of::<MMVertex>()) as u64,
@@ -517,9 +559,15 @@ impl Minimap {
             zi_button,
             zo_button,
             tgt_scale: 1.0,
+            icon_arrow,
+            icon_flyer,
+            icon_turret,
+            icon_robot,
             icon_base,
             icon_factory,
             icon_point,
+            events: Vec::with_capacity(MINIMAP_MAX_EVENTS),
+            time_ms: 0.0,
             baked: false,
             pos_x: 0.0,
             pos_y: 0.0,
@@ -538,6 +586,50 @@ impl Minimap {
     /// the scalar angle; the 2D rotation is applied on the fly in map-space.
     pub fn set_angle(&mut self, angle: f32) {
         self.angle = angle;
+    }
+
+    /// Port of `CMinimap::AddEvent` (MatrixMinimap.cpp:332-360).
+    pub fn add_event(&mut self, x: f32, y: f32, color1: u32, color2: u32) {
+        let ev = MinimapEvent {
+            pos_in_world: [x, y],
+            ttl: 1.0,
+            color1,
+            color2,
+        };
+        if self.events.len() < MINIMAP_MAX_EVENTS {
+            self.events.push(ev);
+            return;
+        }
+        if let Some((idx, _)) = self
+            .events
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| a.ttl.partial_cmp(&b.ttl).unwrap_or(std::cmp::Ordering::Equal))
+        {
+            self.events[idx] = ev;
+        }
+    }
+
+    /// Port of `CMinimap::Takt` / `PauseTakt` (MatrixMinimap.cpp:362-393).
+    pub fn takt(&mut self, dt_ms: f32) {
+        self.time_ms += dt_ms;
+        if self.time_ms > 1_000_000.0 {
+            self.time_ms -= 1_000_000.0;
+        }
+
+        let dt = dt_ms / MINIMAP_EVENT_TTL_MS;
+        let mut i = 0;
+        while i < self.events.len() {
+            self.events[i].ttl -= dt;
+            if self.events[i].ttl < 0.0 {
+                self.events.swap_remove(i);
+            } else {
+                i += 1;
+            }
+        }
+
+        let mul = 1.0 - 0.995f32.powf(dt_ms);
+        self.scale += (self.tgt_scale - self.scale) * mul;
     }
 
     /// Port of `CMinimap::RenderBackground` (MatrixMinimap.cpp:855-1199).
@@ -619,6 +711,62 @@ impl Minimap {
             clear_color,
         );
 
+        // The original bake path follows up with `RenderObjectToBackground`
+        // for buildings. We do not have a top-down mesh pass yet, so stamp the
+        // closest currently-available equivalent: the same minimap atlas icons
+        // used by the live overlay, written directly into the baked texture.
+        let mut bg_markers = Vec::with_capacity(map.buildings.len() * 6);
+        let sz = map.size_x.max(map.size_y) as f32;
+        let fsz = sz * GLOBAL_SCALE;
+        let x0 = (map.size_x as f32 * GLOBAL_SCALE - fsz) * 0.5;
+        let y0 = (map.size_y as f32 * GLOBAL_SCALE - fsz) * 0.5;
+        let stamp_r = 6.0 / TEX_SIZE as f32;
+        for b in &map.buildings {
+            let u = (b.x - x0) / fsz;
+            let v = (b.y - y0) / fsz;
+            let px = 2.0 * u - 1.0;
+            let py = 1.0 - 2.0 * v;
+            let icon = if b.kind == 0 {
+                self.icon_base
+            } else {
+                self.icon_factory
+            };
+            let mut color = self
+                .side_colors
+                .get(b.side as usize)
+                .copied()
+                .unwrap_or([0.85, 0.85, 0.85, 1.0]);
+            color[3] = 0.35;
+            Self::push_marker_clip(&mut bg_markers, [px, py], stamp_r, icon, color);
+        }
+        if !bg_markers.is_empty() {
+            let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("minimap bg buildings"),
+                contents: bytemuck::cast_slice(&bg_markers),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Minimap Background Buildings"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &color_view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.tex_pipeline);
+            pass.set_bind_group(0, &self.icon_bind, &[]);
+            pass.set_vertex_buffer(0, vbuf.slice(..));
+            pass.draw(0..bg_markers.len() as u32, 0..1);
+        }
+
         queue.submit(std::iter::once(encoder.finish()));
         self.baked = true;
     }
@@ -686,48 +834,54 @@ impl Minimap {
         ]
     }
 
+    fn minimap_contains(&self, cursor_x: f32, cursor_y: f32) -> bool {
+        if cursor_x < self.pos_x
+            || cursor_y < self.pos_y
+            || cursor_x > self.pos_x + self.size_x
+            || cursor_y > self.pos_y + self.size_y
+        {
+            return false;
+        }
+        true
+    }
+
     /// Port of `CMinimap::CalcMinimap2World` + `ButtonClick`
     /// (MatrixMinimap.cpp:1356-1379). Returns `Some(world_xy)` when the
     /// cursor is inside the minimap rect; the caller passes that straight
     /// to `camera.set_xy_strategy(tgt)` — the same two-line op the original
     /// performs at MatrixMinimap.cpp:1361.
     pub fn click_to_world(&self, cursor_x: f32, cursor_y: f32) -> Option<[f32; 2]> {
-        if cursor_x < self.pos_x
-            || cursor_y < self.pos_y
-            || cursor_x > self.pos_x + self.size_x
-            || cursor_y > self.pos_y + self.size_y
-        {
+        if !self.minimap_contains(cursor_x, cursor_y) {
             return None;
         }
         Some(self.map_to_world(cursor_x, cursor_y))
     }
 
-    /// Dispatch a left-click at `(cx, cy)` in surface pixels. Checks buttons
-    /// first (they're rendered on top of the landscape), then the minimap
-    /// rect. Returns the action the caller should apply.
-    pub fn click(&mut self, cx: f32, cy: f32) -> MinimapClick {
-        // Panel rect in surface pixels — buttons are panel-local; re-derive
-        // panel_x/panel_y the same way render() does so the two stay in sync.
+    fn button_hit(&self, btn: &Button, cx: f32, cy: f32) -> bool {
         let ui_scale = self.size_x / MINIMAP_SIZE_PX;
         let panel_x = 0.0;
         let panel_y = self.pos_y - MINIMAP_OFFSET_Y_IN_PANEL * ui_scale;
-        let hits = |btn: &Button| -> bool {
-            let bx = panel_x + btn.local[0] * ui_scale;
-            let by = panel_y + btn.local[1] * ui_scale;
-            let bw = btn.local[2] * ui_scale;
-            let bh = btn.local[3] * ui_scale;
-            cx >= bx && cx <= bx + bw && cy >= by && cy <= by + bh
-        };
-        if hits(&self.zi_button) {
+        let bx = panel_x + btn.local[0] * ui_scale;
+        let by = panel_y + btn.local[1] * ui_scale;
+        let bw = btn.local[2] * ui_scale;
+        let bh = btn.local[3] * ui_scale;
+        cx >= bx && cx <= bx + bw && cy >= by && cy <= by + bh
+    }
+
+    /// Dispatch a left-press at `(cx, cy)` in surface pixels. Checks buttons
+    /// first, then the minimap rect. Main-rect presses begin drag immediately,
+    /// matching the original minimap click/drag camera recentering.
+    pub fn click(&mut self, cx: f32, cy: f32) -> MinimapClick {
+        if self.button_hit(&self.zi_button, cx, cy) {
             self.zoom_in();
             return MinimapClick::ZoomIn;
         }
-        if hits(&self.zo_button) {
+        if self.button_hit(&self.zo_button, cx, cy) {
             self.zoom_out();
             return MinimapClick::ZoomOut;
         }
         if let Some(tgt) = self.click_to_world(cx, cy) {
-            MinimapClick::Teleport(tgt)
+            MinimapClick::BeginDrag(tgt)
         } else {
             MinimapClick::None
         }
@@ -738,7 +892,6 @@ impl Minimap {
     pub fn zoom_in(&mut self) {
         self.tgt_scale = (self.tgt_scale * MINIMAP_ZOOM_IN_FACTOR)
             .clamp(MINIMAP_MIN_SCALE, MINIMAP_MAX_SCALE);
-        self.scale = self.tgt_scale;
     }
 
     /// Port of `CMinimap::ButtonZoomOut` (MatrixMinimap.cpp:1350-1354).
@@ -746,7 +899,6 @@ impl Minimap {
     pub fn zoom_out(&mut self) {
         self.tgt_scale = (self.tgt_scale * MINIMAP_ZOOM_OUT_FACTOR)
             .clamp(MINIMAP_MIN_SCALE, MINIMAP_MAX_SCALE);
-        self.scale = self.tgt_scale;
     }
 
     /// Port of `CMinimap::BeforeDraw` (MatrixMinimap.cpp:182-248) — computes
@@ -828,6 +980,51 @@ impl Minimap {
         out.push(v(p_bl, uv_bl));
         out.push(v(p_tr, uv_tr));
         out.push(v(p_br, uv_br));
+    }
+
+    fn push_marker_clip(
+        out: &mut Vec<MMVertex>,
+        clip: [f32; 2],
+        radius_clip: f32,
+        icon: IconUv,
+        color: [f32; 4],
+    ) {
+        let (x, y, r) = (clip[0], clip[1], radius_clip);
+        let v = |p: [f32; 2], uv: [f32; 2]| MMVertex { pos: p, uv, color };
+        let uv_bl = [icon.u0, icon.v1];
+        let uv_tl = [icon.u0, icon.v0];
+        let uv_br = [icon.u1, icon.v1];
+        let uv_tr = [icon.u1, icon.v0];
+        out.push(v([x - r, y - r], uv_bl));
+        out.push(v([x - r, y + r], uv_tl));
+        out.push(v([x + r, y + r], uv_tr));
+        out.push(v([x - r, y - r], uv_bl));
+        out.push(v([x + r, y + r], uv_tr));
+        out.push(v([x + r, y - r], uv_br));
+    }
+
+    fn push_oriented_marker(
+        out: &mut Vec<MMVertex>,
+        px: [f32; 2],
+        radius: f32,
+        dir: [f32; 2],
+        icon: IconUv,
+        color: [f32; 4],
+    ) {
+        let dlen = (dir[0] * dir[0] + dir[1] * dir[1]).sqrt().max(1e-6);
+        let dx = dir[0] / dlen;
+        let dy = dir[1] / dlen;
+        let p0 = [px[0] + radius * (dx + dy), px[1] - radius * (dx - dy)];
+        let p1 = [px[0] + radius * (dx - dy), px[1] + radius * (dx + dy)];
+        let p2 = [px[0] - radius * (dx - dy), px[1] - radius * (dx + dy)];
+        let p3 = [px[0] - radius * (dx + dy), px[1] + radius * (dx - dy)];
+        let v = |p: [f32; 2], uv: [f32; 2]| MMVertex { pos: p, uv, color };
+        out.push(v(p0, [icon.u0, icon.v1]));
+        out.push(v(p1, [icon.u0, icon.v0]));
+        out.push(v(p3, [icon.u1, icon.v0]));
+        out.push(v(p0, [icon.u0, icon.v1]));
+        out.push(v(p3, [icon.u1, icon.v0]));
+        out.push(v(p2, [icon.u1, icon.v1]));
     }
 
     /// Render. `pass` must target the swapchain with LoadOp::Load, no depth.
@@ -930,11 +1127,15 @@ impl Minimap {
         // MMT_FACTORY (radius MINIMAP_BUILDING_R=8). Tint is `m_Color & alpha
         // | GetSideColorMM(side)`. Radii scale with UI so sprites stay
         // proportional to the enlarged minimap rect.
-        let marker_r = 8.0 * ui_scale;
-        let mut markers: Vec<MMVertex> = Vec::with_capacity(map.buildings.len() * 6);
+        let marker_r = MINIMAP_BUILDING_R * ui_scale;
+        let mut markers: Vec<MMVertex> =
+            Vec::with_capacity((map.buildings.len() + self.events.len()) * 6);
+        let mut point_markers: Vec<MMVertex> = Vec::with_capacity(self.events.len() * 6);
         for b in &map.buildings {
-            let px_px = self.world_to_map(b.x, b.y);
-            let px_px = self.apply_rotation(px_px);
+            let mut px_px = self.world_to_map(b.x, b.y);
+            px_px = self.apply_rotation(px_px);
+            px_px[0] = px_px[0].floor() - 0.5;
+            px_px[1] = px_px[1].floor() - 0.5;
             let icon = if b.kind == 0 {
                 self.icon_base
             } else {
@@ -945,12 +1146,46 @@ impl Minimap {
                 .get(b.side as usize)
                 .copied()
                 .unwrap_or([0.85, 0.85, 0.85, 1.0]);
-            Self::push_marker(&mut markers, px_px, marker_r, icon, color);
+            let radius = if b.kind == 0 {
+                MINIMAP_BUILDING_BASE_R * ui_scale
+            } else {
+                marker_r
+            };
+            Self::push_marker(&mut markers, px_px, radius, icon, color);
+        }
+        for ev in &self.events {
+            let pos = self.apply_rotation(self.world_to_map(ev.pos_in_world[0], ev.pos_in_world[1]));
+            if pos[0] < self.pos_x
+                || pos[0] > self.pos_x + self.size_x
+                || pos[1] < self.pos_y
+                || pos[1] > self.pos_y + self.size_y
+            {
+                let clipped = self.clip_to_rect(pos);
+                let dir = [
+                    self.pos_x + self.size_x * 0.5 - clipped[0],
+                    self.pos_y + self.size_y * 0.5 - clipped[1],
+                ];
+                let flash = flash_color(ev.color1, ev.color2, self.time_ms);
+                Self::push_oriented_marker(
+                    &mut markers,
+                    clipped,
+                    MINIMAP_OUT_INDICATOR_R * ui_scale,
+                    dir,
+                    self.icon_arrow,
+                    flash,
+                );
+            } else {
+                let k = 1.0 - ev.ttl;
+                let r = lerp(MINIMAP_EVENT_R1, MINIMAP_EVENT_R2, k) * ui_scale;
+                let color = lerp_color_u32(ev.color1, ev.color2, k);
+                Self::push_marker(&mut point_markers, pos, r, self.icon_point, color);
+            }
         }
         // Clamp to capacity so we never overrun the vertex buffer.
+        markers.extend(point_markers);
         let max_marker_verts = self
             .quad_capacity
-            .saturating_sub(6)
+            .saturating_sub(24)
             .min(markers.len() / 6 * 6);
         let markers = &markers[..max_marker_verts];
 
@@ -1042,6 +1277,67 @@ impl Minimap {
         pass.set_vertex_buffer(0, self.quad_vbuf.slice(..));
         pass.draw(12..24, 0..1);
     }
+
+    fn clip_to_rect(&self, input: [f32; 2]) -> [f32; 2] {
+        let half_w = self.size_y * 0.5;
+        let half_h = self.size_x * 0.5;
+        let cx = self.pos_x + half_w;
+        let cy = self.pos_y + half_h;
+        let mut dir = [cx - input[0], cy - input[1]];
+        loop {
+            if dir[0] > half_w {
+                dir[1] = dir[1] / dir[0] * half_w;
+                dir[0] = half_w;
+                continue;
+            }
+            if dir[0] < -half_w {
+                dir[1] = -dir[1] / dir[0] * half_w;
+                dir[0] = -half_w;
+                continue;
+            }
+            if dir[1] > half_h {
+                dir[0] = dir[0] / dir[1] * half_h;
+                dir[1] = half_h;
+                continue;
+            }
+            if dir[1] < -half_h {
+                dir[0] = -dir[0] / dir[1] * half_h;
+                dir[1] = -half_h;
+                continue;
+            }
+            break;
+        }
+        [cx - dir[0] * MINIMAP_OUT_SCALE, cy - dir[1] * MINIMAP_OUT_SCALE]
+    }
+}
+
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t
+}
+
+fn unpack_argb(c: u32) -> [f32; 4] {
+    [
+        ((c >> 16) & 0xFF) as f32 / 255.0,
+        ((c >> 8) & 0xFF) as f32 / 255.0,
+        (c & 0xFF) as f32 / 255.0,
+        ((c >> 24) & 0xFF) as f32 / 255.0,
+    ]
+}
+
+fn lerp_color_u32(c1: u32, c2: u32, t: f32) -> [f32; 4] {
+    let a = unpack_argb(c1);
+    let b = unpack_argb(c2);
+    [
+        lerp(a[0], b[0], t),
+        lerp(a[1], b[1], t),
+        lerp(a[2], b[2], t),
+        lerp(a[3], b[3], t),
+    ]
+}
+
+fn flash_color(c1: u32, c2: u32, time_ms: f32) -> [f32; 4] {
+    let t = ((std::f32::consts::TAU * time_ms / MINIMAP_FLASH_PERIOD_MS).sin() * 0.5) + 0.5;
+    lerp_color_u32(c1, c2, t)
 }
 
 /// Map top-left-origin pixel position → clip space (Y-up in clip).
