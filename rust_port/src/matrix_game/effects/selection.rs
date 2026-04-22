@@ -29,6 +29,14 @@ pub const SEL_PP_DIST: f32 = 5.5;
 /// (MatrixEffectSelection.cpp:26).
 const MIN_SEL_CNT: usize = 10;
 
+/// Default selection color (MatrixEffect.hpp:142). Full alpha, pure
+/// green — the actual dim appearance in the original comes from the
+/// SELDOT texture's radial alpha gradient, not a dim color.
+pub const SEL_COLOR_DEFAULT: u32 = 0xFF00_FF00;
+/// "Temporary" / deselection-in-progress color (MatrixEffect.hpp:143).
+/// Used by `CMatrixSide::m_ActiveObject` transitions — darker olive.
+pub const SEL_COLOR_TMP: u32 = 0xFF30_5010;
+
 // ── Effect state (ports m_Points + m_Color* + m_Radius) ──────────────────
 
 /// Port of `SSelPoint::m_Pos[0]` (MatrixEffectSelection.hpp:22) — a

@@ -43,11 +43,15 @@ fn vs_main(in: VsIn) -> VsOut {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    // Soft circular disc. `d` is radial distance in the corner space
-    // (0 at center, 1 at the quad edge). Discard outside the unit
-    // circle + gentle feather for anti-aliasing.
+    // Soft fuzzy dot — approximates the radial alpha gradient in the
+    // original SELDOT texture (Matrix/Textures/Billboard/seldot). The
+    // C++ `SetColorOpAnyOrder(0, MODULATE, TEXTURE, DIFFUSE)` path
+    // multiplies the texture's soft alpha against the diffuse color,
+    // so most of each dot's footprint is sub-opaque. We reproduce that
+    // with a quadratic falloff `(1-d)²` from the center.
     let d = length(in.uv);
-    if d > 1.0 { discard; }
-    let alpha = u.color.a * smoothstep(1.0, 0.7, d);
+    if d >= 1.0 { discard; }
+    let falloff = (1.0 - d);
+    let alpha = u.color.a * falloff * falloff;
     return vec4<f32>(u.color.rgb, alpha);
 }

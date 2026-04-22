@@ -639,18 +639,21 @@ fn sync_selection_ring(state: &mut AppState, step_ms: f32) {
     }
 }
 
-/// Pick a highlight color for the selection ring by side. Matches the
-/// C++ palette used in `CMatrixEffect::CreateSelection` calls —
-/// green ring for friendly selections (MatrixSide.cpp shows green as
-/// "own side"), red/yellow for AI. Alpha is encoded in the high byte
-/// (0xAARRGGBB) so the ring shader can multiply through.
+/// Pick a highlight color for the selection ring by side. The C++
+/// defaults every selection to `SEL_COLOR_DEFAULT` (green) regardless
+/// of side — the enemy-ring color change is a runtime tint handled
+/// elsewhere (the `SetColor(SEL_COLOR_TMP)` calls at MatrixSide.cpp:
+/// 1750-1753 are commented out in the shipping code). We keep a
+/// per-side tint as a placeholder for when the full side integration
+/// lands; for the player case we match the original exactly.
 fn side_selection_color(side: i32) -> u32 {
+    use crate::matrix_game::effects::selection::SEL_COLOR_DEFAULT;
     match side {
-        1 => 0xCC00FF00, // player — saturated green
-        2 => 0xCCFF3333,
-        3 => 0xCCFFAA00,
-        4 => 0xCCFFFF33,
-        _ => 0xCCFFFFFF, // neutral — white
+        1 => SEL_COLOR_DEFAULT,      // player — green
+        2 => 0xFFFF_3333,            // enemy red (placeholder)
+        3 => 0xFFFF_AA00,            // enemy orange (placeholder)
+        4 => 0xFFFF_FF33,            // enemy yellow (placeholder)
+        _ => 0xFFFF_FFFF,            // neutral / default — white
     }
 }
 
