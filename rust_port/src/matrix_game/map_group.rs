@@ -171,6 +171,17 @@ pub fn build_bottom_cpu_batches(
             let g = pt.g as f32 / 255.0;
             let b = pt.b as f32 / 255.0;
 
+            // Half-texel offset — intentional divergence from
+            // MatrixMapGroup.cpp:341-342, which samples the corner
+            // (`ts_inv * v->tx`). The original atlas ships as DXT1, so each
+            // 4×4 block is already averaged and bilinear sampling at the
+            // corner of a tile smudges across the DXT boundary without
+            // visible seams. Our atlas is uploaded as uncompressed
+            // Rgba8UnormSrgb (see `texture::create_texture_from_rgba_mipped`
+            // — DXT1 encoding is not done), so the `+0.5` centers the sample
+            // inside the texel and stops bilinear from reaching into the
+            // neighbouring tile. Remove only if/when the atlas is switched
+            // to a BC format that gives the same natural blur.
             let u = ts_inv * (tx as f64 + 0.5);
             let v = ts_inv * (ty as f64 + 0.5);
             let mu = macro_step * vx as f32;
