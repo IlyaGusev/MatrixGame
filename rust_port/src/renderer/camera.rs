@@ -226,7 +226,7 @@ impl Camera {
 
     pub fn init_strategy_angle(&mut self, angle: f32) {
         // MatrixCamera.cpp:696 — strategy yaw is `CamBaseAngleZ + map.CameraAngle`.
-        let combined = self.base_angle_z + angle;
+        let combined = angle_norm(self.base_angle_z + angle);
         self.strategy_init_angle = combined;
         self.ang_strategy = combined;
         self.angle_z = combined;
@@ -256,7 +256,7 @@ impl Camera {
     /// Ports RotateByMouse (MatrixCamera.hpp:238-248).
     pub fn rotate_by_mouse(&mut self, dx: f32, dy: f32) {
         let p = &self.params;
-        self.ang_strategy += p.rot_speed_z * dx * 10.0;
+        self.ang_strategy = angle_norm(self.ang_strategy + p.rot_speed_z * dx * 10.0);
         self.angle_param -= p.rot_speed_x * dy * 5.0;
         self.angle_param = self.angle_param.clamp(0.0, 1.0);
     }
@@ -362,10 +362,10 @@ impl Camera {
         // Yaw/pitch (MatrixCamera.cpp:1103-1127). These bits are cleared on
         // key release via on_key, so we leave self.actions untouched here.
         if self.actions & ACT_ROT_LEFT != 0 {
-            self.ang_strategy -= p.rot_speed_z * dt_ms;
+            self.ang_strategy = angle_norm(self.ang_strategy - p.rot_speed_z * dt_ms);
         }
         if self.actions & ACT_ROT_RIGHT != 0 {
-            self.ang_strategy += p.rot_speed_z * dt_ms;
+            self.ang_strategy = angle_norm(self.ang_strategy + p.rot_speed_z * dt_ms);
         }
         if self.actions & ACT_ROT_UP != 0 {
             self.angle_param = (self.angle_param + p.rot_speed_x * dt_ms).min(1.0);
@@ -373,6 +373,8 @@ impl Camera {
         if self.actions & ACT_ROT_DOWN != 0 {
             self.angle_param = (self.angle_param - p.rot_speed_x * dt_ms).max(0.0);
         }
+        self.ang_strategy = angle_norm(self.ang_strategy);
+        self.angle_z = angle_norm(self.angle_z);
 
         // Keyboard + edge-pan (MatrixCamera.cpp:1062-1086) uses the bottom
         // frustum plane normal projected onto XY.
@@ -624,6 +626,22 @@ fn lerp_dist(p: &CamParam, param: f32) -> f32 {
     p.dist_min + (p.dist_max - p.dist_min) * param
 }
 
+fn angle_norm(a: f32) -> f32 {
+    a.rem_euclid(std::f32::consts::TAU)
+}
+
+#[allow(dead_code)]
+fn angle_dist(from: f32, to: f32) -> f32 {
+    let d = angle_norm(to) - angle_norm(from);
+    if d > std::f32::consts::PI {
+        d - std::f32::consts::TAU
+    } else if d < -std::f32::consts::PI {
+        d + std::f32::consts::TAU
+    } else {
+        d
+    }
+}
+
 /// Parse a numeric robots.dat parameter. The original uses `GetDouble()`,
 /// which accepts the same numeric grammar Rust's `parse::<f32>` does; any
 /// blank/missing value falls through to the hardcoded default.
@@ -642,4 +660,28 @@ pub enum KeyAction {
     RotUp,
     RotDown,
     ResetAngles,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn init_strategy_angle_is_normalized() {
+        let mut cam = Camera::new(1.0);
+        cam.base_angle_z = std::f32::consts::PI * 3.0;
+        cam.init_strategy_angle(std::f32::consts::PI);
+        assert!(cam.ang_strategy >= 0.0);
+        assert!(cam.ang_strategy < std::f32::consts::TAU);
+        assert_eq!(cam.ang_strategy, cam.angle_z);
+    }
+
+    #[test]
+    fn angle_dist_takes_shortest_path() {
+        let eps = 1e-5;
+        let a = std::f32::consts::TAU - 0.1;
+        let b = 0.1;
+        assert!((angle_dist(a, b) - 0.2).abs() < eps);
+        assert!((angle_dist(b, a) + 0.2).abs() < eps);
+    }
 }
