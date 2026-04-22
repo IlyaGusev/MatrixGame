@@ -166,6 +166,21 @@ pub trait MapStatic {
     fn side(&self) -> i32 { -1 }
     fn need_repair(&self) -> bool { false }
 
+    /// Port of `virtual bool Pick(orig, dir, float *outt)`
+    /// (MatrixMapStatic.hpp:462). Ray / object intersection. The
+    /// default is a sphere test against `core().geo_center` +
+    /// `core().radius` — a conservative approximation for subclasses
+    /// that haven't ported their mesh-level pick. Subclasses (Building,
+    /// Robot) can override with a tighter bounds test once per-instance
+    /// mesh data is available.
+    ///
+    /// Returns the ray parameter `t` (distance along `dir` from
+    /// `origin`) for the nearest hit, or `None` if the ray misses.
+    /// `dir` must be normalized for the returned `t` to be a distance.
+    fn pick(&self, origin: Vec3, dir: Vec3) -> Option<f32> {
+        ray_sphere_pick(self.core().geo_center, self.core().radius, origin, dir)
+    }
+
     /// Port of `virtual bool Damage(EWeapon, pos, dir, attacker_side,
     /// attacker)` (MatrixMapStatic.hpp:464). Returns true iff the
     /// damage caused *this* object to be removed from play (C++
@@ -255,6 +270,38 @@ pub fn fit_to_mask(obj: &dyn MapStatic, mask: u32) -> bool {
 pub enum Control {
     Continue,
     Break,
+}
+
+/// Ray-sphere intersection. Returns the nearest positive `t` (ray
+/// parameter, equal to distance when `dir` is a unit vector) at which
+/// `origin + t*dir` intersects the sphere centered at `center` with
+/// radius `radius`. `None` if the ray misses or both roots are behind
+/// the origin. Used as the default `MapStatic::pick` body for
+/// subclasses that don't override with a per-mesh test.
+pub fn ray_sphere_pick(center: Vec3, radius: f32, origin: Vec3, dir: Vec3) -> Option<f32> {
+    if radius <= 0.0 {
+        return None;
+    }
+    let oc = origin - center;
+    let b = oc.dot(dir);
+    let c = oc.length_squared() - radius * radius;
+    let disc = b * b - c;
+    if disc < 0.0 {
+        return None;
+    }
+    let sqrt_d = disc.sqrt();
+    // Two roots: -b - sqrt_d (entering) and -b + sqrt_d (exiting). We
+    // want the nearest positive t — the entering hit unless the ray
+    // origin is already inside the sphere.
+    let t0 = -b - sqrt_d;
+    let t1 = -b + sqrt_d;
+    if t0 >= 0.0 {
+        Some(t0)
+    } else if t1 >= 0.0 {
+        Some(t1)
+    } else {
+        None
+    }
 }
 
 // ── Arena + logic-temp list ─────────────────────────────────────────────
@@ -598,6 +645,45 @@ impl Objects {
         skip: Option<ObjectId>,
     ) -> bool {
         self.find_objects(pos, radius, oscale, mask, skip, |_, _| Control::Break)
+    }
+
+    /// Arena ray-cast. Scans live objects matching `mask` and returns
+    /// the nearest hit `(id, t)` — `t` measured along `dir` from
+    /// `origin`. Ports the "iterate objects, call Pick, keep nearest"
+    /// fragment that CMatrixMap::Trace runs on the `TRACE_*OBJECT`
+    /// bits (MatrixMapTrace.cpp — linear scan variant; group-indexed
+    /// path arrives with the spatial index port).
+    ///
+    /// `skip` excludes one id (typically the caller's own). `dir`
+    /// should be unit-length for the returned `t` to be a distance.
+    pub fn pick_object(
+        &self,
+        origin: Vec3,
+        dir: Vec3,
+        mask: u32,
+        skip: Option<ObjectId>,
+    ) -> Option<(ObjectId, f32)> {
+        let mut best: Option<(ObjectId, f32)> = None;
+        for (i, slot) in self.slots.iter().enumerate() {
+            let obj = match slot.obj.as_deref() {
+                Some(o) => o,
+                None => continue,
+            };
+            let id = ObjectId { index: i as u32, generation: slot.generation };
+            if Some(id) == skip || !fit_to_mask(obj, mask) {
+                continue;
+            }
+            if let Some(t) = obj.pick(origin, dir) {
+                if t < 0.0 {
+                    continue;
+                }
+                match best {
+                    Some((_, bt)) if bt <= t => {}
+                    _ => best = Some((id, t)),
+                }
+            }
+        }
+        best
     }
 
     /// External entry point for `CMatrixMapStatic::Damage(...)`. Uses the
@@ -948,6 +1034,72 @@ mod tests {
         assert!(objs.any_object_in_radius(
             glam::Vec2::ZERO, 10.0, 1.0, TRACE_OBJECT, None,
         ));
+    }
+
+    #[test]
+    fn ray_sphere_pick_hits_front_face_when_outside() {
+        // Sphere at (10, 0, 0) radius 2. Ray from origin down +X.
+        // Front face at x=8 → t=8.
+        let c = Vec3::new(10.0, 0.0, 0.0);
+        let o = Vec3::ZERO;
+        let d = Vec3::X;
+        let t = ray_sphere_pick(c, 2.0, o, d).unwrap();
+        assert!((t - 8.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn ray_sphere_pick_misses_off_axis() {
+        let c = Vec3::new(10.0, 5.0, 0.0);
+        let o = Vec3::ZERO;
+        let d = Vec3::X;
+        // Sphere centered 5 units off the ray axis with radius 2 — misses.
+        assert!(ray_sphere_pick(c, 2.0, o, d).is_none());
+    }
+
+    #[test]
+    fn ray_sphere_pick_returns_exit_when_inside_sphere() {
+        let c = Vec3::ZERO;
+        let o = Vec3::ZERO;
+        let d = Vec3::X;
+        // Origin at center → -b - sqrt_d = -radius, -b + sqrt_d = +radius.
+        // Nearest positive t = +radius.
+        let t = ray_sphere_pick(c, 3.0, o, d).unwrap();
+        assert!((t - 3.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn ray_sphere_pick_rejects_zero_radius() {
+        assert!(ray_sphere_pick(Vec3::ZERO, 0.0, Vec3::new(-10.0, 0.0, 0.0), Vec3::X).is_none());
+    }
+
+    #[test]
+    fn pick_object_returns_nearest_hit_matching_mask() {
+        use crate::matrix_game::common::{TRACE_BUILDING, TRACE_OBJECT, TRACE_ROBOT};
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut objs = Objects::new();
+        let mut mk = |x: f32, kind: ObjectType, r: f32| -> ObjectId {
+            let mut s = Stub::new("x", log.clone());
+            s.core.obj_type = kind;
+            s.core.geo_center = Vec3::new(x, 0.0, 0.0);
+            s.core.radius = r;
+            objs.spawn(Box::new(s))
+        };
+        let _near = mk(5.0, ObjectType::MapObject, 1.0);      // t=4
+        let mid   = mk(10.0, ObjectType::Building, 1.0);      // t=9
+        let _far  = mk(20.0, ObjectType::Building, 1.0);      // t=19
+
+        // TRACE_OBJECT: should hit the MapObject at t≈4.
+        let (_, t) = objs.pick_object(Vec3::ZERO, Vec3::X, TRACE_OBJECT, None).unwrap();
+        assert!((t - 4.0).abs() < 1e-5);
+
+        // TRACE_BUILDING: should hit the NEAREST building (mid, t≈9)
+        // not the farther one.
+        let (hit_id, t) = objs.pick_object(Vec3::ZERO, Vec3::X, TRACE_BUILDING, None).unwrap();
+        assert_eq!(hit_id, mid);
+        assert!((t - 9.0).abs() < 1e-5);
+
+        // TRACE_ROBOT: nothing matches.
+        assert!(objs.pick_object(Vec3::ZERO, Vec3::X, TRACE_ROBOT, None).is_none());
     }
 
     #[test]

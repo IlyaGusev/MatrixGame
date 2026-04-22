@@ -8,12 +8,15 @@
 //! takt (`CMatrixMap::Takt`) aren't part of scope A/B — they land when
 //! sides + the full map takt arrive.
 
+use crate::matrix_game::camera::Camera;
+use crate::matrix_game::common::{PLAYER_SIDE, TRACE_ANYOBJECT};
 use crate::matrix_game::config::{BuildingDamages, ObjectDamages};
 use crate::matrix_game::map::GameMap;
-use crate::matrix_game::map_static::{ObjectId, Objects};
+use crate::matrix_game::map_static::{MapStatic, ObjectId, ObjectType, Objects};
 use crate::matrix_game::object::MapObject;
 use crate::matrix_game::object_building::Building;
 use crate::matrix_game::rnd::Rnd;
+use crate::matrix_game::side::{CurrSel, Side};
 use crate::matrix_lib::base::storage::Storage;
 
 /// `LOGIC_TAKT_PERIOD` from `MatrixLogic.hpp:13`.
@@ -31,6 +34,11 @@ pub struct World {
     /// Total game-time in ms since the first `takt` call. Mirrors the
     /// C++ `GetTime()` return type (milliseconds on an int clock).
     pub elapsed_ms: i64,
+    /// Port of `g_MatrixMap->GetPlayerSide()` (MatrixMap.hpp). The
+    /// player's slice of the per-side state — selection, active
+    /// object, etc. Full per-side AI / resource / stats table lands
+    /// with the full `CMatrixSide` port.
+    pub player_side: Side,
 }
 
 impl Default for World {
@@ -53,6 +61,7 @@ impl World {
             rng: Rnd::new(seed),
             tick: 0,
             elapsed_ms: 0,
+            player_side: Side::new(PLAYER_SIDE),
         }
     }
 
@@ -172,6 +181,70 @@ impl World {
     ///
     /// Returns the spawned IDs so callers can look them up by side /
     /// kind without a subsequent arena scan.
+    /// Port of the selection-entry code path triggered on left-click
+    /// (MatrixFormGame.cpp:530-642 → CMatrixMap pick → CMatrixSide
+    /// SelectObject). Given a screen pixel under the cursor, casts a
+    /// world-space ray via the camera, picks the nearest building /
+    /// unit, and stores it on `player_side`.
+    ///
+    /// Robots / flyers / cannons aren't in the arena yet, so `mask`
+    /// defaults to `TRACE_ANYOBJECT`: buildings match today, other
+    /// subclasses join the search when they land.
+    ///
+    /// Returns `Some(id)` if the click hit an object, `None` to
+    /// mirror the C++ behaviour of "click on empty ground → clear
+    /// selection".
+    pub fn select_at_screen(
+        &mut self,
+        camera: &Camera,
+        sx: f32,
+        sy: f32,
+        screen_w: f32,
+        screen_h: f32,
+    ) -> Option<ObjectId> {
+        let (origin, dir) = camera.screen_to_world_ray(sx, sy, screen_w, screen_h);
+        let hit = self.objects.pick_object(origin, dir, TRACE_ANYOBJECT, None);
+        match hit {
+            Some((id, _t)) => {
+                let sel = match self.objects.get(id).map(|o| o.core().obj_type) {
+                    Some(ObjectType::Building) => {
+                        // Base vs factory panel (MatrixSide.cpp's
+                        // SelectObject branch — base kind = BaseSelected,
+                        // other kinds = BuildingSelected).
+                        let is_base = self.objects.get(id)
+                            .and_then(|o| {
+                                let p = o as *const dyn MapStatic
+                                    as *const crate::matrix_game::object_building::Building;
+                                unsafe { p.as_ref() }
+                                    .map(|b| b.kind == crate::matrix_game::object_building::BuildingType::Base)
+                            })
+                            .unwrap_or(false);
+                        if is_base { CurrSel::BaseSelected } else { CurrSel::BuildingSelected }
+                    }
+                    Some(ObjectType::RobotAi)   => CurrSel::RobotsSelected,
+                    Some(ObjectType::Cannon)    => CurrSel::CannonSelected,
+                    Some(ObjectType::Flyer)     => CurrSel::FlyerSelected,
+                    _ => CurrSel::Nothing,
+                };
+                self.player_side.select(id, sel);
+                Some(id)
+            }
+            None => {
+                self.player_side.clear();
+                None
+            }
+        }
+    }
+
+    /// Return the active-selection id if it's still a live object in
+    /// the arena — tombstones (remove() bumped the generation) return
+    /// `None`, matching the C++ `m_ActiveObject->m_Object == NULL`
+    /// stale-pointer guard.
+    pub fn active_object(&self) -> Option<ObjectId> {
+        let id = self.player_side.active_object?;
+        if self.objects.is_valid(id) { Some(id) } else { None }
+    }
+
     pub fn spawn_buildings(&mut self, map: &GameMap) -> Vec<ObjectId> {
         let mut ids = Vec::with_capacity(map.buildings.len());
         for inst in &map.buildings {

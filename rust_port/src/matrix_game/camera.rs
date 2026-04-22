@@ -479,6 +479,60 @@ impl Camera {
         proj * self.view_matrix()
     }
 
+    /// World-space camera basis vectors. Derived from `inverse(view)`
+    /// where the view matrix sends world→view: the inverse columns
+    /// are the view axes expressed in world. After the `S = diag(1,-1,-1)`
+    /// sign flip in `view_matrix`, glam's `.y_axis` / `.z_axis` come
+    /// out negated relative to the visible screen basis, so we flip
+    /// them back here for callers that want "screen right" / "screen
+    /// up" in world space (billboard orientation, selection-ring dots).
+    pub fn camera_right_world(&self) -> Vec3 {
+        let inv = self.view_matrix().inverse();
+        inv.x_axis.truncate().normalize_or_zero()
+    }
+    pub fn camera_up_world(&self) -> Vec3 {
+        let inv = self.view_matrix().inverse();
+        // `S` flipped view Y; undo via negation so the result reads as
+        // "up on the screen" in world space.
+        (-inv.y_axis.truncate()).normalize_or_zero()
+    }
+
+    /// Unproject a screen-pixel (`sx`, `sy` in `[0, screen_w] × [0, screen_h]`
+    /// with origin top-left) into a world-space ray. Returns
+    /// `(origin, dir)` in **uncentered** world coordinates, so the
+    /// result can be compared directly against a `MapStatic::core().geo_center`.
+    ///
+    /// Ports the idiomatic ray-cast portion of
+    /// `CMatrixCamera::GetPickRay` (MatrixCamera.cpp). We go through
+    /// `inverse(view_proj)` to avoid replicating the sign conventions
+    /// in `view_matrix` by hand — correct by construction. The `near`
+    /// point lives at NDC z=0 (wgpu / D3D LH depth), `far` at z=1.
+    pub fn screen_to_world_ray(
+        &self,
+        sx: f32,
+        sy: f32,
+        screen_w: f32,
+        screen_h: f32,
+    ) -> (Vec3, Vec3) {
+        // Screen → NDC. wgpu / D3D have X right, Y up in NDC; screen
+        // Y is top-origin so we flip.
+        let nx = 2.0 * sx / screen_w - 1.0;
+        let ny = 1.0 - 2.0 * sy / screen_h;
+        let inv_vp = self.view_proj().inverse();
+        let near_w = inv_vp * glam::Vec4::new(nx, ny, 0.0, 1.0);
+        let far_w  = inv_vp * glam::Vec4::new(nx, ny, 1.0, 1.0);
+        let near = near_w.truncate() / near_w.w;
+        let far  = far_w.truncate()  / far_w.w;
+        // The camera operates in *centered* world space (view_matrix
+        // translates by `-link_point`, which itself subtracts map
+        // center). Shift back to uncentered so callers can hit-test
+        // against MapStatic::geo_center.
+        let offset = Vec3::new(self.map_cx, self.map_cy, 0.0);
+        let origin = near + offset;
+        let dir = (far - near).normalize_or_zero();
+        (origin, dir)
+    }
+
     pub fn forward(&self) -> Vec3 {
         (self.link_point - self.eye_pos()).normalize_or_zero()
     }

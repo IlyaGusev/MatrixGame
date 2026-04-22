@@ -1423,6 +1423,16 @@ pub struct MapRenderer {
 }
 
 impl MapRenderer {
+    /// Shared depth buffer view — used by external effect renderers
+    /// (e.g. the selection ring) that want to depth-test against the
+    /// terrain drawn in the same frame without re-attaching a
+    /// separate depth texture.
+    pub fn depth_view(&self) -> &wgpu::TextureView {
+        &self.depth_texture
+    }
+}
+
+impl MapRenderer {
     pub fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,

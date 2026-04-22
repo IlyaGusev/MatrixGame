@@ -21,6 +21,7 @@ pub mod object_building;
 pub mod particles;
 pub mod render_pipeline;
 pub mod rnd;
+pub mod side;
 pub mod sky;
 pub mod ter_surface;
 pub mod units;

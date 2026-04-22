@@ -99,6 +99,76 @@ pub enum BaseState {
 /// definition when the animation code lands.
 pub const BASE_FLOOR_Z: f32 = -63.0;
 
+/// Base selection radius (MatrixObjectBuilding.hpp:25). Each kind adds
+/// a small per-kind extra to tighten the pick against the visible
+/// footprint — values copied from `CMatrixBuilding::Select`
+/// (MatrixObjectBuilding.cpp:1474-1508).
+pub const BUILDING_SELECTION_SIZE: f32 = 50.0;
+
+/// Port of the ring-center + radius math in `CMatrixBuilding::Select`
+/// (MatrixObjectBuilding.cpp:1466-1509). The C++ matrix offsets use
+/// `_21/_22` (row-major D3D = y-axis-world in column-major glam) to
+/// push the ring off the robot-pad towards the building centre, and
+/// `_11/_12` (x-axis-world) to shear sideways for asymmetric kinds
+/// like BASE.
+///
+/// Returns `(ring_center_world, ring_radius)`. `pos` is the
+/// building's `m_Pos` (robot-pad anchor); `build_z` seeds the
+/// ring plane Z at `m_Matrix._43 + 5`.
+pub fn selection_placement(
+    pos: glam::Vec2,
+    build_z: f32,
+    angle_quad: i32,
+    kind: BuildingType,
+) -> (glam::Vec3, f32) {
+    // `m_Angle` is stored as 0..=3 quarter-rotations
+    // (MatrixObjectBuilding.cpp:120-137). Rebuild the matrix basis:
+    let ang = (angle_quad & 3) as f32 * std::f32::consts::FRAC_PI_2;
+    let (s, c) = ang.sin_cos();
+    // Column-major glam: x_axis/y_axis are the matrix columns; their
+    // (x, y) components map 1:1 to D3D row-major `_11/_12` and
+    // `_21/_22` respectively.
+    let x_axis = glam::Vec2::new(c, s);
+    let y_axis = glam::Vec2::new(-s, c);
+
+    // MatrixObjectBuilding.cpp:1470-1472.
+    let mut p = pos - y_axis * 60.0;
+    let mut r = BUILDING_SELECTION_SIZE;
+
+    match kind {
+        BuildingType::Base => {
+            // :1478-1483
+            r += 24.0;
+            p -= x_axis * 7.0;
+            p += y_axis * 16.0;
+        }
+        BuildingType::Energy => {
+            // :1486-1489
+            r += 10.0;
+            p -= y_axis * 13.0;
+        }
+        BuildingType::Plasma => {
+            // :1492-1495
+            r += 15.0;
+            p -= y_axis * 17.0;
+        }
+        BuildingType::Titan => {
+            // :1498-1501
+            r += 15.0;
+            p -= y_axis * 17.0;
+        }
+        BuildingType::Electronic => {
+            // :1504-1507
+            r += 17.0;
+            p -= y_axis * 17.0;
+        }
+        // Repair — no per-kind extra; the C++ falls through with
+        // just the base radius + the initial y-axis * 60 offset.
+        BuildingType::Repair => {}
+    }
+    (glam::Vec3::new(p.x, p.y, build_z + 5.0), r)
+}
+
 /// Port of `CMatrixBuilding`. Minimal field set for now — the
 /// capture / selection / progress-bar / turret-placement state lands
 /// with its owning subsystems.
@@ -198,9 +268,17 @@ impl Building {
     /// and the derived base_floor / build_z. Robot-spawn / capture /
     /// progress-bar state stays at default (noop).
     pub fn from_instance(inst: &BuildingInstance) -> Self {
+        let kind = BuildingType::from_u8(inst.kind).unwrap_or(BuildingType::Base);
+        // Use the same center + radius as the selection ring so
+        // picking matches the visible hit area. Ports the
+        // `CMatrixBuilding::Select` offset math exactly.
+        let (pick_center, radius) = selection_placement(
+            glam::Vec2::new(inst.x, inst.y), inst.build_z, inst.angle as i32, kind,
+        );
         let core = ObjectCore {
             obj_type: ObjectType::Building,
-            geo_center: glam::Vec3::new(inst.x, inst.y, inst.build_z),
+            geo_center: pick_center,
+            radius,
             matrix: glam::Mat4::from_translation(glam::Vec3::new(
                 inst.x, inst.y, inst.build_z,
             )),
@@ -217,7 +295,7 @@ impl Building {
             pos: glam::Vec2::new(inst.x, inst.y),
             angle: inst.angle as i32,
             side: inst.side as i32,
-            kind: BuildingType::from_u8(inst.kind).unwrap_or(BuildingType::Base),
+            kind,
             state: BaseState::Closing,         // MatrixObjectBuilding.cpp:43
             base_floor: 0.2,                   // MatrixObjectBuilding.cpp:42
             build_z: inst.build_z,

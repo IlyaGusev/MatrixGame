@@ -59,6 +59,7 @@ Form, Helper, Math3D, ShadowProj, ShadowStencil.
 | matrix_game/particles.rs      | (stub — will split across Effects/) |
 | matrix_game/render_pipeline.rs| MatrixRenderPipeline.cpp          |
 | matrix_game/rnd.rs            | MatrixLogic.cpp `CMatrixMapLogic::Rnd` (Park–Miller LCG) |
+| matrix_game/side.rs           | MatrixSide.cpp (selection fields only — `m_ActiveObject`, `m_CurrSel`; resources/AI/stats deferred) |
 | matrix_game/sky.rs            | DrawSky in MatrixMap.cpp + skybox parts |
 | matrix_game/ter_surface.rs    | MatrixTerSurface.cpp              |
 | matrix_game/units.rs          | (stub — will become MatrixRobot.cpp etc.) |
@@ -78,6 +79,7 @@ MatrixVisiCalc, DevConsole, StringConstants.
 | Rust file                               | Original                        |
 |-----------------------------------------|---------------------------------|
 | matrix_game/effects/point_light.rs      | MatrixEffectPointLight.cpp      |
+| matrix_game/effects/selection.rs        | MatrixEffectSelection.cpp (visual-parity port — flat annulus vs. animated dot billboards) |
 | matrix_game/effects/weapon.rs           | MatrixEffectWeapon.hpp (EWeapon enum constants only; effect class deferred) |
 
 Not yet ported: MatrixEffect (base), BigBoom, Billboard, Dust,

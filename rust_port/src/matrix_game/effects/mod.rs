@@ -4,4 +4,5 @@
 //! original `MatrixEffect*.cpp` names.
 
 pub mod point_light;
+pub mod selection;
 pub mod weapon;

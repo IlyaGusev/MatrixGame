@@ -27,6 +27,11 @@ struct AppState {
     last_time: f64,
     cursor: [f32; 2],
     minimap_dragging: bool,
+    /// Selection-ring renderer — ports `CMatrixEffectSelection`
+    /// (MatrixEffectSelection.cpp). Drawn over the terrain after the
+    /// object pass; green ring on the ground around the selected
+    /// object.
+    selection_ring: crate::matrix_game::effects::selection::SelectionRingRenderer,
 }
 
 pub struct App {
@@ -130,6 +135,11 @@ impl ApplicationHandler for App {
                 game.objects.iter_logic().count(),
             );
 
+            let selection_ring =
+                crate::matrix_game::effects::selection::SelectionRingRenderer::new(
+                    &gfx.device, &gfx.config,
+                );
+
             *self.state.borrow_mut() = Some(AppState {
                 window,
                 gfx,
@@ -142,6 +152,7 @@ impl ApplicationHandler for App {
                 last_time: crate::platform::now_secs(),
                 cursor: [-1.0, -1.0],
                 minimap_dragging: false,
+                selection_ring,
             });
         }
 
@@ -220,6 +231,9 @@ impl ApplicationHandler for App {
                 }
 
                 let mut game = World::new();
+                game.load_config(&matrix_data);
+                let building_ids = game.spawn_buildings(&map);
+                log::info!("world: spawned {} buildings", building_ids.len());
                 let (_ids, stats) = game.spawn_map_objects(&map, &stor);
                 log::info!(
                     "world: spawned {} map objects (static={}, burn={}, break={}, anim={}, sens={}, spawner={}, terron={}, portret={}, special={})",
@@ -230,6 +244,11 @@ impl ApplicationHandler for App {
                     "world: {} map objects enrolled in logic-temp list at init",
                     game.objects.iter_logic().count(),
                 );
+
+                let selection_ring =
+                    crate::matrix_game::effects::selection::SelectionRingRenderer::new(
+                        &gfx.device, &gfx.config,
+                    );
 
                 *state_slot.borrow_mut() = Some(AppState {
                     window: win.clone(),
@@ -243,6 +262,7 @@ impl ApplicationHandler for App {
                     last_time: crate::platform::now_secs(),
                     cursor: [-1.0, -1.0],
                     minimap_dragging: false,
+                    selection_ring,
                 });
                 win.request_redraw();
                 hide_loading_overlay();
@@ -298,10 +318,28 @@ impl ApplicationHandler for App {
                                     state.camera.set_xy_strategy(tgt);
                                     state.minimap_dragging = true;
                                 }
-                                MinimapClick::ZoomIn
-                                | MinimapClick::ZoomOut
-                                | MinimapClick::None => {
+                                MinimapClick::ZoomIn | MinimapClick::ZoomOut => {
                                     state.minimap_dragging = false;
+                                }
+                                // Click outside the minimap — route to
+                                // world selection. Ports the
+                                // MatrixFormGame.cpp:530-642 branch that
+                                // dispatches non-UI left-clicks to
+                                // CMatrixMap::Pick + CMatrixSide::SelectObject.
+                                MinimapClick::None => {
+                                    state.minimap_dragging = false;
+                                    let w = state.gfx.config.width as f32;
+                                    let h = state.gfx.config.height as f32;
+                                    let hit = state.game.select_at_screen(
+                                        &state.camera, cx, cy, w, h,
+                                    );
+                                    match hit {
+                                        Some(id) => log::info!(
+                                            "selection: hit object {:?}, curr_sel={:?}",
+                                            id, state.game.player_side.curr_sel,
+                                        ),
+                                        None => log::info!("selection: cleared"),
+                                    }
                                 }
                             }
                         }
@@ -402,6 +440,14 @@ impl ApplicationHandler for App {
                 let step_ms = (dt * 1000.0).round() as i32;
                 state.game.takt(step_ms);
                 state.game.graphic_takt(step_ms);
+
+                // Reconcile + animate the selection-ring effect with
+                // `player_side.active_object`. Ports the C++
+                // CMatrixEffectSelection lifecycle (create on Select,
+                // destroy on UnSelect, follow the object's geo-center
+                // each frame, advance dot animation per takt).
+                sync_selection_ring(state, step_ms as f32);
+
                 state.camera.takt(dt * 1000.0); // camera update (ms)
                 state.minimap.takt(dt * 1000.0);
                 state.terrain.takt(
@@ -437,6 +483,49 @@ impl ApplicationHandler for App {
                             vm,
                             &state.map,
                         );
+                        {
+                            // Selection-ring pass — share the terrain's
+                            // depth buffer so the dots are occluded by
+                            // buildings / objects that sit in front of
+                            // them. Upload first with the current view
+                            // basis so the billboards face the camera.
+                            let cr = state.camera.camera_right_world();
+                            let cu = state.camera.camera_up_world();
+                            let mc = glam::Vec2::new(
+                                state.map.world_width() * 0.5,
+                                state.map.world_height() * 0.5,
+                            );
+                            state.selection_ring.upload(&state.gfx.queue, vp, cr, cu, mc);
+                            let mut pass =
+                                encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                    label: Some("Selection Ring Pass"),
+                                    color_attachments: &[Some(
+                                        wgpu::RenderPassColorAttachment {
+                                            view: &view,
+                                            resolve_target: None,
+                                            depth_slice: None,
+                                            ops: wgpu::Operations {
+                                                load: wgpu::LoadOp::Load,
+                                                store: wgpu::StoreOp::Store,
+                                            },
+                                        },
+                                    )],
+                                    depth_stencil_attachment: Some(
+                                        wgpu::RenderPassDepthStencilAttachment {
+                                            view: state.terrain.depth_view(),
+                                            depth_ops: Some(wgpu::Operations {
+                                                load: wgpu::LoadOp::Load,
+                                                store: wgpu::StoreOp::Store,
+                                            }),
+                                            stencil_ops: None,
+                                        },
+                                    ),
+                                    timestamp_writes: None,
+                                    occlusion_query_set: None,
+                                    multiview_mask: None,
+                                });
+                            state.selection_ring.render(&mut pass);
+                        }
                         {
                             let mut pass =
                                 encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -499,6 +588,72 @@ impl ApplicationHandler for App {
 /// itself is a required dependency (MatrixGame.cpp:240-257) — the engine
 /// dereferences `g_MatrixData->BlockGet(...)` without NULL guards all over
 /// Init, so missing `robots.dat` is a fatal startup error.
+
+/// Keep the selection-ring effect in sync with
+/// `player_side.active_object`. Called once per frame after the
+/// logic takt advances. Ports the effect-lifecycle hooks
+/// `CMatrixBuilding::Select` / `UnSelect` +
+/// `CMatrixEffectSelection::SetPos` (MatrixObjectBuilding.cpp:1460-1525,
+/// MatrixEffectSelection.hpp:61-65) as a single reconciler.
+fn sync_selection_ring(state: &mut AppState, step_ms: f32) {
+    use crate::matrix_game::map_static::ObjectType;
+    use crate::matrix_game::object_building::{selection_placement, Building, BuildingType};
+
+    let active = state.game.active_object();
+    match active {
+        Some(id) => {
+            // Compute the ring placement. For buildings we route through
+            // `selection_placement` — the matrix-offset math from
+            // `CMatrixBuilding::Select`. For other object types (robots
+            // etc.) fall back to `core.geo_center + core.radius`.
+            let placement = state.game.objects.get(id).and_then(|obj| {
+                let ot = obj.core().obj_type;
+                if ot == ObjectType::Building {
+                    // Downcast to Building for the matrix offsets.
+                    let b: &Building = unsafe {
+                        &*(obj as *const dyn crate::matrix_game::map_static::MapStatic
+                            as *const Building)
+                    };
+                    let (c, r) = selection_placement(b.pos, b.build_z, b.angle, b.kind);
+                    // Terrain clamp so the anchor z stays on the ground
+                    // in case build_z is below the actual terrain surface
+                    // (the C++ matrix._43 is post-RNeed so it matches
+                    // terrain; we approximate here).
+                    let z = state.map.get_z(c.x, c.y).max(c.z);
+                    let _ = b.kind; let _ = BuildingType::Base; // keep imports live
+                    Some((glam::Vec3::new(c.x, c.y, z), r))
+                } else {
+                    Some((obj.core().geo_center, obj.core().radius.max(12.0)))
+                }
+            });
+            match placement {
+                Some((c, r)) => {
+                    let color = side_selection_color(state.game.player_side.id);
+                    state.selection_ring.set_selection(c, r, color);
+                    state.selection_ring.takt(step_ms, |x, y| state.map.get_z(x, y));
+                }
+                None => state.selection_ring.clear(),
+            }
+        }
+        None => state.selection_ring.clear(),
+    }
+}
+
+/// Pick a highlight color for the selection ring by side. Matches the
+/// C++ palette used in `CMatrixEffect::CreateSelection` calls —
+/// green ring for friendly selections (MatrixSide.cpp shows green as
+/// "own side"), red/yellow for AI. Alpha is encoded in the high byte
+/// (0xAARRGGBB) so the ring shader can multiply through.
+fn side_selection_color(side: i32) -> u32 {
+    match side {
+        1 => 0xCC00FF00, // player — saturated green
+        2 => 0xCCFF3333,
+        3 => 0xCCFFAA00,
+        4 => 0xCCFFFF33,
+        _ => 0xCCFFFFFF, // neutral — white
+    }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn load_map() -> (
     GameMap,
