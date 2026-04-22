@@ -1,4 +1,4 @@
 fn main() {
     env_logger::init();
-    matrixgame_rs::app::run();
+    matrixgame_rs::matrix_game::form_game::run();
 }

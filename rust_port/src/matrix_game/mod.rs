@@ -4,16 +4,17 @@
 //! (e.g. `camera.rs` <- `MatrixCamera.cpp`). See CROSSREF.md at the
 //! project root for the full mapping.
 
-pub mod buildings;
 pub mod camera;
 pub mod common;
 pub mod effects;
+pub mod form_game;
 pub mod interface;
 pub mod logic;
 pub mod map;
 pub mod map_prepare;
 pub mod minimap;
-pub mod objects;
+pub mod object;
+pub mod object_building;
 pub mod particles;
 pub mod render_pipeline;
 pub mod sky;

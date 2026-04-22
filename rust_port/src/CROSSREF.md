@@ -43,20 +43,21 @@ Form, Helper, Math3D, ShadowProj, ShadowStencil.
 
 | Rust file                     | Original                          |
 |-------------------------------|-----------------------------------|
-| matrix_game/buildings.rs      | MatrixObjectBuilding.cpp          |
 | matrix_game/camera.rs         | MatrixCamera.cpp                  |
 | matrix_game/common.rs         | Common.hpp                        |
+| matrix_game/form_game.rs      | MatrixFormGame.cpp (+ MatrixGame.cpp entry glue) |
 | matrix_game/map.rs            | MatrixMap.cpp                     |
 | matrix_game/map_prepare.rs    | MatrixMapPrepare.cpp              |
 | matrix_game/minimap.rs        | MatrixMinimap.cpp                 |
-| matrix_game/objects.rs        | MatrixObject.cpp + MatrixMapStatic.cpp (partial) |
+| matrix_game/object.rs         | MatrixObject.cpp (OBJECT_TYPE_MAPOBJECT — decorative static)|
+| matrix_game/object_building.rs| MatrixObjectBuilding.cpp          |
 | matrix_game/particles.rs      | (stub — will split across Effects/) |
 | matrix_game/render_pipeline.rs| MatrixRenderPipeline.cpp          |
 | matrix_game/sky.rs            | DrawSky in MatrixMap.cpp + skybox parts |
 | matrix_game/ter_surface.rs    | MatrixTerSurface.cpp              |
-| matrix_game/terrain.rs        | MatrixMapGroup.cpp (BuildBottom + draw) — will split in Stage 2 |
+| matrix_game/terrain.rs        | MatrixMapGroup.cpp (BuildBottom + draw) — will split in Stage 2 part 2 |
 | matrix_game/units.rs          | (stub — will become MatrixRobot.cpp etc.) |
-| matrix_game/water.rs          | MatrixWater.cpp + BuildWater in MatrixMapGroup.cpp + WaterAlpha_t3 in MatrixRenderPipeline.cpp — will split in Stage 2 |
+| matrix_game/water.rs          | MatrixWater.cpp + BuildWater in MatrixMapGroup.cpp + WaterAlpha_t3 in MatrixRenderPipeline.cpp — will split in Stage 2 part 2 |
 | matrix_game/world.rs          | (no direct equivalent — top-level game state) |
 
 Not yet ported: MatrixConfig, MatrixCursor, MatrixDebugInfo,
@@ -100,7 +101,6 @@ MatrixRule, MatrixState, MatrixTactics.
 
 | Rust file   | Original                     |
 |-------------|------------------------------|
-| app.rs      | MatrixFormGame.cpp + MatrixGame.cpp (entry glue) — will move to matrix_game/form_game.rs in Stage 2 |
 | lib.rs      | WASM entry (no C++ analogue) |
 | main.rs     | native entry (no C++ analogue) |
 
@@ -113,3 +113,23 @@ MatrixRule, MatrixState, MatrixTactics.
 | gfx/loader.rs    | Platform-split file loading                 |
 | platform/native.rs | Native-specific time / fs                 |
 | platform/web.rs  | WASM-specific time / fs                     |
+
+## shaders/ (WGSL pulled out of the fused renderer files)
+
+The original uses DirectX 9 fixed-function state, not custom shaders.
+We need WGSL for wgpu; keeping it next to the Rust that binds it —
+not embedded as raw-string constants.
+
+| Shader file                          | Bound by                         |
+|--------------------------------------|----------------------------------|
+| shaders/minimap.wgsl                 | matrix_game/minimap.rs           |
+| shaders/object.wgsl                  | matrix_game/object.rs            |
+| shaders/object_building.wgsl         | matrix_game/object_building.rs   |
+| shaders/object_shadow.wgsl           | matrix_game/object.rs            |
+| shaders/object_shadow_texture.wgsl   | matrix_game/object.rs            |
+| shaders/sky_gradient.wgsl            | matrix_game/sky.rs               |
+| shaders/sky_skybox.wgsl              | matrix_game/sky.rs               |
+| shaders/terrain.wgsl                 | matrix_game/terrain.rs           |
+| shaders/terrain_gloss.wgsl           | matrix_game/terrain.rs           |
+| shaders/water.wgsl                   | matrix_game/water.rs             |
+| shaders/water_inshore.wgsl           | matrix_game/water.rs             |

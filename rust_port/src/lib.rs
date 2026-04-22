@@ -1,4 +1,3 @@
-pub mod app;
 pub mod gfx;
 pub mod matrix_game;
 pub mod matrix_lib;
@@ -13,5 +12,5 @@ pub fn start() {
     console_error_panic_hook::set_once();
     console_log::init_with_level(log::Level::Info).ok();
     log::info!("=== MatrixGame WASM v2 (bundle textures) ===");
-    app::run();
+    matrix_game::form_game::run();
 }
