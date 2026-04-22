@@ -89,12 +89,18 @@ SmokeAndFire, Weapon, Zahvat.
 
 ## matrix_game/interface/ (MatrixGame/src/Interface/)
 
-None ported yet. Target files when work starts:
-CAnimation → animation.rs, CConstructor → constructor.rs, CCounter →
-counter.rs, CHistory → history.rs, CIFaceButton → iface_button.rs,
-CIFaceElement → iface_element.rs, CIFaceImage → iface_image.rs,
-CIFaceMenu → iface_menu.rs, CIFaceStatic → iface_static.rs,
-CInterface → interface.rs, MatrixHint → hint.rs.
+| Rust file                               | Original                                           |
+|-----------------------------------------|----------------------------------------------------|
+| matrix_game/interface/iface_element.rs  | CIFaceElement.{cpp,h} (data portion + hit-test)    |
+| matrix_game/interface/iface_list.rs     | CInterface.h::CIFaceList (panel container + events)|
+| matrix_game/interface/interface.rs      | CInterface.{cpp,h} (panel struct + `if/<Name>` loader) |
+| matrix_game/interface/renderer.rs       | (no C++ peer — wgpu 2D quad pipeline for the HUD)  |
+
+Not yet ported: CAnimation → animation.rs, CConstructor → constructor.rs,
+CCounter → counter.rs, CHistory → history.rs, CIFaceButton → iface_button.rs
+(folded into iface_element.rs as a kind), CIFaceImage → iface_image.rs,
+CIFaceMenu → iface_menu.rs, CIFaceStatic → iface_static.rs (folded too),
+MatrixHint → hint.rs.
 
 ## matrix_game/logic/ (MatrixGame/src/Logic/)
 

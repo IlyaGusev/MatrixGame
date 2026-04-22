@@ -32,6 +32,12 @@ struct AppState {
     /// object pass; green ring on the ground around the selected
     /// object.
     selection_ring: crate::matrix_game::effects::selection::SelectionRingRenderer,
+    /// Loaded UI panels (IF_MAIN / IF_BASE / etc.) + focus state.
+    /// Ported from `CIFaceList` (Interface/CInterface.h:269+).
+    iface_list: crate::matrix_game::interface::IFaceList,
+    /// 2D textured-quad renderer for the UI panels. Drawn last so
+    /// the HUD sits on top of world + minimap.
+    iface_renderer: crate::matrix_game::interface::InterfaceRenderer,
 }
 
 pub struct App {
@@ -140,6 +146,33 @@ impl ApplicationHandler for App {
                     &gfx.device, &gfx.config,
                 );
 
+            let iface_list =
+                crate::matrix_game::interface::IFaceList::load_default_panels(&matrix_data);
+            log::info!("iface: loaded {} panels", iface_list.panels.len());
+            let mut iface_renderer =
+                crate::matrix_game::interface::InterfaceRenderer::new(
+                    &gfx.device, &gfx.config,
+                );
+            // Preload every atlas referenced by any element of any
+            // loaded panel. `if/Main` alone pulls from interface1/2/3,
+            // base_1, base_4, text_1; other panels add base_2/3/5/6.
+            let pkg_ref = &pkg;
+            let read = |p: &str| -> Option<Vec<u8>> {
+                let key = p.replace('\\', "/").to_uppercase();
+                for candidate in [&key, &format!("{key}.PNG")] {
+                    if let Ok(data) = pkg_ref.read_file(candidate) {
+                        return Some(data);
+                    }
+                }
+                None
+            };
+            iface_renderer.preload_for_panels(
+                &gfx.device,
+                &gfx.queue,
+                &read,
+                iface_list.panels.iter(),
+            );
+
             *self.state.borrow_mut() = Some(AppState {
                 window,
                 gfx,
@@ -153,6 +186,8 @@ impl ApplicationHandler for App {
                 cursor: [-1.0, -1.0],
                 minimap_dragging: false,
                 selection_ring,
+                iface_list,
+                iface_renderer,
             });
         }
 
@@ -250,6 +285,23 @@ impl ApplicationHandler for App {
                         &gfx.device, &gfx.config,
                     );
 
+                let iface_list =
+                    crate::matrix_game::interface::IFaceList::load_default_panels(&matrix_data);
+                log::info!("iface: loaded {} panels", iface_list.panels.len());
+                let mut iface_renderer =
+                    crate::matrix_game::interface::InterfaceRenderer::new(
+                        &gfx.device, &gfx.config,
+                    );
+                let read = |p: &str| -> Option<Vec<u8>> {
+                    bundle.read_file(p).map(|b| b.to_vec())
+                };
+                iface_renderer.preload_for_panels(
+                    &gfx.device,
+                    &gfx.queue,
+                    &read,
+                    iface_list.panels.iter(),
+                );
+
                 *state_slot.borrow_mut() = Some(AppState {
                     window: win.clone(),
                     gfx,
@@ -263,6 +315,8 @@ impl ApplicationHandler for App {
                     cursor: [-1.0, -1.0],
                     minimap_dragging: false,
                     selection_ring,
+                    iface_list,
+                    iface_renderer,
                 });
                 win.request_redraw();
                 hide_loading_overlay();
@@ -311,40 +365,51 @@ impl ApplicationHandler for App {
                 } else if button == MouseButton::Left {
                     use crate::matrix_game::minimap::MinimapClick;
                     let [cx, cy] = state.cursor;
+                    let w = state.gfx.config.width as f32;
+                    let h = state.gfx.config.height as f32;
                     match btn_state {
                         ElementState::Pressed => {
-                            match state.minimap.click(cx, cy) {
-                                MinimapClick::BeginDrag(tgt) => {
-                                    state.camera.set_xy_strategy(tgt);
-                                    state.minimap_dragging = true;
-                                }
-                                MinimapClick::ZoomIn | MinimapClick::ZoomOut => {
-                                    state.minimap_dragging = false;
-                                }
-                                // Click outside the minimap — route to
-                                // world selection. Ports the
-                                // MatrixFormGame.cpp:530-642 branch that
-                                // dispatches non-UI left-clicks to
-                                // CMatrixMap::Pick + CMatrixSide::SelectObject.
-                                MinimapClick::None => {
-                                    state.minimap_dragging = false;
-                                    let w = state.gfx.config.width as f32;
-                                    let h = state.gfx.config.height as f32;
-                                    let hit = state.game.select_at_screen(
-                                        &state.camera, cx, cy, w, h,
-                                    );
-                                    match hit {
-                                        Some(id) => log::info!(
-                                            "selection: hit object {:?}, curr_sel={:?}",
-                                            id, state.game.player_side.curr_sel,
-                                        ),
-                                        None => log::info!("selection: cleared"),
+                            // Interface gets first dibs on left-clicks —
+                            // ports the event-dispatch order in
+                            // MatrixFormGame.cpp where CIFaceList::
+                            // OnMouseLBDown runs before the world picker.
+                            if state.iface_list.on_mouse_down(cx, cy, w, h) {
+                                state.minimap_dragging = false;
+                            } else {
+                                match state.minimap.click(cx, cy) {
+                                    MinimapClick::BeginDrag(tgt) => {
+                                        state.camera.set_xy_strategy(tgt);
+                                        state.minimap_dragging = true;
+                                    }
+                                    MinimapClick::ZoomIn | MinimapClick::ZoomOut => {
+                                        state.minimap_dragging = false;
+                                    }
+                                    // Click hit neither UI nor minimap —
+                                    // route to world selection (MatrixFormGame.cpp:
+                                    // 530-642 dispatches non-UI left-clicks
+                                    // to CMatrixMap::Pick + CMatrixSide::
+                                    // SelectObject).
+                                    MinimapClick::None => {
+                                        state.minimap_dragging = false;
+                                        let hit = state.game.select_at_screen(
+                                            &state.camera, cx, cy, w, h,
+                                        );
+                                        match hit {
+                                            Some(id) => log::info!(
+                                                "selection: hit object {:?}, curr_sel={:?}",
+                                                id, state.game.player_side.curr_sel,
+                                            ),
+                                            None => log::info!("selection: cleared"),
+                                        }
                                     }
                                 }
                             }
                         }
                         ElementState::Released => {
                             state.minimap_dragging = false;
+                            if let Some(click) = state.iface_list.on_mouse_up(cx, cy, w, h) {
+                                log::info!("iface: clicked {:?}", click);
+                            }
                         }
                     }
                 }
@@ -375,6 +440,13 @@ impl ApplicationHandler for App {
                     if let Some(tgt) = state.minimap.click_to_world(cx, cy) {
                         state.camera.set_xy_strategy(tgt);
                     }
+                }
+                // Interface hover-state tracking — port of
+                // `CIFaceList::OnMouseMove` (Interface/CInterface.cpp).
+                {
+                    let w = state.gfx.config.width as f32;
+                    let h = state.gfx.config.height as f32;
+                    state.iface_list.on_mouse_move(cx, cy, w, h);
                 }
                 state.camera.on_mouse_move(cx, cy);
             }
@@ -447,6 +519,11 @@ impl ApplicationHandler for App {
                 // destroy on UnSelect, follow the object's geo-center
                 // each frame, advance dot animation per takt).
                 sync_selection_ring(state, step_ms as f32);
+
+                // Per-frame interface visibility dispatch — ports the
+                // `CInterface::LogicTakt` branch at
+                // CInterface.cpp:1214-1635. Only `if/Main` for now.
+                refresh_interface_visibility(state);
 
                 state.camera.takt(dt * 1000.0); // camera update (ms)
                 state.minimap.takt(dt * 1000.0);
@@ -555,6 +632,39 @@ impl ApplicationHandler for App {
                                 &state.camera,
                             );
                         }
+                        // Interface (HUD) pass — draws on top of
+                        // world + minimap. Ports
+                        // `CIFaceList::Render` iteration.
+                        {
+                            let panels: Vec<&crate::matrix_game::interface::CInterface> =
+                                state.iface_list.panels.iter().collect();
+                            state.iface_renderer.upload(
+                                &state.gfx.queue,
+                                &panels,
+                                state.gfx.config.width as f32,
+                                state.gfx.config.height as f32,
+                            );
+                            let mut pass =
+                                encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                    label: Some("Interface Pass"),
+                                    color_attachments: &[Some(
+                                        wgpu::RenderPassColorAttachment {
+                                            view: &view,
+                                            resolve_target: None,
+                                            depth_slice: None,
+                                            ops: wgpu::Operations {
+                                                load: wgpu::LoadOp::Load,
+                                                store: wgpu::StoreOp::Store,
+                                            },
+                                        },
+                                    )],
+                                    depth_stencil_attachment: None,
+                                    timestamp_writes: None,
+                                    occlusion_query_set: None,
+                                    multiview_mask: None,
+                                });
+                            state.iface_renderer.render(&mut pass);
+                        }
                         state.gfx.end_frame(output, encoder);
                     }
                     Err(wgpu::SurfaceError::Lost) => {
@@ -588,6 +698,50 @@ impl ApplicationHandler for App {
 /// itself is a required dependency (MatrixGame.cpp:240-257) — the engine
 /// dereferences `g_MatrixData->BlockGet(...)` without NULL guards all over
 /// Init, so missing `robots.dat` is a fatal startup error.
+
+/// Port of `CInterface::LogicTakt`'s per-frame visibility dispatch
+/// for the `if/Main` panel (CInterface.cpp:1214-1635). Reads
+/// `player_side.curr_sel` + the currently-active building's kind /
+/// stack state to decide which `if/Main` elements should show this
+/// frame. Other panels don't have their dispatch ported yet; they
+/// stay hidden.
+fn refresh_interface_visibility(state: &mut AppState) {
+    use crate::matrix_game::interface::MainVisibilityCtx;
+    use crate::matrix_game::map_static::{MapStatic, ObjectType};
+    use crate::matrix_game::object_building::{Building, BuildingType};
+    use crate::matrix_game::side::CurrSel;
+
+    let curr_sel = state.game.player_side.curr_sel;
+    // Pull building context when the selection is a Building.
+    let (kind, stack_empty, turrets_max) = match curr_sel {
+        CurrSel::BaseSelected | CurrSel::BuildingSelected => {
+            let active = state.game.active_object();
+            active
+                .and_then(|id| state.game.objects.get(id))
+                .filter(|o| matches!(o.core().obj_type, ObjectType::Building))
+                .map(|o| {
+                    let b: &Building = unsafe {
+                        &*(o as *const dyn MapStatic as *const Building)
+                    };
+                    // Build stack isn't ported yet — treat it as
+                    // always-empty, which matches initial state.
+                    (Some(b.kind), true, b.turrets_max)
+                })
+                .unwrap_or((None::<BuildingType>, true, 0))
+        }
+        _ => (None, true, 0),
+    };
+
+    let ctx = MainVisibilityCtx {
+        curr_sel,
+        building_kind: kind,
+        building_stack_empty: stack_empty,
+        building_turrets_max: turrets_max,
+    };
+    if let Some(p) = state.iface_list.panel_mut("Main") {
+        p.refresh_main_visibility(&ctx);
+    }
+}
 
 /// Keep the selection-ring effect in sync with
 /// `player_side.active_object`. Called once per frame after the
