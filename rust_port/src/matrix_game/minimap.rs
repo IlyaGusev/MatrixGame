@@ -964,7 +964,10 @@ impl Minimap {
         icon: IconUv,
         color: [f32; 4],
     ) {
-        let (x, y, r) = (px[0], px[1], radius);
+        // Pixel snap — matches `pos.x = floor(pos.x) - 0.5f` in
+        // MatrixMinimap.cpp:743-744. Keeps marker corners on texel grid
+        // boundaries so adjacent frames don't shimmer.
+        let (x, y, r) = (px[0].floor() - 0.5, px[1].floor() - 0.5, radius);
         let v = |p: [f32; 2], uv: [f32; 2]| MMVertex { pos: p, uv, color };
         let p_bl = [x - r, y + r];
         let p_tl = [x - r, y - r];
@@ -1014,10 +1017,13 @@ impl Minimap {
         let dlen = (dir[0] * dir[0] + dir[1] * dir[1]).sqrt().max(1e-6);
         let dx = dir[0] / dlen;
         let dy = dir[1] / dlen;
-        let p0 = [px[0] + radius * (dx + dy), px[1] - radius * (dx - dy)];
-        let p1 = [px[0] + radius * (dx - dy), px[1] + radius * (dx + dy)];
-        let p2 = [px[0] - radius * (dx - dy), px[1] - radius * (dx + dy)];
-        let p3 = [px[0] - radius * (dx + dy), px[1] + radius * (dx - dy)];
+        // Pixel snap the center — see push_marker.
+        let cx = px[0].floor() - 0.5;
+        let cy = px[1].floor() - 0.5;
+        let p0 = [cx + radius * (dx + dy), cy - radius * (dx - dy)];
+        let p1 = [cx + radius * (dx - dy), cy + radius * (dx + dy)];
+        let p2 = [cx - radius * (dx - dy), cy - radius * (dx + dy)];
+        let p3 = [cx - radius * (dx + dy), cy + radius * (dx - dy)];
         let v = |p: [f32; 2], uv: [f32; 2]| MMVertex { pos: p, uv, color };
         out.push(v(p0, [icon.u0, icon.v1]));
         out.push(v(p1, [icon.u0, icon.v0]));
@@ -1134,8 +1140,7 @@ impl Minimap {
         for b in &map.buildings {
             let mut px_px = self.world_to_map(b.x, b.y);
             px_px = self.apply_rotation(px_px);
-            px_px[0] = px_px[0].floor() - 0.5;
-            px_px[1] = px_px[1].floor() - 0.5;
+            // Pixel snap happens inside push_marker.
             let icon = if b.kind == 0 {
                 self.icon_base
             } else {

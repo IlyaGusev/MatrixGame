@@ -24,8 +24,11 @@
 //!
 //! The parser does not open `=<file>` hints itself: the original calls
 //! `LoadFromTextFile` against the game's `CFile`, which is an asset loader
-//! we don't have here. The filename is parsed and kept on the block so a
-//! caller can resolve it through its own `read_texture`-style callback.
+//! we don't have here. Instead, the filename is parsed and kept on the
+//! block. Callers that want C++-equivalent eager inclusion pass a loader
+//! callback to `BlockPar::resolve_includes` (or the `parse_bytes_with_loader`
+//! convenience wrapper), which walks the tree and fills each `=<file>`
+//! block in place.
 
 use std::collections::HashMap;
 
@@ -84,6 +87,48 @@ impl BlockPar {
         let mut cursor = 0;
         parse_block_body(&chars, &mut cursor, &mut root, /*nested=*/ false);
         root
+    }
+
+    /// Parse and eagerly resolve every `=<file>` include. Equivalent to
+    /// `parse_bytes` followed by `resolve_includes` — ports the combined
+    /// effect of `LoadFromText` + `LoadFromTextFile` (CBlockPar.cpp:1072-1073).
+    pub fn parse_bytes_with_loader<F>(bytes: &[u8], mut load: F) -> Self
+    where
+        F: FnMut(&str) -> Option<Vec<u8>>,
+    {
+        let mut bp = Self::parse_bytes(bytes);
+        bp.resolve_includes(&mut load);
+        bp
+    }
+
+    /// Walk the tree and, for every block carrying a `from_file` hint, call
+    /// `load(path)` to fetch the referenced file, parse it, and splice its
+    /// entries into the block. Ports the eager inclusion in
+    /// CBlockPar.cpp:1072 (`m_Block->LoadFromTextFile(...)`). The
+    /// `from_file` hint is kept on the block so save/round-trip still sees
+    /// it. Loaded blocks are themselves resolved so nested `=<file>`
+    /// references work recursively, matching the original's recursive
+    /// `LoadFromText`.
+    pub fn resolve_includes<F>(&mut self, load: &mut F)
+    where
+        F: FnMut(&str) -> Option<Vec<u8>>,
+    {
+        for entry in &mut self.entries {
+            if let Entry::Block {
+                block, from_file, ..
+            } = entry
+            {
+                if let Some(path) = from_file.as_ref() {
+                    if let Some(bytes) = load(path) {
+                        let loaded = BlockPar::parse_bytes(&bytes);
+                        block.entries = loaded.entries;
+                        block.name_index = loaded.name_index;
+                        block.sort = loaded.sort;
+                    }
+                }
+                block.resolve_includes(load);
+            }
+        }
     }
 
     /// Number of entries (all kinds). Mirrors `CBlockPar::AllCount`.
@@ -560,5 +605,33 @@ mod tests {
         let bp = BlockPar::parse("AlphaBlend=1\r\nAlphaTest=0\r\n");
         assert_eq!(bp.par_get_ne("AlphaBlend"), Some("1"));
         assert_eq!(bp.par_get_ne("AlphaTest"), Some("0"));
+    }
+
+    #[test]
+    fn resolve_includes_splices_file_contents() {
+        let mut bp = BlockPar::parse("Shared =other.bpt {\n}\n");
+        bp.resolve_includes(&mut |path| {
+            assert_eq!(path, "other.bpt");
+            Some(b"FromFile = yes\n".to_vec())
+        });
+        assert_eq!(
+            bp.block_get("Shared").unwrap().par_get_ne("FromFile"),
+            Some("yes")
+        );
+    }
+
+    #[test]
+    fn resolve_includes_recurses_into_loaded_files() {
+        let mut bp = BlockPar::parse("Outer =first.bpt {\n}\n");
+        bp.resolve_includes(&mut |path| match path {
+            "first.bpt" => Some(b"Inner =second.bpt {\n}\n".to_vec()),
+            "second.bpt" => Some(b"Deep = done\n".to_vec()),
+            _ => None,
+        });
+        let deep = bp
+            .block_get("Outer")
+            .and_then(|o| o.block_get("Inner"))
+            .and_then(|i| i.par_get_ne("Deep"));
+        assert_eq!(deep, Some("done"));
     }
 }
