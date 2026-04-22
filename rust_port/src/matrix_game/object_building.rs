@@ -24,11 +24,304 @@ use wgpu::util::DeviceExt;
 use crate::matrix_game::effects::point_light::PointLightSystem;
 use crate::matrix_game::common::{unpack_rgb, FOG_END, FOG_START};
 use crate::matrix_game::map::{BuildingInstance, GameMap};
+use crate::matrix_game::map_static::{
+    MapStatic, ObjectCore, ObjectId, Objects, ObjectType, MR_ALL,
+};
+use crate::matrix_game::rnd::Rnd;
 use crate::matrix_lib::three_g::vector_object::{self, CvoGroup, MaterialSpec};
 use crate::matrix_game::camera::Camera;
 use crate::matrix_lib::three_g::texture::{
     create_solid_texture, create_texture_from_rgba, decode_texture_bytes,
 };
+
+// ── Game-object side of CMatrixBuilding ─────────────────────────────────
+//
+// Renderer (BuildingsRenderer, below) is per-type instanced. The `Building`
+// game-object carries per-instance logical state (side, kind, state
+// machine, hit points, capture progress). Rendering and game-object live
+// in the same file to mirror the C++ `MatrixObjectBuilding.{cpp,hpp}`
+// layout.
+//
+// Scope-minimal port: data model + state enums + MapStatic trait impl
+// with noop tick bodies. Takt / LogicTakt / Damage / Capture require
+// effects / sound / per-side / progress-bar subsystems and land with
+// those.
+
+/// Port of `EBuildingType` (MatrixObjectBuilding.hpp:59-69). Discriminants
+/// match the C++ so `BuildingInstance::kind` (already parsed from CMAP)
+/// can be cast directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum BuildingType {
+    Base       = 0,
+    Titan      = 1,
+    Plasma     = 2,
+    Electronic = 3,
+    Energy     = 4,
+    Repair     = 5,
+}
+
+impl BuildingType {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        Some(match v {
+            0 => BuildingType::Base,
+            1 => BuildingType::Titan,
+            2 => BuildingType::Plasma,
+            3 => BuildingType::Electronic,
+            4 => BuildingType::Energy,
+            5 => BuildingType::Repair,
+            _ => return None,
+        })
+    }
+}
+
+/// Port of `EBaseState` (MatrixObjectBuilding.hpp:71-82). The ctor seeds
+/// `m_State = BASE_CLOSING` (MatrixObjectBuilding.cpp:43) — the base
+/// immediately enters its closing animation so it settles at
+/// `BASE_CLOSED` on first Takt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BaseState {
+    Closed      = 0,
+    Opening     = 1,
+    Opened      = 2,
+    Closing     = 3,
+    /// `BUILDING_DIP` — "dying in progress". Reached after a base is
+    /// destroyed; triggers the multi-second explosion sequence.
+    Dip         = 4,
+    /// `BUILDING_DIP_EXPLODED` — explosion sequence finished; ruin
+    /// remains but the building object is otherwise inert.
+    DipExploded = 5,
+}
+
+/// Default floor height of an opening base before it rises to ground
+/// level (MatrixObjectBuilding.hpp:12). Used by the `BASE_OPENING`
+/// animation; stored here so the value lives alongside the type
+/// definition when the animation code lands.
+pub const BASE_FLOOR_Z: f32 = -63.0;
+
+/// Port of `CMatrixBuilding`. Minimal field set for now — the
+/// capture / selection / progress-bar / turret-placement state lands
+/// with its owning subsystems.
+pub struct Building {
+    core: ObjectCore,
+    rchange: u32,
+    object_state: u32,
+    ablaze_ttl: i32,
+    shorted_ttl: i32,
+
+    /// `m_Pos` — XY in world units (MatrixObjectBuilding.hpp:179). The
+    /// `m_Core->m_Matrix` translation is derived from this in `RNeed`.
+    pub pos: glam::Vec2,
+    /// `m_Angle` — one of 0/1/2/3 for 0/90/180/270 deg
+    /// (MatrixObjectBuilding.cpp:120-137).
+    pub angle: i32,
+    /// `m_Side` — 0=neutral, 1=player, 2-8=AI factions
+    /// (MatrixObjectBuilding.hpp:182, MatrixSide.hpp).
+    pub side: i32,
+    pub kind: BuildingType,
+    pub state: BaseState,
+    /// `m_BaseFloor` (MatrixObjectBuilding.hpp:204). Controls the
+    /// opening / closing animation offset. Ctor default 0.2.
+    pub base_floor: f32,
+    /// `m_BuildZ` (MatrixObjectBuilding.hpp:205). Terrain floor under
+    /// the building; seeded from `BuildingInstance::build_z` at spawn.
+    pub build_z: f32,
+
+    /// Hit-point trio (MatrixObjectBuilding.hpp:228-230). Initialised by
+    /// `InitMaxHitpoint(hp)`; subsequent `Damage` calls reduce
+    /// `hit_point` by table entries and flip to BUILDING_DIP on death.
+    pub hit_point: f32,
+    pub hit_point_max: f32,
+    /// `m_MaxHitPointInversed` — 1 / hit_point_max, precomputed so the
+    /// ratio used for progress-bar fill doesn't divide every frame.
+    pub max_hit_point_inv: f32,
+
+    /// `m_defHitPoint` (MatrixObjectBuilding.hpp:176). The "default"
+    /// hit points loaded from robots.dat per-kind; used when
+    /// respawning a captured base with full health.
+    pub def_hit_point: i32,
+
+    /// `m_TurretsHave` (MatrixObjectBuilding.hpp:185).
+    pub turrets_have: i32,
+    /// `m_TurretsMax` (MatrixObjectBuilding.hpp:184). Each building
+    /// type carries 4 slots; the ctor sets this to the per-kind
+    /// `EBuildingTurrets` enum value.
+    pub turrets_max: i32,
+
+    /// `m_UnderAttackTime` (MatrixObjectBuilding.hpp:171). Game-time
+    /// ms past which the base is considered "quiet" (no recent
+    /// attacker) — controls the attacked-warning UI.
+    pub under_attack_time: i32,
+    /// `m_CaptureMeNextTime` (MatrixObjectBuilding.hpp:172). Throttle
+    /// on capture candidacy announcements.
+    pub capture_me_next_time: i32,
+
+    /// `m_ResourcePeriod` (MatrixObjectBuilding.hpp:165, union member).
+    /// Ms until the next resource payout; counted down in Takt.
+    pub resource_period: i32,
+
+    /// `m_ShadowType` / `m_ShadowSize`
+    /// (MatrixObjectBuilding.hpp:240-241). Raw integers from the CMAP
+    /// so the renderer can pick the shadow mode without a second
+    /// enum-lookup pass.
+    pub shadow_type: i32,
+    pub shadow_size: i32,
+
+    /// `m_Capturer` (MatrixObjectBuilding.hpp:223). Tracked by
+    /// ObjectId so a freed robot reads as `None` through the arena's
+    /// tombstone — matches C++ `m_Capturer->m_Object == NULL` check.
+    pub capturer: Option<ObjectId>,
+}
+
+impl Building {
+    /// Port of `CMatrixBuilding` ctor + `OnLoad` (MatrixObjectBuilding.cpp:
+    /// 24-69, :1007+). Minimal: seeds type, pos, angle, side, kind, state,
+    /// and the derived base_floor / build_z. Robot-spawn / capture /
+    /// progress-bar state stays at default (noop).
+    pub fn from_instance(inst: &BuildingInstance) -> Self {
+        let core = ObjectCore {
+            obj_type: ObjectType::Building,
+            geo_center: glam::Vec3::new(inst.x, inst.y, inst.build_z),
+            matrix: glam::Mat4::from_translation(glam::Vec3::new(
+                inst.x, inst.y, inst.build_z,
+            )),
+            ..Default::default()
+        };
+
+        Self {
+            core,
+            rchange: MR_ALL,                   // m_RChange(0xffffffff)
+            object_state: 0,
+            ablaze_ttl: 0,
+            shorted_ttl: 0,
+
+            pos: glam::Vec2::new(inst.x, inst.y),
+            angle: inst.angle as i32,
+            side: inst.side as i32,
+            kind: BuildingType::from_u8(inst.kind).unwrap_or(BuildingType::Base),
+            state: BaseState::Closing,         // MatrixObjectBuilding.cpp:43
+            base_floor: 0.2,                   // MatrixObjectBuilding.cpp:42
+            build_z: inst.build_z,
+
+            hit_point: 0.0,
+            hit_point_max: 0.0,
+            max_hit_point_inv: 0.0,
+
+            def_hit_point: 0,                  // MatrixObjectBuilding.cpp:56
+
+            turrets_have: 0,                   // MatrixObjectBuilding.cpp:54
+            turrets_max: 4,                    // default per-kind turret cap
+            under_attack_time: 0,
+            capture_me_next_time: 0,
+            resource_period: 0,                // MatrixObjectBuilding.cpp:53
+
+            shadow_type: 0,                    // SHADOW_OFF sentinel; CMAP sets
+            shadow_size: 128,                  // MatrixObjectBuilding.cpp:40
+            capturer: None,                    // MatrixObjectBuilding.cpp:48
+        }
+    }
+
+    /// Port of `InitMaxHitpoint(hp)` (MatrixObjectBuilding.hpp:273). Seeds
+    /// current + max + inverse together so later divisions don't need
+    /// a zero-check.
+    pub fn init_max_hitpoint(&mut self, hp: f32) {
+        self.hit_point = hp;
+        self.hit_point_max = hp;
+        self.max_hit_point_inv = if hp != 0.0 { 1.0 / hp } else { 0.0 };
+    }
+
+    /// Port of `Open()` (MatrixObjectBuilding.hpp:251-257). Ignored for
+    /// DIP/DIP_EXPLODED states; otherwise flips the state machine.
+    /// Sound effects deferred.
+    pub fn open(&mut self) {
+        if matches!(self.state, BaseState::Dip | BaseState::DipExploded) {
+            return;
+        }
+        self.state = BaseState::Opening;
+    }
+
+    /// Port of `Close()` (MatrixObjectBuilding.hpp:258-265). Also
+    /// guarded by the `BUILDING_SPAWNBOT` flag — can't close while a
+    /// robot is spawning.
+    pub fn close(&mut self) {
+        if matches!(self.state, BaseState::Dip | BaseState::DipExploded) {
+            return;
+        }
+        if self.object_state
+            & crate::matrix_game::map_static::OBJECT_STATE_BUILDING_SPAWNBOT != 0
+        {
+            return;
+        }
+        self.state = BaseState::Closing;
+    }
+}
+
+impl MapStatic for Building {
+    fn core(&self) -> &ObjectCore { &self.core }
+    fn core_mut(&mut self) -> &mut ObjectCore { &mut self.core }
+    fn rchange(&self) -> u32 { self.rchange }
+    fn rchange_set(&mut self, b: u32) { self.rchange |= b; }
+    fn rchange_clear(&mut self, b: u32) { self.rchange &= !b; }
+    fn object_state(&self) -> u32 { self.object_state }
+    fn object_state_set(&mut self, b: u32) { self.object_state |= b; }
+    fn object_state_clear(&mut self, b: u32) { self.object_state &= !b; }
+    fn ablaze_ttl(&self) -> i32 { self.ablaze_ttl }
+    fn set_ablaze_ttl(&mut self, t: i32) { self.ablaze_ttl = t; }
+    fn shorted_ttl(&self) -> i32 { self.shorted_ttl }
+    fn set_shorted_ttl(&mut self, t: i32) { self.shorted_ttl = t; }
+
+    /// Port of `CMatrixBuilding::RNeed` (MatrixObjectBuilding.cpp:112-344).
+    /// Rebuilds world matrix from `m_Pos` + `m_Angle`, rebuilds the
+    /// CVectorObjectGroup mesh from the per-kind CVO, rebuilds shadow
+    /// projections. Only the transform bit is trivially portable; the
+    /// rest needs the per-instance mesh loader which isn't per-instance
+    /// yet in the Rust port.
+    fn r_need(&mut self, need: u32) {
+        if need & self.rchange & crate::matrix_game::map_static::MR_MATRIX != 0 {
+            self.rchange &= !crate::matrix_game::map_static::MR_MATRIX;
+            // Angle is one of 0..3 (MatrixObjectBuilding.cpp:120-137).
+            // Each increment adds 90°. The `m_Core->m_Matrix` is
+            // translation × Rz(angle).
+            let ang = (self.angle & 3) as f32 * std::f32::consts::FRAC_PI_2;
+            let (s, c) = ang.sin_cos();
+            self.core.matrix = glam::Mat4::from_cols(
+                glam::Vec4::new(c, s, 0.0, 0.0),
+                glam::Vec4::new(-s, c, 0.0, 0.0),
+                glam::Vec4::new(0.0, 0.0, 1.0, 0.0),
+                glam::Vec4::new(self.pos.x, self.pos.y, self.build_z, 1.0),
+            );
+            self.core.inv_matrix = self.core.matrix.inverse();
+        }
+        // MR_GRAPH / MR_SHADOW_* / MR_MINIMAP — clear bits so the
+        // next r_need doesn't spin. Real rebuilds will land with the
+        // per-instance mesh / shadow manager.
+        self.rchange &= !(crate::matrix_game::map_static::MR_GRAPH
+            | crate::matrix_game::map_static::MR_SHADOW_PROJ_GEOM
+            | crate::matrix_game::map_static::MR_SHADOW_PROJ_TEX
+            | crate::matrix_game::map_static::MR_SHADOW_STENCIL
+            | crate::matrix_game::map_static::MR_MINIMAP
+        );
+        let _ = need;
+    }
+
+    /// Port of `CMatrixBuilding::Takt` (MatrixObjectBuilding.cpp:351-439).
+    /// Noop skeleton: BUILDING_NEW_INCOME → score-billboard (effects),
+    /// `m_GGraph->Takt` (per-instance mesh anim), `m_capture` overlay
+    /// creation (effects) — every branch needs subsystems not yet
+    /// ported. Structure preserved so the body lands in-place later.
+    fn takt(&mut self, _cms: i32, _rng: &mut Rnd, _objs: &mut Objects) {}
+
+    /// Port of `CMatrixBuilding::LogicTakt` (MatrixObjectBuilding.cpp:495-899).
+    /// State-machine driver for BASE_OPENING → OPENED (≈2.5s), OPENED
+    /// → CLOSED, DIP explosion cycle, capture progress, resource
+    /// payouts, turret spawning, ... all require effects / sound /
+    /// sides / per-side resources. Skeleton here — the real body
+    /// arrives with those subsystems.
+    fn logic_takt(&mut self, _cms: i32, _rng: &mut Rnd, _objs: &mut Objects) {}
+
+    fn side(&self) -> i32 { self.side }
+    fn need_repair(&self) -> bool { self.hit_point < self.hit_point_max }
+}
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
@@ -696,3 +989,82 @@ fn create_pipeline(
 }
 
 const SHADER: &str = include_str!("../../shaders/object_building.wgsl");
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::matrix_game::common::{TRACE_BUILDING, TRACE_ROBOT};
+    use crate::matrix_game::map_static::{MapStatic, Objects, OBJECT_STATE_BUILDING_SPAWNBOT};
+
+    fn inst(kind: u8, side: u8) -> BuildingInstance {
+        BuildingInstance {
+            x: 100.0, y: 100.0, build_z: 0.0,
+            angle: 0, side, kind,
+            shadow_kind: 0, shadow_size: 128,
+        }
+    }
+
+    #[test]
+    fn from_instance_carries_pos_side_kind_and_initial_state() {
+        let b = Building::from_instance(&inst(0, 1));
+        assert_eq!(b.pos, glam::Vec2::new(100.0, 100.0));
+        assert_eq!(b.side, 1);
+        assert_eq!(b.kind, BuildingType::Base);
+        assert_eq!(b.state, BaseState::Closing);
+        assert_eq!(b.base_floor, 0.2);
+        assert_eq!(b.shadow_size, 128);
+    }
+
+    #[test]
+    fn init_max_hitpoint_seeds_all_three() {
+        let mut b = Building::from_instance(&inst(0, 1));
+        b.init_max_hitpoint(400.0);
+        assert_eq!(b.hit_point, 400.0);
+        assert_eq!(b.hit_point_max, 400.0);
+        assert!((b.max_hit_point_inv - 0.0025).abs() < 1e-9);
+        // Zero HP → inverse is 0 instead of NaN/inf.
+        b.init_max_hitpoint(0.0);
+        assert_eq!(b.max_hit_point_inv, 0.0);
+    }
+
+    #[test]
+    fn open_and_close_respect_dip_and_spawnbot_guards() {
+        // Open/Close ignored in DIP / DIP_EXPLODED states.
+        let mut b = Building::from_instance(&inst(0, 1));
+        b.state = BaseState::Dip;
+        b.open();
+        assert_eq!(b.state, BaseState::Dip);
+        b.close();
+        assert_eq!(b.state, BaseState::Dip);
+
+        // Close blocked while a robot is spawning
+        // (MatrixObjectBuilding.hpp:261).
+        b.state = BaseState::Opened;
+        b.object_state_set(OBJECT_STATE_BUILDING_SPAWNBOT);
+        b.close();
+        assert_eq!(b.state, BaseState::Opened, "close blocked by SPAWNBOT");
+
+        b.object_state_clear(OBJECT_STATE_BUILDING_SPAWNBOT);
+        b.close();
+        assert_eq!(b.state, BaseState::Closing);
+        b.open();
+        assert_eq!(b.state, BaseState::Opening);
+    }
+
+    #[test]
+    fn building_fits_trace_building_mask_and_shows_up_in_find_objects() {
+        // The whole point of pulling buildings into the arena:
+        // FindObjects(TRACE_BUILDING) starts returning them.
+        let mut objs = Objects::new();
+        let b = Building::from_instance(&inst(0, 1));
+        let id = objs.spawn(Box::new(b));
+        assert!(objs.any_object_in_radius(
+            glam::Vec2::new(100.0, 100.0), 50.0, 1.0, TRACE_BUILDING, None,
+        ));
+        // And doesn't match unrelated masks.
+        assert!(!objs.any_object_in_radius(
+            glam::Vec2::new(100.0, 100.0), 50.0, 1.0, TRACE_ROBOT, None,
+        ));
+        let _ = id;
+    }
+}

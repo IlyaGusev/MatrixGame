@@ -117,6 +117,8 @@ impl ApplicationHandler for App {
 
             let mut game = World::new();
             game.load_config(&matrix_data);
+            let building_ids = game.spawn_buildings(&map);
+            log::info!("world: spawned {} buildings", building_ids.len());
             let (_ids, stats) = game.spawn_map_objects(&map, &stor);
             log::info!(
                 "world: spawned {} map objects (static={}, burn={}, break={}, anim={}, sens={}, spawner={}, terron={}, portret={}, special={})",

@@ -12,6 +12,7 @@ use crate::matrix_game::config::ObjectDamages;
 use crate::matrix_game::map::GameMap;
 use crate::matrix_game::map_static::{ObjectId, Objects};
 use crate::matrix_game::object::MapObject;
+use crate::matrix_game::object_building::Building;
 use crate::matrix_game::rnd::Rnd;
 use crate::matrix_lib::base::storage::Storage;
 
@@ -156,6 +157,28 @@ impl World {
             ids.push(id);
         }
         (ids, stats)
+    }
+
+    /// Populate the arena with one [`Building`] per starting base / turret
+    /// placed on the map. Ports the `new CMatrixBuilding()` + `OnLoad()`
+    /// path that `CMatrixMap::LoadBuildings` runs during init.
+    ///
+    /// Buildings opt into the logic-temp list immediately so their
+    /// state machine (currently a stub) ticks every LOGIC_TAKT_PERIOD.
+    /// That matches C++ `CMatrixBuilding::OnLoad` which calls `AddLT()`
+    /// at MatrixObjectBuilding.cpp:1088.
+    ///
+    /// Returns the spawned IDs so callers can look them up by side /
+    /// kind without a subsequent arena scan.
+    pub fn spawn_buildings(&mut self, map: &GameMap) -> Vec<ObjectId> {
+        let mut ids = Vec::with_capacity(map.buildings.len());
+        for inst in &map.buildings {
+            let b = Building::from_instance(inst);
+            let id = self.objects.spawn(Box::new(b));
+            self.objects.add_lt(id);
+            ids.push(id);
+        }
+        ids
     }
 }
 

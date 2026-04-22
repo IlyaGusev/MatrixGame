@@ -70,6 +70,17 @@ pub const OBJECT_STATE_DIP:                 u32 = 1 << 6;
 #[allow(dead_code)] pub const OBJECT_STATE_TERRON_EXPL1:      u32 = 1 << 15;
 #[allow(dead_code)] pub const OBJECT_STATE_TERRON_EXPL2:      u32 = 1 << 16;
 
+// Building-only (overlays bits 10..=12 from MatrixMapStatic.hpp:88-90).
+/// `BUILDING_NEW_INCOME` — a resource tick just fired; Takt emits a
+/// billboard-score effect on the next frame (MatrixObjectBuilding.cpp:355).
+#[allow(dead_code)] pub const OBJECT_STATE_BUILDING_NEW_INCOME:        u32 = 1 << 10;
+/// `BUILDING_SPAWNBOT` — base door is open and a robot is being
+/// delivered; prevents `Close()` mid-spawn (MatrixObjectBuilding.hpp:269-270).
+#[allow(dead_code)] pub const OBJECT_STATE_BUILDING_SPAWNBOT:          u32 = 1 << 11;
+/// `BUILDING_CAPTURE_IN_PROGRESS` — a robot of another side is
+/// capturing the base (MatrixObjectBuilding.hpp:191).
+#[allow(dead_code)] pub const OBJECT_STATE_BUILDING_CAPTURE_IN_PROGRESS: u32 = 1 << 12;
+
 /// `EObjectType` (MatrixMapStatic.hpp:29-39). Discriminants match the C++.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
