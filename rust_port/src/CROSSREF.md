@@ -1,0 +1,115 @@
+# Rust ↔ Original C++ File Cross-Reference
+
+Mapping between Rust port modules and original Space Rangers 2 files.
+When adding a new Rust file, place it where this table predicts — if
+there is no row yet, extend the table in the same PR.
+
+Layout mirrors the original tree:
+
+    MatrixLib/Base/      <-> matrix_lib/base/
+    MatrixLib/3G/        <-> matrix_lib/three_g/
+    MatrixGame/src/      <-> matrix_game/
+    MatrixGame/src/Effects/    <-> matrix_game/effects/
+    MatrixGame/src/Interface/  <-> matrix_game/interface/
+    MatrixGame/src/Logic/      <-> matrix_game/logic/
+
+`gfx/` and `platform/` have no C++ counterpart — they hold wgpu and
+WASM/native glue that replaces the original Windows/DirectX platform
+layer.
+
+## matrix_lib/base/ (MatrixLib/Base/)
+
+| Rust file                         | Original                        |
+|-----------------------------------|---------------------------------|
+| matrix_lib/base/bitmap.rs         | MatrixLib/Bitmap/src/CBitmap.cpp|
+| matrix_lib/base/blockpar.rs       | MatrixLib/Base/src/CBlockPar.cpp|
+| matrix_lib/base/pack.rs           | MatrixLib/Base/src/Pack.cpp     |
+| matrix_lib/base/storage.rs        | MatrixLib/Base/src/CStorage.cpp |
+
+Not yet ported: CBuf, CDWORDMap, CException, CFile, CHeap, CList,
+CMain, CRC32, CReminder, CStr, CWStr, Mem, Registry, Tracer.
+
+## matrix_lib/three_g/ (MatrixLib/3G/)
+
+| Rust file                               | Original                           |
+|-----------------------------------------|------------------------------------|
+| matrix_lib/three_g/texture.rs           | MatrixLib/3G/src/Texture.cpp       |
+| matrix_lib/three_g/vector_object.rs     | MatrixLib/3G/src/VectorObject.cpp  |
+
+Not yet ported: 3g, BigIB, BigVB, Cache, CBillboard, DeviceState,
+Form, Helper, Math3D, ShadowProj, ShadowStencil.
+
+## matrix_game/ (MatrixGame/src/)
+
+| Rust file                     | Original                          |
+|-------------------------------|-----------------------------------|
+| matrix_game/buildings.rs      | MatrixObjectBuilding.cpp          |
+| matrix_game/camera.rs         | MatrixCamera.cpp                  |
+| matrix_game/common.rs         | Common.hpp                        |
+| matrix_game/map.rs            | MatrixMap.cpp                     |
+| matrix_game/map_prepare.rs    | MatrixMapPrepare.cpp              |
+| matrix_game/minimap.rs        | MatrixMinimap.cpp                 |
+| matrix_game/objects.rs        | MatrixObject.cpp + MatrixMapStatic.cpp (partial) |
+| matrix_game/particles.rs      | (stub — will split across Effects/) |
+| matrix_game/render_pipeline.rs| MatrixRenderPipeline.cpp          |
+| matrix_game/sky.rs            | DrawSky in MatrixMap.cpp + skybox parts |
+| matrix_game/ter_surface.rs    | MatrixTerSurface.cpp              |
+| matrix_game/terrain.rs        | MatrixMapGroup.cpp (BuildBottom + draw) — will split in Stage 2 |
+| matrix_game/units.rs          | (stub — will become MatrixRobot.cpp etc.) |
+| matrix_game/water.rs          | MatrixWater.cpp + BuildWater in MatrixMapGroup.cpp + WaterAlpha_t3 in MatrixRenderPipeline.cpp — will split in Stage 2 |
+| matrix_game/world.rs          | (no direct equivalent — top-level game state) |
+
+Not yet ported: MatrixConfig, MatrixCursor, MatrixDebugInfo,
+MatrixFlyer, MatrixInstantDraw, MatrixLoadProgress, MatrixLogic,
+MatrixMapTexture, MatrixMapTrace, MatrixMultiSelection,
+MatrixObjectCannon, MatrixObjectRobot, MatrixProgressBar, MatrixRobot,
+MatrixSampleStateManager, MatrixShadowManager, MatrixSide,
+MatrixSkinManager, MatrixSoundManager, MatrixTransition,
+MatrixVisiCalc, DevConsole, StringConstants.
+
+## matrix_game/effects/ (MatrixGame/src/Effects/)
+
+| Rust file                               | Original                        |
+|-----------------------------------------|---------------------------------|
+| matrix_game/effects/point_light.rs      | MatrixEffectPointLight.cpp      |
+
+Not yet ported: MatrixEffect (base), BigBoom, Billboard, Dust,
+ElevatorField, Explosion, FirePlasma, Flame, Konus, LandscapeSpot,
+Lightening, MoveTo, MovingObject, Path, Repair, Selection, Shleif,
+SmokeAndFire, Weapon, Zahvat.
+
+## matrix_game/interface/ (MatrixGame/src/Interface/)
+
+None ported yet. Target files when work starts:
+CAnimation → animation.rs, CConstructor → constructor.rs, CCounter →
+counter.rs, CHistory → history.rs, CIFaceButton → iface_button.rs,
+CIFaceElement → iface_element.rs, CIFaceImage → iface_image.rs,
+CIFaceMenu → iface_menu.rs, CIFaceStatic → iface_static.rs,
+CInterface → interface.rs, MatrixHint → hint.rs.
+
+## matrix_game/logic/ (MatrixGame/src/Logic/)
+
+| Rust file                               | Original                        |
+|-----------------------------------------|---------------------------------|
+| matrix_game/logic/ai_group.rs           | MatrixAIGroup.cpp (stub)        |
+
+Not yet ported: MatrixEnvironment, MatrixLogicSlot, MatrixRoadNetwork,
+MatrixRule, MatrixState, MatrixTactics.
+
+## Top-level files
+
+| Rust file   | Original                     |
+|-------------|------------------------------|
+| app.rs      | MatrixFormGame.cpp + MatrixGame.cpp (entry glue) — will move to matrix_game/form_game.rs in Stage 2 |
+| lib.rs      | WASM entry (no C++ analogue) |
+| main.rs     | native entry (no C++ analogue) |
+
+## gfx/ and platform/ (no C++ counterpart)
+
+| Rust file        | Purpose                                     |
+|------------------|---------------------------------------------|
+| gfx/bundle.rs    | WASM asset bundle (packaged textures/maps)  |
+| gfx/context.rs   | wgpu device + surface setup                 |
+| gfx/loader.rs    | Platform-split file loading                 |
+| platform/native.rs | Native-specific time / fs                 |
+| platform/web.rs  | WASM-specific time / fs                     |

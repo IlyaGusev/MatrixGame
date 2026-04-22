@@ -1,7 +1,7 @@
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
-use crate::game::map::{GameMap, GLOBAL_SCALE};
+use crate::matrix_game::map::{GameMap, GLOBAL_SCALE};
 
 const WATER_LEVEL: f32 = -2.0;
 const POINTLIGHT_ALTITUDE: f32 = 0.7;
@@ -497,8 +497,8 @@ struct VOut {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::game::common::CELLFLAG_LAND;
-    use crate::game::map::{CompilePoint, MapUnit, ObjectInstance, PointNormal};
+    use crate::matrix_game::common::CELLFLAG_LAND;
+    use crate::matrix_game::map::{CompilePoint, MapUnit, ObjectInstance, PointNormal};
 
     fn test_map() -> GameMap {
         GameMap {
@@ -581,7 +581,7 @@ mod tests {
             group_w: 1,
             group_h: 1,
             min_z: 0.0,
-            group_bounds: vec![crate::game::map::GroupBounds {
+            group_bounds: vec![crate::matrix_game::map::GroupBounds {
                 min_z: 0.0,
                 max_z: 0.0,
             }],

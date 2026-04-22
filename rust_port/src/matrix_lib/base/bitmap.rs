@@ -1,6 +1,6 @@
 //! Bitmap operations — ports CBitmap methods from MatrixLib/Bitmap/src/CBitmap.cpp.
 
-use crate::game::common::TEX_BOTTOM_SIZE;
+use crate::matrix_game::common::TEX_BOTTOM_SIZE;
 
 /// Copy a 64x64 tile onto the atlas at (dx, dy).
 /// Ports CBitmap::Copy.

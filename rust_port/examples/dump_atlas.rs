@@ -1,7 +1,7 @@
 //! Dump texture union atlases as PNG files for visual inspection.
-use matrixgame_rs::assets::pkg_reader::PkgArchive;
-use matrixgame_rs::assets::storage::Storage;
-use matrixgame_rs::game::map::GameMap;
+use matrixgame_rs::matrix_lib::base::pack::PkgArchive;
+use matrixgame_rs::matrix_lib::base::storage::Storage;
+use matrixgame_rs::matrix_game::map::GameMap;
 use std::collections::HashMap;
 
 const TEX_BOTTOM_SIZE: usize = 64;

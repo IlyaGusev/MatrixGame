@@ -1,6 +1,6 @@
 //! Extract all textures needed by the ATOLL map for browser serving.
-use matrixgame_rs::assets::pkg_reader::PkgArchive;
-use matrixgame_rs::assets::storage::Storage;
+use matrixgame_rs::matrix_lib::base::pack::PkgArchive;
+use matrixgame_rs::matrix_lib::base::storage::Storage;
 
 fn main() {
     let pkg_data = std::fs::read("../Data/robots.pkg").unwrap();

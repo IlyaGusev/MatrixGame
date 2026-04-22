@@ -13,10 +13,10 @@ use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3, Vec4};
 use wgpu::util::DeviceExt;
 
-use crate::assets::storage::Storage;
-use crate::game::common::unpack_rgb;
-use crate::renderer::camera::Camera;
-use crate::renderer::texture::{
+use crate::matrix_lib::base::storage::Storage;
+use crate::matrix_game::common::unpack_rgb;
+use crate::matrix_game::camera::Camera;
+use crate::matrix_lib::three_g::texture::{
     create_texture_from_rgba, create_texture_from_rgba_mipped, decode_texture_bytes,
 };
 

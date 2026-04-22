@@ -1,4 +1,4 @@
-use matrixgame_rs::assets::pkg_reader::PkgArchive;
+use matrixgame_rs::matrix_lib::base::pack::PkgArchive;
 
 #[test]
 fn list_pkg_contents() {

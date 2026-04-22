@@ -1,4 +1,4 @@
-use matrixgame_rs::assets::bundle::AssetBundle;
+use matrixgame_rs::gfx::bundle::AssetBundle;
 
 fn main() {
     let data = std::fs::read("assets/atoll.bundle").unwrap();

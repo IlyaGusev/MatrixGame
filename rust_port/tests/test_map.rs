@@ -1,5 +1,5 @@
-use matrixgame_rs::assets::pkg_reader::PkgArchive;
-use matrixgame_rs::game::map::GameMap;
+use matrixgame_rs::matrix_lib::base::pack::PkgArchive;
+use matrixgame_rs::matrix_game::map::GameMap;
 
 #[test]
 fn load_map_from_pkg() {

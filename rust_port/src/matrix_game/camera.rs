@@ -20,7 +20,7 @@
 
 use glam::{Mat4, Vec2, Vec3};
 
-use crate::assets::storage::Storage;
+use crate::matrix_lib::base::storage::Storage;
 
 /// MatrixCamera.hpp defines `CAM_HFOV = 60°`, but the original feeds that
 /// value to `D3DXMatrixPerspectiveFovLH`, which takes a vertical FOV.

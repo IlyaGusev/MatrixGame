@@ -16,7 +16,7 @@
 
 use anyhow::{Context, Result};
 
-use crate::assets::storage::Storage;
+use crate::matrix_lib::base::storage::Storage;
 
 pub struct VoMesh {
     pub vertices: Vec<VoVertex>,
@@ -181,7 +181,7 @@ pub struct CvoGroup {
 /// `cvo_path` is the archive path of the .cvo so we can derive the directory
 /// for asset siblings. `bytes` is the raw file contents.
 pub fn parse_cvo(cvo_path: &str, bytes: &[u8]) -> CvoGroup {
-    let bp = crate::assets::blockpar_text::BlockPar::parse_bytes(bytes);
+    let bp = crate::matrix_lib::base::blockpar::BlockPar::parse_bytes(bytes);
     let dir = cvo_path
         .rsplit_once('/')
         .map(|(d, _)| format!("{d}/"))
@@ -189,7 +189,7 @@ pub fn parse_cvo(cvo_path: &str, bytes: &[u8]) -> CvoGroup {
 
     let mut units = Vec::new();
     for entry in bp.entries() {
-        let crate::assets::blockpar_text::Entry::Block { name, block, .. } = entry else {
+        let crate::matrix_lib::base::blockpar::Entry::Block { name, block, .. } = entry else {
             continue;
         };
 
@@ -437,7 +437,7 @@ pub fn resolve_alpha_test_with_txt(
     let Some(bytes) = read_file(&txt_path) else {
         return suffix_flag;
     };
-    let bp = crate::assets::blockpar_text::BlockPar::parse_bytes(&bytes);
+    let bp = crate::matrix_lib::base::blockpar::BlockPar::parse_bytes(&bytes);
     // The C++ branch gates on `!tstr.IsEmpty()` (Texture.cpp:132), so both an
     // absent key and an empty value leave the suffix flag alone. Only a
     // non-empty value overrides: "0" clears, anything else sets.

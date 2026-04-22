@@ -1,6 +1,6 @@
 //! Decorative objects — palms, rocks, trees, grass, etc.
 //!
-//! Loads .vo meshes (game/vo_loader.rs) for each object type_id referenced by
+//! Loads .vo meshes (matrix_lib/three_g/vector_object.rs) for each object type_id referenced by
 //! the map, then draws all instances of each type as one instanced draw call.
 //! Alpha-tested sampling handles foliage texture cutouts without z-ordering.
 
@@ -10,13 +10,13 @@ use bytemuck::{Pod, Zeroable};
 use glam::{Mat3, Vec3, Vec4};
 use wgpu::util::DeviceExt;
 
-use crate::assets::storage::Storage;
-use crate::effects::point_light::PointLightSystem;
-use crate::game::common::{unpack_rgb, FOG_END, FOG_START};
-use crate::game::map::{GameMap, ObjectInstance, ObjectShadow};
-use crate::game::vo_loader::{self, ShadowKind, VoAnimation, VoFrame, VoSurfaceMesh};
-use crate::renderer::camera::Camera;
-use crate::renderer::texture::{
+use crate::matrix_lib::base::storage::Storage;
+use crate::matrix_game::effects::point_light::PointLightSystem;
+use crate::matrix_game::common::{unpack_rgb, FOG_END, FOG_START};
+use crate::matrix_game::map::{GameMap, ObjectInstance, ObjectShadow};
+use crate::matrix_lib::three_g::vector_object::{self, ShadowKind, VoAnimation, VoFrame, VoSurfaceMesh};
+use crate::matrix_game::camera::Camera;
+use crate::matrix_lib::three_g::texture::{
     create_solid_texture, create_texture_from_rgba, decode_texture_bytes,
 };
 
@@ -409,7 +409,7 @@ impl ObjectsRenderer {
             } else {
                 continue;
             };
-            let Some(paths) = vo_loader::resolve_paths(&id_str) else {
+            let Some(paths) = vector_object::resolve_paths(&id_str) else {
                 failed_types += 1;
                 continue;
             };
@@ -418,7 +418,7 @@ impl ObjectsRenderer {
                 failed_types += 1;
                 continue;
             };
-            let mesh = match vo_loader::parse_vo(&vo_bytes) {
+            let mesh = match vector_object::parse_vo(&vo_bytes) {
                 Ok(m) => m,
                 Err(e) => {
                     log::warn!("objects: parse VO {} failed: {}", paths.vo_path, e);
@@ -473,13 +473,13 @@ impl ObjectsRenderer {
             for surface in &per_surface {
                 let surface_material = if use_vo_surface_materials {
                     surface.texture_ref.as_deref().map(|spec| {
-                        vo_loader::parse_material_spec_with_prefix(spec, object_dir.as_deref())
+                        vector_object::parse_material_spec_with_prefix(spec, object_dir.as_deref())
                     })
                 } else {
                     None
                 };
                 let material = if use_vo_surface_materials {
-                    vo_loader::merge_materials(&paths.material, surface_material.as_ref())
+                    vector_object::merge_materials(&paths.material, surface_material.as_ref())
                 } else {
                     paths.material.clone()
                 };
@@ -532,7 +532,7 @@ impl ObjectsRenderer {
                 // `MaterialSpec`, then let the sibling `.txt`'s `AlphaTest`
                 // key override (Texture.cpp:113-136).
                 let alpha_test = match material.diffuse.as_deref() {
-                    Some(path) => vo_loader::resolve_alpha_test_with_txt(
+                    Some(path) => vector_object::resolve_alpha_test_with_txt(
                         path,
                         material.alpha_test,
                         read_texture,

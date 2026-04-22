@@ -7,10 +7,10 @@ use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
 use super::terrain::{DrawBatch, Vertex};
-use crate::assets::storage::Storage;
-use crate::game::common::{rd_f32, rd_i32, rd_u16, rd_u32};
-use crate::game::map::GameMap;
-use crate::renderer::texture::{
+use crate::matrix_lib::base::storage::Storage;
+use crate::matrix_game::common::{rd_f32, rd_i32, rd_u16, rd_u32};
+use crate::matrix_game::map::GameMap;
+use crate::matrix_lib::three_g::texture::{
     create_solid_texture, create_texture_from_rgba_mipped, decode_texture_bytes,
 };
 
@@ -119,7 +119,7 @@ pub fn build_surface_overlays(
             gloss: vec![],
         };
     }
-    let sources: Vec<(&crate::assets::storage::DataBuf, bool)> = srfm
+    let sources: Vec<(&crate::matrix_lib::base::storage::DataBuf, bool)> = srfm
         .map(|b| (b, true))
         .into_iter()
         .chain(srf.map(|b| (b, false)))

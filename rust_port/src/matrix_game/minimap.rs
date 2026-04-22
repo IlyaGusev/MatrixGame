@@ -23,11 +23,11 @@
 
 use wgpu::util::DeviceExt;
 
-use crate::assets::storage::Storage;
-use crate::game::map::{GameMap, GLOBAL_SCALE};
-use crate::renderer::camera::Camera;
-use crate::renderer::terrain::TerrainRenderer;
-use crate::renderer::texture::{create_texture_from_rgba, decode_texture_bytes};
+use crate::matrix_lib::base::storage::Storage;
+use crate::matrix_game::map::{GameMap, GLOBAL_SCALE};
+use crate::matrix_game::camera::Camera;
+use crate::matrix_game::terrain::TerrainRenderer;
+use crate::matrix_lib::three_g::texture::{create_texture_from_rgba, decode_texture_bytes};
 
 /// Matches `MINIMAP_SIZE` in MatrixMinimap.hpp:14.
 const TEX_SIZE: u32 = 512;

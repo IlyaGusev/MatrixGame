@@ -5,11 +5,11 @@
 //! Bare names resolve to `MATRIX/MAP/<NAME>.CMAP`. The output lands at
 //! `assets/<name>.bundle`, matching the `?bundle=<url>` query the WASM loader
 //! accepts.
-use matrixgame_rs::assets::bundle::AssetBundle;
-use matrixgame_rs::assets::pkg_reader::PkgArchive;
-use matrixgame_rs::assets::storage::Storage;
-use matrixgame_rs::game::map::GameMap;
-use matrixgame_rs::game::vo_loader;
+use matrixgame_rs::gfx::bundle::AssetBundle;
+use matrixgame_rs::matrix_lib::base::pack::PkgArchive;
+use matrixgame_rs::matrix_lib::base::storage::Storage;
+use matrixgame_rs::matrix_game::map::GameMap;
+use matrixgame_rs::matrix_lib::three_g::vector_object;
 
 fn main() {
     let pkg_data = std::fs::read("../Data/robots.pkg").unwrap();
@@ -258,7 +258,7 @@ fn main() {
             continue;
         }
         let id_str = strings.get_as_wstr(*type_id as usize);
-        let Some(paths) = vo_loader::resolve_paths(&id_str) else {
+        let Some(paths) = vector_object::resolve_paths(&id_str) else {
             continue;
         };
         let vo_key = paths.vo_path.to_uppercase();
@@ -294,7 +294,7 @@ fn main() {
         // `build_per_surface_frame_ranges` → `parse_material_spec_with_prefix`,
         // so the bundle must include their textures too. Without this, VOs
         // with multi-material surfaces show untextured / fallback colors.
-        let Ok(vo) = vo_loader::parse_vo(&vo_bytes) else {
+        let Ok(vo) = vector_object::parse_vo(&vo_bytes) else {
             continue;
         };
         let object_dir = paths
@@ -305,7 +305,7 @@ fn main() {
             let Some(spec) = surface.texture_ref.as_deref() else {
                 continue;
             };
-            let m = vo_loader::parse_material_spec_with_prefix(spec, object_dir.as_deref());
+            let m = vector_object::parse_material_spec_with_prefix(spec, object_dir.as_deref());
             for t in [
                 m.diffuse.as_ref(),
                 m.gloss.as_ref(),
@@ -361,7 +361,7 @@ fn main() {
                 continue;
             }
         };
-        let group = vo_loader::parse_cvo(&cvo_path, &cvo_bytes);
+        let group = vector_object::parse_cvo(&cvo_path, &cvo_bytes);
         for unit in &group.units {
             let vo_key = unit.model_path.to_uppercase();
             let vo_bytes = match pkg.read_file(&vo_key) {
@@ -392,14 +392,14 @@ fn main() {
             }
             // VO's own embedded surface-texture fallback — the renderer uses
             // this when a CVO unit omits `Texture=`.
-            if let Ok(vo) = vo_loader::parse_vo(&vo_bytes) {
+            if let Ok(vo) = vector_object::parse_vo(&vo_bytes) {
                 let dir = unit
                     .model_path
                     .rsplit_once('/')
                     .map(|(d, _)| format!("{d}/"));
                 for s in &vo.surfaces {
                     if let Some(spec) = s.texture_ref.as_deref() {
-                        let m = vo_loader::parse_material_spec_with_prefix(spec, dir.as_deref());
+                        let m = vector_object::parse_material_spec_with_prefix(spec, dir.as_deref());
                         for t in [
                             m.diffuse.as_ref(),
                             m.gloss.as_ref(),
@@ -424,7 +424,7 @@ fn main() {
     );
 
     // Pack sibling `.txt` files so the alpha-test override path in
-    // `vo_loader::resolve_alpha_test_with_txt` (which ports
+    // `vector_object::resolve_alpha_test_with_txt` (which ports
     // Texture.cpp:113-136) works in the WASM build. There are ~119 of these
     // in robots.pkg, ~25 bytes each — trivial overhead. We add every .txt we
     // can find under the keys the loader will actually request (mixed-case

@@ -6,11 +6,11 @@
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
-use crate::assets::storage::Storage;
-use crate::game::map::{GameMap, InshorePreSpawn, GLOBAL_SCALE};
-use crate::renderer::camera::Camera;
+use crate::matrix_lib::base::storage::Storage;
+use crate::matrix_game::map::{GameMap, InshorePreSpawn, GLOBAL_SCALE};
+use crate::matrix_game::camera::Camera;
 
-use crate::game::common::{unpack_rgb, FOG_END, FOG_START};
+use crate::matrix_game::common::{unpack_rgb, FOG_END, FOG_START};
 
 /// Ports INSHORE_SPEED (MatrixWater.hpp:17) — animation `t` advances by
 /// `INSHORE_SPEED * step_ms * wave.speed` each tick.
@@ -388,8 +388,8 @@ impl Water {
 
         let load_required_tex = |path: &str, label: &str| -> Option<wgpu::TextureView> {
             let view = read_texture(path)
-                .and_then(|d| super::texture::decode_texture_bytes(&d))
-                .map(|rgba| super::texture::create_texture_from_rgba(device, queue, &rgba));
+                .and_then(|d| crate::matrix_lib::three_g::texture::decode_texture_bytes(&d))
+                .map(|rgba| crate::matrix_lib::three_g::texture::create_texture_from_rgba(device, queue, &rgba));
             if view.is_none() {
                 log::warn!(
                     "water: failed to load {} texture '{}'; subsystem disabled",
@@ -1197,7 +1197,7 @@ fn sample_height_for_water(map: &GameMap, wx: f32, wy: f32) -> f32 {
 
     if ix >= 0 && iy >= 0 && ix < map.size_x as i32 && iy < map.size_y as i32 {
         let unit = map.unit(ix as usize, iy as usize);
-        if unit.flags & crate::game::common::CELLFLAG_BRIDGE != 0 {
+        if unit.flags & crate::matrix_game::common::CELLFLAG_BRIDGE != 0 {
             let kx = scaledx - ix as f32;
             let ky = scaledy - iy as f32;
 
@@ -1462,7 +1462,7 @@ fn check_candidate(
     pos: &[glam::Vec2; 4],
     p0: glam::Vec2,
     p1: glam::Vec2,
-    bounds: crate::game::map::GroupBounds,
+    bounds: crate::matrix_game::map::GroupBounds,
     planes: &[[f32; 4]; 4],
     cx: f32,
     cy: f32,
@@ -1774,14 +1774,14 @@ fn build_inshore_system(
         );
         return Err(());
     };
-    let Some(rgba) = super::texture::decode_texture_bytes(&tex_bytes) else {
+    let Some(rgba) = crate::matrix_lib::three_g::texture::decode_texture_bytes(&tex_bytes) else {
         log::warn!(
             "water: inshore texture '{}' failed to decode; subsystem disabled",
             tex_path
         );
         return Err(());
     };
-    let tex_view = super::texture::create_texture_from_rgba(device, queue, &rgba);
+    let tex_view = crate::matrix_lib::three_g::texture::create_texture_from_rgba(device, queue, &rgba);
 
     let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
         label: Some("Inshore Sampler"),

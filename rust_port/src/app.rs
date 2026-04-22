@@ -8,13 +8,13 @@ use winit::{
     window::{Window, WindowAttributes, WindowId},
 };
 
-use crate::effects::point_light::PointLightSystem;
-use crate::game::map::GameMap;
-use crate::game::world::World;
-use crate::renderer::camera::Camera;
-use crate::renderer::context::GfxContext;
-use crate::renderer::minimap::Minimap;
-use crate::renderer::terrain::TerrainRenderer;
+use crate::matrix_game::effects::point_light::PointLightSystem;
+use crate::matrix_game::map::GameMap;
+use crate::matrix_game::world::World;
+use crate::matrix_game::camera::Camera;
+use crate::gfx::context::GfxContext;
+use crate::matrix_game::minimap::Minimap;
+use crate::matrix_game::terrain::TerrainRenderer;
 struct AppState {
     window: Arc<Window>,
     gfx: GfxContext,
@@ -262,7 +262,7 @@ impl ApplicationHandler for App {
                     let [x, y] = state.cursor;
                     state.camera.on_rotate_button(pressed, x, y);
                 } else if button == MouseButton::Left {
-                    use crate::renderer::minimap::MinimapClick;
+                    use crate::matrix_game::minimap::MinimapClick;
                     let [cx, cy] = state.cursor;
                     match btn_state {
                         ElementState::Pressed => {
@@ -331,7 +331,7 @@ impl ApplicationHandler for App {
 
             // ── Keyboard (MatrixFormGame.cpp:247-282) ──
             WindowEvent::KeyboardInput { event, .. } => {
-                use crate::renderer::camera::KeyAction;
+                use crate::matrix_game::camera::KeyAction;
                 use winit::keyboard::{KeyCode, PhysicalKey};
                 let pressed = event.state == winit::event::ElementState::Pressed;
                 let action =
@@ -467,12 +467,12 @@ impl ApplicationHandler for App {
 #[cfg(not(target_arch = "wasm32"))]
 fn load_map() -> (
     GameMap,
-    crate::assets::storage::Storage,
-    crate::assets::storage::Storage,
-    crate::assets::pkg_reader::PkgArchive,
+    crate::matrix_lib::base::storage::Storage,
+    crate::matrix_lib::base::storage::Storage,
+    crate::matrix_lib::base::pack::PkgArchive,
 ) {
-    use crate::assets::pkg_reader::PkgArchive;
-    use crate::assets::storage::Storage;
+    use crate::matrix_lib::base::pack::PkgArchive;
+    use crate::matrix_lib::base::storage::Storage;
 
     let candidates = [
         "../Data/robots.pkg",
@@ -566,16 +566,16 @@ fn resolve_map_name(requested: &str) -> String {
 #[cfg(target_arch = "wasm32")]
 async fn load_map_async() -> (
     GameMap,
-    crate::assets::storage::Storage,
-    crate::assets::storage::Storage,
-    crate::assets::bundle::AssetBundle,
+    crate::matrix_lib::base::storage::Storage,
+    crate::matrix_lib::base::storage::Storage,
+    crate::gfx::bundle::AssetBundle,
 ) {
-    use crate::assets::bundle::AssetBundle;
-    use crate::assets::storage::Storage;
+    use crate::gfx::bundle::AssetBundle;
+    use crate::matrix_lib::base::storage::Storage;
 
     let bundle_url = bundle_url_from_query().unwrap_or_else(|| "assets/atoll.bundle".to_string());
     log::info!("loading bundle: {}", bundle_url);
-    let bundle_data = crate::assets::loader::load_bytes(&bundle_url)
+    let bundle_data = crate::gfx::loader::load_bytes(&bundle_url)
         .await
         .unwrap_or_else(|_| panic!("failed to fetch asset bundle: {}", bundle_url));
     let bundle = AssetBundle::from_bytes(&bundle_data).expect("failed to parse bundle");

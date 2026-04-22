@@ -11,19 +11,19 @@
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
-use crate::assets::storage::Storage;
-use crate::effects::point_light::{PointLightRenderer, PointLightSystem};
-use crate::game::common::{
+use crate::matrix_lib::base::storage::Storage;
+use crate::matrix_game::effects::point_light::{PointLightRenderer, PointLightSystem};
+use crate::matrix_game::common::{
     rd_u16, rd_u32, unpack_rgb, CELLFLAG_DOWN, FOG_END, FOG_START, MAP_GROUP_SIZE, TEX_BOTTOM_SIZE,
 };
-use crate::game::map::{GameMap, GLOBAL_SCALE};
-use crate::game::map_prepare::build_tex_union_atlases;
-use crate::renderer::camera::Camera;
-use crate::renderer::ter_surface::{
+use crate::matrix_game::map::{GameMap, GLOBAL_SCALE};
+use crate::matrix_game::map_prepare::build_tex_union_atlases;
+use crate::matrix_game::camera::Camera;
+use crate::matrix_game::ter_surface::{
     build_surface_overlays, GlossOverlayBatch, GlossResources, GlossVertex, OverlayBatch,
 };
-use crate::renderer::texture::*;
-use crate::renderer::water::visible_groups_mask;
+use crate::matrix_lib::three_g::texture::*;
+use crate::matrix_game::water::visible_groups_mask;
 
 /// Bottom vertex — ports SMatrixMapVertexBottom.
 #[repr(C)]

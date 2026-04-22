@@ -1,6 +1,6 @@
-use matrixgame_rs::assets::bundle::AssetBundle;
-use matrixgame_rs::assets::pkg_reader::PkgArchive;
-use matrixgame_rs::renderer::texture::decode_texture_bytes;
+use matrixgame_rs::gfx::bundle::AssetBundle;
+use matrixgame_rs::matrix_lib::base::pack::PkgArchive;
+use matrixgame_rs::matrix_lib::three_g::texture::decode_texture_bytes;
 
 fn main() {
     // Also peek at what the WASM bundle serves for the same textures.

@@ -1,9 +1,8 @@
 pub mod app;
-pub mod assets;
-pub mod effects;
-pub mod game;
+pub mod gfx;
+pub mod matrix_game;
+pub mod matrix_lib;
 pub mod platform;
-pub mod renderer;
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;

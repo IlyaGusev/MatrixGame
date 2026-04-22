@@ -1,7 +1,7 @@
 //! Verify BuildingInstance parsing + CVO resolution against the shipped pkg.
-use matrixgame_rs::assets::pkg_reader::PkgArchive;
-use matrixgame_rs::game::map::GameMap;
-use matrixgame_rs::game::vo_loader;
+use matrixgame_rs::matrix_lib::base::pack::PkgArchive;
+use matrixgame_rs::matrix_game::map::GameMap;
+use matrixgame_rs::matrix_lib::three_g::vector_object;
 
 fn main() {
     let pkg = PkgArchive::from_bytes(std::fs::read("../Data/robots.pkg").unwrap()).unwrap();
@@ -31,7 +31,7 @@ fn main() {
                 continue;
             }
         };
-        let group = vo_loader::parse_cvo(&path, &bytes);
+        let group = vector_object::parse_cvo(&path, &bytes);
         println!("[kind {kind}] {path} → {} units:", group.units.len());
         for u in &group.units {
             let vo_upper = u.model_path.to_uppercase();

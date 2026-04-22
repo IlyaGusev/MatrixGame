@@ -1,7 +1,7 @@
-use matrixgame_rs::assets::pkg_reader::PkgArchive;
-use matrixgame_rs::assets::storage::Storage;
-use matrixgame_rs::game::common::{CELLFLAG_BRIDGE, CELLFLAG_FLAT};
-use matrixgame_rs::game::map::GameMap;
+use matrixgame_rs::matrix_lib::base::pack::PkgArchive;
+use matrixgame_rs::matrix_lib::base::storage::Storage;
+use matrixgame_rs::matrix_game::common::{CELLFLAG_BRIDGE, CELLFLAG_FLAT};
+use matrixgame_rs::matrix_game::map::GameMap;
 
 const CELLFLAG_LAND: u8 = 1 << 0;
 const CELLFLAG_WATER: u8 = 1 << 1;
@@ -23,7 +23,7 @@ fn main() {
     println!("map {}x{}", map.size_x, map.size_y);
     println!("objects: {}", map.objects.len());
 
-    use matrixgame_rs::game::vo_loader;
+    use matrixgame_rs::matrix_lib::three_g::vector_object;
     let stor = Storage::from_bytes(&cmap).unwrap();
     let strings = stor.get_buf("strings", "String").unwrap();
     let seen: std::collections::BTreeSet<u32> = map.objects.iter().map(|o| o.type_id).collect();
@@ -35,7 +35,7 @@ fn main() {
             continue;
         }
         let id = strings.get_as_wstr(*t as usize);
-        let Some(paths) = vo_loader::resolve_paths(&id) else {
+        let Some(paths) = vector_object::resolve_paths(&id) else {
             continue;
         };
         let key = paths.vo_path.to_uppercase();
@@ -44,7 +44,7 @@ fn main() {
             load_fail += 1;
             continue;
         };
-        match vo_loader::parse_vo(&data) {
+        match vector_object::parse_vo(&data) {
             Ok(m) => {
                 let tri_count: usize = m.surfaces.iter().map(|s| s.indices.len() / 3).sum();
                 let texture_refs: Vec<_> = m

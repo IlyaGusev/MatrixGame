@@ -5,7 +5,7 @@
 //! Each CMAP `buildings/*` row produces one `BuildingInstance`. We group the
 //! instances by `kind` (BUILDING_BASE..BUILDING_REPAIR), load the matching
 //! `Matrix\Building\bN.cvo` (MatrixObjectBuilding.cpp:158-163), parse it into
-//! a list of sub-meshes via `vo_loader::parse_cvo`, and create one GPU batch
+//! a list of sub-meshes via `vector_object::parse_cvo`, and create one GPU batch
 //! per sub-mesh. Every sub-mesh shares the building's world transform — the
 //! original uses a group-wide `m_GroupToWorldMatrix` pointer and each unit
 //! composes it with its local animation matrix. We currently draw frame-0 of
@@ -21,12 +21,12 @@ use bytemuck::{Pod, Zeroable};
 use glam::{Mat3, Vec4};
 use wgpu::util::DeviceExt;
 
-use crate::effects::point_light::PointLightSystem;
-use crate::game::common::{unpack_rgb, FOG_END, FOG_START};
-use crate::game::map::{BuildingInstance, GameMap};
-use crate::game::vo_loader::{self, CvoGroup, MaterialSpec};
-use crate::renderer::camera::Camera;
-use crate::renderer::texture::{
+use crate::matrix_game::effects::point_light::PointLightSystem;
+use crate::matrix_game::common::{unpack_rgb, FOG_END, FOG_START};
+use crate::matrix_game::map::{BuildingInstance, GameMap};
+use crate::matrix_lib::three_g::vector_object::{self, CvoGroup, MaterialSpec};
+use crate::matrix_game::camera::Camera;
+use crate::matrix_lib::three_g::texture::{
     create_solid_texture, create_texture_from_rgba, decode_texture_bytes,
 };
 
@@ -175,7 +175,7 @@ impl BuildingsRenderer {
                 missing_kinds += 1;
                 continue;
             };
-            let group: CvoGroup = vo_loader::parse_cvo(&cvo_path, &cvo_bytes);
+            let group: CvoGroup = vector_object::parse_cvo(&cvo_path, &cvo_bytes);
             if group.units.is_empty() {
                 log::warn!("buildings: CVO has no units: {}", cvo_path);
                 missing_kinds += 1;
@@ -197,7 +197,7 @@ impl BuildingsRenderer {
                     log::debug!("buildings: sub-VO not found: {}", unit.model_path);
                     continue;
                 };
-                let mesh = match vo_loader::parse_vo(&vo_bytes) {
+                let mesh = match vector_object::parse_vo(&vo_bytes) {
                     Ok(m) => m,
                     Err(e) => {
                         log::warn!("buildings: parse {} failed: {}", unit.model_path, e);
@@ -239,11 +239,11 @@ impl BuildingsRenderer {
                     let material = if unit.material.diffuse.is_some() {
                         unit.material.clone()
                     } else if let Some(spec) = surf.texture_ref.as_deref() {
-                        let surface_mat = vo_loader::parse_material_spec_with_prefix(
+                        let surface_mat = vector_object::parse_material_spec_with_prefix(
                             spec,
                             cvo_dir.as_deref(),
                         );
-                        vo_loader::merge_materials(&surface_mat, Some(&unit.material))
+                        vector_object::merge_materials(&surface_mat, Some(&unit.material))
                     } else {
                         unit.material.clone()
                     };
@@ -494,7 +494,7 @@ fn resolve_diffuse(
     let path = material.diffuse.as_ref()?;
     let view = resolve_texture(Some(path), device, queue, cache, read_texture)?;
     let alpha_test =
-        vo_loader::resolve_alpha_test_with_txt(path, material.alpha_test, read_texture);
+        vector_object::resolve_alpha_test_with_txt(path, material.alpha_test, read_texture);
     Some((view, alpha_test))
 }
 

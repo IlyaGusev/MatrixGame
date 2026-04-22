@@ -1,4 +1,4 @@
-use matrixgame_rs::assets::pkg_reader::PkgArchive;
+use matrixgame_rs::matrix_lib::base::pack::PkgArchive;
 
 fn main() {
     let data = std::fs::read("../Data/robots.pkg").unwrap();

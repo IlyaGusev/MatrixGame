@@ -3,10 +3,10 @@
 
 use std::collections::HashMap;
 
-use crate::assets::storage::Storage;
-use crate::game::bitmap::{blit_tile, copy_col, copy_row, merge_by_mask, merge_with_alpha};
-use crate::game::common::TEX_BOTTOM_SIZE;
-use crate::renderer::texture::{create_texture_from_rgba_mipped, decode_texture_bytes};
+use crate::matrix_lib::base::storage::Storage;
+use crate::matrix_lib::base::bitmap::{blit_tile, copy_col, copy_row, merge_by_mask, merge_with_alpha};
+use crate::matrix_game::common::TEX_BOTTOM_SIZE;
+use crate::matrix_lib::three_g::texture::{create_texture_from_rgba_mipped, decode_texture_bytes};
 
 /// Ports BuildTexUnions (MatrixMapPrepare.cpp:108-293).
 pub fn build_tex_union_atlases(
@@ -44,7 +44,7 @@ pub fn build_tex_union_atlases(
     // which already knows DXT1/3/5 in addition to the image crate's formats.
     let load_src = |id: usize,
                     cache: &mut HashMap<usize, image::RgbaImage>,
-                    strings: &crate::assets::storage::DataBuf,
+                    strings: &crate::matrix_lib::base::storage::DataBuf,
                     read_texture: &dyn Fn(&str) -> Option<Vec<u8>>| {
         if let std::collections::hash_map::Entry::Vacant(entry) = cache.entry(id) {
             if id < strings.arrays_count() {

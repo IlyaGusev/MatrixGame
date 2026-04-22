@@ -1,5 +1,5 @@
 //! Extract a CMAP file from robots.pkg for browser testing.
-use matrixgame_rs::assets::pkg_reader::PkgArchive;
+use matrixgame_rs::matrix_lib::base::pack::PkgArchive;
 
 fn main() {
     let pkg_data = std::fs::read("../Data/robots.pkg").expect("read robots.pkg");

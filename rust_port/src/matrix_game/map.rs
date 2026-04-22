@@ -2,9 +2,9 @@
 
 use anyhow::{bail, Context, Result};
 
-use crate::assets::storage::Storage;
-use crate::effects::point_light::PointLightSystem;
-use crate::game::common::{
+use crate::matrix_lib::base::storage::Storage;
+use crate::matrix_game::effects::point_light::PointLightSystem;
+use crate::matrix_game::common::{
     CELLFLAG_BRIDGE, CELLFLAG_FLAT, CELLFLAG_LAND, CELLFLAG_WATER, MAP_GROUP_SIZE,
 };
 
@@ -1128,7 +1128,7 @@ fn load_buildings(
             return 0.0;
         }
         let u = units[iy as usize * size_x + ix as usize];
-        if u.flags & crate::game::common::CELLFLAG_FLAT != 0 {
+        if u.flags & crate::matrix_game::common::CELLFLAG_FLAT != 0 {
             return u.a1;
         }
         let lx = wx - ix as f32 * GLOBAL_SCALE;
@@ -1173,7 +1173,7 @@ fn read_i32_array(bytes: &[u8]) -> Vec<i32> {
 }
 
 fn parse_object_shadow(
-    buf: &crate::assets::storage::DataBuf,
+    buf: &crate::matrix_lib::base::storage::DataBuf,
     index: usize,
     points: &[CompilePoint],
     normals: &[PointNormal],
@@ -1332,8 +1332,8 @@ fn float2int(x: f32) -> i32 {
 }
 
 fn find_property_int(
-    names: &crate::assets::storage::DataBuf,
-    values: &crate::assets::storage::DataBuf,
+    names: &crate::matrix_lib::base::storage::DataBuf,
+    values: &crate::matrix_lib::base::storage::DataBuf,
     key: &str,
 ) -> Result<i32> {
     let idx = names
@@ -1347,8 +1347,8 @@ fn find_property_int(
 }
 
 fn find_property_float(
-    names: &crate::assets::storage::DataBuf,
-    values: &crate::assets::storage::DataBuf,
+    names: &crate::matrix_lib::base::storage::DataBuf,
+    values: &crate::matrix_lib::base::storage::DataBuf,
     key: &str,
 ) -> Result<f32> {
     let idx = names
