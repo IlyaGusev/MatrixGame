@@ -79,7 +79,7 @@ MatrixVisiCalc, DevConsole, StringConstants.
 | Rust file                               | Original                        |
 |-----------------------------------------|---------------------------------|
 | matrix_game/effects/point_light.rs      | MatrixEffectPointLight.cpp      |
-| matrix_game/effects/selection.rs        | MatrixEffectSelection.cpp (visual-parity port — flat annulus vs. animated dot billboards) |
+| matrix_game/effects/selection.rs        | MatrixEffectSelection.cpp (animated dot billboards; CBillboard draw-queue + BBT_SELDOT texture deferred — own pipeline + radial-alpha shader stand in) |
 | matrix_game/effects/weapon.rs           | MatrixEffectWeapon.hpp (EWeapon enum constants only; effect class deferred) |
 
 Not yet ported: MatrixEffect (base), BigBoom, Billboard, Dust,
