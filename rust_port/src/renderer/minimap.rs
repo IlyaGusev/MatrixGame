@@ -126,6 +126,10 @@ pub struct Minimap {
     bg_depth_tex: wgpu::Texture,
     _white_tex: wgpu::Texture,
 
+    /// Per-side minimap color (index = side id, 0..=4 from robots.dat `Side`
+    /// block, MatrixMap.cpp:1015). Parsed once at init.
+    side_colors: [[f32; 4]; 8],
+
     /// Sub-rects for MMT_BASE / MMT_FACTORY / MMT_POINT, parsed from the
     /// `Minimap` block in robots.dat (MatrixMinimap.cpp:50-65).
     icon_base: IconUv,
@@ -359,6 +363,8 @@ impl Minimap {
         let panel_bind = make_bind(&panel_view, "minimap panel bind");
         let panel_uv = panel_src.to_uv();
 
+        let side_colors = parse_side_colors_mm(matrix_data);
+
         // ── Pipelines ───────────────────────────────────────────────────────
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("minimap shader"),
@@ -461,6 +467,7 @@ impl Minimap {
             panel_bind,
             panel_src,
             panel_uv,
+            side_colors,
             icon_base,
             icon_factory,
             icon_point,
@@ -814,7 +821,11 @@ impl Minimap {
             } else {
                 self.icon_factory
             };
-            let color = side_color_mm(b.side);
+            let color = self
+                .side_colors
+                .get(b.side as usize)
+                .copied()
+                .unwrap_or([0.85, 0.85, 0.85, 1.0]);
             Self::push_marker(&mut markers, px_px, marker_r, icon, color);
         }
         // Clamp to capacity so we never overrun the vertex buffer.
@@ -1023,19 +1034,40 @@ fn parse_minimap_block(
     (128, rects)
 }
 
-/// Side color table for the minimap. Mirrors `MatrixMap.cpp:1014-1020` —
-/// the original reads these per-map from the CMAP `sides` block; we inline
-/// the SR2 defaults until the Rust port parses that block.
-fn side_color_mm(side: u8) -> [f32; 4] {
-    let rgb = match side {
-        1 => [1.00, 0.86, 0.15], // yellow (player)
-        2 => [0.30, 0.55, 1.00], // blue
-        3 => [1.00, 0.30, 0.30], // red
-        4 => [0.40, 0.95, 0.40], // green
-        5 => [0.95, 0.40, 0.95], // magenta
-        _ => [0.75, 0.75, 0.75], // neutral
+/// Parse the per-side minimap colors from robots.dat. The `Side` block
+/// entries are keyed by side id and hold values of the form
+/// "Name,R,G,B,Minimap,R_MM,G_MM,B_MM" (MatrixMap.cpp:1014-1020).
+fn parse_side_colors_mm(matrix_data: &Storage) -> [[f32; 4]; 8] {
+    let mut out = [[0.85f32, 0.85, 0.85, 1.0]; 8];
+    let Some(side) = matrix_data.block_record("da", "Side") else {
+        return out;
     };
-    [rgb[0], rgb[1], rgb[2], 1.0]
+    let Some(keys) = matrix_data.get_buf(&side, "0") else {
+        return out;
+    };
+    let Some(vals) = matrix_data.get_buf(&side, "1") else {
+        return out;
+    };
+    for i in 0..keys.arrays_count() {
+        let id: usize = match keys.get_as_wstr(i).parse() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if id >= out.len() {
+            continue;
+        }
+        // Value format: "Name,R,G,B,Minimap,R_MM,G_MM,B_MM".
+        let raw = vals.get_as_wstr(i);
+        let parts: Vec<&str> = raw.split(',').collect();
+        if parts.len() < 8 {
+            continue;
+        }
+        let r = parts[5].trim().parse::<f32>().unwrap_or(255.0) / 255.0;
+        let g = parts[6].trim().parse::<f32>().unwrap_or(255.0) / 255.0;
+        let b = parts[7].trim().parse::<f32>().unwrap_or(255.0) / 255.0;
+        out[id] = [r, g, b, 1.0];
+    }
+    out
 }
 
 const SHADER_SRC: &str = r#"
