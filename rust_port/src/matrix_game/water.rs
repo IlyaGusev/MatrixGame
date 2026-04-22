@@ -845,32 +845,10 @@ impl Water {
         } else {
             (Vec::new(), Vec::new())
         };
-        if !ocean_instances.is_empty() {
-            self.ensure_ocean_capacity(device, ocean_instances.len());
-            let ocean_verts = build_instance_vertices(
-                &ocean_instances,
-                &lattice_z,
-                &lattice_normals,
-                self.water_scale,
-            );
-            let ocean_idxs = build_instance_indices(ocean_instances.len());
-            self.ocean_num_indices = ocean_idxs.len() as u32;
-            queue.write_buffer(
-                &self.ocean_vertex_buffer,
-                0,
-                bytemuck::cast_slice(&ocean_verts),
-            );
-            queue.write_buffer(
-                &self.ocean_index_buffer,
-                0,
-                bytemuck::cast_slice(&ocean_idxs),
-            );
-            pass.set_pipeline(&self.solid_pipeline);
-            pass.set_bind_group(0, &self.solid_bind_group, &[]);
-            pass.set_vertex_buffer(0, self.ocean_vertex_buffer.slice(..));
-            pass.set_index_buffer(self.ocean_index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..self.ocean_num_indices, 0, 0..1);
-        }
+
+        // On-map hole fill first so the alpha-shoreline pass has opaque water
+        // to blend against inside mixed-coast groups (Rust-specific; no C++
+        // analog — the original's per-group alpha texture is self-contained).
         if !fill_instances.is_empty() {
             self.ensure_fill_capacity(device, fill_instances.len());
             let fill_verts = build_instance_vertices(
@@ -898,6 +876,9 @@ impl Water {
             pass.draw_indexed(0..self.fill_num_indices, 0, 0..1);
         }
 
+        // Alpha-shoreline pass (in-map groups). Ports the first `WaterAlpha`
+        // loop in MatrixMap.cpp:1743-1767 — the original runs this before
+        // the opaque off-map solid pass.
         pass.set_pipeline(&self.pipeline);
         pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
@@ -908,6 +889,35 @@ impl Water {
                 0,
                 0..1,
             );
+        }
+
+        // Opaque off-map ocean pass — ports MatrixMap.cpp:1772-1790's
+        // `WaterSolid` loop. Drawn after alpha to match the original order.
+        if !ocean_instances.is_empty() {
+            self.ensure_ocean_capacity(device, ocean_instances.len());
+            let ocean_verts = build_instance_vertices(
+                &ocean_instances,
+                &lattice_z,
+                &lattice_normals,
+                self.water_scale,
+            );
+            let ocean_idxs = build_instance_indices(ocean_instances.len());
+            self.ocean_num_indices = ocean_idxs.len() as u32;
+            queue.write_buffer(
+                &self.ocean_vertex_buffer,
+                0,
+                bytemuck::cast_slice(&ocean_verts),
+            );
+            queue.write_buffer(
+                &self.ocean_index_buffer,
+                0,
+                bytemuck::cast_slice(&ocean_idxs),
+            );
+            pass.set_pipeline(&self.solid_pipeline);
+            pass.set_bind_group(0, &self.solid_bind_group, &[]);
+            pass.set_vertex_buffer(0, self.ocean_vertex_buffer.slice(..));
+            pass.set_index_buffer(self.ocean_index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..self.ocean_num_indices, 0, 0..1);
         }
 
         if let Some(inshore) = self.inshore.as_mut() {
