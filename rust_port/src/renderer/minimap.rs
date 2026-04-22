@@ -55,6 +55,16 @@ const DESIGN_HEIGHT_PX: f32 = 768.0;
 /// `MINIMAP_CAM_COLOR = 0xFF30FFFF` (MatrixMinimap.cpp:19), D3DCOLOR ARGB.
 const MINIMAP_CAM_COLOR: [f32; 4] = [48.0 / 255.0, 1.0, 1.0, 1.0];
 
+/// MatrixMinimap.hpp:11-12 — scale clamp range for the zoom buttons.
+const MINIMAP_MIN_SCALE: f32 = 1.0;
+const MINIMAP_MAX_SCALE: f32 = 3.0;
+/// Multiplicative zoom factors — mirror MatrixMinimap.cpp:1346 / 1352:
+///   ButtonZoomIn:  SetOutParams(GetScale() * 1.8)
+///   ButtonZoomOut: SetOutParams(GetScale() * 0.5)
+/// Clamped to [MIN, MAX], so from 1.0 the reachable levels are 1.0, 1.8, 3.0.
+const MINIMAP_ZOOM_IN_FACTOR: f32 = 1.8;
+const MINIMAP_ZOOM_OUT_FACTOR: f32 = 0.5;
+
 /// Water plane Z — from `renderer/water.rs`, matches `WATER_LEVEL` in the
 /// original. Used both for the heightmap bake (coast cutoff) and for the
 /// frustum projection plane in `frustum_on_water`.
@@ -89,6 +99,23 @@ struct SubRect {
     h: f32,
     tex_w: f32,
     tex_h: f32,
+}
+
+/// Button UI element port of CIFaceButton (CInterface.cpp:430-467). Stores
+/// the panel-local draw rect and the interface1 sub-rect UV for the
+/// `sNormal` state (we don't bother animating focused/pressed).
+#[derive(Copy, Clone, Default)]
+struct Button {
+    local: [f32; 4], // xPos, yPos, xSize, ySize (panel-local design-space)
+    uv: IconUv,
+}
+
+/// Result of a minimap left-click — see `Minimap::click`.
+pub enum MinimapClick {
+    None,
+    Teleport([f32; 2]),
+    ZoomIn,
+    ZoomOut,
 }
 impl SubRect {
     fn to_uv(self) -> IconUv {
@@ -129,6 +156,16 @@ pub struct Minimap {
     /// Per-side minimap color (index = side id, 0..=4 from robots.dat `Side`
     /// block, MatrixMap.cpp:1015). Parsed once at init.
     side_colors: [[f32; 4]; 8],
+
+    /// Zoom-in / zoom-out buttons parsed from the `MiniM` panel children
+    /// (Button{Name=zi}/{Name=zo}). Drawn on top of the panel art; clicking
+    /// them calls zoom_in/zoom_out (MatrixMinimap.hpp:192-193).
+    zi_button: Button,
+    zo_button: Button,
+
+    /// Target scale tracked by the buttons, matches `m_TgtScale`
+    /// (MatrixMinimap.hpp:101). Clamped to [MINIMAP_MIN_SCALE, MINIMAP_MAX_SCALE].
+    tgt_scale: f32,
 
     /// Sub-rects for MMT_BASE / MMT_FACTORY / MMT_POINT, parsed from the
     /// `Minimap` block in robots.dat (MatrixMinimap.cpp:50-65).
@@ -365,6 +402,15 @@ impl Minimap {
 
         let side_colors = parse_side_colors_mm(matrix_data);
 
+        let zi_button = parse_minim_button(matrix_data, "zi").unwrap_or(Button {
+            local: [149.0, 187.0, 12.0, 12.0],
+            uv: IconUv { u0: 446.0/512.0, v0: 44.0/512.0, u1: 458.0/512.0, v1: 56.0/512.0 },
+        });
+        let zo_button = parse_minim_button(matrix_data, "zo").unwrap_or(Button {
+            local: [10.0, 187.0, 12.0, 12.0],
+            uv: IconUv { u0: 398.0/512.0, v0: 44.0/512.0, u1: 410.0/512.0, v1: 56.0/512.0 },
+        });
+
         // ── Pipelines ───────────────────────────────────────────────────────
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("minimap shader"),
@@ -468,6 +514,9 @@ impl Minimap {
             panel_src,
             panel_uv,
             side_colors,
+            zi_button,
+            zo_button,
+            tgt_scale: 1.0,
             icon_base,
             icon_factory,
             icon_point,
@@ -653,6 +702,53 @@ impl Minimap {
         Some(self.map_to_world(cursor_x, cursor_y))
     }
 
+    /// Dispatch a left-click at `(cx, cy)` in surface pixels. Checks buttons
+    /// first (they're rendered on top of the landscape), then the minimap
+    /// rect. Returns the action the caller should apply.
+    pub fn click(&mut self, cx: f32, cy: f32) -> MinimapClick {
+        // Panel rect in surface pixels — buttons are panel-local; re-derive
+        // panel_x/panel_y the same way render() does so the two stay in sync.
+        let ui_scale = self.size_x / MINIMAP_SIZE_PX;
+        let panel_x = 0.0;
+        let panel_y = self.pos_y - MINIMAP_OFFSET_Y_IN_PANEL * ui_scale;
+        let hits = |btn: &Button| -> bool {
+            let bx = panel_x + btn.local[0] * ui_scale;
+            let by = panel_y + btn.local[1] * ui_scale;
+            let bw = btn.local[2] * ui_scale;
+            let bh = btn.local[3] * ui_scale;
+            cx >= bx && cx <= bx + bw && cy >= by && cy <= by + bh
+        };
+        if hits(&self.zi_button) {
+            self.zoom_in();
+            return MinimapClick::ZoomIn;
+        }
+        if hits(&self.zo_button) {
+            self.zoom_out();
+            return MinimapClick::ZoomOut;
+        }
+        if let Some(tgt) = self.click_to_world(cx, cy) {
+            MinimapClick::Teleport(tgt)
+        } else {
+            MinimapClick::None
+        }
+    }
+
+    /// Port of `CMinimap::ButtonZoomIn` (MatrixMinimap.cpp:1344-1348).
+    /// `scale *= 1.8`, clamped to [MINIMAP_MIN_SCALE, MINIMAP_MAX_SCALE].
+    pub fn zoom_in(&mut self) {
+        self.tgt_scale = (self.tgt_scale * MINIMAP_ZOOM_IN_FACTOR)
+            .clamp(MINIMAP_MIN_SCALE, MINIMAP_MAX_SCALE);
+        self.scale = self.tgt_scale;
+    }
+
+    /// Port of `CMinimap::ButtonZoomOut` (MatrixMinimap.cpp:1350-1354).
+    /// `scale *= 0.5`, clamped the same way.
+    pub fn zoom_out(&mut self) {
+        self.tgt_scale = (self.tgt_scale * MINIMAP_ZOOM_OUT_FACTOR)
+            .clamp(MINIMAP_MIN_SCALE, MINIMAP_MAX_SCALE);
+        self.scale = self.tgt_scale;
+    }
+
     /// Port of `CMinimap::BeforeDraw` (MatrixMinimap.cpp:182-248) — computes
     /// `m_Delta` so the map square stays pinned to the minimap rect when the
     /// world is scaled, then emits the four corner vertices.
@@ -777,12 +873,10 @@ impl Minimap {
         // Quad layout in `quad_vbuf`:
         //   [ 0.. 6] MiniM panel art (`mmp` sub-rect of interface1)
         //   [ 6..12] landscape background (bake output)
-        //   [12..  ] building markers
-        //
-        // The original draws every UI element through CIFaceElement as
-        // textured pre-transformed quads; we emit the same two quads here
-        // with the sub-rect UVs pulled from robots.dat.
-        let mut head = [MMVertex::default(); 12];
+        //   [12..18] zoom-in button (interface1 sub-rect)
+        //   [18..24] zoom-out button (interface1 sub-rect)
+        //   [24..  ] building markers
+        let mut head = [MMVertex::default(); 24];
         // MiniM panel art quad (at panel_x, panel_y, panel_w × panel_h).
         fill_uv_rect_quad(
             &mut head[0..6],
@@ -801,6 +895,31 @@ impl Minimap {
                 color: v.color,
             };
         }
+        // Zoom buttons (panel-local coords scaled by ui_scale).
+        let place_button = |btn: &Button| -> [f32; 4] {
+            [
+                panel_x + btn.local[0] * ui_scale,
+                panel_y + btn.local[1] * ui_scale,
+                btn.local[2] * ui_scale,
+                btn.local[3] * ui_scale,
+            ]
+        };
+        fill_uv_rect_quad(
+            &mut head[12..18],
+            place_button(&self.zi_button),
+            self.zi_button.uv,
+            [1.0, 1.0, 1.0, 1.0],
+            screen_w,
+            screen_h,
+        );
+        fill_uv_rect_quad(
+            &mut head[18..24],
+            place_button(&self.zo_button),
+            self.zo_button.uv,
+            [1.0, 1.0, 1.0, 1.0],
+            screen_w,
+            screen_h,
+        );
         queue.write_buffer(&self.quad_vbuf, 0, bytemuck::cast_slice(&head));
         // `panel_src` is loaded at construction; we keep it around so future
         // layout changes can reference the raw sub-rect without reparsing.
@@ -847,7 +966,7 @@ impl Minimap {
         if !markers_clip.is_empty() {
             queue.write_buffer(
                 &self.quad_vbuf,
-                (12 * std::mem::size_of::<MMVertex>()) as u64,
+                (24 * std::mem::size_of::<MMVertex>()) as u64,
                 bytemuck::cast_slice(&markers_clip),
             );
         }
@@ -882,26 +1001,46 @@ impl Minimap {
         pass.set_pipeline(&self.tex_pipeline);
         pass.set_vertex_buffer(0, self.quad_vbuf.slice(..));
 
-        // 1) MiniM panel art from interface1 (sub-rect `mmp`).
+        // 1) MiniM panel art from interface1 (sub-rect `mmp`). No scissor —
+        //    the panel frame extends beyond the 145×145 inner landscape rect.
         pass.set_bind_group(0, &self.panel_bind, &[]);
         pass.draw(0..6, 0..1);
 
-        // 2) Landscape background quad (bake output).
+        // 2) Landscape + markers + frustum are clipped to the inner rect so
+        //    zoom > 1 doesn't spill the world outside the panel frame. Ports
+        //    the `SetViewport(m_Viewport)` clip in MatrixMinimap.cpp:595.
+        let sx = self.pos_x.floor().max(0.0) as u32;
+        let sy = self.pos_y.floor().max(0.0) as u32;
+        let sw_u = (self.size_x.ceil() as i32)
+            .max(0)
+            .min(screen_w as i32 - sx as i32) as u32;
+        let sh_u = (self.size_y.ceil() as i32)
+            .max(0)
+            .min(screen_h as i32 - sy as i32) as u32;
+        if sw_u > 0 && sh_u > 0 {
+            pass.set_scissor_rect(sx, sy, sw_u, sh_u);
+        }
+
         pass.set_bind_group(0, &self.bg_bind, &[]);
         pass.draw(6..12, 0..1);
 
-        // 3) Building markers — sampled from the icon atlas so each sprite
-        //    uses its real UV sub-rect from `radarIcons.dds`.
         if !markers_clip.is_empty() {
             pass.set_bind_group(0, &self.icon_bind, &[]);
-            pass.draw(12..(12 + markers_clip.len() as u32), 0..1);
+            pass.draw(24..(24 + markers_clip.len() as u32), 0..1);
         }
 
-        // 4) Camera frustum outline (line strip).
         pass.set_pipeline(&self.line_pipeline);
         pass.set_bind_group(0, &self.white_bind, &[]);
         pass.set_vertex_buffer(0, self.line_vbuf.slice(..));
         pass.draw(0..5, 0..1);
+
+        // Reset scissor before drawing the zoom buttons — they live on the
+        // panel art, *outside* the inner landscape rect.
+        pass.set_scissor_rect(0, 0, screen_w as u32, screen_h as u32);
+        pass.set_pipeline(&self.tex_pipeline);
+        pass.set_bind_group(0, &self.panel_bind, &[]);
+        pass.set_vertex_buffer(0, self.quad_vbuf.slice(..));
+        pass.draw(12..24, 0..1);
     }
 }
 
@@ -956,6 +1095,45 @@ impl PxRect {
             v1: (self.y + self.h) / atlas_h,
         }
     }
+}
+
+/// Resolve a Button inside `if/MiniM` by its Name parameter. Mirrors
+/// `CIFaceButton` loading in CInterface.cpp:430-467 — only the `sNormal`
+/// state is ported since we don't animate button hover/press yet.
+fn parse_minim_button(matrix_data: &Storage, name: &str) -> Option<Button> {
+    let minim = matrix_data.block_record("if", "MiniM")?;
+    let names = matrix_data.get_buf(&minim, "2")?;
+    let records = matrix_data.get_buf(&minim, "3")?;
+    for i in 0..names.arrays_count() {
+        if names.get_as_wstr(i) != "Button" {
+            continue;
+        }
+        let child = records.get_as_wstr(i);
+        if matrix_data.block_param(&child, "Name").as_deref() != Some(name) {
+            continue;
+        }
+        let x = parse_f32_param(matrix_data, &child, "xPos")?;
+        let y = parse_f32_param(matrix_data, &child, "yPos")?;
+        let w = parse_f32_param(matrix_data, &child, "xSize")?;
+        let h = parse_f32_param(matrix_data, &child, "ySize")?;
+        let sx = parse_f32_param(matrix_data, &child, "sNormalX")?;
+        let sy = parse_f32_param(matrix_data, &child, "sNormalY")?;
+        let tw = parse_f32_param(matrix_data, &child, "sNormalWidth")?;
+        let th = parse_f32_param(matrix_data, &child, "sNormalHeight")?;
+        return Some(Button {
+            local: [x, y, w, h],
+            uv: SubRect {
+                x: sx,
+                y: sy,
+                w,
+                h,
+                tex_w: tw,
+                tex_h: th,
+            }
+            .to_uv(),
+        });
+    }
+    None
 }
 
 /// Resolve the `if / MiniM / Static {Name=mmp}` sub-rect — the panel art

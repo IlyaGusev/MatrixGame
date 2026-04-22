@@ -261,13 +261,20 @@ impl ApplicationHandler for App {
                 } else if button == MouseButton::Left
                     && btn_state == ElementState::Pressed
                 {
-                    // Minimap click-to-teleport. Ports CMinimap::ButtonClick
-                    // + CalcMinimap2World (MatrixMinimap.cpp:1356-1379): if
-                    // the cursor is on the minimap rect, map pixel → world
-                    // and feed it to `m_Camera.SetXYStrategy`.
+                    // Left-click on the minimap dispatches to zoom-in /
+                    // zoom-out buttons (ports CMinimap::ButtonZoomIn/Out),
+                    // or teleports to the clicked world pos (ports
+                    // CMinimap::ButtonClick + CalcMinimap2World,
+                    // MatrixMinimap.cpp:1356-1379).
+                    use crate::renderer::minimap::MinimapClick;
                     let [cx, cy] = state.cursor;
-                    if let Some(tgt) = state.minimap.click_to_world(cx, cy) {
-                        state.camera.set_xy_strategy(tgt);
+                    match state.minimap.click(cx, cy) {
+                        MinimapClick::Teleport(tgt) => {
+                            state.camera.set_xy_strategy(tgt);
+                        }
+                        MinimapClick::ZoomIn
+                        | MinimapClick::ZoomOut
+                        | MinimapClick::None => {}
                     }
                 }
             }
