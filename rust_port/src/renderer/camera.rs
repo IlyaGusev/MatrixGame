@@ -426,20 +426,23 @@ impl Camera {
         let cz = self.angle_z.cos();
         let sx = self.angle_x.sin();
         let cx = self.angle_x.cos();
-        // Place the camera on the +Y side of the link point at angle_z=0,
-        // matching the original's matView construction. Solving `p * matView
-        // = 0` for `matView = Rz(-yaw) * Rx(pitch) * T(0,0,-dist)` (with the
-        // Y+Z column negations from MatrixCamera.cpp:742-745) gives eye =
-        // (lp.x - sin(yaw)*cos(pitch)*dist, lp.y + cos(yaw)*cos(pitch)*dist,
-        // lp.z + sin(pitch)*dist). The previous formula had the X and Y
-        // offsets negated, putting the camera on the opposite side of the
-        // link point — invisible on symmetric maps (atoll), but on training
-        // it appeared as a left-right mirror since every asymmetric feature
-        // showed from the wrong side.
+        // Port of the original's matView inverse. From MatrixCamera.cpp:737-745
+        // the view matrix is T(-LP) * Rz(-AZ) * Rx(AX) * T(0,0,-Dist) * S
+        // (row-major D3D) with S = diag(1,-1,-1,1). Solving `eye * matView = 0`
+        // places the camera at:
+        //     eye = LP + (-Dist*sin(AX)*sin(AZ),
+        //                  Dist*sin(AX)*cos(AZ),
+        //                  Dist*cos(AX))
+        // So sin(AX) is the horizontal offset and cos(AX) is the vertical —
+        // AX = 0 → top-down view, AX = π/2 → level view. The atoll map's
+        // `CamRotAngleMin=100` (clamped to 94°) is a near-level pitch in
+        // this convention. The previous formula had sin/cos swapped, which
+        // treated AX as elevation and pushed the eye past the zenith at
+        // high AX, producing the left/right flip and the look_at singularity.
         let mut eye = Vec3::new(
-            lp.x - sz * cx * self.dist,
-            lp.y + cz * cx * self.dist,
-            lp.z + sx * self.dist,
+            lp.x - sz * sx * self.dist,
+            lp.y + cz * sx * self.dist,
+            lp.z + cx * self.dist,
         );
         if let Some(sample_ground) = &self.sample_ground {
             let wx = eye.x + self.map_cx;
@@ -452,30 +455,24 @@ impl Camera {
         eye
     }
 
+    /// Direct port of the view matrix construction in MatrixCamera.cpp:737-745.
+    /// Row-major D3D: `matView = T(-LP) * Rz(-AZ) * Rx(AX) * T(0,0,-Dist) * S`
+    /// with S = diag(1,-1,-1,1). Transposed into glam's column-major convention
+    /// the operation order reverses: `S * T(0,0,-Dist) * Rx(AX) * Rz(-AZ) * T(-LP)`.
+    /// Constructing the matrix explicitly (rather than via `look_at_lh`) avoids
+    /// the near-zenith singularity when the camera is nearly top-down.
     pub fn view_matrix(&self) -> Mat4 {
-        let eye = self.eye_pos();
-        let target = self.link_point;
-        Mat4::look_at_lh(eye, target, Vec3::Z)
+        let s = Mat4::from_scale(Vec3::new(1.0, -1.0, -1.0));
+        let t2 = Mat4::from_translation(Vec3::new(0.0, 0.0, -self.dist));
+        let rx = Mat4::from_rotation_x(self.angle_x);
+        let rz = Mat4::from_rotation_z(-self.angle_z);
+        let t1 = Mat4::from_translation(-self.link_point);
+        s * t2 * rx * rz * t1
     }
 
     pub fn view_proj(&self) -> Mat4 {
-        let eye = self.eye_pos();
-        let target = self.link_point;
-
-        // Z-up (x,y,z) → Y-up (x,z,-y) before LH look-at. Using `look_at_rh`
-        // here computes `right = f × up` and puts world +X on screen LEFT,
-        // mirroring every asymmetric map; `look_at_lh` gives `right = up × f`
-        // and matches the original D3D matView.
-        let eye_yup = Vec3::new(eye.x, eye.z, -eye.y);
-        let target_yup = Vec3::new(target.x, target.z, -target.y);
-        let view = Mat4::look_at_lh(eye_yup, target_yup, Vec3::Y);
-
         let proj = Mat4::perspective_lh(CAM_FOV, self.aspect, self.near, self.far);
-
-        let z_to_y = Mat4::from_cols_array(&[
-            1.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0,
-        ]);
-        proj * view * z_to_y
+        proj * self.view_matrix()
     }
 
     pub fn forward(&self) -> Vec3 {
@@ -483,28 +480,10 @@ impl Camera {
     }
 
     fn bottom_plane_xy_dir(&self) -> Vec2 {
-        let eye = self.eye_pos();
-        let target = self.link_point;
-        let eye_yup = Vec3::new(eye.x, eye.z, -eye.y);
-        let target_yup = Vec3::new(target.x, target.z, -target.y);
-        let view = Mat4::look_at_lh(eye_yup, target_yup, Vec3::Y);
-        let proj = Mat4::perspective_lh(CAM_FOV, self.aspect, self.near, self.far);
-        let inv_vp = (proj * view).inverse();
-
-        let sample_corner = |sx: f32| {
-            let near4 = inv_vp * glam::Vec4::new(sx, -1.0, 0.0, 1.0);
-            let far4 = inv_vp * glam::Vec4::new(sx, -1.0, 1.0, 1.0);
-            let near = (near4 / near4.w).truncate();
-            let far = (far4 / far4.w).truncate();
-            far - near
-        };
-        let lb = sample_corner(-1.0);
-        let rb = sample_corner(1.0);
         // Match MatrixCamera.cpp:791: bottom plane inward normal = LB × RB.
-        // The previous `rb × lb` flipped the sign of `dir`, which the keyboard
-        // bindings and the `ldir/rdir` formulas were silently compensating for.
+        let [_, _, rb, lb] = self.frustum_corner_dirs_zup();
         let n = lb.cross(rb).normalize_or_zero();
-        let xy = Vec2::new(n.x, -n.z);
+        let xy = Vec2::new(n.x, n.y);
         if xy.length_squared() < 1e-8 {
             let s = self.angle_z.sin();
             let c = self.angle_z.cos();
@@ -552,8 +531,18 @@ impl Camera {
             project(lb, false),
         ];
 
-        let bottom_norm_z = rb.cross(lb).normalize_or_zero().z;
-        if bottom_norm_z > 0.0 {
+        // MatrixVisiCalc.cpp:602-604 always applies the disp in the horizon
+        // branch, and MatrixVisiCalc.cpp:651-656 applies it in the non-horizon
+        // branch only when FrustPlaneB.norm.z > 0, with
+        // FrustPlaneB.norm = LB × RB (MatrixCamera.cpp:791). The previous
+        // `rb × lb` had the opposite sign, so disp fired at steep angles
+        // (cutting off the bottom of the screen) and not at near-level ones.
+        let apply_disp = if horizon_case {
+            true
+        } else {
+            lb.cross(rb).normalize_or_zero().z > 0.0
+        };
+        if apply_disp {
             let bottom_mid = (out[2] + out[3]) * 0.5;
             let disp = Vec2::new(center.x - bottom_mid.x, center.y - bottom_mid.y);
             out[2].x += disp.x;
