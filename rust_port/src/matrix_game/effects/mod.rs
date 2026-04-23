@@ -4,6 +4,7 @@
 //! original `MatrixEffect*.cpp` names.
 
 pub mod marquee;
+pub mod move_to;
 pub mod point_light;
 pub mod selection;
 pub mod weapon;

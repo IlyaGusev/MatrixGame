@@ -61,6 +61,11 @@ struct AppState {
     /// left-button and drags on empty terrain. Rebuilt each frame
     /// from `lmb_anchor` + current cursor; hidden otherwise.
     marquee: crate::matrix_game::effects::marquee::MarqueeRenderer,
+    /// Move-order ground-ping effect — port of `CMatrixEffectMoveto`
+    /// (Effects/MatrixEffectMoveTo.cpp). Spawned at the terrain hit
+    /// point when a right-click issues a move order while robots are
+    /// selected; lifetime 400ms.
+    move_to: crate::matrix_game::effects::move_to::MoveToRenderer,
     /// Loaded UI panels (IF_MAIN / IF_BASE / etc.) + focus state.
     /// Ported from `CIFaceList` (Interface/CInterface.h:269+).
     iface_list: crate::matrix_game::interface::IFaceList,
@@ -182,6 +187,8 @@ impl ApplicationHandler for App {
                 &gfx.device,
                 &gfx.config,
             );
+            let move_to =
+                crate::matrix_game::effects::move_to::MoveToRenderer::new(&gfx.device, &gfx.config);
 
             let iface_list =
                 crate::matrix_game::interface::IFaceList::load_default_panels(&matrix_data);
@@ -232,6 +239,7 @@ impl ApplicationHandler for App {
                 robot_lights: std::collections::HashMap::new(),
                 selection_ring,
                 marquee,
+                move_to,
                 iface_list,
                 iface_renderer,
                 progress_bars,
@@ -333,6 +341,10 @@ impl ApplicationHandler for App {
                     &gfx.device,
                     &gfx.config,
                 );
+                let move_to = crate::matrix_game::effects::move_to::MoveToRenderer::new(
+                    &gfx.device,
+                    &gfx.config,
+                );
 
                 let iface_list =
                     crate::matrix_game::interface::IFaceList::load_default_panels(&matrix_data);
@@ -371,6 +383,7 @@ impl ApplicationHandler for App {
                     robot_lights: std::collections::HashMap::new(),
                     selection_ring,
                     marquee,
+                    move_to,
                     iface_list,
                     iface_renderer,
                     progress_bars,
@@ -439,6 +452,20 @@ impl ApplicationHandler for App {
                                 .order_move_to_at(&state.camera, cx, cy, w, h, &state.map);
                         if n > 0 {
                             log::info!("move order: issued to {} robot(s)", n);
+                            // Spawn the move-order ground ping — port
+                            // of `CMatrixEffect::CreateMoveto` in
+                            // `PGShowPlace` (MatrixSide.cpp:8553,8561).
+                            if let Some((wx, wy)) = crate::matrix_game::logic::screen_to_terrain_xy(
+                                &state.camera,
+                                &state.map,
+                                cx,
+                                cy,
+                                w,
+                                h,
+                            ) {
+                                let wz = state.map.get_z(wx, wy);
+                                state.move_to.spawn(glam::Vec3::new(wx, wy, wz));
+                            }
                         }
                     }
                 } else if button == MouseButton::Left {
@@ -688,6 +715,12 @@ impl ApplicationHandler for App {
                     );
                 }
 
+                // Per-frame move-order ping animation advance — port
+                // of `CMatrixEffectMoveto::Takt` (MatrixEffectMoveTo.cpp:93).
+                if state.move_to.is_active() {
+                    state.move_to.takt(step_ms as f32);
+                }
+
                 // Per-frame: reconcile point lights for each live
                 // robot so the build-factory spawns are visible even
                 // without a robot renderer. Stand-in for the C++
@@ -780,6 +813,9 @@ impl ApplicationHandler for App {
                             state
                                 .selection_ring
                                 .upload(&state.gfx.queue, vp, cr, cu, mc);
+                            state
+                                .move_to
+                                .upload(&state.gfx.queue, &state.map, vp, cr, cu, mc);
                             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                                 label: Some("Selection Ring Pass"),
                                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -806,6 +842,11 @@ impl ApplicationHandler for App {
                                 multiview_mask: None,
                             });
                             state.selection_ring.render(&mut pass);
+                            // Move-order ping — same color/depth target
+                            // as the selection ring (billboards are
+                            // additively blended + depth-tested against
+                            // terrain so they occlude behind geometry).
+                            state.move_to.render(&mut pass);
                             // Marquee shares the overlay color target +
                             // depth attachment with the selection ring;
                             // render inline to avoid a separate pass.
