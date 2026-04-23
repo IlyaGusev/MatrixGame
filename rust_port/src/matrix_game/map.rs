@@ -29,6 +29,60 @@ use crate::matrix_game::water::visible_groups_mask;
 
 pub const GLOBAL_SCALE: f32 = 20.0;
 
+// ── Scoped current-map pointer (the `g_MatrixMap` of this port) ────────
+//
+// Subsystems dispatched from `logic_takt` / `takt` via the
+// `MapStatic` trait need a reference to the map (pathfinder, terrain
+// Z lookup, spatial queries). Threading `&GameMap` through the
+// trait signature would ripple through every test stub. Instead we
+// stash a raw pointer in a static for the duration of the tick call,
+// guarded by a scope RAII handle so it's cleared automatically.
+// The pointer is only ever set while the caller's `&GameMap`
+// borrow is live.
+
+use std::ptr;
+use std::sync::atomic::{AtomicPtr, Ordering};
+
+static CURRENT_MAP: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
+static CURRENT_ELAPSED_MS: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(0);
+
+/// RAII guard — sets `CURRENT_MAP` + `CURRENT_ELAPSED_MS` on
+/// construction, clears on drop. Use:
+/// `let _scope = MapScope::enter(&map, elapsed_ms); world.takt(ms);`.
+pub struct MapScope;
+
+impl MapScope {
+    pub fn enter(map: &GameMap, elapsed_ms: i64) -> Self {
+        CURRENT_MAP.store(map as *const GameMap as *mut (), Ordering::Release);
+        CURRENT_ELAPSED_MS.store(elapsed_ms, Ordering::Release);
+        MapScope
+    }
+}
+impl Drop for MapScope {
+    fn drop(&mut self) {
+        CURRENT_MAP.store(ptr::null_mut(), Ordering::Release);
+    }
+}
+
+/// Fetch the currently-scoped map. Returns `None` outside a takt
+/// call. The lifetime is tied to the outstanding `MapScope` — do
+/// not cache the reference past the tick.
+///
+/// Safety: caller must not hold the returned reference after the
+/// outermost `MapScope` drops. Used only from inside takt dispatch
+/// which always sits inside a scope.
+pub fn current_map<'a>() -> Option<&'a GameMap> {
+    let ptr = CURRENT_MAP.load(Ordering::Acquire) as *const GameMap;
+    if ptr.is_null() { None } else { unsafe { Some(&*ptr) } }
+}
+
+/// Game-time elapsed (ms) as registered by the active `MapScope`.
+/// Ports `g_MatrixMap->GetTime()`.
+pub fn current_elapsed_ms() -> i64 {
+    CURRENT_ELAPSED_MS.load(Ordering::Acquire)
+}
+
 /// Heightmap point from SCompilePoint (12 bytes, /Zp1 packed).
 #[derive(Debug, Clone, Copy)]
 pub struct CompilePoint {
@@ -46,6 +100,40 @@ pub struct PointNormal {
     pub x: f32,
     pub y: f32,
     pub z: f32,
+}
+
+/// Per-fine-cell movement metadata. Ports `SMatrixMapMove`
+/// (MatrixMap.hpp:139-168). The `stop` bitmask gates passability
+/// per chassis kind: bit `1 << kind` set means "cannot cross this
+/// cell" for that chassis kind. Zone/sphere/zubchik carry region
+/// / sphere-corner / geometric-corner info the full AI / physics
+/// code uses; the pathfinder only reads `stop`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MoveCell {
+    pub zone: i32,
+    pub sphere: u32,
+    pub zubchik: u32,
+    pub stop: u32,
+}
+
+impl MoveCell {
+    /// Bit-mask for a placement of `size` cells square by chassis
+    /// kind `nsh`. Port of MatrixLogic.cpp:520 —
+    /// `(1 << nsh) << (6 * (size - 1))`. `size` must be 1..=5.
+    /// For a robot footprint (size = 4) the mask is at bits 18-22.
+    #[inline]
+    pub fn stop_mask(nsh: usize, size: i32) -> u32 {
+        debug_assert!((1..=5).contains(&size));
+        (1u32 << nsh) << (6 * (size - 1) as u32)
+    }
+
+    /// True when `size × size` footprint at this cell is blocked
+    /// for chassis `nsh`. Matches `(m_Stop & mask) != 0` semantics
+    /// from MatrixLogic.cpp:523, :877.
+    #[inline]
+    pub fn is_impassable_for(&self, nsh: usize, size: i32) -> bool {
+        (self.stop & Self::stop_mask(nsh, size)) != 0
+    }
 }
 
 /// Per-cell coefficients matching SMatrixMapUnit fields used by GetZ.
@@ -107,6 +195,13 @@ pub struct GameMap {
     pub group_max_z_land: Vec<f32>,
     pub group_w: usize,
     pub group_h: usize,
+    /// Per-move-cell passability / terrain metadata. Flat row-major,
+    /// dimensions `(size_x * 2) × (size_y * 2)`. Ports `m_Move` built
+    /// in MatrixMapPrepare.cpp:1244-1290 — the fine-grained grid the
+    /// robot AI pathfinder operates on.
+    pub move_cells: Vec<MoveCell>,
+    pub size_move_x: usize,
+    pub size_move_y: usize,
     /// Global minimum heightmap z — the plane `CalcMapGroupVisibility`
     /// projects the frustum corner rays onto (MatrixVisiCalc.cpp:567).
     pub min_z: f32,
@@ -358,6 +453,22 @@ impl GameMap {
         let _w = size_x + 1;
         let normals = compute_normals(&points, size_x, size_y);
         let units = compute_units(&points, size_x, size_y);
+        let (move_cells, size_move_x, size_move_y) =
+            load_move_cells(&stor, &points, size_x, size_y);
+        // Debug: count impassable-for-Track cells per size bucket.
+        let mut track_blocked = [0usize; 5];
+        let mut all_zero = 0usize;
+        for c in &move_cells {
+            if c.stop == 0 { all_zero += 1; }
+            for size in 1..=5 {
+                let mask = (1u32 << 2) << (6 * (size - 1));
+                if c.stop & mask != 0 { track_blocked[size - 1] += 1; }
+            }
+        }
+        log::info!(
+            "map: loaded move grid {}x{} ({} cells); Track-impassable per size [1,2,3,4,5]={:?}; m_Stop==0 cells={}",
+            size_move_x, size_move_y, move_cells.len(), track_blocked, all_zero,
+        );
 
         let objects = load_objects(&stor, &points, &normals, size_x, size_y);
         log::info!("map: loaded {} decorative objects", objects.len());
@@ -417,6 +528,9 @@ impl GameMap {
             group_max_z_land,
             group_w,
             group_h,
+            move_cells,
+            size_move_x,
+            size_move_y,
             min_z,
             group_bounds,
         })
@@ -479,12 +593,65 @@ impl GameMap {
         &self.units[y * self.size_x + x]
     }
 
+    /// Bounds-checked `SMatrixMapUnit::m_Flags` accessor. Ports the
+    /// `UnitGetTest(x, y)` helper at MatrixMap.hpp. Returns `None`
+    /// for off-map / negative coords.
+    pub fn unit_flags(&self, x: i32, y: i32) -> Option<u8> {
+        if x < 0 || y < 0 { return None; }
+        let (x, y) = (x as usize, y as usize);
+        if x >= self.size_x || y >= self.size_y { return None; }
+        Some(self.units[y * self.size_x + x].flags)
+    }
+
     pub fn world_width(&self) -> f32 {
         self.size_x as f32 * GLOBAL_SCALE
     }
 
     pub fn world_height(&self) -> f32 {
         self.size_y as f32 * GLOBAL_SCALE
+    }
+
+    /// Move-cell width/height — `GLOBAL_SCALE_MOVE` in
+    /// MatrixMap.hpp:18. Each map cell is sub-divided into `MOVE_CNT`
+    /// (=2) move cells on each axis.
+    pub const GLOBAL_SCALE_MOVE: f32 = GLOBAL_SCALE / 2.0;
+
+    /// World coords → move-cell coords. Mirrors
+    /// `TruncFloat(x * INVERT(GLOBAL_SCALE_MOVE))` used throughout
+    /// MatrixRobot.cpp (e.g. :377).
+    pub fn world_to_move(&self, wx: f32, wy: f32) -> (i32, i32) {
+        (
+            (wx / Self::GLOBAL_SCALE_MOVE).floor() as i32,
+            (wy / Self::GLOBAL_SCALE_MOVE).floor() as i32,
+        )
+    }
+
+    /// Move-cell coords → world-space center of the cell.
+    pub fn move_to_world(&self, mx: i32, my: i32) -> (f32, f32) {
+        (
+            (mx as f32 + 0.5) * Self::GLOBAL_SCALE_MOVE,
+            (my as f32 + 0.5) * Self::GLOBAL_SCALE_MOVE,
+        )
+    }
+
+    pub fn move_cell(&self, mx: i32, my: i32) -> Option<&MoveCell> {
+        if mx < 0 || my < 0 { return None; }
+        let (mx, my) = (mx as usize, my as usize);
+        if mx >= self.size_move_x || my >= self.size_move_y { return None; }
+        Some(&self.move_cells[my * self.size_move_x + mx])
+    }
+
+    /// Pathfinder passability check for a robot-sized footprint.
+    /// Reads the single precomputed `size = ROBOT_MOVECELLS_PER_SIZE`
+    /// bit — `(1 << chassis) << 18` — which the CMAP loader baked in
+    /// (encodes the full 4×4 footprint test in one bit per cell per
+    /// chassis kind). Ports `PlaceIsEmpty`'s wall test
+    /// (MatrixLogic.cpp:877). `size` = 1..=5.
+    pub fn is_passable_size(&self, mx: i32, my: i32, chassis_kind: usize, size: i32) -> bool {
+        match self.move_cell(mx, my) {
+            Some(c) => !c.is_impassable_for(chassis_kind, size),
+            None => false,
+        }
     }
 
     /// Ports CMatrixMap::GetZ for terrain/water boundary tests.
@@ -799,6 +966,64 @@ fn compute_normals(points: &[CompilePoint], size_x: usize, size_y: usize) -> Vec
         }
     }
     normals
+}
+
+/// Port of the `move/Data` buffer → `m_Move` expansion at
+/// MatrixMapPrepare.cpp:1241-1290. Each `SCompileMoveCell` (4 ×
+/// `SCompileMove`, 64 bytes) on the stored list holds the per-corner
+/// move metadata for a map cell; we fan it out into the flat
+/// `SizeMove.x × SizeMove.y` grid where `SizeMove = Size * 2`.
+/// Returns `(move_cells, size_move_x, size_move_y)`.
+fn load_move_cells(
+    stor: &crate::matrix_lib::base::storage::Storage,
+    points: &[CompilePoint],
+    size_x: usize,
+    size_y: usize,
+) -> (Vec<MoveCell>, usize, usize) {
+    let size_move_x = size_x * 2;
+    let size_move_y = size_y * 2;
+    let mut cells = vec![MoveCell::default(); size_move_x * size_move_y];
+
+    let Some(buf) = stor.get_buf("move", "Data") else {
+        log::warn!("map: move/Data block missing — pathfinder will treat every cell as impassable");
+        return (cells, size_move_x, size_move_y);
+    };
+    let data = buf.get_bytes(0);
+
+    // sizeof(SCompileMoveCell) = 4 × sizeof(SCompileMove) = 4 × 16 = 64
+    const CELL_SIZE: usize = 64;
+    let compiled_count = data.len() / CELL_SIZE;
+
+    let read_move = |off: usize| -> (i32, u32, u32, u32) {
+        let zone    = i32::from_le_bytes([data[off],    data[off+1],  data[off+2],  data[off+3]]);
+        let stop    = u32::from_le_bytes([data[off+4],  data[off+5],  data[off+6],  data[off+7]]);
+        let sphere  = u32::from_le_bytes([data[off+8],  data[off+9],  data[off+10], data[off+11]]);
+        let zubchik = u32::from_le_bytes([data[off+12], data[off+13], data[off+14], data[off+15]]);
+        (zone, stop, sphere, zubchik)
+    };
+
+    let stride = size_x + 1;
+    for y in 0..size_y {
+        for x in 0..size_x {
+            let mi = points[y * stride + x].move_idx;
+            if mi < 0 || (mi as usize) >= compiled_count { continue; }
+            let base_off = (mi as usize) * CELL_SIZE;
+            // Four sub-cells c[0..3] at local positions:
+            //   c[0] = (x*2,   y*2)
+            //   c[1] = (x*2+1, y*2)
+            //   c[2] = (x*2,   y*2+1)
+            //   c[3] = (x*2+1, y*2+1)
+            for (i, (dx, dy)) in [(0, 0), (1, 0), (0, 1), (1, 1)].iter().enumerate() {
+                let (zone, stop, sphere, zubchik) = read_move(base_off + i * 16);
+                let mx = x * 2 + dx;
+                let my = y * 2 + dy;
+                if mx < size_move_x && my < size_move_y {
+                    cells[my * size_move_x + mx] = MoveCell { zone, sphere, zubchik, stop };
+                }
+            }
+        }
+    }
+    (cells, size_move_x, size_move_y)
 }
 
 fn compute_units(points: &[CompilePoint], size_x: usize, size_y: usize) -> Vec<MapUnit> {
@@ -2126,18 +2351,21 @@ impl MapRenderer {
         }
     }
 
-    /// Rebuild per-robot instance transforms for the chassis-only
-    /// renderer. Called each frame after `World::takt` so freshly
-    /// spawned robots show up on the next render.
+    /// Rebuild per-robot instance transforms for the chassis
+    /// renderer + advance per-robot animation cursors. Called each
+    /// frame after `MapLogic::takt` so freshly spawned robots show
+    /// up and tracks keep animating. `cms` is the per-frame delta
+    /// used for the anim step.
     pub fn sync_robots(
         &mut self,
         queue: &wgpu::Queue,
-        objs: &super::map_static::Objects,
+        objs: &mut super::map_static::Objects,
         map: &GameMap,
         point_lights: &PointLightSystem,
+        cms: i32,
     ) {
         if let Some(robots) = &mut self.robots {
-            robots.sync_robots(queue, objs, map, point_lights);
+            robots.sync_robots(queue, objs, map, point_lights, cms);
         }
     }
 

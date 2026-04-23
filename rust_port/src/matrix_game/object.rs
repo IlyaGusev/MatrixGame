@@ -2455,8 +2455,8 @@ mod tests {
     #[test]
     fn ablaze_logic_takt_flips_burned_flag_after_5s() {
         use crate::matrix_game::effects::weapon::WEAPON_BIGBOOM;
-        use crate::matrix_game::world::World;
-        let mut world = World::with_seed(1);
+        use crate::matrix_game::logic::MapLogic;
+        let mut world = MapLogic::with_seed(1);
 
         let mut o = MapObject::from_instance(&inst());
         o.apply_ids_row("path*vo*tex******Burn,Tex,Burn01", &mut Rnd::new(1), || {});
@@ -2484,12 +2484,12 @@ mod tests {
     fn sens_logic_takt_transitions_on_nearby_robot() {
         use crate::matrix_game::map_static::{MapStatic, ObjectType};
         use crate::matrix_game::rnd::Rnd;
-        use crate::matrix_game::world::World;
+        use crate::matrix_game::logic::MapLogic;
 
         // Build a world with one SENS mapobject at the origin and a
         // "robot" (stub MapStatic with ObjectType::RobotAi) 30 units
         // away — inside the 50-unit sens radius.
-        let mut world = World::with_seed(1);
+        let mut world = MapLogic::with_seed(1);
         let mut sensor = MapObject::from_instance(&inst());
         sensor.apply_ids_row("path*vo*tex******Sens,50.0", &mut Rnd::new(1), || {});
         assert_eq!(sensor.beh_flag, BehFlag::Sens);

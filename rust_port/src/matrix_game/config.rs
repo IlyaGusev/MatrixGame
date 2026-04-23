@@ -167,6 +167,81 @@ impl BuildingDamages {
     }
 }
 
+/// Port of the `g_Config.m_ItemChars[CHASSIS{N}_MOVE_SPEED]` rows at
+/// MatrixConfig.cpp:874,881,888,895,902. The original stores per-chassis
+/// rotation speed, slope/water corrections, structure hp, etc. — only
+/// move speed is ported here because that's all `ROBOT_BASE_MOVEOUT`
+/// needs. The others land when their call sites land.
+///
+/// Indexed by `ChassisKind as usize` (0..=4).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ChassisChars {
+    pub move_speed: [f32; 5],
+    pub rotation_speed: [f32; 5],
+}
+
+impl ChassisChars {
+    /// Load `Chars/Chassis/CHASSIS{N}_MOVE_SPEED` +
+    /// `CHASSIS{N}_ROTATION_SPEED` from `robots.dat`
+    /// (MatrixConfig.cpp:870-905). Any missing key falls back to 0.0
+    /// — the C++ `BlockGet` for a missing param returns a default
+    /// `0.0` double.
+    pub fn from_matrix_data(stor: &Storage) -> Option<Self> {
+        let chars_rec = stor.block_record("da", "Chars")?;
+        let chassis_rec = stor.block_record(&chars_rec, "Chassis")?;
+        let keys = stor.get_buf(&chassis_rec, "0")?;
+        let values = stor.get_buf(&chassis_rec, "1")?;
+        let n = keys.arrays_count().min(values.arrays_count());
+
+        let mut out = Self::default();
+        for i in 0..n {
+            let name = keys.get_as_wstr(i);
+            let val = values.get_as_wstr(i);
+            let Some(rest) = name.strip_prefix("CHASSIS") else { continue };
+            let (digit, field) = match rest.split_once('_') {
+                Some(v) => v,
+                None => continue,
+            };
+            let Ok(n) = digit.parse::<usize>() else { continue };
+            if n < 1 || n > 5 { continue; }
+            let v: f32 = val.parse().unwrap_or(0.0);
+            match field {
+                "MOVE_SPEED" => out.move_speed[n - 1] = v,
+                "ROTATION_SPEED" => out.rotation_speed[n - 1] = v,
+                _ => {}
+            }
+        }
+        Some(out)
+    }
+}
+
+/// Process-wide config — ports `g_Config` (MatrixConfig.hpp). Only the
+/// subsets ported so far are exposed here. `World::load_config` seeds
+/// it; reading before that yields all-default tables.
+///
+/// Global singleton rather than threaded everywhere because `g_Config`
+/// is read from `CMatrixRobotAI::logic_takt` + sibling tick paths that
+/// can't easily carry an extra param through the `MapStatic` trait.
+static GLOBAL_CONFIG: std::sync::OnceLock<std::sync::RwLock<GlobalConfig>> =
+    std::sync::OnceLock::new();
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GlobalConfig {
+    pub chassis: ChassisChars,
+}
+
+pub fn global() -> GlobalConfig {
+    *GLOBAL_CONFIG
+        .get_or_init(|| std::sync::RwLock::new(GlobalConfig::default()))
+        .read()
+        .unwrap()
+}
+
+pub fn set_global(cfg: GlobalConfig) {
+    let slot = GLOBAL_CONFIG.get_or_init(|| std::sync::RwLock::new(GlobalConfig::default()));
+    *slot.write().unwrap() = cfg;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

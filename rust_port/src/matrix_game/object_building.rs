@@ -23,7 +23,7 @@ use wgpu::util::DeviceExt;
 
 use crate::matrix_game::effects::point_light::PointLightSystem;
 use crate::matrix_game::common::{unpack_rgb, FOG_END, FOG_START, PLAYER_SIDE};
-use crate::matrix_game::units::{ChassisKind, Robot};
+use crate::matrix_game::robot::{ChassisKind, Robot};
 use crate::matrix_game::map::{BuildingInstance, GameMap};
 use crate::matrix_game::map_static::{
     MapStatic, ObjectCore, ObjectId, Objects, ObjectType, MR_ALL,
@@ -184,6 +184,7 @@ impl BuildStack {
         parent_self_id: ObjectId,
         parent_state: BaseState,
         parent_pos: glam::Vec3,
+        parent_angle_quad: i32,
     ) -> Option<ObjectId> {
         if self.items.is_empty() {
             self.timer = 0;
@@ -212,7 +213,7 @@ impl BuildStack {
         // `JoinToGroup` + `AddObject`.
         let spawn_pos = glam::Vec3::new(parent_pos.x, parent_pos.y, parent_pos.z);
         let mut robot = Robot::new(spawn_pos, head.side, chassis);
-        robot.robot_spawn(parent_self_id, parent_pos.z);
+        robot.robot_spawn(parent_self_id, parent_angle_quad, parent_pos.z);
         let id = objs.spawn(Box::new(robot));
         objs.add_lt(id);
         Some(id)
@@ -588,7 +589,7 @@ impl MapStatic for Building {
         let parent_pos = glam::Vec3::new(self.pos.x, self.pos.y, self.build_z);
         if let Some(parent_id) = self.self_id {
             if let Some(spawned) = self.build_stack.tick_timer(
-                cms, objs, parent_id, self.state, parent_pos,
+                cms, objs, parent_id, self.state, parent_pos, self.angle,
             ) {
                 log::info!(
                     "build: factory side={} produced robot {:?} at ({:.0}, {:.0}, {:.0})",
@@ -1724,8 +1725,8 @@ mod tests {
 
     #[test]
     fn opening_base_completes_and_latches_at_opened() {
-        use crate::matrix_game::world::World;
-        let mut w = World::with_seed(1);
+        use crate::matrix_game::logic::MapLogic;
+        let mut w = MapLogic::with_seed(1);
         let mut b = Building::from_instance(&inst(0, PLAYER_SIDE as u8));
         b.init_max_hitpoint(500.0);
         b.open();
@@ -1752,8 +1753,8 @@ mod tests {
 
     #[test]
     fn closing_base_completes_and_latches_at_closed() {
-        use crate::matrix_game::world::World;
-        let mut w = World::with_seed(1);
+        use crate::matrix_game::logic::MapLogic;
+        let mut w = MapLogic::with_seed(1);
         let mut b = Building::from_instance(&inst(0, PLAYER_SIDE as u8));
         b.init_max_hitpoint(500.0);
         b.base_floor_progress = 1.0;
@@ -1781,8 +1782,8 @@ mod tests {
         // BUILDING_TITAN etc. have no open/close animation — state
         // transitions issued via open()/close() stay in Opening/Closing
         // because the animation block is gated on kind==Base.
-        use crate::matrix_game::world::World;
-        let mut w = World::with_seed(1);
+        use crate::matrix_game::logic::MapLogic;
+        let mut w = MapLogic::with_seed(1);
         let mut b = Building::from_instance(&inst(1, PLAYER_SIDE as u8));   // kind=Titan
         b.init_max_hitpoint(500.0);
         b.open();
@@ -1798,8 +1799,8 @@ mod tests {
 
     #[test]
     fn under_attack_timer_decays_to_zero() {
-        use crate::matrix_game::world::World;
-        let mut w = World::with_seed(1);
+        use crate::matrix_game::logic::MapLogic;
+        let mut w = MapLogic::with_seed(1);
         let mut b = Building::from_instance(&inst(0, PLAYER_SIDE as u8));
         b.init_max_hitpoint(500.0);
         b.under_attack_time = 1000;
@@ -1839,8 +1840,8 @@ mod tests {
     fn timers_freeze_in_dip_state() {
         // Dying buildings skip the pre-DIP block entirely (C++ guard
         // at MatrixObjectBuilding.cpp:502).
-        use crate::matrix_game::world::World;
-        let mut w = World::with_seed(1);
+        use crate::matrix_game::logic::MapLogic;
+        let mut w = MapLogic::with_seed(1);
         let mut b = Building::from_instance(&inst(0, PLAYER_SIDE as u8));
         b.init_max_hitpoint(500.0);
         b.state = BaseState::Dip;

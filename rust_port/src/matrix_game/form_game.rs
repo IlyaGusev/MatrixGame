@@ -10,7 +10,7 @@ use winit::{
 
 use crate::matrix_game::effects::point_light::PointLightSystem;
 use crate::matrix_game::map::GameMap;
-use crate::matrix_game::world::World;
+use crate::matrix_game::logic::MapLogic;
 use crate::matrix_game::camera::Camera;
 use crate::gfx::context::GfxContext;
 use crate::matrix_game::minimap::Minimap;
@@ -23,7 +23,7 @@ struct AppState {
     terrain: MapRenderer,
     minimap: Minimap,
     camera: Camera,
-    game: World,
+    game: MapLogic,
     last_time: f64,
     cursor: [f32; 2],
     minimap_dragging: bool,
@@ -139,7 +139,7 @@ impl ApplicationHandler for App {
             );
             minimap.set_angle(-map.camera_angle);
 
-            let mut game = World::new();
+            let mut game = MapLogic::new();
             game.load_config(&matrix_data);
             let building_ids = game.spawn_buildings(&map);
             log::info!("world: spawned {} buildings", building_ids.len());
@@ -285,7 +285,7 @@ impl ApplicationHandler for App {
                     );
                 }
 
-                let mut game = World::new();
+                let mut game = MapLogic::new();
                 game.load_config(&matrix_data);
                 let building_ids = game.spawn_buildings(&map);
                 log::info!("world: spawned {} buildings", building_ids.len());
@@ -538,8 +538,18 @@ impl ApplicationHandler for App {
                 // Camera / minimap / terrain takts mirror
                 // `CMatrixMap::Takt`'s remaining subsystem dispatches.
                 let step_ms = (dt * 1000.0).round() as i32;
-                state.game.takt(step_ms);
-                state.game.graphic_takt(step_ms);
+                {
+                    // Scope the map pointer for the duration of
+                    // the logic + graphic takt so dispatched
+                    // `logic_takt` / `takt` methods can call
+                    // `current_map()` (ports `g_MatrixMap`).
+                    let _scope = crate::matrix_game::map::MapScope::enter(
+                        &state.map,
+                        state.game.elapsed_ms,
+                    );
+                    state.game.takt(step_ms);
+                    state.game.graphic_takt(step_ms);
+                }
 
                 // Reconcile + animate the selection-ring effect with
                 // `player_side.active_object`. Ports the C++
@@ -595,9 +605,10 @@ impl ApplicationHandler for App {
                 // MatrixObjectRobot.cpp:359-480).
                 state.terrain.sync_robots(
                     &state.gfx.queue,
-                    &state.game.objects,
+                    &mut state.game.objects,
                     &state.map,
                     &state.point_lights,
+                    step_ms,
                 );
 
                 // Bake the minimap background the first time — ports
@@ -856,7 +867,7 @@ fn dispatch_ui_click(state: &mut AppState, click: &crate::matrix_game::interface
     use crate::matrix_game::map_static::{MapStatic, ObjectType};
     use crate::matrix_game::object_building::{Building, BuildingType};
     use crate::matrix_game::side::CurrSel;
-    use crate::matrix_game::units::ChassisKind;
+    use crate::matrix_game::robot::ChassisKind;
 
     match click {
         Click::Button(name) if name == "buro" => {

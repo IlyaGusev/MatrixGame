@@ -11,6 +11,6 @@ use wasm_bindgen::prelude::*;
 pub fn start() {
     console_error_panic_hook::set_once();
     console_log::init_with_level(log::Level::Info).ok();
-    log::info!("=== MatrixGame WASM v2 (bundle textures) ===");
+    log::info!("=== MatrixGame WASM v74 (anim+move debug) ===");
     matrix_game::form_game::run();
 }

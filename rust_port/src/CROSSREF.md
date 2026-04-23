@@ -57,6 +57,9 @@ Form, Helper, Math3D, ShadowProj, ShadowStencil.
 | matrix_game/object.rs         | MatrixObject.cpp (OBJECT_TYPE_MAPOBJECT — decorative rendering + `MapObject` game-object side)|
 | matrix_game/object_building.rs| MatrixObjectBuilding.cpp          |
 | matrix_game/object_robot.rs   | MatrixObjectRobot.cpp (chassis-only RNeed + per-frame instance sync) |
+| matrix_game/logic.rs          | MatrixLogic.cpp (CMatrixMapLogic: Takt driver, Place*/IsAbsenceWall helpers; also module root for Logic/ subsystems) |
+| matrix_game/map_trace.rs      | MatrixMapTrace.cpp (FindLocalPath A* + OptimizeMovePath line-of-sight cull) |
+| matrix_game/orders.rs         | MatrixRobot.hpp SOrder/OrderType/OrderPhase + AllocPlaceForOrderOnTop pool |
 | matrix_game/particles.rs      | (stub — will split across Effects/) |
 | matrix_game/progress_bar.rs   | MatrixProgressBar.cpp (3-segment bar + LIC color, atlas-backed) |
 | matrix_game/render_pipeline.rs| MatrixRenderPipeline.cpp          |
@@ -64,15 +67,13 @@ Form, Helper, Math3D, ShadowProj, ShadowStencil.
 | matrix_game/side.rs           | MatrixSide.cpp (selection fields only — `m_ActiveObject`, `m_CurrSel`; resources/AI/stats deferred) |
 | matrix_game/sky.rs            | DrawSky in MatrixMap.cpp + skybox parts |
 | matrix_game/ter_surface.rs    | MatrixTerSurface.cpp              |
-| matrix_game/units.rs          | (stub — will become MatrixRobot.cpp etc.) |
+| matrix_game/robot.rs          | MatrixRobot.cpp (CMatrixRobotAI AI state machine — spawn flow + move-out + MoveTo + GetLost) |
 | matrix_game/water.rs          | MatrixWater.cpp + BuildWater in MatrixMapGroup.cpp + WaterAlpha_t3 in MatrixRenderPipeline.cpp — will split in Stage 2 part 2 |
-| matrix_game/world.rs          | MatrixLogic.cpp `CMatrixMapLogic::Takt` (logic-takt decomposition only; sides/pathfinding deferred) |
 
 Not yet ported: MatrixConfig, MatrixCursor, MatrixDebugInfo,
-MatrixFlyer, MatrixInstantDraw, MatrixLoadProgress, MatrixLogic,
-MatrixMapTexture, MatrixMapTrace, MatrixMultiSelection,
-MatrixObjectCannon, MatrixObjectRobot, MatrixProgressBar, MatrixRobot,
-MatrixSampleStateManager, MatrixShadowManager, MatrixSide,
+MatrixFlyer, MatrixInstantDraw, MatrixLoadProgress,
+MatrixMapTexture, MatrixMultiSelection,
+MatrixObjectCannon, MatrixSampleStateManager, MatrixShadowManager,
 MatrixSkinManager, MatrixSoundManager, MatrixTransition,
 MatrixVisiCalc, DevConsole, StringConstants.
 

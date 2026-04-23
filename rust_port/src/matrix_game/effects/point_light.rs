@@ -580,6 +580,9 @@ mod tests {
             group_max_z_land: vec![0.0],
             group_w: 1,
             group_h: 1,
+            move_cells: vec![Default::default(); 4],
+            size_move_x: 2,
+            size_move_y: 2,
             min_z: 0.0,
             group_bounds: vec![crate::matrix_game::map::GroupBounds {
                 min_z: 0.0,

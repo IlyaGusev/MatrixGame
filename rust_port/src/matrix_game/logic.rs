@@ -1,16 +1,19 @@
-//! Top-level game state: the [`Objects`] arena + the logic/graphic tick
-//! driver.
+//! Port of `MatrixLogic.{cpp,hpp}` — `CMatrixMapLogic`, the
+//! logic-layer subclass of `CMatrixMap`. Owns the Objects arena
+//! (indirectly), the shared RNG, the takt-decomposition driver,
+//! per-side state, and the cell-level place / wall helpers used by
+//! the robot AI.
 //!
-//! Ports the `CMatrixMapLogic::Takt` decomposition in
-//! `MatrixLogic.cpp:2720-2766`: step is broken into full
-//! `LOGIC_TAKT_PERIOD` (10ms) portions + a remainder, each dispatched
-//! through `CMatrixMapStatic::ProceedLogic`. Side logic and the graphic
-//! takt (`CMatrixMap::Takt`) aren't part of scope A/B — they land when
-//! sides + the full map takt arrive.
+//! Also the module root for `Logic/*.cpp` ports — `ai_group.rs`
+//! (Logic/MatrixAIGroup.cpp) and future siblings declare here.
+
+pub mod ai_group;
 
 use crate::matrix_game::camera::Camera;
 use crate::matrix_game::common::{PLAYER_SIDE, TRACE_ANYOBJECT};
-use crate::matrix_game::config::{BuildingDamages, ObjectDamages};
+use crate::matrix_game::config::{
+    self, BuildingDamages, ChassisChars, GlobalConfig, ObjectDamages,
+};
 use crate::matrix_game::map::GameMap;
 use crate::matrix_game::map_static::{MapStatic, ObjectId, ObjectType, Objects};
 use crate::matrix_game::object::MapObject;
@@ -22,39 +25,48 @@ use crate::matrix_lib::base::storage::Storage;
 /// `LOGIC_TAKT_PERIOD` from `MatrixLogic.hpp:13`.
 pub const LOGIC_TAKT_PERIOD_MS: i32 = 10;
 
-pub struct World {
+/// Port of `ROBOT_MOVECELLS_PER_SIZE` (MatrixMap.hpp:25). The robot
+/// footprint in move cells is a square this wide on each side. The
+/// `SMatrixMapMove::m_Stop` bitmask stores per-size passability at
+/// bits `(1 << chassis) << (6 * (size-1))`; for a robot we always
+/// use `size = ROBOT_MOVECELLS_PER_SIZE`, hence the shift = 18.
+pub const ROBOT_MOVECELLS_PER_SIZE: i32 = 4;
+
+/// Port of `COLLIDE_BOT_R` (MatrixRobot.hpp:26). Radius of the
+/// robot's collision sphere — used by `PlaceIsEmpty` to exclude
+/// candidate cells that sit too close to another robot or to
+/// another robot's destination.
+pub const COLLIDE_BOT_R: f32 = 18.0;
+
+/// Port of the Takt driver + per-session arena / RNG / player-side
+/// aggregation. In C++ all these live on `CMatrixMapLogic`; in
+/// Rust we keep the map (`GameMap`) and the logic state in
+/// different structs because the map is built at load time and
+/// shared immutably across renderer / physics / AI paths, whereas
+/// the logic state mutates every tick.
+pub struct MapLogic {
     pub objects: Objects,
     /// The shared RNG — matches `CMatrixMapLogic::m_Rnd`
-    /// (MatrixLogic.hpp:75). Threaded into every `takt`/`logic_takt` so
-    /// subclasses (and us here) can branch deterministically.
+    /// (MatrixLogic.hpp:75).
     pub rng: Rnd,
     /// Number of LOGIC_TAKT_PERIOD portions elapsed since construction.
-    /// `u64` so a 10ms tick doesn't wrap in any reasonable session.
     pub tick: u64,
-    /// Total game-time in ms since the first `takt` call. Mirrors the
-    /// C++ `GetTime()` return type (milliseconds on an int clock).
+    /// Total game-time in ms. Ports `g_MatrixMap->GetTime()` return.
     pub elapsed_ms: i64,
-    /// Port of `g_MatrixMap->GetPlayerSide()` (MatrixMap.hpp). The
-    /// player's slice of the per-side state — selection, active
-    /// object, etc. Full per-side AI / resource / stats table lands
-    /// with the full `CMatrixSide` port.
+    /// Port of `g_MatrixMap->GetPlayerSide()`. Full per-side state
+    /// lands with `CMatrixSide`.
     pub player_side: Side,
 }
 
-impl Default for World {
-    fn default() -> Self {
-        Self::new()
-    }
+impl Default for MapLogic {
+    fn default() -> Self { Self::new() }
 }
 
-impl World {
-    pub fn new() -> Self {
-        Self::with_seed(1)
-    }
+impl MapLogic {
+    pub fn new() -> Self { Self::with_seed(1) }
 
-    /// Deterministic-seed constructor — tests and replay paths use this
-    /// so the generator state is reproducible. Matches the C++ ctor up
-    /// to the `rand()` seeding step (which is nondeterministic).
+    /// Deterministic-seed constructor — tests and replay use this
+    /// so the generator state is reproducible.
     pub fn with_seed(seed: i32) -> Self {
         Self {
             objects: Objects::new(),
@@ -66,13 +78,10 @@ impl World {
     }
 
     /// Port of the logic-takt portion of `CMatrixMapLogic::Takt`
-    /// (`MatrixLogic.cpp:2722-2734`). Full 10ms slices run first, then
-    /// the remainder in a single final call — matching the original's
-    /// trailing `if (portions) ProceedLogic(portions);`.
+    /// (`MatrixLogic.cpp:2722-2734`). Full 10ms slices, then the
+    /// remainder — matching the trailing `if (portions) ProceedLogic(portions);`.
     pub fn takt(&mut self, step_ms: i32) {
-        if step_ms <= 0 {
-            return;
-        }
+        if step_ms <= 0 { return; }
         let full = step_ms / LOGIC_TAKT_PERIOD_MS;
         for _ in 0..full {
             self.objects.proceed_logic(LOGIC_TAKT_PERIOD_MS, &mut self.rng);
@@ -86,42 +95,27 @@ impl World {
     }
 
     /// Port of `CMatrixMap::Takt`'s `SortEndGraphicTakt` call
-    /// (MatrixMap.cpp:2501 → MatrixMapStatic.cpp:755-765). Per-frame
-    /// per-object graphic takt; paired with (and strictly *after*) the
-    /// logic takt. Only the `Takt` dispatch portion is ported here —
-    /// the sky-angle / effects / sound / minimap / skin-manager takts
-    /// from `CMatrixMap::Takt` live elsewhere in the Rust port (already
-    /// driven from `form_game.rs`).
+    /// (MatrixMap.cpp:2501 → MatrixMapStatic.cpp:755-765).
     pub fn graphic_takt(&mut self, step_ms: i32) {
-        if step_ms <= 0 {
-            return;
-        }
+        if step_ms <= 0 { return; }
         self.objects.graphic_takt(step_ms, &mut self.rng);
     }
 
-    /// Load `g_Config.m_ObjectDamages` from `robots.dat`
-    /// (MatrixConfig.cpp:591-607). Missing / malformed data falls back
-    /// to the zero-initialized table (same semantics as the C++
-    /// `memset` at :593). Safe to call multiple times; subsequent
-    /// calls overwrite.
+    /// Load damage / chassis tables from `robots.dat` into
+    /// `g_Config` + per-object-arena caches. Ports the loader
+    /// portions of `CMatrixConfig::LoadConfig` invoked at startup.
     pub fn load_config(&mut self, matrix_data: &Storage) {
         self.objects.object_damages =
             ObjectDamages::from_matrix_data(matrix_data).unwrap_or_default();
         self.objects.building_damages =
             BuildingDamages::from_matrix_data(matrix_data).unwrap_or_default();
+        let chassis = ChassisChars::from_matrix_data(matrix_data).unwrap_or_default();
+        config::set_global(GlobalConfig { chassis });
     }
 
-    /// Populate the arena with one [`MapObject`] per decorative object
-    /// placed on the map. Ports the `new CMatrixMapObject()` + `Init(type)`
-    /// pattern in `CMatrixMap::LoadObjects`.
-    ///
-    /// `map_stor` is the map's `STRG` storage so each instance can look
-    /// up its Ids row and drive `apply_ids_row` — the behaviour-keyword
-    /// switch that decides `BehFlag` and whether to `AddLT`.
-    ///
-    /// Returns `(spawned_ids, stats)` where `stats` summarises how many
-    /// objects landed in each `BehFlag` bucket. Useful for logging at
-    /// init; the original prints similar counts via `DM(...)` calls.
+    /// Populate the arena with one [`MapObject`] per decorative
+    /// object placed on the map. Ports `CMatrixMap::LoadObjects`'s
+    /// `new CMatrixMapObject() + Init(type)` pattern.
     pub fn spawn_map_objects(
         &mut self,
         map: &GameMap,
@@ -135,9 +129,6 @@ impl World {
 
         for inst in &map.objects {
             let mut obj = MapObject::from_instance(inst);
-            // `g_MatrixMap->IdsGet(m_Type)` — the row; may be absent if
-            // `m_Type` is `m_IdsCnt-1` (the mapname slot — mapobjects
-            // don't land there) or if strings isn't present.
             let ids_row = if (inst.type_id as usize) < ids_count {
                 strings.map(|s| s.get_as_wstr(inst.type_id as usize)).unwrap_or_default()
             } else {
@@ -145,16 +136,9 @@ impl World {
             };
 
             let add_lt = if ids_row.is_empty() {
-                // No row → fallthrough to BEHF_STATIC (the from_instance
-                // default). `apply_ids_row` on "" would do the same but
-                // skipping avoids the unnecessary parse pass.
                 false
             } else {
                 obj.apply_ids_row(&ids_row, &mut self.rng, || {
-                    // `g_MatrixMap->m_BeforeWinCount` bump on '+' prefix
-                    // (MatrixObject.cpp:1023). The counter itself isn't
-                    // ported yet — it drives the "you must destroy all
-                    // special objects to win" UI, a separate scope.
                     stats.special_win_target += 1;
                 })
             };
@@ -170,30 +154,37 @@ impl World {
         (ids, stats)
     }
 
-    /// Populate the arena with one [`Building`] per starting base / turret
-    /// placed on the map. Ports the `new CMatrixBuilding()` + `OnLoad()`
-    /// path that `CMatrixMap::LoadBuildings` runs during init.
-    ///
-    /// Buildings opt into the logic-temp list immediately so their
-    /// state machine (currently a stub) ticks every LOGIC_TAKT_PERIOD.
-    /// That matches C++ `CMatrixBuilding::OnLoad` which calls `AddLT()`
-    /// at MatrixObjectBuilding.cpp:1088.
-    ///
-    /// Returns the spawned IDs so callers can look them up by side /
-    /// kind without a subsequent arena scan.
-    /// Port of the selection-entry code path triggered on left-click
-    /// (MatrixFormGame.cpp:530-642 → CMatrixMap pick → CMatrixSide
-    /// SelectObject). Given a screen pixel under the cursor, casts a
-    /// world-space ray via the camera, picks the nearest building /
-    /// unit, and stores it on `player_side`.
-    ///
-    /// Robots / flyers / cannons aren't in the arena yet, so `mask`
-    /// defaults to `TRACE_ANYOBJECT`: buildings match today, other
-    /// subclasses join the search when they land.
-    ///
-    /// Returns `Some(id)` if the click hit an object, `None` to
-    /// mirror the C++ behaviour of "click on empty ground → clear
-    /// selection".
+    /// Populate the arena with one [`Building`] per starting base /
+    /// turret. Ports `CMatrixMap::LoadBuildings` + `Building::OnLoad`.
+    pub fn spawn_buildings(&mut self, map: &GameMap) -> Vec<ObjectId> {
+        let mut ids = Vec::with_capacity(map.buildings.len());
+        for inst in &map.buildings {
+            let mut b = Building::from_instance(inst);
+            let kind_idx = b.kind as usize;
+            let hp = self.objects.building_damages
+                .hitpoint
+                .get(kind_idx)
+                .copied()
+                .unwrap_or(0);
+            if hp > 0 {
+                b.init_max_hitpoint(hp as f32);
+            }
+            let id = self.objects.spawn(Box::new(b));
+            if let Some(obj) = self.objects.get_mut(id) {
+                let b_mut: &mut Building = unsafe {
+                    &mut *(obj as *mut dyn MapStatic as *mut Building)
+                };
+                b_mut.self_id = Some(id);
+            }
+            self.objects.add_lt(id);
+            ids.push(id);
+        }
+        ids
+    }
+
+    /// Port of the selection-entry code path triggered on left-click.
+    /// Ports `CMatrixMap` pick → `CMatrixSide::SelectObject`
+    /// (MatrixFormGame.cpp:530-642).
     pub fn select_at_screen(
         &mut self,
         camera: &Camera,
@@ -208,9 +199,6 @@ impl World {
             Some((id, _t)) => {
                 let sel = match self.objects.get(id).map(|o| o.core().obj_type) {
                     Some(ObjectType::Building) => {
-                        // Base vs factory panel (MatrixSide.cpp's
-                        // SelectObject branch — base kind = BaseSelected,
-                        // other kinds = BuildingSelected).
                         let is_base = self.objects.get(id)
                             .and_then(|o| {
                                 let p = o as *const dyn MapStatic
@@ -236,51 +224,124 @@ impl World {
         }
     }
 
-    /// Return the active-selection id if it's still a live object in
-    /// the arena — tombstones (remove() bumped the generation) return
-    /// `None`, matching the C++ `m_ActiveObject->m_Object == NULL`
-    /// stale-pointer guard.
+    /// Return the active-selection id if it's still a live object.
     pub fn active_object(&self) -> Option<ObjectId> {
         let id = self.player_side.active_object?;
         if self.objects.is_valid(id) { Some(id) } else { None }
     }
-
-    pub fn spawn_buildings(&mut self, map: &GameMap) -> Vec<ObjectId> {
-        let mut ids = Vec::with_capacity(map.buildings.len());
-        for inst in &map.buildings {
-            let mut b = Building::from_instance(inst);
-            // Seed max HP from the loaded `Weapons/Damages/Building/HITPOINT`
-            // table. Indexed by `EBuildingType`. Falls back to 0 when
-            // robots.dat hasn't been loaded — tests can bypass with
-            // explicit `init_max_hitpoint` calls.
-            let kind_idx = b.kind as usize;
-            let hp = self.objects.building_damages
-                .hitpoint
-                .get(kind_idx)
-                .copied()
-                .unwrap_or(0);
-            if hp > 0 {
-                b.init_max_hitpoint(hp as f32);
-            }
-            let id = self.objects.spawn(Box::new(b));
-            // Back-fill the building's own id so BuildStack can hand
-            // it to freshly-produced robots for their spawn animation.
-            if let Some(obj) = self.objects.get_mut(id) {
-                let b_mut: &mut Building = unsafe {
-                    &mut *(obj as *mut dyn crate::matrix_game::map_static::MapStatic as *mut Building)
-                };
-                b_mut.self_id = Some(id);
-            }
-            self.objects.add_lt(id);
-            ids.push(id);
-        }
-        ids
-    }
 }
 
-/// Per-BehFlag spawn counts. `MapObject::apply_ids_row` drives the
-/// dispatch, so aggregating here is the cheapest way to surface "what
-/// actually landed in the arena" for a given map.
+// ── Cell / wall helpers (MatrixLogic.cpp:440-903) ───────────────────
+//
+// The original class methods hang off `CMatrixMapLogic` because they
+// read `m_Move` (owned by the map base class) and the live-object
+// list (owned by the logic layer). In Rust we split the two into
+// `&GameMap` + `&Objects` parameters so any caller can invoke them
+// without threading a `&MapLogic` through every order / tick path.
+
+/// Port of `CMatrixMapLogic::IsAbsenceWall` (MatrixLogic.cpp:513-536).
+/// Returns true when the precomputed size-N bit for `chassis_kind`
+/// is CLEAR at `(mx, my)` — i.e. no wall blocks a placement of
+/// `size` cells square here.
+pub fn is_absence_wall(
+    map: &GameMap,
+    chassis_kind: usize,
+    size: i32,
+    mx: i32,
+    my: i32,
+) -> bool {
+    if mx < 0 || (mx + size) as usize > map.size_move_x { return false; }
+    if my < 0 || (my + size) as usize > map.size_move_y { return false; }
+    map.is_passable_size(mx, my, chassis_kind, size)
+}
+
+/// Port of `CMatrixMapLogic::PlaceIsEmpty` (MatrixLogic.cpp:864-903).
+/// Combines the size-aware wall check with a scan of all live
+/// robots in `objs`: rejects if any non-DIP robot's center lies
+/// within `2 * COLLIDE_BOT_R` of the candidate's center, or if
+/// any other robot has a destination / return target there.
+///
+/// `skip` optionally excludes a specific object id (typically the
+/// robot doing the query) from the collision check.
+pub fn place_is_empty(
+    map: &GameMap,
+    objs: &Objects,
+    chassis_kind: usize,
+    size: i32,
+    mx: i32,
+    my: i32,
+    skip: Option<ObjectId>,
+) -> bool {
+    if !is_absence_wall(map, chassis_kind, size, mx, my) { return false; }
+
+    let kof = GameMap::GLOBAL_SCALE_MOVE * (ROBOT_MOVECELLS_PER_SIZE as f32) / 2.0;
+    let cx = GameMap::GLOBAL_SCALE_MOVE * mx as f32 + kof;
+    let cy = GameMap::GLOBAL_SCALE_MOVE * my as f32 + kof;
+    let r2 = (COLLIDE_BOT_R * 2.0).powi(2);
+
+    use crate::matrix_game::robot::Robot;
+
+    for id in objs.iter_live() {
+        if skip.map_or(false, |s| s == id) { continue; }
+        let Some(obj) = objs.get(id) else { continue };
+        if !matches!(obj.core().obj_type, ObjectType::RobotAi) { continue; }
+        let r: &Robot = unsafe { &*(obj as *const dyn MapStatic as *const Robot) };
+
+        let dx = cx - r.pos_x;
+        let dy = cy - r.pos_y;
+        if dx * dx + dy * dy < r2 { return false; }
+
+        // GetMoveToCoords — check robot's current MOVE_TO destination.
+        if let Some(pt) = r.move_to_coords() {
+            let tx = GameMap::GLOBAL_SCALE_MOVE * pt.0 as f32 + kof;
+            let ty = GameMap::GLOBAL_SCALE_MOVE * pt.1 as f32 + kof;
+            if (cx - tx).powi(2) + (cy - ty).powi(2) < r2 { return false; }
+        }
+        // GetReturnCoords — check robot's MOVE_RETURN anchor if any.
+        if let Some(pt) = r.return_coords() {
+            let tx = GameMap::GLOBAL_SCALE_MOVE * pt.0 as f32 + kof;
+            let ty = GameMap::GLOBAL_SCALE_MOVE * pt.1 as f32 + kof;
+            if (cx - tx).powi(2) + (cy - ty).powi(2) < r2 { return false; }
+        }
+    }
+    true
+}
+
+/// Port of `CMatrixMapLogic::PlaceFindNear(nsh, size, mx, my)` —
+/// the commented-out simpler variant from MatrixLogic.cpp:540-570
+/// (the full variant at :713-758 adds other-robot-destination
+/// avoidance; we defer that). Spirals outward looking for a cell
+/// that passes `place_is_empty` for `(chassis_kind, size)`.
+/// Returns the nearest valid cell as `(mx, my)`.
+pub fn place_find_near(
+    map: &GameMap,
+    objs: &Objects,
+    chassis_kind: usize,
+    size: i32,
+    mx: i32,
+    my: i32,
+    radius: i32,
+    skip: Option<ObjectId>,
+) -> Option<(i32, i32)> {
+    if place_is_empty(map, objs, chassis_kind, size, mx, my, skip) {
+        return Some((mx, my));
+    }
+    for r in 1..=radius {
+        for dy in -r..=r {
+            for dx in -r..=r {
+                if dx.abs() != r && dy.abs() != r { continue; } // ring only
+                let nx = mx + dx;
+                let ny = my + dy;
+                if place_is_empty(map, objs, chassis_kind, size, nx, ny, skip) {
+                    return Some((nx, ny));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Per-BehFlag spawn counts collected during `spawn_map_objects`.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SpawnStats {
     pub r#static: u32,
@@ -291,8 +352,6 @@ pub struct SpawnStats {
     pub spawner: u32,
     pub terron: u32,
     pub portret: u32,
-    /// Count of rows whose behaviour field started with '+' (special
-    /// win-target objects, see `apply_ids_row`).
     pub special_win_target: u32,
 }
 
@@ -354,7 +413,7 @@ mod tests {
 
     #[test]
     fn takt_decomposes_step_into_full_portions_plus_remainder() {
-        let mut w = World::new();
+        let mut w = MapLogic::new();
         let calls = Rc::new(RefCell::new(Vec::new()));
         let id = w.objects.spawn(Box::new(Counter {
             core: ObjectCore { obj_type: ObjectType::MapObject, ..Default::default() },
@@ -372,7 +431,7 @@ mod tests {
 
     #[test]
     fn takt_with_exact_multiple_has_no_remainder_call() {
-        let mut w = World::new();
+        let mut w = MapLogic::new();
         let calls = Rc::new(RefCell::new(Vec::new()));
         let id = w.objects.spawn(Box::new(Counter {
             core: ObjectCore { obj_type: ObjectType::MapObject, ..Default::default() },
@@ -388,7 +447,7 @@ mod tests {
 
     #[test]
     fn takt_with_sub_period_step_uses_only_remainder() {
-        let mut w = World::new();
+        let mut w = MapLogic::new();
         let calls = Rc::new(RefCell::new(Vec::new()));
         let id = w.objects.spawn(Box::new(Counter {
             core: ObjectCore { obj_type: ObjectType::MapObject, ..Default::default() },
@@ -405,7 +464,7 @@ mod tests {
 
     #[test]
     fn takt_with_nonpositive_step_is_noop() {
-        let mut w = World::new();
+        let mut w = MapLogic::new();
         w.takt(0);
         w.takt(-5);
         assert_eq!(w.tick, 0);
