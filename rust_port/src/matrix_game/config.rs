@@ -178,6 +178,20 @@ impl BuildingDamages {
 pub struct ChassisChars {
     pub move_speed: [f32; 5],
     pub rotation_speed: [f32; 5],
+    /// `m_ItemChars[CHASSIS{N}_MOVE_WATER_CORR]` (MatrixConfig.cpp:875,...).
+    /// Multiplier applied to `m_Speed` when `ROBOT_FLAG_ONWATER` is set
+    /// (MatrixRobot.cpp:2420). Typical values: 0 for land-only chassis,
+    /// 0.5–1.0 for amphibious.
+    pub water_corr: [f32; 5],
+    /// `m_ItemChars[CHASSIS{N}_MOVE_SLOPE_CORR_UP]` (MatrixConfig.cpp:877,...).
+    /// Slope (sin θ) at which uphill speed multiplier reaches zero. Values
+    /// below this lerp linearly from 1.0 at slope=0 to 0.0 at slope=this
+    /// (MatrixRobot.cpp:2432-2438).
+    pub slope_corr_up: [f32; 5],
+    /// `m_ItemChars[CHASSIS{N}_MOVE_SLOPE_CORR_DOWN]` (MatrixConfig.cpp:876,...).
+    /// Target multiplier reached when going fully downhill (slope = -1).
+    /// LERP from 1.0 at slope=0 to this at slope=-1 (MatrixRobot.cpp:2441).
+    pub slope_corr_down: [f32; 5],
 }
 
 impl ChassisChars {
@@ -208,6 +222,9 @@ impl ChassisChars {
             match field {
                 "MOVE_SPEED" => out.move_speed[n - 1] = v,
                 "ROTATION_SPEED" => out.rotation_speed[n - 1] = v,
+                "MOVE_WATER_CORR" => out.water_corr[n - 1] = v,
+                "MOVE_SLOPE_CORR_UP" => out.slope_corr_up[n - 1] = v,
+                "MOVE_SLOPE_CORR_DN" => out.slope_corr_down[n - 1] = v,
                 _ => {}
             }
         }

@@ -134,6 +134,31 @@ impl MoveCell {
     pub fn is_impassable_for(&self, nsh: usize, size: i32) -> bool {
         (self.stop & Self::stop_mask(nsh, size)) != 0
     }
+
+    /// Port of `SMatrixMapMove::GetType(nsh)` (MatrixMap.hpp:149-166).
+    /// Packs the 8 per-corner sphere/zubchik bits for chassis `nsh`
+    /// into one byte:
+    ///   - bits 0..3 = `m_Sphere` corner mask (sphere corners at LU/RU/RD/LD)
+    ///   - bits 4..7 = `m_Zubchik` corner mask (triangular `zubchik` corners)
+    /// Returns `0xff` when the size-1 cell is *passable* for `nsh`
+    /// (`m_Stop` bit for size-1 is not set — shift=0). That sentinel is
+    /// what `SphereRobotToAABBObstacleCollision` tests at :2791.
+    #[inline]
+    pub fn get_type(&self, nsh: usize) -> u8 {
+        if (self.stop & (1u32 << nsh)) == 0 {
+            return 0xff;
+        }
+        let mut rv: u8 = 0;
+        if (self.sphere & ((1u32 << nsh) <<  0)) != 0 { rv |= 1; }
+        if (self.sphere & ((1u32 << nsh) <<  8)) != 0 { rv |= 2; }
+        if (self.sphere & ((1u32 << nsh) << 16)) != 0 { rv |= 4; }
+        if (self.sphere & ((1u32 << nsh) << 24)) != 0 { rv |= 8; }
+        if (self.zubchik & ((1u32 << nsh) <<  0)) != 0 { rv |= 16; }
+        if (self.zubchik & ((1u32 << nsh) <<  8)) != 0 { rv |= 32; }
+        if (self.zubchik & ((1u32 << nsh) << 16)) != 0 { rv |= 64; }
+        if (self.zubchik & ((1u32 << nsh) << 24)) != 0 { rv |= 128; }
+        rv
+    }
 }
 
 /// Per-cell coefficients matching SMatrixMapUnit fields used by GetZ.

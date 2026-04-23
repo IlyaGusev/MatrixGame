@@ -70,6 +70,17 @@ pub const OBJECT_STATE_DIP:                 u32 = 1 << 6;
 #[allow(dead_code)] pub const OBJECT_STATE_TERRON_EXPL1:      u32 = 1 << 15;
 #[allow(dead_code)] pub const OBJECT_STATE_TERRON_EXPL2:      u32 = 1 << 16;
 
+// Robot-only (`ROBOT_FLAG_*` — MatrixMapStatic.hpp:62-77).
+/// `ROBOT_FLAG_ONWATER` (`SETBIT(14)`, MatrixMapStatic.hpp:76). Set by
+/// `Z_From_Pos` (MatrixObjectRobot.cpp:282) whenever the terrain height
+/// at the robot's XY is below `WATER_LEVEL`. Read by `Seek`
+/// (MatrixRobot.cpp:2420) to apply the chassis `m_SpeedWaterCorr`.
+pub const ROBOT_FLAG_ONWATER:  u32 = 1 << 14;
+/// `ROBOT_FLAG_COLLISION` — set by LowLevelMove when a collision
+/// correction kicked in this tick (MatrixRobot.cpp:2623).
+#[allow(dead_code)]
+pub const ROBOT_FLAG_COLLISION: u32 = 1 << 15;
+
 // Building-only (overlays bits 10..=12 from MatrixMapStatic.hpp:88-90).
 /// `BUILDING_NEW_INCOME` — a resource tick just fired; Takt emits a
 /// billboard-score effect on the next frame (MatrixObjectBuilding.cpp:355).

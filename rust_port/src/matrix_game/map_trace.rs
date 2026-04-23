@@ -3,12 +3,29 @@
 //!
 //! Entry points mirror the original:
 //!   * `find_path` → `CMatrixMap::FindLocalPath` (8-way A* over the
-//!     move cells). The C++ also accepts a "zone hint" chain from
-//!     `ZonePathCalc` which we defer — the regions network isn't
-//!     ported yet. For small maps this has no effect on the
-//!     resulting path.
+//!     move cells).
 //!   * `optimize_path` → `CMatrixMap::OptimizeMovePath` (drops
 //!     collinear midpoints with a line-of-sight check).
+//!
+//! ## Zone-path hint — deferred by design
+//!
+//! The C++ `FindLocalPath` takes a `zonepath[]` array computed by
+//! `CMatrixRobotAI::ZonePathCalc` (MatrixRobot.cpp:1578-1605) that
+//! comes from a precomputed road network (`CMatrixRoadNetwork`,
+//! 2706 lines at `Logic/MatrixRoadNetwork.cpp`). Its effect inside
+//! `FindLocalPath` (MatrixLogic.cpp:1245-1259) is to **restrict the
+//! search rectangle** to the union of the listed zones' bboxes. It
+//! does not alter which path is chosen when a path exists — A* run
+//! over the full map yields the same (or a shorter) route, only
+//! slower on very large maps.
+//!
+//! Porting the zone subsystem requires (a) deserialising the `rn`
+//! block from each CMAP (MatrixMapPrepare.cpp:1608 —
+//! `m_RN.Load(rnb, ver)`), (b) porting `CMatrixRoadNetwork`'s zone /
+//! crotch / group graph, and (c) wiring `CMatrixSide` team / group
+//! logic that feeds `FindPathInZone`. None of those side
+//! dependencies are in the port yet, and the only observable effect
+//! is search speed on large maps. Left as a targeted follow-up.
 //!
 //! Waypoint semantics match the original: each path cell
 //! `(mx, my)` is the **upper-left corner of the robot's 4×4 move-cell
@@ -40,6 +57,29 @@ pub struct MovePt {
 
 impl MovePt {
     pub fn new(x: i32, y: i32) -> Self { Self { x, y } }
+}
+
+/// Port of the `(other_path_list[i], other_des[i])` tuple fed to
+/// `CMatrixMap::FindLocalPath` (MatrixRobot.cpp:1630-1643). Each
+/// blocker is another live robot (or cannon) whose future footprint
+/// should raise the cost of routing through those cells:
+///   - `pos`: where the robot currently stands — `path_list[0]` in
+///     C++. Weight 30 (MatrixLogic.cpp:1289-1300).
+///   - `dest`: where the robot is heading. Weight 200
+///     (MatrixLogic.cpp:1278-1287).
+///
+/// The C++ version originally also walked the *remaining* path and
+/// stamped `SetWeightFromTo` along it, but that loop is commented
+/// out in the shipped binary (MatrixLogic.cpp:1273-1276), so we
+/// faithfully omit it. Blockers influence `find_path` *cost* only —
+/// A* can still route through them when no detour exists.
+#[derive(Debug, Clone, Copy)]
+pub struct Blocker {
+    /// Current standing cell (upper-left corner of footprint). `None`
+    /// for stationary objects where only the final pos is known.
+    pub pos: Option<MovePt>,
+    /// Destination cell (upper-left corner of footprint).
+    pub dest: MovePt,
 }
 
 /// Port of `m_MovePath[]` contents — a contiguous list of move-cell
@@ -104,23 +144,27 @@ impl PartialOrd for Node {
 /// The robot's 4×4 footprint must be passable at every cell on the
 /// path (see `footprint_passable`).
 ///
-/// `blockers` is a list of move-cell positions (upper-left corners
-/// of footprints) that A* must treat as impassable for the
-/// duration of this search — port of the `other_des` /
-/// `other_path_list` arguments the C++ `FindLocalPath` takes at
-/// MatrixRobot.cpp:1658-1664. Used to route around other robots'
-/// current positions and destinations so the initial path doesn't
-/// drive straight into another robot.
+/// `blockers` is a list of `(pos, dest)` cells from other live
+/// robots / cannons. Port of the `other_des` / `other_path_list`
+/// arguments to `CMatrixMap::FindLocalPath` (MatrixRobot.cpp:1658-
+/// 1664 + MatrixLogic.cpp:1217-1301). Each blocker raises the
+/// per-cell traversal weight inside a footprint-sized window:
+///   - `dest` → weight 200 (line 1285),
+///   - `pos`  → weight 30  (line 1297).
+/// Everything else has a base weight of 5. Rust rescales to 1.0 /
+/// 6.0 / 40.0 so the octile heuristic stays admissible at step=1.
 ///
-/// Port of `CMatrixMap::FindLocalPath` (MatrixMapTrace.cpp / the
-/// pathfinder in the road-network). We skip the zone constraints;
-/// those are efficiency hints in the original, not correctness.
+/// Port of `CMatrixMap::FindLocalPath` (MatrixLogic.cpp:1217). The
+/// zone-constraint argument (`zonepath`) is omitted — the regions
+/// network isn't ported yet and the C++ uses it purely as an
+/// efficiency hint (restricts the search rectangle); correctness
+/// is preserved by letting A* see the full map.
 pub fn find_path(
     map: &GameMap,
     start: MovePt,
     goal: MovePt,
     chassis_kind: usize,
-    blockers: &[MovePt],
+    blockers: &[Blocker],
 ) -> Option<Vec<MovePt>> {
     let sx = map.size_move_x as i32;
     let sy = map.size_move_y as i32;
@@ -134,36 +178,45 @@ pub fn find_path(
     if !in_bounds(start) || !in_bounds(goal) { return None; }
     if !footprint_passable(map, goal.x, goal.y, chassis_kind) { return None; }
 
-    // Expand each blocker into its footprint cells. Two footprints
-    // overlap iff their upper-left corners are within
-    // ROBOT_MOVECELLS_PER_SIZE on each axis — the standard AABB
-    // test. We store the set as a bitmap for O(1) lookup.
+    // Per-cell traversal weight grid. Base = 1.0; each blocker stamps
+    // a footprint window around `pos` (weight 6.0) and `dest`
+    // (weight 40.0). `max` between old and new matches C++ `if(w<200)
+    // w=200` / `if(w<30) w=30` semantics (MatrixLogic.cpp:1285, 1297).
     let w = sx as usize;
     let h = sy as usize;
-    let mut blocked = vec![false; w * h];
-    for b in blockers {
-        if *b == start { continue; } // don't block our own start
-        for dy in -(ROBOT_MOVECELLS_PER_SIZE - 1)..=(ROBOT_MOVECELLS_PER_SIZE - 1) {
-            for dx in -(ROBOT_MOVECELLS_PER_SIZE - 1)..=(ROBOT_MOVECELLS_PER_SIZE - 1) {
-                let bx = b.x + dx;
-                let by = b.y + dy;
+    let mut weight = vec![1.0_f32; w * h];
+    const W_POS:  f32 = 6.0;  // C++ 30 / 5
+    const W_DEST: f32 = 40.0; // C++ 200 / 5
+    let stamp = |grid: &mut [f32], c: MovePt, new_w: f32| {
+        // Footprint window = `[c.x-(S-1) .. c.x+S) × [c.y-(S-1) ..
+        // c.y+S)` — same `other_size[i]=4` window the C++ uses at
+        // :1278-1287 and :1290-1299.
+        for dy in -(ROBOT_MOVECELLS_PER_SIZE - 1)..ROBOT_MOVECELLS_PER_SIZE {
+            for dx in -(ROBOT_MOVECELLS_PER_SIZE - 1)..ROBOT_MOVECELLS_PER_SIZE {
+                let bx = c.x + dx;
+                let by = c.y + dy;
                 if bx >= 0 && by >= 0 && bx < sx && by < sy {
-                    blocked[(by as usize) * w + (bx as usize)] = true;
+                    let i = (by as usize) * w + (bx as usize);
+                    if grid[i] < new_w { grid[i] = new_w; }
                 }
             }
         }
-    }
-    let is_blocked = |p: MovePt| -> bool {
-        if p.x < 0 || p.y < 0 || p.x >= sx || p.y >= sy { return false; }
-        blocked[(p.y as usize) * w + (p.x as usize)]
     };
+    for b in blockers {
+        // Dest first (higher weight) then pos — stamp order matches
+        // C++ and the `max` semantics make it order-insensitive.
+        stamp(&mut weight, b.dest, W_DEST);
+        if let Some(p) = b.pos {
+            stamp(&mut weight, p, W_POS);
+        }
+    }
+    // Never penalise our own start cell — the C++ never does because
+    // path_list[0] of the *current* robot was never added to its own
+    // blocker list.
+    weight[(start.y as usize) * w + (start.x as usize)] = 1.0;
 
-    // Flat index into (sx+1)-wide scratch arrays. We index cells by
-    // their upper-left corner so the reachable cell set is
-    // sx * sy = map.size_move_x * map.size_move_y.
     let idx = |p: MovePt| -> usize { (p.y as usize) * w + (p.x as usize) };
 
-    // g-score (best known) + parent (for path reconstruction).
     let mut g = vec![f32::INFINITY; w * h];
     let mut parent = vec![(-1i32, -1i32); w * h];
     let mut closed = vec![false; w * h];
@@ -171,7 +224,8 @@ pub fn find_path(
     let h_cost = |p: MovePt| -> f32 {
         let dx = (goal.x - p.x).abs() as f32;
         let dy = (goal.y - p.y).abs() as f32;
-        // Octile distance — admissible for 8-way uniform-step grid.
+        // Octile distance — admissible for 8-way grid with min weight
+        // 1.0. Safe overestimate for weighted cells (conservative).
         let (a, b) = if dx < dy { (dx, dy) } else { (dy, dx) };
         (b - a) + 1.41421356 * a
     };
@@ -180,9 +234,6 @@ pub fn find_path(
     g[idx(start)] = 0.0;
     open.push(Node { f: h_cost(start), g: 0.0, x: start.x, y: start.y });
 
-    // 8-way: 4 ortho (cost 1) + 4 diag (cost √2). For diagonals we
-    // also require both ortho neighbors be passable so the robot's
-    // footprint doesn't corner-clip.
     const MOVES: [(i32, i32, f32); 8] = [
         (1, 0, 1.0), (-1, 0, 1.0), (0, 1, 1.0), (0, -1, 1.0),
         (1, 1, 1.41421356), (1, -1, 1.41421356),
@@ -192,7 +243,6 @@ pub fn find_path(
     while let Some(Node { g: gu, x, y, .. }) = open.pop() {
         let u = MovePt::new(x, y);
         if u == goal {
-            // Reconstruct.
             let mut out = vec![goal];
             let mut cur = goal;
             while cur != start {
@@ -212,9 +262,6 @@ pub fn find_path(
             let v = MovePt::new(u.x + dx, u.y + dy);
             if !in_bounds(v) { continue; }
             if !footprint_passable(map, v.x, v.y, chassis_kind) { continue; }
-            if is_blocked(v) { continue; }
-            // For diagonals, both ortho neighbors must also pass —
-            // blocks corner-clipping across a diagonal wall.
             if dx != 0 && dy != 0 {
                 if !footprint_passable(map, u.x + dx, u.y, chassis_kind) { continue; }
                 if !footprint_passable(map, u.x, u.y + dy, chassis_kind) { continue; }
@@ -222,7 +269,11 @@ pub fn find_path(
 
             let iv = idx(v);
             if closed[iv] { continue; }
-            let new_g = gu + step;
+            // Step cost = base direction cost × enter-cell weight —
+            // matches C++ `smm->m_Find = smm2->m_Find + smm->m_Weight`
+            // where the step itself is free and the entered cell's
+            // weight dominates (MatrixLogic.cpp:1373).
+            let new_g = gu + step * weight[iv];
             if new_g + 1e-5 < g[iv] {
                 g[iv] = new_g;
                 parent[iv] = (u.x, u.y);
@@ -239,15 +290,14 @@ pub fn find_path(
 /// segment to the latest kept waypoint is passable — yielding a
 /// shorter path of diagonal straight runs.
 ///
-/// `blockers` is the same list handed to `find_path`. The optimizer
-/// must not smooth through dynamic blockers or the resulting path
-/// will drive straight into another robot that A* had carefully
-/// routed around.
+/// **No blocker awareness** — matches C++ where `OptimizeMovePath`
+/// takes only `(chassis, size, cnt, path)` and never consults the
+/// dynamic-blocker list. Blockers affected A* cost; the optimizer
+/// collapses the resulting path on pure terrain passability.
 pub fn optimize_path(
     map: &GameMap,
     path: &[MovePt],
     chassis_kind: usize,
-    blockers: &[MovePt],
 ) -> Vec<MovePt> {
     if path.len() <= 2 { return path.to_vec(); }
     let mut out = Vec::with_capacity(path.len());
@@ -255,10 +305,8 @@ pub fn optimize_path(
     let mut anchor = 0usize;
     let mut i = 1usize;
     while i < path.len() {
-        // Try to extend the anchor→path[i] segment. If the segment
-        // past `i` still has line-of-sight from anchor, keep going.
         if i + 1 < path.len()
-            && line_of_sight(map, path[anchor], path[i + 1], chassis_kind, blockers)
+            && line_of_sight(map, path[anchor], path[i + 1], chassis_kind)
         {
             i += 1;
         } else {
@@ -275,22 +323,7 @@ fn line_of_sight(
     a: MovePt,
     b: MovePt,
     chassis_kind: usize,
-    blockers: &[MovePt],
 ) -> bool {
-    // Bresenham-ish footprint sweep. Each cell on the line must have
-    // a passable footprint (terrain/walls) AND not overlap any
-    // dynamic blocker's ROBOT_MOVECELLS_PER_SIZE footprint.
-    let blocker_hit = |p: MovePt| -> bool {
-        for b in blockers {
-            if (p.x - b.x).abs() < ROBOT_MOVECELLS_PER_SIZE
-                && (p.y - b.y).abs() < ROBOT_MOVECELLS_PER_SIZE
-            {
-                return true;
-            }
-        }
-        false
-    };
-
     let dx = b.x - a.x;
     let dy = b.y - a.y;
     let steps = dx.abs().max(dy.abs());
@@ -301,7 +334,6 @@ fn line_of_sight(
         let x = (a.x as f32 + fx * s as f32).round() as i32;
         let y = (a.y as f32 + fy * s as f32).round() as i32;
         if !footprint_passable(map, x, y, chassis_kind) { return false; }
-        if blocker_hit(MovePt::new(x, y)) { return false; }
     }
     true
 }
