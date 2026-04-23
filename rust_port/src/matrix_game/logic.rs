@@ -343,12 +343,18 @@ impl MapLogic {
     }
 
     /// Right-click move order — ports the order-dispatch path at
-    /// `CMatrixSideUnit::OnRButtonDown` + the per-robot `MoveTo` loop
-    /// (MatrixSide.cpp). Ray-casts the cursor to the terrain, then
-    /// converts to move-cell coords and calls `Robot::move_to` on
-    /// every currently-selected own-side robot.
+    /// `CMatrixSideUnit::OnRButtonDown` + `PGOrderMoveTo` +
+    /// `PGAssignPlacePlayer` (MatrixSide.cpp:847, 7953-8010, 8694-
+    /// 8757). Ray-casts the cursor to the terrain, then runs the
+    /// formation-placement spiral search per selected robot so each
+    /// ends up at a unique cell around the click point rather than
+    /// piling onto the same destination.
     ///
-    /// Returns the number of robots the order was issued to.
+    /// Returns the list of per-robot assigned world-space destinations
+    /// (centered on the 4×4 footprint), so the caller can spawn one
+    /// move-order ping per slot — matching `PGShowPlace`
+    /// (MatrixSide.cpp:8538-8568) which creates a `CMatrixEffectMoveto`
+    /// per robot at its own assigned place.
     pub fn order_move_to_at(
         &mut self,
         camera: &Camera,
@@ -357,20 +363,50 @@ impl MapLogic {
         screen_w: f32,
         screen_h: f32,
         map: &GameMap,
-    ) -> usize {
+    ) -> Vec<(f32, f32)> {
         let Some((wx, wy)) = screen_to_terrain_xy(camera, map, sx, sy, screen_w, screen_h) else {
-            return 0;
+            return Vec::new();
         };
         // World XY → move-cell upper-left corner of the robot's 4×4
-        // footprint, matching the conversion used by
-        // `CMatrixRobotAI::MoveTo` callers (MatrixRobot.cpp:4625).
+        // footprint, matching the conversion at MatrixRobot.cpp:4625 /
+        // MatrixSide.cpp:816-817.
         let (cmx, cmy) = map.world_to_move(wx, wy);
-        let mx = cmx - ROBOT_MOVECELLS_PER_SIZE / 2;
-        let my = cmy - ROBOT_MOVECELLS_PER_SIZE / 2;
+        let center_mx = cmx - ROBOT_MOVECELLS_PER_SIZE / 2;
+        let center_my = cmy - ROBOT_MOVECELLS_PER_SIZE / 2;
 
-        let ids: Vec<ObjectId> = self.player_side.selected.clone();
-        let mut n = 0;
-        for id in ids {
+        // Seed the blocker list with every out-of-group robot's
+        // claimed place. The C++ at MatrixSide.cpp:8700-8727 walks
+        // `GetFirstLogic` and adds entries where `GetGroupLogic != no`
+        // — we approximate "not in our group" as "not in the current
+        // selection" since per-side logical groups aren't ported yet.
+        let selected: Vec<ObjectId> = self.player_side.selected.clone();
+        let mut blockers: Vec<(i32, i32)> = Vec::new();
+        for id in self.objects.iter_live() {
+            let Some(obj) = self.objects.get(id) else {
+                continue;
+            };
+            if !matches!(obj.core().obj_type, ObjectType::RobotAi) {
+                continue;
+            }
+            if selected.contains(&id) {
+                continue;
+            }
+            let other: &crate::matrix_game::robot::Robot = unsafe {
+                &*(obj as *const dyn MapStatic as *const crate::matrix_game::robot::Robot)
+            };
+            if let Some((px, py)) = other.place_add {
+                blockers.push((px, py));
+            }
+        }
+
+        // Spiral-search a unique cell per in-group robot; each newly
+        // assigned slot joins the blocker list before the next robot
+        // starts searching. Matches the second loop in
+        // `PGAssignPlacePlayer` (MatrixSide.cpp:8729-8756) — that loop
+        // also stamps the result into the robot's env via
+        // `PGSetPlace` + feeds it back into `other_des`.
+        let mut out: Vec<(f32, f32)> = Vec::new();
+        for id in selected {
             let Some(obj) = self.objects.get_mut(id) else {
                 continue;
             };
@@ -383,10 +419,26 @@ impl MapLogic {
             if r.side != self.player_side.id {
                 continue;
             }
+            let chassis = r.chassis as usize;
+            let (mx, my) = place_find_near_with_blockers(
+                map,
+                chassis,
+                ROBOT_MOVECELLS_PER_SIZE,
+                center_mx,
+                center_my,
+                &blockers,
+            )
+            .unwrap_or((center_mx, center_my));
+            // `PGSetPlace` → `m_PlaceAdd = (mx, my)` (MatrixSide.cpp:8473).
+            r.place_add = Some((mx, my));
             r.move_to(mx, my);
-            n += 1;
+            blockers.push((mx, my));
+            // World-space ping position = footprint center.
+            let gs = crate::matrix_game::map::GameMap::GLOBAL_SCALE_MOVE;
+            let half = ROBOT_MOVECELLS_PER_SIZE as f32 * 0.5;
+            out.push(((mx as f32 + half) * gs, (my as f32 + half) * gs));
         }
-        n
+        out
     }
 
     /// Return the active-selection id if it's still a live object.
@@ -566,6 +618,79 @@ pub fn place_find_near(
                 }
             }
         }
+    }
+    None
+}
+
+/// Port of `CMatrixMapLogic::PlaceFindNear` with blocker list
+/// (MatrixLogic.cpp:572-627). Spirals outward from `(mx, my)` and
+/// returns the first cell whose `size × size` footprint passes
+/// `is_absence_wall` AND doesn't overlap any `(bx, by)` blocker
+/// footprint. Each blocker is the upper-left corner of another
+/// robot's claimed `size × size` placement.
+///
+/// AABB-overlap matches the C++ predicate at :582, :595, etc.:
+///   `!(bx + size <= tx || bx >= tx + size)
+///    && !(by + size <= ty || by >= ty + size)`
+///
+/// Unlike [`place_find_near`] this variant ignores the live-robot
+/// arena — callers pass the relevant blockers directly, which lets
+/// the group-formation loop include in-progress same-group
+/// placements that aren't yet written back to the arena.
+pub fn place_find_near_with_blockers(
+    map: &GameMap,
+    chassis_kind: usize,
+    size: i32,
+    mx: i32,
+    my: i32,
+    blockers: &[(i32, i32)],
+) -> Option<(i32, i32)> {
+    let overlap = |tx: i32, ty: i32| -> bool {
+        for &(bx, by) in blockers {
+            // Equivalent to the C++ AABB predicate at :582 — two `size`-
+            // sized squares overlap iff neither axis separates them.
+            let sep_x = bx + size <= tx || bx >= tx + size;
+            let sep_y = by + size <= ty || by >= ty + size;
+            if !sep_x && !sep_y {
+                return true;
+            }
+        }
+        false
+    };
+    // Start cell — C++ tests it directly before spiraling.
+    if is_absence_wall(map, chassis_kind, size, mx, my) && !overlap(mx, my) {
+        return Some((mx, my));
+    }
+    // Spiral shell-by-shell. Each shell of radius `i+1` visits the
+    // top/bottom rows first (length `2(i+1)+1`), then the left/right
+    // columns minus corners (length `2i+1`). Matches the interleaved
+    // loops at MatrixLogic.cpp:590-623.
+    let limit = map.size_move_x.max(map.size_move_y) as i32;
+    let mut i = 0i32;
+    while i < limit {
+        // Top / bottom rows.
+        for u in 0..(i + 1) * 2 + 1 {
+            for (tx, ty) in [
+                (mx - (i + 1) + u, my - (i + 1)), // top row
+                (mx - (i + 1) + u, my + (i + 1)), // bottom row
+            ] {
+                if is_absence_wall(map, chassis_kind, size, tx, ty) && !overlap(tx, ty) {
+                    return Some((tx, ty));
+                }
+            }
+        }
+        // Left / right columns (corners already covered above).
+        for u in 0..i * 2 + 1 {
+            for (tx, ty) in [
+                (mx - (i + 1), my - i + u), // left col
+                (mx + (i + 1), my - i + u), // right col
+            ] {
+                if is_absence_wall(map, chassis_kind, size, tx, ty) && !overlap(tx, ty) {
+                    return Some((tx, ty));
+                }
+            }
+        }
+        i += 1;
     }
     None
 }

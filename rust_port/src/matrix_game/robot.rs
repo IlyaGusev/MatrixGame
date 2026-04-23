@@ -169,6 +169,20 @@ pub struct Robot {
     /// collision was detected; clamped by the CollisionCallback when
     /// one is.
     pub col_speed: f32,
+    /// Port of `SMatrixRobotAIEnv::m_PlaceAdd`
+    /// (MatrixRobot.hpp env struct). Set by `PGSetPlace` when the
+    /// group-formation spiral search finds a free cell that doesn't
+    /// map to a road-network `m_Place` entry — a direct move-cell
+    /// upper-left corner the robot is heading for. The corresponding
+    /// `m_Place` (road-network index) isn't ported since the road
+    /// network itself isn't, so `m_Place >= 0` always resolves to
+    /// `-1` here and we always fall back to `place_add`.
+    ///
+    /// Read by `PGAssignPlacePlayer` to avoid walking every group
+    /// member onto the same destination, and by the move-to ping
+    /// spawner to draw one ping per assigned cell.
+    pub place_add: Option<(i32, i32)>,
+
     /// `m_CollAvoid` (MatrixRobot.hpp — per-instance). Unit vector the
     /// WallAvoid hint pushes Seek to steer along when hugging a wall.
     /// In the shipped C++ build `WallAvoid` has an unconditional `return;`
@@ -251,6 +265,7 @@ impl Robot {
             group_speed: 0.0,
             col_speed: 100.0,
             coll_avoid: glam::Vec2::ZERO,
+            place_add: None,
             animation: Animation::Off,
             chassis_anim: Default::default(),
         }

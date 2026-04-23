@@ -446,23 +446,17 @@ impl ApplicationHandler for App {
                         && pressed
                         && !state.game.player_side.selected.is_empty()
                     {
-                        let n =
+                        let slots =
                             state
                                 .game
                                 .order_move_to_at(&state.camera, cx, cy, w, h, &state.map);
-                        if n > 0 {
-                            log::info!("move order: issued to {} robot(s)", n);
-                            // Spawn the move-order ground ping — port
-                            // of `CMatrixEffect::CreateMoveto` in
-                            // `PGShowPlace` (MatrixSide.cpp:8553,8561).
-                            if let Some((wx, wy)) = crate::matrix_game::logic::screen_to_terrain_xy(
-                                &state.camera,
-                                &state.map,
-                                cx,
-                                cy,
-                                w,
-                                h,
-                            ) {
+                        if !slots.is_empty() {
+                            log::info!("move order: issued to {} robot(s)", slots.len());
+                            // One ping per formation slot — matches
+                            // `PGShowPlace` creating a moveto effect
+                            // per group member at its assigned place
+                            // (MatrixSide.cpp:8553,8561).
+                            for (wx, wy) in slots {
                                 let wz = state.map.get_z(wx, wy);
                                 state.move_to.spawn(glam::Vec3::new(wx, wy, wz));
                             }
