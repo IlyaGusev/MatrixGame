@@ -27,6 +27,22 @@ struct AppState {
     last_time: f64,
     cursor: [f32; 2],
     minimap_dragging: bool,
+    /// Shift-key modifier state — tracked so left-click can toggle
+    /// the multi-selection (`CMultiSelection::Add/Remove` at
+    /// MatrixSide.cpp:1584-1598) vs. replace it.
+    shift_down: bool,
+    /// Left-button press anchor (screen coords) while the button is
+    /// held. `Some` → either a pending click or an in-progress
+    /// marquee-drag; `None` → button released. `CMultiSelection::Begin`
+    /// in the C++ stores the same state (MatrixMultiSelection.cpp).
+    lmb_anchor: Option<[f32; 2]>,
+    /// Whether the current LMB press was consumed by UI / minimap
+    /// (if so, release mustn't issue a world click or marquee).
+    lmb_consumed_by_ui: bool,
+    /// Last rect the marquee rendered / was releasing. Needed across
+    /// frames because the DIP fade keeps drawing for 50ms after the
+    /// user lifts LMB and has to resample alpha off the same coords.
+    marquee_last_rect: Option<[f32; 4]>,
     /// Map of currently-tracked arena robots → their visibility
     /// point-light id. Rebuilt per frame in `sync_robot_lights` so
     /// freshly-spawned robots light up and despawned ones go dark.
@@ -41,6 +57,10 @@ struct AppState {
     /// object pass; green ring on the ground around the selected
     /// object.
     selection_ring: crate::matrix_game::effects::selection::SelectionRingRenderer,
+    /// Screen-space marquee rectangle drawn while the user holds
+    /// left-button and drags on empty terrain. Rebuilt each frame
+    /// from `lmb_anchor` + current cursor; hidden otherwise.
+    marquee: crate::matrix_game::effects::marquee::MarqueeRenderer,
     /// Loaded UI panels (IF_MAIN / IF_BASE / etc.) + focus state.
     /// Ported from `CIFaceList` (Interface/CInterface.h:269+).
     iface_list: crate::matrix_game::interface::IFaceList,
@@ -158,6 +178,10 @@ impl ApplicationHandler for App {
                 crate::matrix_game::effects::selection::SelectionRingRenderer::new(
                     &gfx.device, &gfx.config,
                 );
+            let marquee =
+                crate::matrix_game::effects::marquee::MarqueeRenderer::new(
+                    &gfx.device, &gfx.config,
+                );
 
             let iface_list =
                 crate::matrix_game::interface::IFaceList::load_default_panels(&matrix_data);
@@ -203,8 +227,13 @@ impl ApplicationHandler for App {
                 last_time: crate::platform::now_secs(),
                 cursor: [-1.0, -1.0],
                 minimap_dragging: false,
+                shift_down: false,
+                lmb_anchor: None,
+                lmb_consumed_by_ui: false,
+                marquee_last_rect: None,
                 robot_lights: std::collections::HashMap::new(),
                 selection_ring,
+                marquee,
                 iface_list,
                 iface_renderer,
                 progress_bars,
@@ -304,6 +333,10 @@ impl ApplicationHandler for App {
                     crate::matrix_game::effects::selection::SelectionRingRenderer::new(
                         &gfx.device, &gfx.config,
                     );
+                let marquee =
+                    crate::matrix_game::effects::marquee::MarqueeRenderer::new(
+                        &gfx.device, &gfx.config,
+                    );
 
                 let iface_list =
                     crate::matrix_game::interface::IFaceList::load_default_panels(&matrix_data);
@@ -339,8 +372,13 @@ impl ApplicationHandler for App {
                     last_time: crate::platform::now_secs(),
                     cursor: [-1.0, -1.0],
                     minimap_dragging: false,
+                    shift_down: false,
+                    lmb_anchor: None,
+                    lmb_consumed_by_ui: false,
+                    marquee_last_rect: None,
                     robot_lights: std::collections::HashMap::new(),
                     selection_ring,
+                    marquee,
                     iface_list,
                     iface_renderer,
                     progress_bars,
@@ -379,55 +417,69 @@ impl ApplicationHandler for App {
 
             // ── Mouse input (MatrixFormGame.cpp:530-642) ──
             // Middle or right button toggles MouseCam mode (rotate-on-drag).
+            // Right-click down also issues move orders to the selected
+            // robots (C++: `CMatrixSideUnit::OnRButtonDown`, dispatched
+            // alongside the camera-rotate state toggle).
             WindowEvent::MouseInput {
                 state: btn_state,
                 button,
                 ..
             } => {
                 use winit::event::{ElementState, MouseButton};
+                let [cx, cy] = state.cursor;
+                let w = state.gfx.config.width as f32;
+                let h = state.gfx.config.height as f32;
                 if matches!(button, MouseButton::Middle | MouseButton::Right) {
                     let pressed = btn_state == ElementState::Pressed;
-                    let [x, y] = state.cursor;
-                    state.camera.on_rotate_button(pressed, x, y);
+                    state.camera.on_rotate_button(pressed, cx, cy);
+                    // Right-click down → issue move orders to all own
+                    // robots currently selected. MatrixFormGame.cpp:758
+                    // fires the order unconditionally at RBDOWN; camera
+                    // rotate only shows visibly if the user actually
+                    // drags, so both coexist.
+                    if button == MouseButton::Right
+                        && pressed
+                        && !state.game.player_side.selected.is_empty()
+                    {
+                        let n = state.game.order_move_to_at(
+                            &state.camera, cx, cy, w, h, &state.map,
+                        );
+                        if n > 0 {
+                            log::info!("move order: issued to {} robot(s)", n);
+                        }
+                    }
                 } else if button == MouseButton::Left {
                     use crate::matrix_game::minimap::MinimapClick;
-                    let [cx, cy] = state.cursor;
-                    let w = state.gfx.config.width as f32;
-                    let h = state.gfx.config.height as f32;
                     match btn_state {
                         ElementState::Pressed => {
-                            // Interface gets first dibs on left-clicks —
-                            // ports the event-dispatch order in
-                            // MatrixFormGame.cpp where CIFaceList::
-                            // OnMouseLBDown runs before the world picker.
+                            // UI first dibs (MatrixFormGame.cpp:748-755).
                             if state.iface_list.on_mouse_down(cx, cy, w, h) {
                                 state.minimap_dragging = false;
+                                state.lmb_anchor = None;
+                                state.lmb_consumed_by_ui = true;
                             } else {
                                 match state.minimap.click(cx, cy) {
                                     MinimapClick::BeginDrag(tgt) => {
                                         state.camera.set_xy_strategy(tgt);
                                         state.minimap_dragging = true;
+                                        state.lmb_anchor = None;
+                                        state.lmb_consumed_by_ui = true;
                                     }
                                     MinimapClick::ZoomIn | MinimapClick::ZoomOut => {
                                         state.minimap_dragging = false;
+                                        state.lmb_anchor = None;
+                                        state.lmb_consumed_by_ui = true;
                                     }
-                                    // Click hit neither UI nor minimap —
-                                    // route to world selection (MatrixFormGame.cpp:
-                                    // 530-642 dispatches non-UI left-clicks
-                                    // to CMatrixMap::Pick + CMatrixSide::
-                                    // SelectObject).
                                     MinimapClick::None => {
                                         state.minimap_dragging = false;
-                                        let hit = state.game.select_at_screen(
-                                            &state.camera, cx, cy, w, h,
-                                        );
-                                        match hit {
-                                            Some(id) => log::info!(
-                                                "selection: hit object {:?}, curr_sel={:?}",
-                                                id, state.game.player_side.curr_sel,
-                                            ),
-                                            None => log::info!("selection: cleared"),
-                                        }
+                                        // Record the press anchor. The
+                                        // click-vs-marquee decision is
+                                        // deferred until release, matching
+                                        // `CMultiSelection::Begin` +
+                                        // `End` semantics (MatrixFormGame.
+                                        // cpp:763-770, 664-670).
+                                        state.lmb_anchor = Some([cx, cy]);
+                                        state.lmb_consumed_by_ui = false;
                                     }
                                 }
                             }
@@ -437,7 +489,49 @@ impl ApplicationHandler for App {
                             if let Some(click) = state.iface_list.on_mouse_up(cx, cy, w, h) {
                                 log::info!("iface: clicked {:?}", click);
                                 dispatch_ui_click(state, &click);
+                            } else if let Some([ax, ay]) = state.lmb_anchor.take() {
+                                if !state.lmb_consumed_by_ui {
+                                    // Drag distance — anything ≤ 4 px is a
+                                    // click, otherwise a marquee rect.
+                                    let dx = (cx - ax).abs();
+                                    let dy = (cy - ay).abs();
+                                    const DRAG_PX: f32 = 4.0;
+                                    if dx <= DRAG_PX && dy <= DRAG_PX {
+                                        let hit = state.game.click_at_screen(
+                                            &state.camera, cx, cy, w, h,
+                                            state.shift_down,
+                                        );
+                                        match hit {
+                                            Some(id) => log::info!(
+                                                "selection: hit object {:?}, curr_sel={:?}, selected={}",
+                                                id, state.game.player_side.curr_sel,
+                                                state.game.player_side.selected.len(),
+                                            ),
+                                            None => log::info!(
+                                                "selection: cleared (selected={})",
+                                                state.game.player_side.selected.len(),
+                                            ),
+                                        }
+                                    } else {
+                                        let rmin = [ax.min(cx), ay.min(cy)];
+                                        let rmax = [ax.max(cx), ay.max(cy)];
+                                        let n = state.game.marquee_select(
+                                            &state.camera, rmin, rmax, w, h,
+                                            state.shift_down,
+                                        );
+                                        log::info!(
+                                            "marquee: selected {} robot(s)", n,
+                                        );
+                                        // Start the 50ms DIP fade — port
+                                        // of `CMultiSelection::End` at
+                                        // MatrixMultiSelection.cpp:278-279.
+                                        state.marquee.begin_dip_fade(
+                                            state.game.elapsed_ms as f32,
+                                        );
+                                    }
+                                }
                             }
+                            state.lmb_consumed_by_ui = false;
                         }
                     }
                 }
@@ -467,6 +561,22 @@ impl ApplicationHandler for App {
                 if state.minimap_dragging {
                     if let Some(tgt) = state.minimap.click_to_world(cx, cy) {
                         state.camera.set_xy_strategy(tgt);
+                    }
+                }
+                // Live marquee rect — update while LMB is held and
+                // the drag has exceeded the click threshold. Ports the
+                // `CMultiSelection::Update` call at MatrixFormGame.cpp:
+                // 564 that re-evaluates the rect each mouse move.
+                if let Some([ax, ay]) = state.lmb_anchor {
+                    if !state.lmb_consumed_by_ui {
+                        const DRAG_PX: f32 = 4.0;
+                        if (cx - ax).abs() > DRAG_PX || (cy - ay).abs() > DRAG_PX {
+                            let rect = [ax, ay, cx, cy];
+                            state.marquee_last_rect = Some(rect);
+                            let w = state.gfx.config.width as f32;
+                            let h = state.gfx.config.height as f32;
+                            state.marquee.set_rect(&state.gfx.queue, rect, w, h);
+                        }
                     }
                 }
                 // Interface hover-state tracking — port of
@@ -520,6 +630,15 @@ impl ApplicationHandler for App {
                         PhysicalKey::Code(KeyCode::PageDown) => Some(KeyAction::RotDown),
                         // Reset angles (KA_CAM_SETDEFAULT). Original: `\`.
                         PhysicalKey::Code(KeyCode::Backslash) => Some(KeyAction::ResetAngles),
+                        // Shift — tracked for click-to-toggle in the
+                        // multi-selection path. Matches the C++ shift
+                        // modifier branch in `CMultiSelection::Add`
+                        // (MatrixSide.cpp:1584-1598).
+                        PhysicalKey::Code(KeyCode::ShiftLeft)
+                        | PhysicalKey::Code(KeyCode::ShiftRight) => {
+                            state.shift_down = pressed;
+                            None
+                        }
                         _ => None,
                     };
                 if let Some(a) = action {
@@ -557,6 +676,21 @@ impl ApplicationHandler for App {
                 // destroy on UnSelect, follow the object's geo-center
                 // each frame, advance dot animation per takt).
                 sync_selection_ring(state, step_ms as f32);
+
+                // Advance the marquee's DIP fade (ports the per-frame
+                // `CMultiSelection::Draw` fade block at
+                // MatrixMultiSelection.cpp:109-123). When the rect is
+                // not in DIP, this is a no-op.
+                if state.marquee.is_fading() {
+                    let w = state.gfx.config.width as f32;
+                    let h = state.gfx.config.height as f32;
+                    state.marquee.takt(
+                        &state.gfx.queue,
+                        state.game.elapsed_ms as f32,
+                        state.marquee_last_rect,
+                        w, h,
+                    );
+                }
 
                 // Per-frame: reconcile point lights for each live
                 // robot so the build-factory spawns are visible even
@@ -677,6 +811,10 @@ impl ApplicationHandler for App {
                                     multiview_mask: None,
                                 });
                             state.selection_ring.render(&mut pass);
+                            // Marquee shares the overlay color target +
+                            // depth attachment with the selection ring;
+                            // render inline to avoid a separate pass.
+                            state.marquee.render(&mut pass);
                         }
                         {
                             let mut pass =
@@ -1029,54 +1167,44 @@ fn refresh_interface_visibility(state: &mut AppState) {
     }
 }
 
-/// Keep the selection-ring effect in sync with
-/// `player_side.active_object`. Called once per frame after the
-/// logic takt advances. Ports the effect-lifecycle hooks
+/// Keep the selection-ring effects in sync with
+/// `player_side.selected`. Called once per frame after the logic
+/// takt advances. Ports the effect-lifecycle hooks
 /// `CMatrixBuilding::Select` / `UnSelect` +
 /// `CMatrixEffectSelection::SetPos` (MatrixObjectBuilding.cpp:1460-1525,
-/// MatrixEffectSelection.hpp:61-65) as a single reconciler.
+/// MatrixEffectSelection.hpp:61-65) as a single reconciler, driven
+/// off the whole multi-select set so every selected object gets its
+/// own ring.
 fn sync_selection_ring(state: &mut AppState, step_ms: f32) {
-    use crate::matrix_game::map_static::ObjectType;
+    use crate::matrix_game::map_static::{ObjectId, ObjectType};
     use crate::matrix_game::object_building::{selection_placement, Building, BuildingType};
 
-    let active = state.game.active_object();
-    match active {
-        Some(id) => {
-            // Compute the ring placement. For buildings we route through
-            // `selection_placement` — the matrix-offset math from
-            // `CMatrixBuilding::Select`. For other object types (robots
-            // etc.) fall back to `core.geo_center + core.radius`.
-            let placement = state.game.objects.get(id).and_then(|obj| {
-                let ot = obj.core().obj_type;
-                if ot == ObjectType::Building {
-                    // Downcast to Building for the matrix offsets.
-                    let b: &Building = unsafe {
-                        &*(obj as *const dyn crate::matrix_game::map_static::MapStatic
-                            as *const Building)
-                    };
-                    let (c, r) = selection_placement(b.pos, b.build_z, b.angle, b.kind);
-                    // Terrain clamp so the anchor z stays on the ground
-                    // in case build_z is below the actual terrain surface
-                    // (the C++ matrix._43 is post-RNeed so it matches
-                    // terrain; we approximate here).
-                    let z = state.map.get_z(c.x, c.y).max(c.z);
-                    let _ = b.kind; let _ = BuildingType::Base; // keep imports live
-                    Some((glam::Vec3::new(c.x, c.y, z), r))
-                } else {
-                    Some((obj.core().geo_center, obj.core().radius.max(12.0)))
-                }
-            });
-            match placement {
-                Some((c, r)) => {
-                    let color = side_selection_color(state.game.player_side.id);
-                    state.selection_ring.set_selection(c, r, color);
-                    state.selection_ring.takt(step_ms, |x, y| state.map.get_z(x, y));
-                }
-                None => state.selection_ring.clear(),
+    let color = side_selection_color(state.game.player_side.id);
+    let mut desired: Vec<(ObjectId, glam::Vec3, f32, u32)> = Vec::new();
+    let ids: Vec<ObjectId> = state.game.player_side.selected.clone();
+    for id in ids {
+        if !state.game.objects.is_valid(id) { continue; }
+        let placement = state.game.objects.get(id).and_then(|obj| {
+            let ot = obj.core().obj_type;
+            if ot == ObjectType::Building {
+                let b: &Building = unsafe {
+                    &*(obj as *const dyn crate::matrix_game::map_static::MapStatic
+                        as *const Building)
+                };
+                let (c, r) = selection_placement(b.pos, b.build_z, b.angle, b.kind);
+                let z = state.map.get_z(c.x, c.y).max(c.z);
+                let _ = BuildingType::Base; // keep import live
+                Some((glam::Vec3::new(c.x, c.y, z), r))
+            } else {
+                Some((obj.core().geo_center, obj.core().radius.max(12.0)))
             }
+        });
+        if let Some((c, r)) = placement {
+            desired.push((id, c, r, color));
         }
-        None => state.selection_ring.clear(),
     }
+    state.selection_ring.set_selections(&desired);
+    state.selection_ring.takt(step_ms, |x, y| state.map.get_z(x, y));
 }
 
 /// Pick a highlight color for the selection ring by side. The C++

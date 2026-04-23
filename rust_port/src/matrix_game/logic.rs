@@ -182,9 +182,74 @@ impl MapLogic {
         ids
     }
 
-    /// Port of the selection-entry code path triggered on left-click.
-    /// Ports `CMatrixMap` pick → `CMatrixSide::SelectObject`
-    /// (MatrixFormGame.cpp:530-642).
+    /// Pick the `CurrSel` enum for a given object id — port of the
+    /// `switch(ms->GetObjectType())` in `CMatrixSideUnit::SelectObject`
+    /// (MatrixSide.cpp).
+    fn curr_sel_for(&self, id: ObjectId) -> CurrSel {
+        match self.objects.get(id).map(|o| o.core().obj_type) {
+            Some(ObjectType::Building) => {
+                let is_base = self.objects.get(id)
+                    .and_then(|o| {
+                        let p = o as *const dyn MapStatic
+                            as *const crate::matrix_game::object_building::Building;
+                        unsafe { p.as_ref() }
+                            .map(|b| b.kind == crate::matrix_game::object_building::BuildingType::Base)
+                    })
+                    .unwrap_or(false);
+                if is_base { CurrSel::BaseSelected } else { CurrSel::BuildingSelected }
+            }
+            Some(ObjectType::RobotAi)   => CurrSel::RobotsSelected,
+            Some(ObjectType::Cannon)    => CurrSel::CannonSelected,
+            Some(ObjectType::Flyer)     => CurrSel::FlyerSelected,
+            _ => CurrSel::Nothing,
+        }
+    }
+
+    /// Port of the single-click selection entry path — routes
+    /// `CMatrixMap::Pick` → `CMatrixSide::SelectObject` +
+    /// `CMultiSelection::Add/Remove` (MatrixFormGame.cpp:530-642,
+    /// MatrixSide.cpp:1584-1598). `shift` = true matches the C++
+    /// shift-modifier branch that toggles the hit in the multi-set
+    /// instead of replacing it.
+    pub fn click_at_screen(
+        &mut self,
+        camera: &Camera,
+        sx: f32,
+        sy: f32,
+        screen_w: f32,
+        screen_h: f32,
+        shift: bool,
+    ) -> Option<ObjectId> {
+        let (origin, dir) = camera.screen_to_world_ray(sx, sy, screen_w, screen_h);
+        let hit = self.objects.pick_object(origin, dir, TRACE_ANYOBJECT, None);
+        match hit {
+            Some((id, _t)) => {
+                let sel = self.curr_sel_for(id);
+                // Multi-select is only valid on own-side robots — the
+                // C++ callback rejects other types (MatrixSide.cpp's
+                // SideSelectionCallBack filters on `IsLiveRobot() &&
+                // GetSide()==PLAYER_SIDE`). Ctrl+click on a building
+                // etc. still does single-select like the C++.
+                let own_robot = sel == CurrSel::RobotsSelected
+                    && self.object_side(id) == self.player_side.id;
+                if shift && own_robot {
+                    self.player_side.select_toggle(id, sel);
+                } else {
+                    self.player_side.select_single(id, sel);
+                }
+                Some(id)
+            }
+            None => {
+                if !shift {
+                    self.player_side.clear();
+                }
+                None
+            }
+        }
+    }
+
+    /// Back-compat alias for call sites that pre-date shift support.
+    /// Equivalent to `click_at_screen(..., shift = false)`.
     pub fn select_at_screen(
         &mut self,
         camera: &Camera,
@@ -193,35 +258,101 @@ impl MapLogic {
         screen_w: f32,
         screen_h: f32,
     ) -> Option<ObjectId> {
-        let (origin, dir) = camera.screen_to_world_ray(sx, sy, screen_w, screen_h);
-        let hit = self.objects.pick_object(origin, dir, TRACE_ANYOBJECT, None);
-        match hit {
-            Some((id, _t)) => {
-                let sel = match self.objects.get(id).map(|o| o.core().obj_type) {
-                    Some(ObjectType::Building) => {
-                        let is_base = self.objects.get(id)
-                            .and_then(|o| {
-                                let p = o as *const dyn MapStatic
-                                    as *const crate::matrix_game::object_building::Building;
-                                unsafe { p.as_ref() }
-                                    .map(|b| b.kind == crate::matrix_game::object_building::BuildingType::Base)
-                            })
-                            .unwrap_or(false);
-                        if is_base { CurrSel::BaseSelected } else { CurrSel::BuildingSelected }
-                    }
-                    Some(ObjectType::RobotAi)   => CurrSel::RobotsSelected,
-                    Some(ObjectType::Cannon)    => CurrSel::CannonSelected,
-                    Some(ObjectType::Flyer)     => CurrSel::FlyerSelected,
-                    _ => CurrSel::Nothing,
-                };
-                self.player_side.select(id, sel);
-                Some(id)
-            }
-            None => {
-                self.player_side.clear();
-                None
+        self.click_at_screen(camera, sx, sy, screen_w, screen_h, false)
+    }
+
+    /// Port of the end-of-marquee fold at `CMultiSelection::End`
+    /// (MatrixMultiSelection.cpp). Projects every live own-side robot
+    /// to screen coords and keeps the ones whose projection lands
+    /// inside the axis-aligned rect `[rect_min, rect_max]`. The
+    /// result is committed as the new selection with the first hit
+    /// as `active_object`.
+    pub fn marquee_select(
+        &mut self,
+        camera: &Camera,
+        rect_min: [f32; 2],
+        rect_max: [f32; 2],
+        screen_w: f32,
+        screen_h: f32,
+        shift: bool,
+    ) -> usize {
+        let vp = camera.view_proj();
+        let map_cx = camera.map_cx();
+        let map_cy = camera.map_cy();
+        let mut hits: Vec<ObjectId> = if shift {
+            self.player_side.selected.clone()
+        } else {
+            Vec::new()
+        };
+
+        for id in self.objects.iter_live() {
+            let Some(obj) = self.objects.get(id) else { continue };
+            if !matches!(obj.core().obj_type, ObjectType::RobotAi) { continue; }
+            if self.object_side(id) != self.player_side.id { continue; }
+            let c = obj.core().geo_center;
+            // View-proj expects centered world (see camera::view_proj
+            // + selection shader — map_center subtracted everywhere).
+            let clip = vp * glam::Vec4::new(
+                c.x - map_cx, c.y - map_cy, c.z, 1.0,
+            );
+            if clip.w <= 0.0 { continue; } // behind camera
+            let ndc_x = clip.x / clip.w;
+            let ndc_y = clip.y / clip.w;
+            // NDC → screen (Y flip, same as screen_to_world_ray).
+            let sx = (ndc_x * 0.5 + 0.5) * screen_w;
+            let sy = (1.0 - (ndc_y * 0.5 + 0.5)) * screen_h;
+            if sx >= rect_min[0] && sx <= rect_max[0]
+                && sy >= rect_min[1] && sy <= rect_max[1]
+                && !hits.contains(&id)
+            {
+                hits.push(id);
             }
         }
+        let n = hits.len();
+        let primary = hits.last().copied();
+        self.player_side.select_replace(hits, primary, CurrSel::RobotsSelected);
+        n
+    }
+
+    /// Right-click move order — ports the order-dispatch path at
+    /// `CMatrixSideUnit::OnRButtonDown` + the per-robot `MoveTo` loop
+    /// (MatrixSide.cpp). Ray-casts the cursor to the terrain, then
+    /// converts to move-cell coords and calls `Robot::move_to` on
+    /// every currently-selected own-side robot.
+    ///
+    /// Returns the number of robots the order was issued to.
+    pub fn order_move_to_at(
+        &mut self,
+        camera: &Camera,
+        sx: f32,
+        sy: f32,
+        screen_w: f32,
+        screen_h: f32,
+        map: &GameMap,
+    ) -> usize {
+        let Some((wx, wy)) = screen_to_terrain_xy(camera, map, sx, sy, screen_w, screen_h) else {
+            return 0;
+        };
+        // World XY → move-cell upper-left corner of the robot's 4×4
+        // footprint, matching the conversion used by
+        // `CMatrixRobotAI::MoveTo` callers (MatrixRobot.cpp:4625).
+        let (cmx, cmy) = map.world_to_move(wx, wy);
+        let mx = cmx - ROBOT_MOVECELLS_PER_SIZE / 2;
+        let my = cmy - ROBOT_MOVECELLS_PER_SIZE / 2;
+
+        let ids: Vec<ObjectId> = self.player_side.selected.clone();
+        let mut n = 0;
+        for id in ids {
+            let Some(obj) = self.objects.get_mut(id) else { continue };
+            if !matches!(obj.core().obj_type, ObjectType::RobotAi) { continue; }
+            let r: &mut crate::matrix_game::robot::Robot = unsafe {
+                &mut *(obj as *mut dyn MapStatic as *mut crate::matrix_game::robot::Robot)
+            };
+            if r.side != self.player_side.id { continue; }
+            r.move_to(mx, my);
+            n += 1;
+        }
+        n
     }
 
     /// Return the active-selection id if it's still a live object.
@@ -229,6 +360,51 @@ impl MapLogic {
         let id = self.player_side.active_object?;
         if self.objects.is_valid(id) { Some(id) } else { None }
     }
+
+    /// Side id of `obj`, or `0` (neutral) if not resolvable.
+    fn object_side(&self, id: ObjectId) -> i32 {
+        self.objects.get(id).map(|o| o.side()).unwrap_or(0)
+    }
+}
+
+/// Intersect the view ray at `(sx, sy)` with the terrain heightmap.
+/// Returns the world-space XY hit or `None` when the ray misses (e.g.
+/// pointing above the horizon).
+///
+/// Approximates the C++ `CMatrixCamera::GetCursorOnMap` / CursorHit
+/// logic (MatrixCamera.cpp) — a plane-intersection fallback followed
+/// by two refinement iterations that re-sample `get_z` under the
+/// current XY estimate. Converges in practice for reasonable slopes.
+pub fn screen_to_terrain_xy(
+    camera: &Camera,
+    map: &GameMap,
+    sx: f32,
+    sy: f32,
+    screen_w: f32,
+    screen_h: f32,
+) -> Option<(f32, f32)> {
+    let (origin, dir) = camera.screen_to_world_ray(sx, sy, screen_w, screen_h);
+    if dir.z >= -1.0e-4 { return None; } // pointing up / parallel
+
+    // First hit at z=0.
+    let mut t = -origin.z / dir.z;
+    let mut x = origin.x + t * dir.x;
+    let mut y = origin.y + t * dir.y;
+    // Refine against actual terrain height twice — the typical map
+    // max slope means this converges to ~pixel accuracy.
+    for _ in 0..2 {
+        let z = map.get_z(x, y);
+        t = (z - origin.z) / dir.z;
+        x = origin.x + t * dir.x;
+        y = origin.y + t * dir.y;
+    }
+    // Clamp to map bounds.
+    let max_x = map.world_width();
+    let max_y = map.world_height();
+    if x < 0.0 || y < 0.0 || x >= max_x || y >= max_y {
+        return None;
+    }
+    Some((x, y))
 }
 
 // ── Cell / wall helpers (MatrixLogic.cpp:440-903) ───────────────────

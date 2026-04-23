@@ -474,6 +474,13 @@ impl Camera {
         s * t2 * rx * rz * t1
     }
 
+    /// Map center X the camera subtracts from every world position
+    /// before projection (so renderers + hit-tests operate in the
+    /// same centered space). Equals `world_width / 2`.
+    pub fn map_cx(&self) -> f32 { self.map_cx }
+    /// Map center Y — see [`map_cx`].
+    pub fn map_cy(&self) -> f32 { self.map_cy }
+
     pub fn view_proj(&self) -> Mat4 {
         let proj = Mat4::perspective_lh(CAM_FOV, self.aspect, self.near, self.far);
         proj * self.view_matrix()

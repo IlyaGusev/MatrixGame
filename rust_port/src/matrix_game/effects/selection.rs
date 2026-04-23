@@ -248,7 +248,12 @@ pub struct SelectionRingRenderer {
     instance_cap: usize,
     uniform_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
-    effect: Option<SelectionEffect>,
+    /// Active selection effects keyed by `ObjectId` so per-frame
+    /// reconciliation is stable across ticks. Multi-select uploads
+    /// all effects into a single instance buffer under one color
+    /// (all selected objects belong to the player side and share the
+    /// same `SEL_COLOR_DEFAULT`, so a single color uniform suffices).
+    effects: Vec<(crate::matrix_game::map_static::ObjectId, SelectionEffect)>,
     /// Dots currently uploaded to the GPU (≤ instance_cap).
     dot_count: u32,
 }
@@ -397,49 +402,73 @@ impl SelectionRingRenderer {
             instance_cap,
             uniform_buffer,
             bind_group,
-            effect: None,
+            effects: Vec::new(),
             dot_count: 0,
         }
     }
 
-    /// Drop the current effect (Kill / UnSelect).
+    /// Drop all effects (Kill / UnSelect).
     pub fn clear(&mut self) {
-        self.effect = None;
+        self.effects.clear();
         self.dot_count = 0;
     }
 
-    /// Bring the effect into existence, or rebind its center/radius/color.
-    /// Ports `CMatrixEffect::CreateSelection` + subsequent SetPos/SetRadius
-    /// calls (MatrixEffectSelection.hpp:61-82) as a single reconciler.
-    pub fn set_selection(&mut self, center: Vec3, radius: f32, color: u32) {
-        if self.effect.is_none() {
-            self.effect = Some(SelectionEffect::new(center, radius, color));
-        } else {
-            let e = self.effect.as_mut().unwrap();
-            e.set_pos(center);
-            e.set_radius(radius);
-            if e.color_to != color {
-                e.set_color(color);
+    /// Reconcile the active effects against the desired selection set.
+    /// Ports `CMatrixEffect::CreateSelection` + per-tick `SetPos/
+    /// SetRadius` calls (MatrixEffectSelection.hpp:61-82), extended to
+    /// multi-selection: any id in `desired` that doesn't yet have an
+    /// effect is created, existing ids update center/radius in place,
+    /// and ids not in `desired` are dropped.
+    pub fn set_selections(
+        &mut self,
+        desired: &[(crate::matrix_game::map_static::ObjectId, Vec3, f32, u32)],
+    ) {
+        // Drop stale.
+        self.effects.retain(|(id, _)| desired.iter().any(|d| d.0 == *id));
+        // Add / update.
+        for &(id, center, radius, color) in desired {
+            match self.effects.iter_mut().find(|e| e.0 == id) {
+                Some((_, e)) => {
+                    e.set_pos(center);
+                    e.set_radius(radius);
+                    if e.color_to != color {
+                        e.set_color(color);
+                    }
+                }
+                None => {
+                    self.effects.push((id, SelectionEffect::new(center, radius, color)));
+                }
             }
         }
     }
 
-    /// Advance the dot animation by `step_ms`.
+    /// Convenience for the single-selection case — equivalent to
+    /// `set_selections(&[(id, center, radius, color)])`.
+    pub fn set_selection_single(
+        &mut self,
+        id: crate::matrix_game::map_static::ObjectId,
+        center: Vec3,
+        radius: f32,
+        color: u32,
+    ) {
+        self.set_selections(&[(id, center, radius, color)]);
+    }
+
+    /// Advance the dot animation by `step_ms` for every active effect.
     pub fn takt(&mut self, step_ms: f32, get_z: impl Fn(f32, f32) -> f32) {
-        if let Some(e) = &mut self.effect {
-            e.takt(step_ms, get_z);
+        for (_, e) in &mut self.effects {
+            e.takt(step_ms, &get_z);
         }
     }
 
-    /// Upload the current dot centers to the instance buffer and the
-    /// current view matrix bases to the uniform. Called once per frame
-    /// before `render()`.
+    /// Upload the concatenated dot centers from every active effect
+    /// into the instance buffer, plus the current view matrix bases
+    /// to the uniform. Called once per frame before `render()`.
     ///
-    /// `map_center` is the `(world_width/2, world_height/2)` offset the
-    /// scene renderers subtract from every world position before upload
-    /// (see BuildingsRenderer, ObjectsRenderer). The selection shader
-    /// multiplies by `view_proj` which expects that same centered
-    /// space, so we apply the shift here too.
+    /// `map_center` is the `(world_width/2, world_height/2)` offset
+    /// the scene renderers subtract before upload — selection shader
+    /// multiplies by `view_proj` which expects the same centered
+    /// space.
     pub fn upload(
         &mut self,
         queue: &wgpu::Queue,
@@ -448,21 +477,29 @@ impl SelectionRingRenderer {
         cam_up: Vec3,
         map_center: glam::Vec2,
     ) {
-        let Some(e) = &self.effect else {
+        if self.effects.is_empty() {
             self.dot_count = 0;
             return;
-        };
-        let centers: Vec<InstanceData> = e.world_positions()
-            .take(self.instance_cap)
-            .map(|p| InstanceData {
-                center: [p.x - map_center.x, p.y - map_center.y, p.z],
-                _pad: 0.0,
-            })
-            .collect();
+        }
+
+        let mut centers: Vec<InstanceData> = Vec::new();
+        for (_, e) in &self.effects {
+            if centers.len() >= self.instance_cap { break; }
+            for p in e.world_positions() {
+                if centers.len() >= self.instance_cap { break; }
+                centers.push(InstanceData {
+                    center: [p.x - map_center.x, p.y - map_center.y, p.z],
+                    _pad: 0.0,
+                });
+            }
+        }
         self.dot_count = centers.len() as u32;
         queue.write_buffer(&self.instance_vb, 0, bytemuck::cast_slice(&centers));
 
-        let col = e.color();
+        // All effects share the same color today (`SEL_COLOR_DEFAULT`
+        // for own-side selections). Sample the first so the fade
+        // animation on the primary object still drives uniform output.
+        let col = self.effects[0].1.color();
         let a = ((col >> 24) & 0xFF) as f32 / 255.0;
         let r = ((col >> 16) & 0xFF) as f32 / 255.0;
         let g = ((col >> 8) & 0xFF) as f32 / 255.0;
