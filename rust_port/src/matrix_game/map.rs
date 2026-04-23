@@ -1414,6 +1414,7 @@ pub struct MapRenderer {
     fog_color: [f32; 4],
     objects: Option<super::object::ObjectsRenderer>,
     buildings: Option<super::object_building::BuildingsRenderer>,
+    robots: Option<super::object_robot::RobotsRenderer>,
     point_lights: PointLightRenderer,
     water: Option<super::water::Water>,
     uniform_buffer: wgpu::Buffer,
@@ -1796,6 +1797,11 @@ impl MapRenderer {
         // Starting buildings from the CMAP `buildings/*` table.
         let buildings =
             super::object_building::BuildingsRenderer::new(device, queue, config, map, read_texture);
+        // Robot chassis meshes — built once from `Matrix/Robot/ChassisN.vo`
+        // (MatrixObjectRobot.cpp:352). Instances are synced per-frame
+        // from the arena.
+        let robots =
+            super::object_robot::RobotsRenderer::new(device, queue, config, map, read_texture);
 
         // Water (MatrixWater.cpp)
         let water =
@@ -2050,6 +2056,7 @@ impl MapRenderer {
             depth_texture,
             last_point_light_revision: 0,
             buildings,
+            robots,
         }
     }
 
@@ -2095,8 +2102,43 @@ impl MapRenderer {
         if let Some(buildings) = &mut self.buildings {
             buildings.takt(dt_ms, queue, map, point_lights);
         }
+        if let Some(robots) = &mut self.robots {
+            robots.takt(dt_ms);
+        }
         self.sky.takt(dt_ms);
         self.point_lights.sync(device, map, point_lights);
+    }
+
+    /// Push the current per-frame `CMatrixBuilding::m_BaseFloor` /
+    /// sub-unit matrix state from the live arena into the
+    /// `BuildingsRenderer` instance buffers. Ports
+    /// MatrixObjectBuilding.cpp:836-852. Called each frame after
+    /// `World::takt` so the platform-rise animation is visible.
+    pub fn sync_building_animation(
+        &mut self,
+        queue: &wgpu::Queue,
+        objs: &super::map_static::Objects,
+        map: &GameMap,
+        point_lights: &PointLightSystem,
+    ) {
+        if let Some(buildings) = &mut self.buildings {
+            buildings.sync_building_animation(queue, objs, map, point_lights);
+        }
+    }
+
+    /// Rebuild per-robot instance transforms for the chassis-only
+    /// renderer. Called each frame after `World::takt` so freshly
+    /// spawned robots show up on the next render.
+    pub fn sync_robots(
+        &mut self,
+        queue: &wgpu::Queue,
+        objs: &super::map_static::Objects,
+        map: &GameMap,
+        point_lights: &PointLightSystem,
+    ) {
+        if let Some(robots) = &mut self.robots {
+            robots.sync_robots(queue, objs, map, point_lights);
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2243,6 +2285,9 @@ impl MapRenderer {
         // Starting buildings — drawn after objects so their shadow projection
         // (when we add it) can overlay object silhouettes the way the original
         // does (MatrixMap.cpp DrawLandscape ordering).
+        if let Some(robots) = &self.robots {
+            robots.render(queue, &mut pass, camera, view_proj);
+        }
         if let Some(buildings) = &self.buildings {
             buildings.render(queue, &mut pass, camera, view_proj);
         }

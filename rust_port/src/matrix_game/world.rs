@@ -263,6 +263,14 @@ impl World {
                 b.init_max_hitpoint(hp as f32);
             }
             let id = self.objects.spawn(Box::new(b));
+            // Back-fill the building's own id so BuildStack can hand
+            // it to freshly-produced robots for their spawn animation.
+            if let Some(obj) = self.objects.get_mut(id) {
+                let b_mut: &mut Building = unsafe {
+                    &mut *(obj as *mut dyn crate::matrix_game::map_static::MapStatic as *mut Building)
+                };
+                b_mut.self_id = Some(id);
+            }
             self.objects.add_lt(id);
             ids.push(id);
         }

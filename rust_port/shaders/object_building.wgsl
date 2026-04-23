@@ -29,6 +29,11 @@ struct VIn {
     @location(5) m2: vec4<f32>,
     @location(6) m3: vec4<f32>,
     @location(7) terrain_color: vec4<f32>,
+    // Per-instance sub-unit offset applied in local space BEFORE the
+    // world transform — ports the per-unit `D3DXMatrixTranslation`
+    // updates at MatrixObjectBuilding.cpp:842-850 (platform rise /
+    // door slide on BASE open/close).
+    @location(8) unit_offset: vec4<f32>,
 };
 struct VOut {
     @builtin(position) clip_position: vec4<f32>,
@@ -40,7 +45,8 @@ struct VOut {
 };
 
 @vertex fn vs_main(in: VIn) -> VOut {
-    let p = vec4<f32>(in.position, 1.0);
+    let local = in.position + in.unit_offset.xyz;
+    let p = vec4<f32>(local, 1.0);
     let world = vec4<f32>(dot(in.m0, p), dot(in.m1, p), dot(in.m2, p), dot(in.m3, p));
     let clip = u.view_proj * world;
     var out: VOut;

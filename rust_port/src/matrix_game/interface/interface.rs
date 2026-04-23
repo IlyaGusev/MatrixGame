@@ -62,6 +62,9 @@ pub struct MainVisibilityCtx {
     pub building_stack_empty: bool,
     /// `bld->m_TurretsMax` — 1..4. Drives `podl1..podl4` visibility.
     pub building_turrets_max: i32,
+    /// `bld->m_BS.GetItemsCnt()` — number of queued items. Drives
+    /// stack-icon visibility (CInterface.cpp:1592).
+    pub building_stack_items: i32,
 }
 
 impl CInterface {
@@ -122,6 +125,28 @@ impl CInterface {
         })
     }
 
+    /// Find a named element in this panel. Case-sensitive (matches
+    /// the C++ `CWStr::operator==` comparison at CInterface.cpp:
+    /// 1442, :1501, etc.).
+    pub fn element_by_name(&self, name: &str) -> Option<&crate::matrix_game::interface::iface_element::IFaceElement> {
+        self.elements.iter().find(|e| e.name == name)
+    }
+
+    /// Screen-space pixel rect of a named element. Computed from the
+    /// panel's resolved_pos + the element's local (pos_x, pos_y,
+    /// size_x, size_y) scaled by `scale`.
+    pub fn element_rect(
+        &self,
+        name: &str,
+        screen_w: f32,
+        screen_h: f32,
+    ) -> Option<[f32; 4]> {
+        let e = self.element_by_name(name)?;
+        let scale = (screen_h / DESIGN_H).max(0.1);
+        let panel = self.resolved_pos(screen_w, screen_h, scale);
+        Some(e.rect_in_panel(panel, scale))
+    }
+
     /// Per-frame visibility refresh for `if/Main`. Ports the
     /// dispatch at CInterface.cpp:1214-1635 — hide every element by
     /// default, then selectively re-show based on `curr_sel` +
@@ -172,6 +197,7 @@ impl CInterface {
         if matches!(ctx.curr_sel, CurrSel::BaseSelected | CurrSel::BuildingSelected) {
             let kind = ctx.building_kind;
             let empty = ctx.building_stack_empty;
+            let has_items = ctx.building_stack_items > 0;
             for e in &mut self.elements {
                 match e.name.as_str() {
                     "bopis" if empty => e.set_visible(true),
@@ -198,6 +224,12 @@ impl CInterface {
                     "podl2" if ctx.building_turrets_max == 2 => e.set_visible(true),
                     "podl3" if ctx.building_turrets_max == 3 => e.set_visible(true),
                     "podl4" if ctx.building_turrets_max == 4 => e.set_visible(true),
+                    // Build-queue UI (CInterface.cpp:1592, :1679). The
+                    // stack icons (`sticon`, `stother`) and progress
+                    // track (`prog`) only show while an item is being
+                    // produced.
+                    "sticon" | "stother" if has_items => e.set_visible(true),
+                    "prog" if has_items => e.set_visible(true),
                     _ => {}
                 }
             }

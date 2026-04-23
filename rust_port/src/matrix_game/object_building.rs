@@ -23,6 +23,7 @@ use wgpu::util::DeviceExt;
 
 use crate::matrix_game::effects::point_light::PointLightSystem;
 use crate::matrix_game::common::{unpack_rgb, FOG_END, FOG_START, PLAYER_SIDE};
+use crate::matrix_game::units::{ChassisKind, Robot};
 use crate::matrix_game::map::{BuildingInstance, GameMap};
 use crate::matrix_game::map_static::{
     MapStatic, ObjectCore, ObjectId, Objects, ObjectType, MR_ALL,
@@ -98,6 +99,125 @@ pub enum BaseState {
 /// animation; stored here so the value lives alongside the type
 /// definition when the animation code lands.
 pub const BASE_FLOOR_Z: f32 = -63.0;
+
+/// Max queued build items per building (MatrixObjectBuilding.hpp:43).
+/// `CBuildStack` rejects AddItem once the queue hits this.
+pub const MAX_STACK_UNITS: usize = 6;
+
+/// Time in ms to produce one robot from the build stack. In C++ this
+/// is `g_Config.m_Timings[UNIT_ROBOT]`, loaded from robots.dat's
+/// Timings block. Hardcoded here until the timings config lands.
+pub const UNIT_ROBOT_BUILD_TIME_MS: i32 = 5000;
+
+/// Port of `CBuildStack` (MatrixObjectBuilding.{cpp,hpp}). The C++
+/// holds an intrusive list of `CMatrixMapStatic*` (robots / cannons /
+/// flyers) with `m_NextStackItem` / `m_PrevStackItem` pointers. We
+/// use `Vec<PendingItem>` — the list semantics aren't needed since
+/// we only ever pop the top.
+///
+/// Fully-constructed robots don't exist here yet (the robot
+/// constructor UI isn't ported), so `PendingItem` carries enough
+/// data to build a default robot at dequeue-time.
+#[derive(Debug, Clone, Default)]
+pub struct BuildStack {
+    items: Vec<PendingItem>,
+    timer: i32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PendingItem {
+    pub kind: PendingKind,
+    pub side: i32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum PendingKind {
+    /// A default robot with the given chassis. Ports the robot-
+    /// constructor output — the C++ passes a fully-configured
+    /// `CMatrixRobotAI*` here; we stub it to a chassis kind + defaults.
+    Robot(ChassisKind),
+    // Cannon / Flyer land with their subclass ports.
+}
+
+impl BuildStack {
+    pub fn new() -> Self { Self::default() }
+
+    pub fn items(&self) -> usize { self.items.len() }
+    pub fn is_full(&self) -> bool { self.items.len() >= MAX_STACK_UNITS }
+    pub fn is_empty(&self) -> bool { self.items.is_empty() }
+
+    /// Port of `CBuildStack::AddItem` (MatrixObjectBuilding.cpp:
+    /// 1832-1842). Pushes `item` to the tail of the queue if there's
+    /// room. The C++ also creates a UI stack-icon on the player-side
+    /// HUD (`g_IFaceList->CreateStackIcon`); that hook lands with the
+    /// rest of the player-side interface integration.
+    pub fn add_item(&mut self, item: PendingItem) -> bool {
+        if self.is_full() { return false; }
+        self.items.push(item);
+        true
+    }
+
+    /// Read-only view of the head item (what `TickTimer` is currently
+    /// producing). Maps to `m_Top` in C++.
+    pub fn head(&self) -> Option<&PendingItem> { self.items.first() }
+
+    /// Progress ratio of the head item in `[0.0, 1.0]`. Drives the
+    /// progress-bar UI the C++ updates at MatrixObjectBuilding.cpp:1681.
+    pub fn progress(&self) -> f32 {
+        if self.items.is_empty() { return 0.0; }
+        (self.timer as f32 / UNIT_ROBOT_BUILD_TIME_MS as f32).clamp(0.0, 1.0)
+    }
+
+    /// Port of `CBuildStack::TickTimer` (MatrixObjectBuilding.cpp:
+    /// 1665-1717) for the robot branch only. Advances the timer;
+    /// when it hits `UNIT_ROBOT_BUILD_TIME_MS` and the parent base
+    /// is CLOSED, dequeues the head, produces a `Robot` at the
+    /// base's spawn position, inserts it into the arena, and calls
+    /// `JoinToGroup` (not ported).
+    ///
+    /// Returns the new robot's `ObjectId` on production — caller can
+    /// use it to attach point lights / effects for visibility.
+    pub fn tick_timer(
+        &mut self,
+        cms: i32,
+        objs: &mut Objects,
+        parent_self_id: ObjectId,
+        parent_state: BaseState,
+        parent_pos: glam::Vec3,
+    ) -> Option<ObjectId> {
+        if self.items.is_empty() {
+            self.timer = 0;
+            return None;
+        }
+        self.timer += cms;
+
+        let head = self.items[0];
+        let PendingKind::Robot(chassis) = head.kind;
+        if self.timer < UNIT_ROBOT_BUILD_TIME_MS {
+            return None;
+        }
+        if parent_state != BaseState::Closed {
+            // Wait — the C++ explicitly gates production on
+            // BASE_CLOSED (MatrixObjectBuilding.cpp:1690).
+            return None;
+        }
+
+        // Produce: pop, build robot, insert.
+        self.items.remove(0);
+        self.timer = 0;
+
+        // Port of MatrixObjectBuilding.cpp:1709-1712: create the robot
+        // at the base's location, call `RobotSpawn(pBase)` so its
+        // state machine enters the platform-rising animation, then
+        // `JoinToGroup` + `AddObject`.
+        let spawn_pos = glam::Vec3::new(parent_pos.x, parent_pos.y, parent_pos.z);
+        let mut robot = Robot::new(spawn_pos, head.side, chassis);
+        robot.robot_spawn(parent_self_id, parent_pos.z);
+        let id = objs.spawn(Box::new(robot));
+        objs.add_lt(id);
+        Some(id)
+    }
+}
 
 /// Base selection radius (MatrixObjectBuilding.hpp:25). Each kind adds
 /// a small per-kind extra to tighten the pick against the visible
@@ -260,6 +380,19 @@ pub struct Building {
     /// BASE_OPENING / BASE_CLOSING state machine at `BASE_FLOOR_SPEED`
     /// per ms (MatrixObjectBuilding.cpp:812-833).
     pub base_floor_progress: f32,
+
+    /// Port of `m_BS` (MatrixObjectBuilding.hpp:177). Queue of items
+    /// to produce; advanced per-tick by `logic_takt`.
+    pub build_stack: BuildStack,
+
+    /// The arena id for *this* building — populated by
+    /// `World::spawn_buildings` immediately after `Objects::spawn`
+    /// returns. The C++ doesn't carry this explicitly because its
+    /// objects are raw pointers; for the Rust port it's how the
+    /// build-stack hands a parent reference to freshly-produced
+    /// robots so `RobotSpawn` + the spawn-animation can read the
+    /// base's `m_BaseFloor` / `m_State`.
+    pub self_id: Option<ObjectId>,
 }
 
 impl Building {
@@ -323,7 +456,19 @@ impl Building {
             // value starts at 0 and animates toward 0 on the first
             // logic tick of a freshly-spawned building.
             base_floor_progress: 0.0,
+            build_stack: BuildStack::new(),
+            self_id: None,
         }
+    }
+
+    /// Entry point for the build-robot UI action — ports the
+    /// `m_Base->m_BS.AddItem(m_Build)` call at CConstructor.cpp:219.
+    /// Returns true if the queue accepted the item, false if full.
+    pub fn queue_robot(&mut self, chassis: ChassisKind) -> bool {
+        self.build_stack.add_item(PendingItem {
+            kind: PendingKind::Robot(chassis),
+            side: self.side,
+        })
     }
 
     /// Entry-point for `CMatrixBuilding::ShowHitpoint` (MatrixObjectBuilding.hpp:272).
@@ -434,8 +579,28 @@ impl MapStatic for Building {
     /// DIP explosion sequence (HP<0 → emit periodic explosions →
     /// replace with ruins), `m_GGraph` per-unit matrix updates
     /// (requires per-instance mesh state).
-    fn logic_takt(&mut self, cms: i32, _rng: &mut Rnd, _objs: &mut Objects) {
+    fn logic_takt(&mut self, cms: i32, _rng: &mut Rnd, objs: &mut Objects) {
         use crate::matrix_game::common::BASE_FLOOR_SPEED;
+
+        // Build-stack tick — port of `m_BS.TickTimer(cms)` call at
+        // MatrixObjectBuilding.cpp:605. Advances the build timer and
+        // produces the head item when it expires.
+        let parent_pos = glam::Vec3::new(self.pos.x, self.pos.y, self.build_z);
+        if let Some(parent_id) = self.self_id {
+            if let Some(spawned) = self.build_stack.tick_timer(
+                cms, objs, parent_id, self.state, parent_pos,
+            ) {
+                log::info!(
+                    "build: factory side={} produced robot {:?} at ({:.0}, {:.0}, {:.0})",
+                    self.side, spawned, parent_pos.x, parent_pos.y, parent_pos.z,
+                );
+                // Port of MatrixRobot.cpp:2183 + 2228 — set the
+                // BUILDING_SPAWNBOT flag and open the base so the
+                // platform starts rising with the robot on top.
+                self.object_state |= crate::matrix_game::map_static::OBJECT_STATE_BUILDING_SPAWNBOT;
+                self.open();
+            }
+        }
 
         // Pre-DIP pass: countdowns + capture/resource. Capture and
         // resources are still deferred; the countdowns are portable.
@@ -610,6 +775,14 @@ struct InstanceData {
     row2: [f32; 4],
     row3: [f32; 4],
     terrain_color: [f32; 4],
+    /// Per-sub-unit translation applied in mesh-local space before
+    /// the world matrix. Port of the per-unit
+    /// `D3DXMatrixTranslation` updates at
+    /// MatrixObjectBuilding.cpp:842-850. Zero-filled for all
+    /// sub-units on non-BASE kinds + for the "body" sub-unit on
+    /// BASE. Populated for BASE sub-unit IDs 1/2/3 (platform / left
+    /// door / right door) each frame by `BuildingsRenderer::takt`.
+    unit_offset: [f32; 4],
 }
 
 #[repr(C)]
@@ -644,6 +817,14 @@ struct MeshBatch {
     /// refresh the object renderer does in its `takt`).
     buildings: Vec<BuildingInstance>,
     center: [f32; 2],
+    /// Kind of building this batch's mesh belongs to. Needed so the
+    /// per-frame animation takt only touches BUILDING_BASE instances.
+    kind: BuildingType,
+    /// Sub-unit id from the CVO (`Id` param at
+    /// VectorObject.cpp:2415-2553). BASE's platform is id=1, left
+    /// door 2, right door 3; other sub-units and non-BASE kinds get
+    /// `None` here.
+    unit_id: Option<i32>,
 }
 
 pub struct BuildingsRenderer {
@@ -746,15 +927,11 @@ impl BuildingsRenderer {
                 continue;
             }
 
-            let inst_data: Vec<InstanceData> = instances
+            let base_inst_data: Vec<InstanceData> = instances
                 .iter()
                 .map(|b| instance_matrix(b, cx, cy, map, None))
                 .collect();
-            let instance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Buildings Inst VB"),
-                contents: bytemuck::cast_slice(&inst_data),
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            });
+            let kind_enum = BuildingType::from_u8(*kind).unwrap_or(BuildingType::Base);
 
             for unit in &group.units {
                 let Some(vo_bytes) = read_texture(&unit.model_path) else {
@@ -900,15 +1077,28 @@ impl BuildingsRenderer {
                         ],
                     });
 
+                    // Each batch owns its own instance buffer so the
+                    // per-sub-unit animation (platform rise, doors
+                    // slide) can write different offsets per batch
+                    // without stomping on sibling sub-units that
+                    // share the kind.
+                    let instance_buffer =
+                        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("Buildings Inst VB"),
+                            contents: bytemuck::cast_slice(&base_inst_data),
+                            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                        });
                     batches.push(MeshBatch {
                         vertex_buffer,
                         index_buffer,
                         num_indices: surf.indices.len() as u32,
-                        instance_buffer: instance_buffer.clone(),
-                        num_instances: inst_data.len() as u32,
+                        instance_buffer,
+                        num_instances: base_inst_data.len() as u32,
                         bind_group,
                         buildings: instances.iter().map(|b| (*b).clone()).collect(),
                         center: [cx, cy],
+                        kind: kind_enum,
+                        unit_id: unit.id,
                     });
                 }
             }
@@ -965,6 +1155,80 @@ impl BuildingsRenderer {
                 queue.write_buffer(&batch.instance_buffer, 0, bytemuck::cast_slice(&inst_data));
             }
             self.last_point_light_revision = revision;
+        }
+    }
+
+    /// Sync per-sub-unit animation offsets (platform rise / doors
+    /// slide) from the live `Building` objects in the arena. Ports
+    /// `CMatrixBuilding::LogicTakt`'s per-unit matrix updates at
+    /// MatrixObjectBuilding.cpp:836-852. Called once per frame
+    /// AFTER `World::takt` so the offsets are computed from the
+    /// current frame's `base_floor_progress`.
+    pub fn sync_building_animation(
+        &mut self,
+        queue: &wgpu::Queue,
+        objs: &Objects,
+        map: &GameMap,
+        point_lights: &PointLightSystem,
+    ) {
+        use crate::matrix_game::map_static::{MapStatic, ObjectType};
+
+        // Collect live Building progress keyed by (pos_x, pos_y) so
+        // the renderer can match its static `BuildingInstance` list.
+        //
+        // The C++ keeps `CMatrixBuilding::m_Pos` and the renderer's
+        // CVectorObjectGroup sharing the same world transform, so
+        // identical (pos.x, pos.y) is a safe key.
+        let mut progress_by_pos: std::collections::HashMap<(i32, i32), f32> =
+            std::collections::HashMap::new();
+        for id in objs.iter_live() {
+            if let Some(obj) = objs.get(id) {
+                if !matches!(obj.core().obj_type, ObjectType::Building) {
+                    continue;
+                }
+                let b: &Building = unsafe {
+                    &*(obj as *const dyn MapStatic as *const Building)
+                };
+                if b.kind == BuildingType::Base {
+                    progress_by_pos.insert(
+                        ((b.pos.x * 10.0) as i32, (b.pos.y * 10.0) as i32),
+                        b.base_floor_progress,
+                    );
+                }
+            }
+        }
+
+        // Early-out when nothing is animating.
+        if progress_by_pos.is_empty() {
+            return;
+        }
+
+        for batch in &mut self.batches {
+            if batch.kind != BuildingType::Base {
+                continue;
+            }
+            // Only platform + doors move (unit IDs 1, 2, 3).
+            let Some(uid) = batch.unit_id else { continue };
+            if !(1..=3).contains(&uid) {
+                continue;
+            }
+            let [cx, cy] = batch.center;
+            let inst_data: Vec<InstanceData> = batch
+                .buildings
+                .iter()
+                .map(|b| {
+                    let key = ((b.x * 10.0) as i32, (b.y * 10.0) as i32);
+                    let p = progress_by_pos.get(&key).copied().unwrap_or(0.0);
+                    let mut d = instance_matrix(b, cx, cy, map, Some(point_lights));
+                    d.unit_offset = sub_unit_offset(uid, p);
+                    d
+                })
+                .collect();
+            queue.write_buffer(
+                &batch.instance_buffer,
+                0,
+                bytemuck::cast_slice(&inst_data),
+            );
         }
     }
 
@@ -1045,6 +1309,23 @@ fn instance_matrix(
         row2: [rot.x_axis.z, rot.y_axis.z, rot.z_axis.z, b.build_z],
         row3: [0.0, 0.0, 0.0, 1.0],
         terrain_color: [terrain_r, terrain_g, terrain_b, 1.0],
+        unit_offset: [0.0, 0.0, 0.0, 0.0],
+    }
+}
+
+/// Port of the per-unit `D3DXMatrixTranslation` applied in
+/// `CMatrixBuilding::RNeed` (MatrixObjectBuilding.cpp:842-850) while
+/// the base's floor is animating. `progress` is `m_BaseFloor` in
+/// [0, 1]. Platform (unit 1) translates in Z by
+/// `-(1 - p) * 63 - 3`; left door (unit 2) slides `+25` along X,
+/// right door (unit 3) slides `-25`, both maxing at `p = 0.5`.
+fn sub_unit_offset(unit_id: i32, progress: f32) -> [f32; 4] {
+    let door_shift = (progress * 2.0).clamp(0.0, 1.0) * 25.0;
+    match unit_id {
+        1 => [0.0, 0.0, -(1.0 - progress) * 63.0 - 3.0, 0.0],
+        2 => [door_shift, 0.0, 0.0, 0.0],
+        3 => [-door_shift, 0.0, 0.0, 0.0],
+        _ => [0.0, 0.0, 0.0, 0.0],
     }
 }
 
@@ -1223,6 +1504,11 @@ fn create_pipeline(
                         wgpu::VertexAttribute {
                             offset: 64,
                             shader_location: 7,
+                            format: wgpu::VertexFormat::Float32x4,
+                        },
+                        wgpu::VertexAttribute {
+                            offset: 80,
+                            shader_location: 8,
                             format: wgpu::VertexFormat::Float32x4,
                         },
                     ],

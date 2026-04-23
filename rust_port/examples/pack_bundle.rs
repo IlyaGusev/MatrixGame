@@ -119,6 +119,19 @@ fn main() {
     extra_paths.push("Matrix/Iface/interface1".to_string());
     extra_paths.push("Matrix/Iface/interface2".to_string());
     extra_paths.push("Matrix/Iface/interface3".to_string());
+    // Text / LabelsText atlases referenced by `if/Main`'s statics
+    // (CInterface.cpp:540+ loader reads `sNormal = Matrix\\IFace\\text_1`
+    // for `lives`, `name`, `bopis`, `bresg`, `fresg`, `prog`, ...).
+    extra_paths.push("Matrix/Iface/text_1".to_string());
+    extra_paths.push("Matrix/Iface/text_2".to_string());
+    // Base-selection sprites referenced by `if/Main`'s per-kind
+    // platform / resource-label statics.
+    for i in 1..=6 {
+        extra_paths.push(format!("Matrix/Iface/base_{}", i));
+    }
+    // Progress-bar sprite used by `CMatrixProgressBar`
+    // (MatrixProgressBar.cpp:22 `TEXTURE_PATH_PB`). Ships only as DDS.
+    extra_paths.push("Matrix/Textures/pb".to_string());
     // Sky panorama textures referenced by the hardcoded sky config table in
     // `renderer/sky.rs::resolve_sky_texture`. Pack all of them so every sky
     // name resolves regardless of which map is loaded next.
@@ -421,6 +434,64 @@ fn main() {
     println!(
         "  buildings: {} cvo files, {} sub-vos, {} textures packed",
         cvo_count, sub_vo_count, building_tex_count
+    );
+
+    // Pack robot chassis meshes — `Matrix\Robot\ChassisN.vo` for N in 1..=5
+    // (MatrixObjectRobot.cpp:352, path from OBJECT_PATH_ROBOT_CHASSIS +
+    // m_Kind). The renderer needs the VO, its diffuse/gloss textures,
+    // and the embedded surface-texture fallback the VO may reference.
+    let mut chassis_vo_count = 0;
+    let mut chassis_tex_count = 0;
+    for n in 1..=5u32 {
+        let vo_path = format!("Matrix/Robot/Chassis{}.vo", n);
+        let vo_key = vo_path.to_uppercase();
+        let vo_bytes = match pkg.read_file(&vo_key) {
+            Ok(data) => {
+                bundle.add(&vo_path, data.clone());
+                chassis_vo_count += 1;
+                data
+            }
+            Err(_) => {
+                eprintln!("  MISS chassis vo: {}", vo_path);
+                continue;
+            }
+        };
+        // Texture stem (C++ LoadObject takes the name part before .vo and
+        // loads diffuse/gloss via the material composition machinery).
+        let stem = format!("Matrix/Robot/Chassis{}", n);
+        for suffix in ["", "_gloss"] {
+            let t = format!("{}{}", stem, suffix);
+            if try_pack_texture(&mut bundle, &mut vo_tex_seen, &t) {
+                chassis_tex_count += 1;
+            }
+        }
+        if let Ok(vo) = vector_object::parse_vo(&vo_bytes) {
+            let dir = vo_path
+                .rsplit_once('/')
+                .map(|(d, _)| format!("{d}/"));
+            for s in &vo.surfaces {
+                if let Some(spec) = s.texture_ref.as_deref() {
+                    let m = vector_object::parse_material_spec_with_prefix(spec, dir.as_deref());
+                    for t in [
+                        m.diffuse.as_ref(),
+                        m.gloss.as_ref(),
+                        m.back.as_ref(),
+                        m.mask.as_ref(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        if try_pack_texture(&mut bundle, &mut vo_tex_seen, t) {
+                            chassis_tex_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    println!(
+        "  robots: {} chassis vo files, {} textures packed",
+        chassis_vo_count, chassis_tex_count
     );
 
     // Pack sibling `.txt` files so the alpha-test override path in

@@ -56,7 +56,9 @@ Form, Helper, Math3D, ShadowProj, ShadowStencil.
 | matrix_game/minimap.rs        | MatrixMinimap.cpp                 |
 | matrix_game/object.rs         | MatrixObject.cpp (OBJECT_TYPE_MAPOBJECT — decorative rendering + `MapObject` game-object side)|
 | matrix_game/object_building.rs| MatrixObjectBuilding.cpp          |
+| matrix_game/object_robot.rs   | MatrixObjectRobot.cpp (chassis-only RNeed + per-frame instance sync) |
 | matrix_game/particles.rs      | (stub — will split across Effects/) |
+| matrix_game/progress_bar.rs   | MatrixProgressBar.cpp (3-segment bar + LIC color, atlas-backed) |
 | matrix_game/render_pipeline.rs| MatrixRenderPipeline.cpp          |
 | matrix_game/rnd.rs            | MatrixLogic.cpp `CMatrixMapLogic::Rnd` (Park–Miller LCG) |
 | matrix_game/side.rs           | MatrixSide.cpp (selection fields only — `m_ActiveObject`, `m_CurrSel`; resources/AI/stats deferred) |

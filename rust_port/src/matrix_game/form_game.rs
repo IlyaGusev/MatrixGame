@@ -27,6 +27,15 @@ struct AppState {
     last_time: f64,
     cursor: [f32; 2],
     minimap_dragging: bool,
+    /// Map of currently-tracked arena robots → their visibility
+    /// point-light id. Rebuilt per frame in `sync_robot_lights` so
+    /// freshly-spawned robots light up and despawned ones go dark.
+    /// Substitutes for the full mesh / billboard renderer (the
+    /// CMatrixRobotAI draw path) until that lands.
+    robot_lights: std::collections::HashMap<
+        crate::matrix_game::map_static::ObjectId,
+        crate::matrix_game::effects::point_light::PointLightId,
+    >,
     /// Selection-ring renderer — ports `CMatrixEffectSelection`
     /// (MatrixEffectSelection.cpp). Drawn over the terrain after the
     /// object pass; green ring on the ground around the selected
@@ -38,6 +47,10 @@ struct AppState {
     /// 2D textured-quad renderer for the UI panels. Drawn last so
     /// the HUD sits on top of world + minimap.
     iface_renderer: crate::matrix_game::interface::InterfaceRenderer,
+    /// Horizontal 3-segment progress bars — port of
+    /// `CMatrixProgressBar`. Queued each frame from
+    /// `refresh_progress_bars`; drawn after the interface pass.
+    progress_bars: crate::matrix_game::progress_bar::ProgressBarRenderer,
 }
 
 pub struct App {
@@ -172,6 +185,11 @@ impl ApplicationHandler for App {
                 &read,
                 iface_list.panels.iter(),
             );
+            let mut progress_bars =
+                crate::matrix_game::progress_bar::ProgressBarRenderer::new(
+                    &gfx.device, &gfx.config,
+                );
+            progress_bars.load_atlas(&gfx.device, &gfx.queue, &read);
 
             *self.state.borrow_mut() = Some(AppState {
                 window,
@@ -185,9 +203,11 @@ impl ApplicationHandler for App {
                 last_time: crate::platform::now_secs(),
                 cursor: [-1.0, -1.0],
                 minimap_dragging: false,
+                robot_lights: std::collections::HashMap::new(),
                 selection_ring,
                 iface_list,
                 iface_renderer,
+                progress_bars,
             });
         }
 
@@ -301,6 +321,11 @@ impl ApplicationHandler for App {
                     &read,
                     iface_list.panels.iter(),
                 );
+                let mut progress_bars =
+                    crate::matrix_game::progress_bar::ProgressBarRenderer::new(
+                        &gfx.device, &gfx.config,
+                    );
+                progress_bars.load_atlas(&gfx.device, &gfx.queue, &read);
 
                 *state_slot.borrow_mut() = Some(AppState {
                     window: win.clone(),
@@ -314,9 +339,11 @@ impl ApplicationHandler for App {
                     last_time: crate::platform::now_secs(),
                     cursor: [-1.0, -1.0],
                     minimap_dragging: false,
+                    robot_lights: std::collections::HashMap::new(),
                     selection_ring,
                     iface_list,
                     iface_renderer,
+                    progress_bars,
                 });
                 win.request_redraw();
                 hide_loading_overlay();
@@ -409,6 +436,7 @@ impl ApplicationHandler for App {
                             state.minimap_dragging = false;
                             if let Some(click) = state.iface_list.on_mouse_up(cx, cy, w, h) {
                                 log::info!("iface: clicked {:?}", click);
+                                dispatch_ui_click(state, &click);
                             }
                         }
                     }
@@ -520,10 +548,23 @@ impl ApplicationHandler for App {
                 // each frame, advance dot animation per takt).
                 sync_selection_ring(state, step_ms as f32);
 
+                // Per-frame: reconcile point lights for each live
+                // robot so the build-factory spawns are visible even
+                // without a robot renderer. Stand-in for the C++
+                // `CMatrixRobotAI::Draw` path until mesh rendering lands.
+                sync_robot_lights(state);
+
                 // Per-frame interface visibility dispatch — ports the
                 // `CInterface::LogicTakt` branch at
                 // CInterface.cpp:1214-1635. Only `if/Main` for now.
                 refresh_interface_visibility(state);
+
+                // Queue the build-stack progress bar on top of the
+                // `prog` element. Ports
+                // `m_BS.m_PB.Modify(m_Timer / UNIT_ROBOT) +
+                // CreateClone(PBC_CLONE1, x, y, 87)` at
+                // MatrixObjectBuilding.cpp:1681-1689.
+                refresh_progress_bars(state);
 
                 state.camera.takt(dt * 1000.0); // camera update (ms)
                 state.minimap.takt(dt * 1000.0);
@@ -535,6 +576,29 @@ impl ApplicationHandler for App {
                     &state.gfx.device,
                     &state.gfx.queue,
                 ); // water animation + dynamic object tint updates
+
+                // Push BASE per-sub-unit animation (platform rise,
+                // door slide) from the live `Building::base_floor_progress`
+                // into the BuildingsRenderer instance buffers. Ports
+                // MatrixObjectBuilding.cpp:836-852. Must run AFTER
+                // `state.game.takt` advances the base's state machine.
+                state.terrain.sync_building_animation(
+                    &state.gfx.queue,
+                    &state.game.objects,
+                    &state.map,
+                    &state.point_lights,
+                );
+
+                // Rebuild chassis instance buffers from the live arena
+                // so newly-spawned robots show up (stand-in for
+                // `CMatrixRobotAI::RNeed`'s per-robot matrix update —
+                // MatrixObjectRobot.cpp:359-480).
+                state.terrain.sync_robots(
+                    &state.gfx.queue,
+                    &state.game.objects,
+                    &state.map,
+                    &state.point_lights,
+                );
 
                 // Bake the minimap background the first time — ports
                 // CMinimap::RenderBackground (called once at map load). Must
@@ -665,6 +729,35 @@ impl ApplicationHandler for App {
                                 });
                             state.iface_renderer.render(&mut pass);
                         }
+                        // Progress-bar overlay pass — on top of the UI.
+                        {
+                            state.progress_bars.upload(
+                                &state.gfx.device,
+                                &state.gfx.queue,
+                                state.gfx.config.width as f32,
+                                state.gfx.config.height as f32,
+                            );
+                            let mut pass =
+                                encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                    label: Some("ProgressBar Pass"),
+                                    color_attachments: &[Some(
+                                        wgpu::RenderPassColorAttachment {
+                                            view: &view,
+                                            resolve_target: None,
+                                            depth_slice: None,
+                                            ops: wgpu::Operations {
+                                                load: wgpu::LoadOp::Load,
+                                                store: wgpu::StoreOp::Store,
+                                            },
+                                        },
+                                    )],
+                                    depth_stencil_attachment: None,
+                                    timestamp_writes: None,
+                                    occlusion_query_set: None,
+                                    multiview_mask: None,
+                                });
+                            state.progress_bars.render(&mut pass);
+                        }
                         state.gfx.end_frame(output, encoder);
                     }
                     Err(wgpu::SurfaceError::Lost) => {
@@ -699,6 +792,188 @@ impl ApplicationHandler for App {
 /// dereferences `g_MatrixData->BlockGet(...)` without NULL guards all over
 /// Init, so missing `robots.dat` is a fatal startup error.
 
+/// Keep per-robot visibility point lights in sync with the arena.
+/// Every frame: spawn a light for each new `ObjectType::RobotAi`,
+/// drop lights whose target id is no longer valid. Per-side color
+/// so enemy and friendly spawns read apart at a glance.
+fn sync_robot_lights(state: &mut AppState) {
+    use crate::matrix_game::map_static::ObjectType;
+
+    // Build a set of current live robot ids.
+    let mut live_robots: Vec<crate::matrix_game::map_static::ObjectId> = Vec::new();
+    for id in state.game.objects.iter_live() {
+        if let Some(obj) = state.game.objects.get(id) {
+            if matches!(obj.core().obj_type, ObjectType::RobotAi) {
+                live_robots.push(id);
+            }
+        }
+    }
+
+    // Add lights for new robots + update positions for existing ones
+    // so the light follows the robot rising out of the silo.
+    for id in &live_robots {
+        let Some(obj) = state.game.objects.get(*id) else { continue };
+        let pos = obj.core().geo_center;
+        let lit_pos = [pos.x, pos.y, pos.z + 6.0];
+        if let Some(light_id) = state.robot_lights.get(id).copied() {
+            state.point_lights.set_pos(&state.map, light_id, lit_pos);
+        } else {
+            // Bright yellow for player, red for enemies.
+            let color = if obj.side() == crate::matrix_game::common::PLAYER_SIDE {
+                0xFFFF66
+            } else {
+                0xFF3333
+            };
+            let light_id = state.point_lights.add_light(&state.map, lit_pos, 25.0, color);
+            state.robot_lights.insert(*id, light_id);
+        }
+    }
+
+    // Remove lights for dead robots (tombstone-aware via `is_valid`).
+    let dead: Vec<_> = state
+        .robot_lights
+        .iter()
+        .filter_map(|(id, light_id)| {
+            if state.game.objects.is_valid(*id) { None } else { Some((*id, *light_id)) }
+        })
+        .collect();
+    for (id, light_id) in dead {
+        state.point_lights.remove_light(&state.map, light_id);
+        state.robot_lights.remove(&id);
+    }
+}
+
+/// Port of `CMatrixSideUnit::PlayerAction` + the follow-on
+/// `CBuildStack::AddItem` call. Dispatches the button identified by
+/// its `Name` to the right game-state change. Currently handles
+/// `buro` (build robot) → push a default-chassis robot onto the
+/// selected base's build stack. The C++ opens the full
+/// `m_ConstructPanel` for chassis/armor/weapon selection first; the
+/// constructor UI isn't ported, so we skip straight to AddItem with
+/// a default chassis.
+fn dispatch_ui_click(state: &mut AppState, click: &crate::matrix_game::interface::Click) {
+    use crate::matrix_game::interface::Click;
+    use crate::matrix_game::map_static::{MapStatic, ObjectType};
+    use crate::matrix_game::object_building::{Building, BuildingType};
+    use crate::matrix_game::side::CurrSel;
+    use crate::matrix_game::units::ChassisKind;
+
+    match click {
+        Click::Button(name) if name == "buro" => {
+            if state.game.player_side.curr_sel != CurrSel::BaseSelected {
+                log::info!("buro: no base selected, ignoring");
+                return;
+            }
+            let Some(id) = state.game.active_object() else { return };
+            // Downcast the active MapStatic to Building and queue a
+            // robot. `ChassisKind::Track` is a reasonable default
+            // (the C++ defaults vary by constructor state; Track is
+            // the cheapest one).
+            let Some(obj) = state.game.objects.get_mut(id) else { return };
+            if !matches!(obj.core().obj_type, ObjectType::Building) { return }
+            let b: &mut Building = unsafe {
+                &mut *(obj as *mut dyn MapStatic as *mut Building)
+            };
+            if b.kind != BuildingType::Base {
+                log::info!("buro: can only build from a base, got {:?}", b.kind);
+                return;
+            }
+            if b.queue_robot(ChassisKind::Track) {
+                log::info!(
+                    "buro: queued robot on base at ({:.0},{:.0}); stack now has {} items",
+                    b.pos.x, b.pos.y, b.build_stack.items(),
+                );
+            } else {
+                log::info!("buro: stack full, click rejected");
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Queue progress bars for the active building's build stack. Ports
+/// the `m_BS.m_PB.Modify(...) + CreateClone(PBC_CLONE1, x, y, 87)`
+/// dispatch at MatrixObjectBuilding.cpp:1681-1689 — a 87-pixel-wide
+/// bar drawn over the `if/Main` panel coords that CInterface resolves
+/// at `(m_xPos+283, m_yPos+71)`.  We route through
+/// `CInterface::element_rect("prog")` so the bar lands exactly where
+/// the Static the C++ draws underneath it lives.
+fn refresh_progress_bars(state: &mut AppState) {
+    use crate::matrix_game::map_static::{MapStatic, ObjectType};
+    use crate::matrix_game::object_building::Building;
+    use crate::matrix_game::progress_bar::ProgressBar;
+    use crate::matrix_game::side::CurrSel;
+
+    state.progress_bars.clear();
+
+    // Only fires for a selected building with queued items — matches
+    // the C++ guard at MatrixObjectBuilding.cpp:1685-1689.
+    if !matches!(
+        state.game.player_side.curr_sel,
+        CurrSel::BaseSelected | CurrSel::BuildingSelected
+    ) {
+        return;
+    }
+    let Some(id) = state.game.active_object() else { return };
+    let Some(obj) = state.game.objects.get(id) else { return };
+    if !matches!(obj.core().obj_type, ObjectType::Building) {
+        return;
+    }
+    let b: &Building = unsafe { &*(obj as *const dyn MapStatic as *const Building) };
+    if b.build_stack.is_empty() {
+        return;
+    }
+
+    let w = state.gfx.config.width as f32;
+    let h = state.gfx.config.height as f32;
+    let Some(main) = state.iface_list.panel("Main") else {
+        log::warn!("progress: no Main panel");
+        return;
+    };
+
+    // Port of MatrixObjectBuilding.cpp:1676-1689:
+    //   float x = g_IFaceList->GetMainX() + 283;
+    //   float y = g_IFaceList->GetMainY() + 71;
+    //   ...
+    //   m_PB.CreateClone(PBC_CLONE1, x, y, 87);
+    //
+    // `GetMainX()/GetMainY()` return the IF_MAIN panel's resolved
+    // top-left in screen pixels; the +283/+71 offsets and 87-wide
+    // clone are design-space pixels that the C++ uses at its fixed
+    // 1024×768 resolution. We scale them by `screen_h / 768` the
+    // same way CInterface scales its own panels.
+    const PB_OFFSET_X: f32 = 283.0;
+    const PB_OFFSET_Y: f32 = 71.0;
+    const PB_WIDTH: f32 = 87.0;
+    use crate::matrix_game::interface::interface::DESIGN_H;
+    let scale = (h / DESIGN_H).max(0.1);
+    let [panel_x, panel_y] = main.resolved_pos(w, h, scale);
+    let bar_h_design = {
+        let d = state.progress_bars.bar_height_design();
+        if d > 0.0 { d } else { 16.0 }
+    };
+    let rect = [
+        panel_x + PB_OFFSET_X * scale,
+        panel_y + PB_OFFSET_Y * scale,
+        PB_WIDTH * scale,
+        bar_h_design * scale,
+    ];
+
+    // One-shot log so we can verify the rect + fill on first build.
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        log::info!(
+            "progress: pushing bar rect=({:.0},{:.0},{:.0},{:.0}) fill={:.2}",
+            rect[0], rect[1], rect[2], rect[3], b.build_stack.progress(),
+        );
+    }
+
+    state.progress_bars.push(ProgressBar {
+        rect,
+        fill: b.build_stack.progress(),
+    });
+}
+
 /// Port of `CInterface::LogicTakt`'s per-frame visibility dispatch
 /// for the `if/Main` panel (CInterface.cpp:1214-1635). Reads
 /// `player_side.curr_sel` + the currently-active building's kind /
@@ -713,7 +988,7 @@ fn refresh_interface_visibility(state: &mut AppState) {
 
     let curr_sel = state.game.player_side.curr_sel;
     // Pull building context when the selection is a Building.
-    let (kind, stack_empty, turrets_max) = match curr_sel {
+    let (kind, stack_empty, stack_items, turrets_max) = match curr_sel {
         CurrSel::BaseSelected | CurrSel::BuildingSelected => {
             let active = state.game.active_object();
             active
@@ -723,19 +998,19 @@ fn refresh_interface_visibility(state: &mut AppState) {
                     let b: &Building = unsafe {
                         &*(o as *const dyn MapStatic as *const Building)
                     };
-                    // Build stack isn't ported yet — treat it as
-                    // always-empty, which matches initial state.
-                    (Some(b.kind), true, b.turrets_max)
+                    let n = b.build_stack.items() as i32;
+                    (Some(b.kind), n == 0, n, b.turrets_max)
                 })
-                .unwrap_or((None::<BuildingType>, true, 0))
+                .unwrap_or((None::<BuildingType>, true, 0, 0))
         }
-        _ => (None, true, 0),
+        _ => (None, true, 0, 0),
     };
 
     let ctx = MainVisibilityCtx {
         curr_sel,
         building_kind: kind,
         building_stack_empty: stack_empty,
+        building_stack_items: stack_items,
         building_turrets_max: turrets_max,
     };
     if let Some(p) = state.iface_list.panel_mut("Main") {
@@ -921,6 +1196,17 @@ async fn load_map_async() -> (
     use crate::matrix_lib::base::storage::Storage;
 
     let bundle_url = bundle_url_from_query().unwrap_or_else(|| "assets/atoll.bundle".to_string());
+    // Cache-bust: append the same `?v=N` that index.html uses for
+    // the JS import so the browser refetches when the UI textures
+    // in the bundle change.
+    let bundle_url = if bundle_url.contains('?') {
+        bundle_url
+    } else {
+        // Bump this whenever `pack_bundle.rs` changes the set of
+        // packed keys, so the browser refetches instead of serving
+        // a stale cached response.
+        format!("{bundle_url}?bv=3")
+    };
     log::info!("loading bundle: {}", bundle_url);
     let bundle_data = crate::gfx::loader::load_bytes(&bundle_url)
         .await
