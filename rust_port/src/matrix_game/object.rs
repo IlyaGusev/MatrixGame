@@ -16,27 +16,29 @@ use bytemuck::{Pod, Zeroable};
 use glam::{Mat3, Mat4, Vec3, Vec4};
 use wgpu::util::DeviceExt;
 
-use crate::matrix_lib::base::storage::Storage;
-use crate::matrix_game::effects::point_light::PointLightSystem;
+use crate::matrix_game::camera::Camera;
 use crate::matrix_game::common::{unpack_rgb, FOG_END, FOG_START};
-use crate::matrix_game::map::{GameMap, ObjectInstance, ObjectShadow};
-use crate::matrix_game::map_static::{
-    MapStatic, ObjectCore, ObjectId, Objects, ObjectType, MR_ALL, MR_GRAPH, MR_MATRIX,
-    MR_SHADOW_PROJ_GEOM, MR_SHADOW_PROJ_TEX, OBJECT_STATE_ABLAZE, OBJECT_STATE_BURNED,
-    OBJECT_STATE_SHADOW_SPECIAL, OBJECT_STATE_SPECIAL, OBJECT_STATE_TRACE_INVISIBLE,
-};
 use crate::matrix_game::common::{
     OBJECT_ABLAZE_BURNED_AT_MS, OTP_BEHAVIOUR, OTP_INVLOGIC, PLAYER_SIDE,
 };
+use crate::matrix_game::effects::point_light::PointLightSystem;
 use crate::matrix_game::effects::weapon::{
     is_fire_weapon, Weapon, WEAPON_ABLAZE, WEAPON_FLAMETHROWER, WEAPON_PLASMA,
 };
+use crate::matrix_game::map::{GameMap, ObjectInstance, ObjectShadow};
+use crate::matrix_game::map_static::{
+    MapStatic, ObjectCore, ObjectId, ObjectType, Objects, MR_ALL, MR_GRAPH, MR_MATRIX,
+    MR_SHADOW_PROJ_GEOM, MR_SHADOW_PROJ_TEX, OBJECT_STATE_ABLAZE, OBJECT_STATE_BURNED,
+    OBJECT_STATE_SHADOW_SPECIAL, OBJECT_STATE_SPECIAL, OBJECT_STATE_TRACE_INVISIBLE,
+};
 use crate::matrix_game::rnd::Rnd;
+use crate::matrix_lib::base::storage::Storage;
 use crate::matrix_lib::base::wstr;
-use crate::matrix_lib::three_g::vector_object::{self, ShadowKind, VoAnimation, VoFrame, VoSurfaceMesh};
-use crate::matrix_game::camera::Camera;
 use crate::matrix_lib::three_g::texture::{
     create_solid_texture, create_texture_from_rgba, decode_texture_bytes,
+};
+use crate::matrix_lib::three_g::vector_object::{
+    self, ShadowKind, VoAnimation, VoFrame, VoSurfaceMesh,
 };
 
 // ── Game-object side of CMatrixMapObject ────────────────────────────────
@@ -51,13 +53,13 @@ use crate::matrix_lib::three_g::texture::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum BehFlag {
-    Static  = 0,
-    Burn    = 1,
-    Break   = 2,
-    Anim    = 3,
-    Sens    = 4,
+    Static = 0,
+    Burn = 1,
+    Break = 2,
+    Anim = 3,
+    Sens = 4,
     Spawner = 5,
-    Terron  = 6,
+    Terron = 6,
     Portret = 7,
 }
 
@@ -93,7 +95,6 @@ pub struct MapObject {
     // have that without unsafe unions, so we keep the fields distinct.
     // Adds only what ported behaviours currently touch; more land with
     // their branches.
-
     /// `m_Photo` (BEHF_PORTRET): 0 = mask variant, 1 = back variant
     /// (MatrixObject.hpp:90). Toggled in `takt` on time-out.
     pub photo: i32,
@@ -167,7 +168,7 @@ impl MapObject {
 
         Self {
             core,
-            rchange: MR_ALL,                  // m_RChange(0xffffffff)
+            rchange: MR_ALL, // m_RChange(0xffffffff)
             object_state: 0,
             ablaze_ttl: 0,
             shorted_ttl: 0,
@@ -175,10 +176,10 @@ impl MapObject {
             angle_x: inst.angle_x,
             angle_y: inst.angle_y,
             scale: inst.scale.max(0.0001),
-            tex_bias: -1.0,                   // MatrixObject.cpp:43
+            tex_bias: -1.0, // MatrixObject.cpp:43
             type_id: inst.type_id as i32,
-            uid: -1,                          // MatrixObject.cpp:61
-            beh_flag: BehFlag::Static,        // MatrixObject.cpp:56
+            uid: -1,                   // MatrixObject.cpp:61
+            beh_flag: BehFlag::Static, // MatrixObject.cpp:56
             photo: 0,
             photo_time: 0,
             prev_state_robots_in_radius: 0,
@@ -239,7 +240,7 @@ impl MapObject {
             // matches the defaults in our ctor. The `Tex`-variant burn
             // skin load (MatrixObject.cpp:1035-1042) depends on the skin
             // manager, still unported.
-            false  // BEHF_BURN is not AddLT'd — it enrolls on damage.
+            false // BEHF_BURN is not AddLT'd — it enrolls on damage.
         } else if wstr::compare_first(&beh, "Break") {
             // "Break,<something>,<hp>,Terron?"  (MatrixObject.cpp:1043-1058)
             // Field 2 is the starting hit-point count.
@@ -265,7 +266,7 @@ impl MapObject {
                 //   m_Photo = 0;
                 self.photo_time = rng.range(1000, 2000);
                 self.photo = 0;
-                false  // BEHF_PORTRET doesn't AddLT (Takt handles it).
+                false // BEHF_PORTRET doesn't AddLT (Takt handles it).
             } else {
                 self.beh_flag = BehFlag::Anim;
                 // MatrixObject.cpp:1072 — ApplyAnimState(0). The state
@@ -334,18 +335,42 @@ impl MapObject {
 }
 
 impl MapStatic for MapObject {
-    fn core(&self) -> &ObjectCore { &self.core }
-    fn core_mut(&mut self) -> &mut ObjectCore { &mut self.core }
-    fn rchange(&self) -> u32 { self.rchange }
-    fn rchange_set(&mut self, b: u32) { self.rchange |= b; }
-    fn rchange_clear(&mut self, b: u32) { self.rchange &= !b; }
-    fn object_state(&self) -> u32 { self.object_state }
-    fn object_state_set(&mut self, b: u32) { self.object_state |= b; }
-    fn object_state_clear(&mut self, b: u32) { self.object_state &= !b; }
-    fn ablaze_ttl(&self) -> i32 { self.ablaze_ttl }
-    fn set_ablaze_ttl(&mut self, t: i32) { self.ablaze_ttl = t; }
-    fn shorted_ttl(&self) -> i32 { self.shorted_ttl }
-    fn set_shorted_ttl(&mut self, t: i32) { self.shorted_ttl = t; }
+    fn core(&self) -> &ObjectCore {
+        &self.core
+    }
+    fn core_mut(&mut self) -> &mut ObjectCore {
+        &mut self.core
+    }
+    fn rchange(&self) -> u32 {
+        self.rchange
+    }
+    fn rchange_set(&mut self, b: u32) {
+        self.rchange |= b;
+    }
+    fn rchange_clear(&mut self, b: u32) {
+        self.rchange &= !b;
+    }
+    fn object_state(&self) -> u32 {
+        self.object_state
+    }
+    fn object_state_set(&mut self, b: u32) {
+        self.object_state |= b;
+    }
+    fn object_state_clear(&mut self, b: u32) {
+        self.object_state &= !b;
+    }
+    fn ablaze_ttl(&self) -> i32 {
+        self.ablaze_ttl
+    }
+    fn set_ablaze_ttl(&mut self, t: i32) {
+        self.ablaze_ttl = t;
+    }
+    fn shorted_ttl(&self) -> i32 {
+        self.shorted_ttl
+    }
+    fn set_shorted_ttl(&mut self, t: i32) {
+        self.shorted_ttl = t;
+    }
 
     /// Port of `CMatrixMapObject::RNeed` (MatrixObject.cpp:374-669). The
     /// full implementation rebuilds the world matrix, loads the
@@ -384,14 +409,25 @@ impl MapStatic for MapObject {
         // `LoadObject` / `CVOShadowStencil` / `CMatrixShadowProj` /
         // `CMinimap::RenderObjectToBackground`. Stubbed for scope B —
         // clear the dirty bits so the next `r_need` doesn't spin on them.
-        if need & MR_GRAPH != 0 { self.rchange &= !MR_GRAPH; }
-        if need & MR_SHADOW_PROJ_GEOM != 0 { self.rchange &= !MR_SHADOW_PROJ_GEOM; }
-        if need & MR_SHADOW_PROJ_TEX != 0 { self.rchange &= !MR_SHADOW_PROJ_TEX; }
+        if need & MR_GRAPH != 0 {
+            self.rchange &= !MR_GRAPH;
+        }
+        if need & MR_SHADOW_PROJ_GEOM != 0 {
+            self.rchange &= !MR_SHADOW_PROJ_GEOM;
+        }
+        if need & MR_SHADOW_PROJ_TEX != 0 {
+            self.rchange &= !MR_SHADOW_PROJ_TEX;
+        }
     }
 
     /// Port of `CMatrixMapObject::Takt` (MatrixObject.cpp:671-731). The
     /// graphic takt.
-    fn takt(&mut self, cms: i32, rng: &mut Rnd, _objs: &mut crate::matrix_game::map_static::Objects) {
+    fn takt(
+        &mut self,
+        cms: i32,
+        rng: &mut Rnd,
+        _objs: &mut crate::matrix_game::map_static::Objects,
+    ) {
         if self.beh_flag == BehFlag::Portret {
             // MatrixObject.cpp:675-689 — photo toggle. `m_PhotoTime`
             // counts down; at 0 the `m_Photo` bit flips and the timer
@@ -437,9 +473,7 @@ impl MapStatic for MapObject {
 
         // MatrixObject.cpp:105 — special (win-target) objects can only
         // be hit by the player.
-        if attacker_side != PLAYER_SIDE
-            && self.object_state & OBJECT_STATE_SPECIAL != 0
-        {
+        if attacker_side != PLAYER_SIDE && self.object_state & OBJECT_STATE_SPECIAL != 0 {
             return false;
         }
 
@@ -568,10 +602,15 @@ impl MapStatic for MapObject {
     /// other branches enroll via `apply_ids_row` but their bodies need
     /// subsystems (progress bars, effects, sound, robot spawning) that
     /// aren't ported.
-    fn logic_takt(&mut self, ms: i32, _rng: &mut Rnd, objs: &mut crate::matrix_game::map_static::Objects) {
+    fn logic_takt(
+        &mut self,
+        ms: i32,
+        _rng: &mut Rnd,
+        objs: &mut crate::matrix_game::map_static::Objects,
+    ) {
         use crate::matrix_game::common::TRACE_ROBOT;
         use crate::matrix_game::map_static::fit_to_mask as _fit_to_mask;
-        let _ = _fit_to_mask;  // keep import used even when SENS disabled
+        let _ = _fit_to_mask; // keep import used even when SENS disabled
 
         if self.beh_flag == BehFlag::Sens {
             // Port of the BEHF_SENS branch (MatrixObject.cpp:1485-1532).
@@ -597,9 +636,8 @@ impl MapStatic for MapObject {
                 // `logic_takt` (take-the-box pattern in proceed_logic),
                 // so find_objects cannot hit us. Passing `None` matches
                 // the C++ which also doesn't skip self here.
-                let robot_nearby = objs.any_object_in_radius(
-                    pos, self.sens_radius, 1.0, TRACE_ROBOT, None,
-                );
+                let robot_nearby =
+                    objs.any_object_in_radius(pos, self.sens_radius, 1.0, TRACE_ROBOT, None);
 
                 if robot_nearby {
                     if self.prev_state_robots_in_radius == 0 {
@@ -2143,9 +2181,15 @@ mod tests {
 
     fn inst() -> ObjectInstance {
         ObjectInstance {
-            x: 0.0, y: 0.0, z: 0.0,
-            angle_z: 0.0, angle_x: 0.0, angle_y: 0.0,
-            scale: 1.0, type_id: 0, shadow: None,
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+            angle_z: 0.0,
+            angle_x: 0.0,
+            angle_y: 0.0,
+            scale: 1.0,
+            type_id: 0,
+            shadow: None,
         }
     }
 
@@ -2170,7 +2214,7 @@ mod tests {
 
     #[test]
     fn break_variant_terron_is_distinguished() {
-        let break_plain  = "path*vo*tex******Break,X,5000,Normal";
+        let break_plain = "path*vo*tex******Break,X,5000,Normal";
         let break_terron = "path*vo*tex******Break,X,5000,Terron";
         let mut a = MapObject::from_instance(&inst());
         let mut b = MapObject::from_instance(&inst());
@@ -2183,7 +2227,7 @@ mod tests {
     #[test]
     fn anim_vs_animp_split_on_fifth_char() {
         let anim_plain = "path*vo*tex******Anim";
-        let animp      = "path*vo*tex******AnimP";
+        let animp = "path*vo*tex******AnimP";
         let mut a = MapObject::from_instance(&inst());
         let mut p = MapObject::from_instance(&inst());
         let a_lt = a.apply_ids_row(anim_plain, &mut Rnd::new(1), || {});
@@ -2214,7 +2258,9 @@ mod tests {
         let row = "path*vo*tex******+Break,X,5000,Normal";
         let mut o = MapObject::from_instance(&inst());
         let mut bumps = 0;
-        let add_lt = o.apply_ids_row(row, &mut Rnd::new(1), || { bumps += 1; });
+        let add_lt = o.apply_ids_row(row, &mut Rnd::new(1), || {
+            bumps += 1;
+        });
         assert!(add_lt);
         assert_eq!(o.beh_flag, BehFlag::Break);
         assert_ne!(o.object_state & OBJECT_STATE_SPECIAL, 0);
@@ -2274,10 +2320,11 @@ mod tests {
         // Non-BEHF_BURN objects ignore damage (MatrixObject.cpp:107 branch
         // guard). Confirms the fall-through of the switch.
         use crate::matrix_game::effects::weapon::WEAPON_BIGBOOM;
-        use crate::matrix_game::map_static::{MapStatic, ObjectId, Objects};
+        use crate::matrix_game::map_static::Objects;
         let mut objs = Objects::new();
         let id = objs.spawn(Box::new(MapObject::from_instance(&inst())));
-        let dropped = objs.apply_damage(id, WEAPON_BIGBOOM, glam::Vec3::ZERO, glam::Vec3::Z, 2, None);
+        let dropped =
+            objs.apply_damage(id, WEAPON_BIGBOOM, glam::Vec3::ZERO, glam::Vec3::Z, 2, None);
         assert!(!dropped);
         let o = objs.get(id).unwrap();
         assert_eq!(o.object_state() & OBJECT_STATE_ABLAZE, 0);
@@ -2301,24 +2348,52 @@ mod tests {
         let id = objs.spawn(Box::new(o));
 
         // WEAPON_BIGBOOM (fire-type) kindles with +10_000 TTL.
-        assert!(!objs.apply_damage(id, WEAPON_BIGBOOM, glam::Vec3::ZERO, glam::Vec3::Z, PLAYER_SIDE, None));
+        assert!(!objs.apply_damage(
+            id,
+            WEAPON_BIGBOOM,
+            glam::Vec3::ZERO,
+            glam::Vec3::Z,
+            PLAYER_SIDE,
+            None
+        ));
         let o = objs.get(id).unwrap();
         assert_ne!(o.object_state() & OBJECT_STATE_ABLAZE, 0);
         assert_eq!(o.ablaze_ttl(), 10_000);
         assert!(objs.in_lt(id), "BEHF_BURN objects AddLT on first damage");
 
         // Another hit with WEAPON_FLAMETHROWER: +100 to TTL.
-        assert!(!objs.apply_damage(id, WEAPON_FLAMETHROWER, glam::Vec3::ZERO, glam::Vec3::Z, PLAYER_SIDE, None));
+        assert!(!objs.apply_damage(
+            id,
+            WEAPON_FLAMETHROWER,
+            glam::Vec3::ZERO,
+            glam::Vec3::Z,
+            PLAYER_SIDE,
+            None
+        ));
         assert_eq!(objs.get(id).unwrap().ablaze_ttl(), 10_100);
 
         // WEAPON_PLASMA: +200.
-        assert!(!objs.apply_damage(id, WEAPON_PLASMA, glam::Vec3::ZERO, glam::Vec3::Z, PLAYER_SIDE, None));
+        assert!(!objs.apply_damage(
+            id,
+            WEAPON_PLASMA,
+            glam::Vec3::ZERO,
+            glam::Vec3::Z,
+            PLAYER_SIDE,
+            None
+        ));
         // Unburned cap = 15_000; the stacked TTL is 10_300 < cap.
         assert_eq!(objs.get(id).unwrap().ablaze_ttl(), 10_300);
 
         // Big hits stack TTL up to the unburned cap.
         for _ in 0..5 {
-            objs.apply_damage(id, WEAPON_BIGBOOM, glam::Vec3::ZERO, glam::Vec3::Z, PLAYER_SIDE, None);
+            objs.apply_damage(
+                id,
+                WEAPON_BIGBOOM,
+                glam::Vec3::ZERO,
+                glam::Vec3::Z,
+                PLAYER_SIDE,
+                None,
+            );
         }
         assert_eq!(objs.get(id).unwrap().ablaze_ttl(), 15_000);
     }
@@ -2327,28 +2402,35 @@ mod tests {
     fn break_damage_decrements_hp_and_flips_burned_on_death() {
         // BEHF_BREAK object with 500hp. WEAPON_GUN (idx=8) deals 100 /
         // floor 0. Three hits leave 200, fourth kills.
-        use crate::matrix_game::config::{ObjectDamages, WeaponDamage};
-        use crate::matrix_game::effects::weapon::{WEAPON_GUN, weap_to_index};
+        use crate::matrix_game::config::WeaponDamage;
+        use crate::matrix_game::effects::weapon::{weap_to_index, WEAPON_GUN};
         use crate::matrix_game::map_static::Objects;
 
         let mut rng = Rnd::new(1);
         let mut o = MapObject::from_instance(&inst());
-        assert!(o.apply_ids_row(
-            "path*vo*tex******Break,1,500,Normal",
-            &mut rng, || {},
-        ));
+        assert!(o.apply_ids_row("path*vo*tex******Break,1,500,Normal", &mut rng, || {},));
         assert_eq!(o.beh_flag, BehFlag::Break);
         assert_eq!(o.break_hit_point, 500);
         assert_eq!(o.break_hit_point_max, 500);
 
         let mut objs = Objects::new();
-        objs.object_damages.table[weap_to_index(WEAPON_GUN).unwrap()] =
-            WeaponDamage { damage: 100, mindamage: 0, friend_damage: 0 };
+        objs.object_damages.table[weap_to_index(WEAPON_GUN).unwrap()] = WeaponDamage {
+            damage: 100,
+            mindamage: 0,
+            friend_damage: 0,
+        };
         let id = objs.spawn(Box::new(o));
 
         // 500 → 400 → 300 → 200 → 100 → ≤0
         for expected in [400, 300, 200, 100] {
-            objs.apply_damage(id, WEAPON_GUN, glam::Vec3::ZERO, glam::Vec3::Z, PLAYER_SIDE, None);
+            objs.apply_damage(
+                id,
+                WEAPON_GUN,
+                glam::Vec3::ZERO,
+                glam::Vec3::Z,
+                PLAYER_SIDE,
+                None,
+            );
             let obj = objs.get(id).unwrap();
             let mo = unsafe { &*(obj as *const dyn MapStatic as *const MapObject) };
             assert_eq!(mo.break_hit_point, expected);
@@ -2356,7 +2438,14 @@ mod tests {
         }
 
         // 5th hit drops to ≤0 → BURNED flag, MR_Graph dirty.
-        objs.apply_damage(id, WEAPON_GUN, glam::Vec3::ZERO, glam::Vec3::Z, PLAYER_SIDE, None);
+        objs.apply_damage(
+            id,
+            WEAPON_GUN,
+            glam::Vec3::ZERO,
+            glam::Vec3::Z,
+            PLAYER_SIDE,
+            None,
+        );
         let obj = objs.get(id).unwrap();
         let mo = unsafe { &*(obj as *const dyn MapStatic as *const MapObject) };
         assert!(mo.break_hit_point <= 0);
@@ -2368,8 +2457,8 @@ mod tests {
     fn break_damage_respects_mindamage_floor() {
         // Hit-points above mindamage get decremented; below/equal they
         // don't — matches MatrixObject.cpp:191 (`if hp > mindamage`).
-        use crate::matrix_game::config::{ObjectDamages, WeaponDamage};
-        use crate::matrix_game::effects::weapon::{WEAPON_GUN, weap_to_index};
+        use crate::matrix_game::config::WeaponDamage;
+        use crate::matrix_game::effects::weapon::{weap_to_index, WEAPON_GUN};
         use crate::matrix_game::map_static::Objects;
 
         let mut rng = Rnd::new(1);
@@ -2378,12 +2467,22 @@ mod tests {
 
         let mut objs = Objects::new();
         // Big damage but a 50-point floor — won't go below 50.
-        objs.object_damages.table[weap_to_index(WEAPON_GUN).unwrap()] =
-            WeaponDamage { damage: 20, mindamage: 50, friend_damage: 0 };
+        objs.object_damages.table[weap_to_index(WEAPON_GUN).unwrap()] = WeaponDamage {
+            damage: 20,
+            mindamage: 50,
+            friend_damage: 0,
+        };
         let id = objs.spawn(Box::new(o));
 
         // Starting hp 30 ≤ mindamage 50 → no decrement, no death.
-        objs.apply_damage(id, WEAPON_GUN, glam::Vec3::ZERO, glam::Vec3::Z, PLAYER_SIDE, None);
+        objs.apply_damage(
+            id,
+            WEAPON_GUN,
+            glam::Vec3::ZERO,
+            glam::Vec3::Z,
+            PLAYER_SIDE,
+            None,
+        );
         let obj = objs.get(id).unwrap();
         let mo = unsafe { &*(obj as *const dyn MapStatic as *const MapObject) };
         assert_eq!(mo.break_hit_point, 30, "mindamage floor prevents hp drop");
@@ -2405,7 +2504,10 @@ mod tests {
 
         o.apply_anim_state(2, "Anim,0:5:100#1:3:50#2:7:0");
         assert_eq!(o.anim_state, 2);
-        assert_eq!(o.break_hit_point, 2_000_000_000, "hp=0 → invincible sentinel");
+        assert_eq!(
+            o.break_hit_point, 2_000_000_000,
+            "hp=0 → invincible sentinel"
+        );
 
         // Missing state: state_id stays set, hp left as-is.
         let prev = o.break_hit_point;
@@ -2421,10 +2523,7 @@ mod tests {
         // entry (MatrixObject.cpp:1072).
         let mut rng = Rnd::new(1);
         let mut o = MapObject::from_instance(&inst());
-        assert!(o.apply_ids_row(
-            "path*vo*tex******Anim,0:1:300#1:2:150",
-            &mut rng, || {},
-        ));
+        assert!(o.apply_ids_row("path*vo*tex******Anim,0:1:300#1:2:150", &mut rng, || {},));
         assert_eq!(o.beh_flag, BehFlag::Anim);
         assert_eq!(o.anim_state, 0);
         assert_eq!(o.break_hit_point, 300);
@@ -2446,10 +2545,23 @@ mod tests {
         let id = objs.spawn(Box::new(o));
         // Enemy AI side 2 cannot hit a SPECIAL object.
         objs.apply_damage(id, WEAPON_BIGBOOM, glam::Vec3::ZERO, glam::Vec3::Z, 2, None);
-        assert_eq!(objs.get(id).unwrap().object_state() & OBJECT_STATE_ABLAZE, 0);
+        assert_eq!(
+            objs.get(id).unwrap().object_state() & OBJECT_STATE_ABLAZE,
+            0
+        );
         // But player (side 1) can.
-        objs.apply_damage(id, WEAPON_BIGBOOM, glam::Vec3::ZERO, glam::Vec3::Z, PLAYER_SIDE, None);
-        assert_ne!(objs.get(id).unwrap().object_state() & OBJECT_STATE_ABLAZE, 0);
+        objs.apply_damage(
+            id,
+            WEAPON_BIGBOOM,
+            glam::Vec3::ZERO,
+            glam::Vec3::Z,
+            PLAYER_SIDE,
+            None,
+        );
+        assert_ne!(
+            objs.get(id).unwrap().object_state() & OBJECT_STATE_ABLAZE,
+            0
+        );
     }
 
     #[test]
@@ -2464,27 +2576,43 @@ mod tests {
 
         // Kindle: adds OBJECT_STATE_ABLAZE, enrolls in LT, TTL=10_000.
         world.objects.apply_damage(
-            id, WEAPON_BIGBOOM, glam::Vec3::ZERO, glam::Vec3::Z, PLAYER_SIDE, None,
+            id,
+            WEAPON_BIGBOOM,
+            glam::Vec3::ZERO,
+            glam::Vec3::Z,
+            PLAYER_SIDE,
+            None,
         );
 
         // Drive 4s of game-time — still not burned.
         world.takt(4000);
         let o = world.objects.get(id).unwrap();
-        assert_ne!(o.object_state() & OBJECT_STATE_ABLAZE, 0, "still ablaze at 4s");
-        assert_eq!(o.object_state() & OBJECT_STATE_BURNED, 0, "not yet burned at 4s");
+        assert_ne!(
+            o.object_state() & OBJECT_STATE_ABLAZE,
+            0,
+            "still ablaze at 4s"
+        );
+        assert_eq!(
+            o.object_state() & OBJECT_STATE_BURNED,
+            0,
+            "not yet burned at 4s"
+        );
 
         // Drive another 1.5s to cross the 5000ms mark.
         world.takt(1500);
         let o = world.objects.get(id).unwrap();
-        assert_ne!(o.object_state() & OBJECT_STATE_BURNED, 0,
-            "BURNED flag latched after 5s of ablaze accumulation");
+        assert_ne!(
+            o.object_state() & OBJECT_STATE_BURNED,
+            0,
+            "BURNED flag latched after 5s of ablaze accumulation"
+        );
     }
 
     #[test]
     fn sens_logic_takt_transitions_on_nearby_robot() {
+        use crate::matrix_game::logic::MapLogic;
         use crate::matrix_game::map_static::{MapStatic, ObjectType};
         use crate::matrix_game::rnd::Rnd;
-        use crate::matrix_game::logic::MapLogic;
 
         // Build a world with one SENS mapobject at the origin and a
         // "robot" (stub MapStatic with ObjectType::RobotAi) 30 units
@@ -2511,11 +2639,11 @@ mod tests {
         // Inspect sensor state via downcast — MapObject is the concrete
         // type behind the trait object.
         let obj = world.objects.get(sensor_id).expect("sensor still live");
-        let mapobj = unsafe {
-            &*(obj as *const dyn MapStatic as *const MapObject)
-        };
-        assert_eq!(mapobj.prev_state_robots_in_radius, 1,
-            "sensor detected the robot and transitioned to state=1");
+        let mapobj = unsafe { &*(obj as *const dyn MapStatic as *const MapObject) };
+        assert_eq!(
+            mapobj.prev_state_robots_in_radius, 1,
+            "sensor detected the robot and transitioned to state=1"
+        );
 
         // Move robot outside the radius, takt again.
         let robot_slot_obj = world.objects.get_mut(robot_id).unwrap();
@@ -2524,11 +2652,11 @@ mod tests {
         world.takt(210);
 
         let obj = world.objects.get(sensor_id).unwrap();
-        let mapobj = unsafe {
-            &*(obj as *const dyn MapStatic as *const MapObject)
-        };
-        assert_eq!(mapobj.prev_state_robots_in_radius, 0,
-            "sensor falls back to idle after robot leaves the radius");
+        let mapobj = unsafe { &*(obj as *const dyn MapStatic as *const MapObject) };
+        assert_eq!(
+            mapobj.prev_state_robots_in_radius, 0,
+            "sensor falls back to idle after robot leaves the radius"
+        );
     }
 
     #[test]

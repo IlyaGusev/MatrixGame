@@ -17,9 +17,9 @@ use std::collections::HashMap;
 
 use bytemuck::{Pod, Zeroable};
 
-use crate::matrix_lib::base::storage::Storage;
 use crate::matrix_game::common::{rd_u16, rd_u32, CELLFLAG_BRIDGE, CELLFLAG_DOWN, MAP_GROUP_SIZE};
 use crate::matrix_game::map::{GameMap, GLOBAL_SCALE};
+use crate::matrix_lib::base::storage::Storage;
 
 /// Bottom vertex — ports `SMatrixMapVertexBottom` from MatrixMapGroup.cpp.
 #[repr(C)]
@@ -86,11 +86,7 @@ pub type BottomCpuBatches = HashMap<u32, (Vec<Vertex>, Vec<u32>, Vec<(usize, usi
 /// triangles across all groups that share a texture into a single per-texture
 /// batch (see the module-level divergence note). The result is CPU-side only;
 /// the caller uploads each entry into GPU buffers and builds bind groups.
-pub fn build_bottom_cpu_batches(
-    stor: &Storage,
-    map: &GameMap,
-    ts_inv: f64,
-) -> BottomCpuBatches {
+pub fn build_bottom_cpu_batches(stor: &Storage, map: &GameMap, ts_inv: f64) -> BottomCpuBatches {
     let groups_buf = stor.get_buf("groups", "Data");
     let cx = map.world_width() * 0.5;
     let cy = map.world_height() * 0.5;

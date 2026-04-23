@@ -17,7 +17,8 @@ fn main() {
         println!("  {}x{}, fourcc={}", w, h, fourcc);
 
         // Decode and check alpha
-        if let Some(img) = matrixgame_rs::matrix_lib::three_g::texture::decode_texture_bytes(&data) {
+        if let Some(img) = matrixgame_rs::matrix_lib::three_g::texture::decode_texture_bytes(&data)
+        {
             let mut min_a = 255u8;
             let mut max_a = 0u8;
             let mut sum_a = 0u64;

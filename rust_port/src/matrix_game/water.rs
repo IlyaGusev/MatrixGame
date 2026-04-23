@@ -6,9 +6,9 @@
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
-use crate::matrix_lib::base::storage::Storage;
-use crate::matrix_game::map::{GameMap, InshorePreSpawn, GLOBAL_SCALE};
 use crate::matrix_game::camera::Camera;
+use crate::matrix_game::map::{GameMap, InshorePreSpawn, GLOBAL_SCALE};
+use crate::matrix_lib::base::storage::Storage;
 
 use crate::matrix_game::common::{unpack_rgb, FOG_END, FOG_START};
 
@@ -299,8 +299,7 @@ impl Water {
 
         // BuildWater (MatrixMapGroup.cpp:366-452). Helpers live in
         // `map_group.rs` so per-group build code stays in one place.
-        let water_groups =
-            crate::matrix_game::map_group::water_bearing_groups(stor, map);
+        let water_groups = crate::matrix_game::map_group::water_bearing_groups(stor, map);
         if water_groups.is_empty() {
             return None;
         }
@@ -354,7 +353,11 @@ impl Water {
         let load_required_tex = |path: &str, label: &str| -> Option<wgpu::TextureView> {
             let view = read_texture(path)
                 .and_then(|d| crate::matrix_lib::three_g::texture::decode_texture_bytes(&d))
-                .map(|rgba| crate::matrix_lib::three_g::texture::create_texture_from_rgba(device, queue, &rgba));
+                .map(|rgba| {
+                    crate::matrix_lib::three_g::texture::create_texture_from_rgba(
+                        device, queue, &rgba,
+                    )
+                });
             if view.is_none() {
                 log::warn!(
                     "water: failed to load {} texture '{}'; subsystem disabled",
@@ -839,12 +842,12 @@ impl Water {
         );
 
         let (ocean_instances, fill_instances) = self.collect_visible_solid_tiles(camera);
-        let (lattice_z, lattice_normals) = if !ocean_instances.is_empty() || !fill_instances.is_empty()
-        {
-            build_wave_lattice(self.angle, self.water_normal_len, &self.phase_offsets)
-        } else {
-            (Vec::new(), Vec::new())
-        };
+        let (lattice_z, lattice_normals) =
+            if !ocean_instances.is_empty() || !fill_instances.is_empty() {
+                build_wave_lattice(self.angle, self.water_normal_len, &self.phase_offsets)
+            } else {
+                (Vec::new(), Vec::new())
+            };
 
         // On-map hole fill first so the alpha-shoreline pass has opaque water
         // to blend against inside mixed-coast groups (Rust-specific; no C++
@@ -864,11 +867,7 @@ impl Water {
                 0,
                 bytemuck::cast_slice(&fill_verts),
             );
-            queue.write_buffer(
-                &self.fill_index_buffer,
-                0,
-                bytemuck::cast_slice(&fill_idxs),
-            );
+            queue.write_buffer(&self.fill_index_buffer, 0, bytemuck::cast_slice(&fill_idxs));
             pass.set_pipeline(&self.fill_pipeline);
             pass.set_bind_group(0, &self.solid_bind_group, &[]);
             pass.set_vertex_buffer(0, self.fill_vertex_buffer.slice(..));
@@ -931,6 +930,7 @@ impl Water {
     ///     the fsz×fsz square centered on the map and draws ocean water.
     ///   - Alpha loop (MatrixMinimap.cpp:1086-1112): draws per-group alpha
     ///     water over every recorded group regardless of visibility.
+    ///
     /// Uses the wave lattice at its current animation phase — matches the
     /// original, which runs the bake at map load before animation has started
     /// (lattice = initial phase offsets).
@@ -964,10 +964,10 @@ impl Water {
         let group_w = self.group_world;
         let sz_tiles = ((self.map_half_w * 2.0).max(self.map_half_h * 2.0) / group_w).ceil() as i32;
         let tiles_per_side = sz_tiles;
-        let x0_tile = ((self.map_half_w * 2.0 - tiles_per_side as f32 * group_w) * 0.5)
-            - self.map_half_w;
-        let y0_tile = ((self.map_half_h * 2.0 - tiles_per_side as f32 * group_w) * 0.5)
-            - self.map_half_h;
+        let x0_tile =
+            ((self.map_half_w * 2.0 - tiles_per_side as f32 * group_w) * 0.5) - self.map_half_w;
+        let y0_tile =
+            ((self.map_half_h * 2.0 - tiles_per_side as f32 * group_w) * 0.5) - self.map_half_h;
         let mut ocean = Vec::with_capacity((tiles_per_side * tiles_per_side) as usize);
         let mut fill = Vec::new();
         for gy in 0..tiles_per_side {
@@ -1150,8 +1150,7 @@ impl Water {
                 if !quad_intersects_rect(&quad, rect_min, rect_max) {
                     continue;
                 }
-                let on_map =
-                    gx >= 0 && gx < self.map_group_w && gy >= 0 && gy < self.map_group_h;
+                let on_map = gx >= 0 && gx < self.map_group_w && gy >= 0 && gy < self.map_group_h;
                 let has_record = on_map && self.has_group.contains(&(gx, gy));
                 if has_record {
                     fill.push(WaterInstance { x0, y0 });
@@ -1730,7 +1729,8 @@ fn build_inshore_system(
         );
         return Err(());
     };
-    let tex_view = crate::matrix_lib::three_g::texture::create_texture_from_rgba(device, queue, &rgba);
+    let tex_view =
+        crate::matrix_lib::three_g::texture::create_texture_from_rgba(device, queue, &rgba);
 
     let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
         label: Some("Inshore Sampler"),

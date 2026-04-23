@@ -19,9 +19,9 @@
 #[repr(u8)]
 pub enum ElementState {
     #[default]
-    Normal   = 0,
-    Focused  = 1,
-    Pressed  = 2,
+    Normal = 0,
+    Focused = 1,
+    Pressed = 2,
     Disabled = 3,
 }
 
@@ -53,17 +53,17 @@ pub struct StateImage {
 #[repr(u8)]
 pub enum ElementKind {
     /// `CIFaceStatic` — a non-interactive image/label (uses `sNormal`).
-    Static  = 1,
+    Static = 1,
     /// `CIFaceButton` — interactable, cycles Normal → Focused → Pressed.
-    Button  = 2,
+    Button = 2,
     /// `CIFaceImage` — atlas reference; never rendered directly in the
     /// C++ (it's a source handle for other elements).
-    Image   = 3,
+    Image = 3,
     /// Counter / progress (`CIFaceCounter`) — stubbed for now.
     Counter = 4,
 }
 
-pub const IFEF_VISIBLE:   u32 = 1 << 0;
+pub const IFEF_VISIBLE: u32 = 1 << 0;
 pub const IFEF_CLEARRECT: u32 = 1 << 1;
 
 /// Port of the data portion of `CIFaceElement` (Interface/CIFaceElement.h:

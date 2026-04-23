@@ -159,17 +159,8 @@ impl IFaceList {
     /// Mouse-button-up event. If release happens on the same element
     /// that was pressed, fire a `Click`. Ports
     /// `CIFaceButton::OnMouseLBUp` (Interface/CIFaceButton.cpp).
-    pub fn on_mouse_up(
-        &mut self,
-        sx: f32,
-        sy: f32,
-        screen_w: f32,
-        screen_h: f32,
-    ) -> Option<Click> {
-        let pressed = self.pressed.take();
-        let Some((pi, ei)) = pressed else {
-            return None;
-        };
+    pub fn on_mouse_up(&mut self, sx: f32, sy: f32, screen_w: f32, screen_h: f32) -> Option<Click> {
+        let (pi, ei) = self.pressed.take()?;
 
         // Reset the pressed element's state (matching cursor position).
         let release_hit = self.hit_test(sx, sy, screen_w, screen_h);
@@ -180,10 +171,10 @@ impl IFaceList {
                 } else {
                     e.def_state
                 };
-                if release_hit == Some((pi, ei)) {
-                    if matches!(e.kind, super::iface_element::ElementKind::Button) {
-                        return Some(Click::Button(e.name.clone()));
-                    }
+                if release_hit == Some((pi, ei))
+                    && matches!(e.kind, super::iface_element::ElementKind::Button)
+                {
+                    return Some(Click::Button(e.name.clone()));
                 }
             }
         }

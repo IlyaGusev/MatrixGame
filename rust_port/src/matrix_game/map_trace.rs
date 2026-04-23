@@ -56,7 +56,9 @@ pub struct MovePt {
 }
 
 impl MovePt {
-    pub fn new(x: i32, y: i32) -> Self { Self { x, y } }
+    pub fn new(x: i32, y: i32) -> Self {
+        Self { x, y }
+    }
 }
 
 /// Port of the `(other_path_list[i], other_des[i])` tuple fed to
@@ -96,14 +98,18 @@ pub struct MovePath {
 }
 
 impl MovePath {
-    pub fn clear(&mut self) { *self = Self::default(); }
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
 
     pub fn is_active(&self) -> bool {
         !self.pts.is_empty() && self.cur + 1 < self.pts.len()
     }
 
     pub fn current_segment(&self) -> Option<(MovePt, MovePt)> {
-        if self.cur + 1 >= self.pts.len() { return None; }
+        if self.cur + 1 >= self.pts.len() {
+            return None;
+        }
         Some((self.pts[self.cur], self.pts[self.cur + 1]))
     }
 }
@@ -116,9 +122,7 @@ impl MovePath {
 /// much cheaper than iterating the 4×4 footprint — the compiled
 /// data already encodes the full-footprint test.
 pub fn footprint_passable(map: &GameMap, mx: i32, my: i32, chassis_kind: usize) -> bool {
-    crate::matrix_game::logic::is_absence_wall(
-        map, chassis_kind, ROBOT_MOVECELLS_PER_SIZE, mx, my,
-    )
+    crate::matrix_game::logic::is_absence_wall(map, chassis_kind, ROBOT_MOVECELLS_PER_SIZE, mx, my)
 }
 
 #[derive(Copy, Clone, PartialEq)]
@@ -136,7 +140,9 @@ impl Ord for Node {
     }
 }
 impl PartialOrd for Node {
-    fn partial_cmp(&self, o: &Self) -> Option<Ordering> { Some(self.cmp(o)) }
+    fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
+        Some(self.cmp(o))
+    }
 }
 
 /// A* on the move grid with 8-way connectivity. Returns a path
@@ -151,6 +157,7 @@ impl PartialOrd for Node {
 /// per-cell traversal weight inside a footprint-sized window:
 ///   - `dest` → weight 200 (line 1285),
 ///   - `pos`  → weight 30  (line 1297).
+///
 /// Everything else has a base weight of 5. Rust rescales to 1.0 /
 /// 6.0 / 40.0 so the octile heuristic stays admissible at step=1.
 ///
@@ -175,8 +182,12 @@ pub fn find_path(
             && p.x + ROBOT_MOVECELLS_PER_SIZE <= sx
             && p.y + ROBOT_MOVECELLS_PER_SIZE <= sy
     };
-    if !in_bounds(start) || !in_bounds(goal) { return None; }
-    if !footprint_passable(map, goal.x, goal.y, chassis_kind) { return None; }
+    if !in_bounds(start) || !in_bounds(goal) {
+        return None;
+    }
+    if !footprint_passable(map, goal.x, goal.y, chassis_kind) {
+        return None;
+    }
 
     // Per-cell traversal weight grid. Base = 1.0; each blocker stamps
     // a footprint window around `pos` (weight 6.0) and `dest`
@@ -185,7 +196,7 @@ pub fn find_path(
     let w = sx as usize;
     let h = sy as usize;
     let mut weight = vec![1.0_f32; w * h];
-    const W_POS:  f32 = 6.0;  // C++ 30 / 5
+    const W_POS: f32 = 6.0; // C++ 30 / 5
     const W_DEST: f32 = 40.0; // C++ 200 / 5
     let stamp = |grid: &mut [f32], c: MovePt, new_w: f32| {
         // Footprint window = `[c.x-(S-1) .. c.x+S) × [c.y-(S-1) ..
@@ -197,7 +208,9 @@ pub fn find_path(
                 let by = c.y + dy;
                 if bx >= 0 && by >= 0 && bx < sx && by < sy {
                     let i = (by as usize) * w + (bx as usize);
-                    if grid[i] < new_w { grid[i] = new_w; }
+                    if grid[i] < new_w {
+                        grid[i] = new_w;
+                    }
                 }
             }
         }
@@ -227,17 +240,28 @@ pub fn find_path(
         // Octile distance — admissible for 8-way grid with min weight
         // 1.0. Safe overestimate for weighted cells (conservative).
         let (a, b) = if dx < dy { (dx, dy) } else { (dy, dx) };
-        (b - a) + 1.41421356 * a
+        (b - a) + std::f32::consts::SQRT_2 * a
     };
 
     let mut open = BinaryHeap::new();
     g[idx(start)] = 0.0;
-    open.push(Node { f: h_cost(start), g: 0.0, x: start.x, y: start.y });
+    open.push(Node {
+        f: h_cost(start),
+        g: 0.0,
+        x: start.x,
+        y: start.y,
+    });
 
+    const D: f32 = std::f32::consts::SQRT_2;
     const MOVES: [(i32, i32, f32); 8] = [
-        (1, 0, 1.0), (-1, 0, 1.0), (0, 1, 1.0), (0, -1, 1.0),
-        (1, 1, 1.41421356), (1, -1, 1.41421356),
-        (-1, 1, 1.41421356), (-1, -1, 1.41421356),
+        (1, 0, 1.0),
+        (-1, 0, 1.0),
+        (0, 1, 1.0),
+        (0, -1, 1.0),
+        (1, 1, D),
+        (1, -1, D),
+        (-1, 1, D),
+        (-1, -1, D),
     ];
 
     while let Some(Node { g: gu, x, y, .. }) = open.pop() {
@@ -247,7 +271,9 @@ pub fn find_path(
             let mut cur = goal;
             while cur != start {
                 let (px, py) = parent[idx(cur)];
-                if px < 0 { return None; }
+                if px < 0 {
+                    return None;
+                }
                 cur = MovePt::new(px, py);
                 out.push(cur);
             }
@@ -255,20 +281,32 @@ pub fn find_path(
             return Some(out);
         }
         let iu = idx(u);
-        if closed[iu] { continue; }
+        if closed[iu] {
+            continue;
+        }
         closed[iu] = true;
 
         for (dx, dy, step) in MOVES {
             let v = MovePt::new(u.x + dx, u.y + dy);
-            if !in_bounds(v) { continue; }
-            if !footprint_passable(map, v.x, v.y, chassis_kind) { continue; }
+            if !in_bounds(v) {
+                continue;
+            }
+            if !footprint_passable(map, v.x, v.y, chassis_kind) {
+                continue;
+            }
             if dx != 0 && dy != 0 {
-                if !footprint_passable(map, u.x + dx, u.y, chassis_kind) { continue; }
-                if !footprint_passable(map, u.x, u.y + dy, chassis_kind) { continue; }
+                if !footprint_passable(map, u.x + dx, u.y, chassis_kind) {
+                    continue;
+                }
+                if !footprint_passable(map, u.x, u.y + dy, chassis_kind) {
+                    continue;
+                }
             }
 
             let iv = idx(v);
-            if closed[iv] { continue; }
+            if closed[iv] {
+                continue;
+            }
             // Step cost = base direction cost × enter-cell weight —
             // matches C++ `smm->m_Find = smm2->m_Find + smm->m_Weight`
             // where the step itself is free and the entered cell's
@@ -277,7 +315,12 @@ pub fn find_path(
             if new_g + 1e-5 < g[iv] {
                 g[iv] = new_g;
                 parent[iv] = (u.x, u.y);
-                open.push(Node { f: new_g + h_cost(v), g: new_g, x: v.x, y: v.y });
+                open.push(Node {
+                    f: new_g + h_cost(v),
+                    g: new_g,
+                    x: v.x,
+                    y: v.y,
+                });
             }
         }
     }
@@ -294,20 +337,16 @@ pub fn find_path(
 /// takes only `(chassis, size, cnt, path)` and never consults the
 /// dynamic-blocker list. Blockers affected A* cost; the optimizer
 /// collapses the resulting path on pure terrain passability.
-pub fn optimize_path(
-    map: &GameMap,
-    path: &[MovePt],
-    chassis_kind: usize,
-) -> Vec<MovePt> {
-    if path.len() <= 2 { return path.to_vec(); }
+pub fn optimize_path(map: &GameMap, path: &[MovePt], chassis_kind: usize) -> Vec<MovePt> {
+    if path.len() <= 2 {
+        return path.to_vec();
+    }
     let mut out = Vec::with_capacity(path.len());
     out.push(path[0]);
     let mut anchor = 0usize;
     let mut i = 1usize;
     while i < path.len() {
-        if i + 1 < path.len()
-            && line_of_sight(map, path[anchor], path[i + 1], chassis_kind)
-        {
+        if i + 1 < path.len() && line_of_sight(map, path[anchor], path[i + 1], chassis_kind) {
             i += 1;
         } else {
             out.push(path[i]);
@@ -318,22 +357,21 @@ pub fn optimize_path(
     out
 }
 
-fn line_of_sight(
-    map: &GameMap,
-    a: MovePt,
-    b: MovePt,
-    chassis_kind: usize,
-) -> bool {
+fn line_of_sight(map: &GameMap, a: MovePt, b: MovePt, chassis_kind: usize) -> bool {
     let dx = b.x - a.x;
     let dy = b.y - a.y;
     let steps = dx.abs().max(dy.abs());
-    if steps == 0 { return footprint_passable(map, a.x, a.y, chassis_kind); }
+    if steps == 0 {
+        return footprint_passable(map, a.x, a.y, chassis_kind);
+    }
     let fx = dx as f32 / steps as f32;
     let fy = dy as f32 / steps as f32;
     for s in 0..=steps {
         let x = (a.x as f32 + fx * s as f32).round() as i32;
         let y = (a.y as f32 + fy * s as f32).round() as i32;
-        if !footprint_passable(map, x, y, chassis_kind) { return false; }
+        if !footprint_passable(map, x, y, chassis_kind) {
+            return false;
+        }
     }
     true
 }

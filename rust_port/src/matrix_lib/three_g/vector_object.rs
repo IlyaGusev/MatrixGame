@@ -224,9 +224,7 @@ pub fn parse_cvo(cvo_path: &str, bytes: &[u8]) -> CvoGroup {
             .par_get_ne("TextureBackScroll")
             .map(parse_scroll)
             .unwrap_or([0.0, 0.0]);
-        let alpha_test = block
-            .par_get_ne("Texture")
-            .is_some_and(has_trans_suffix);
+        let alpha_test = block.par_get_ne("Texture").is_some_and(has_trans_suffix);
 
         let id = block
             .par_get_ne("Id")
@@ -446,10 +444,8 @@ pub fn resolve_alpha_test_with_txt(
             let trimmed = v.trim();
             if trimmed.is_empty() {
                 suffix_flag
-            } else if trimmed == "0" {
-                false
             } else {
-                true
+                trimmed != "0"
             }
         }
         None => suffix_flag,

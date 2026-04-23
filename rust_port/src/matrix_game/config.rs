@@ -44,7 +44,9 @@ impl Default for ObjectDamages {
     fn default() -> Self {
         // `memset(&m_ObjectDamages, 0, sizeof(m_ObjectDamages))`
         // at MatrixConfig.cpp:593 — zero-fill before reading.
-        Self { table: [WeaponDamage::default(); WEAPON_COUNT] }
+        Self {
+            table: [WeaponDamage::default(); WEAPON_COUNT],
+        }
     }
 }
 
@@ -60,7 +62,7 @@ impl ObjectDamages {
         // see form_game.rs for precedent with "Config").
         let weapons_rec = stor.block_record("da", "Weapons")?;
         let damages_rec = stor.block_record(&weapons_rec, "Damages")?;
-        let object_rec  = stor.block_record(&damages_rec, "Object")?;
+        let object_rec = stor.block_record(&damages_rec, "Object")?;
 
         // Iterate the param keys in the "Object" record by reading the
         // Storage columns directly — we need both names ("0") and
@@ -81,20 +83,25 @@ impl ObjectDamages {
             let val = values.get_as_wstr(i);
             let damage = wstr::int_par(&val, 0, ",");
             let nn = wstr::count_par(&val, ",");
-            let mindamage = if nn > 1 { wstr::int_par(&val, 1, ",") } else { 0 };
+            let mindamage = if nn > 1 {
+                wstr::int_par(&val, 1, ",")
+            } else {
+                0
+            };
             // The Object block never carries friend_damage — the C++
             // loader at MatrixConfig.cpp:591-607 only reads two fields.
-            out.table[idx] = WeaponDamage { damage, mindamage, friend_damage: 0 };
+            out.table[idx] = WeaponDamage {
+                damage,
+                mindamage,
+                friend_damage: 0,
+            };
         }
         Some(out)
     }
 
     /// Look up the entry for a weapon discriminant. Non-damage-table
     /// weapons (e.g. `WEAPON_NONE`) return `None`.
-    pub fn get(
-        &self,
-        weap: crate::matrix_game::effects::weapon::Weapon,
-    ) -> Option<WeaponDamage> {
+    pub fn get(&self, weap: crate::matrix_game::effects::weapon::Weapon) -> Option<WeaponDamage> {
         let idx = crate::matrix_game::effects::weapon::weap_to_index(weap)?;
         Some(self.table[idx])
     }
@@ -126,8 +133,8 @@ impl BuildingDamages {
     /// ending in `HITPOINT` are the per-type hp list; other keys are
     /// weapon names identical to the Object table.
     pub fn from_matrix_data(stor: &Storage) -> Option<Self> {
-        let weapons_rec  = stor.block_record("da", "Weapons")?;
-        let damages_rec  = stor.block_record(&weapons_rec, "Damages")?;
+        let weapons_rec = stor.block_record("da", "Weapons")?;
+        let damages_rec = stor.block_record(&weapons_rec, "Damages")?;
         let building_rec = stor.block_record(&damages_rec, "Building")?;
 
         let keys = stor.get_buf(&building_rec, "0")?;
@@ -145,23 +152,33 @@ impl BuildingDamages {
                 }
                 continue;
             }
-            let Some(idx) = weap_name_to_index(&name) else { continue };
+            let Some(idx) = weap_name_to_index(&name) else {
+                continue;
+            };
             let nn = wstr::count_par(&val, ",");
             let damage = wstr::int_par(&val, 0, ",");
-            let mindamage = if nn > 1 { wstr::int_par(&val, 1, ",") } else { 0 };
+            let mindamage = if nn > 1 {
+                wstr::int_par(&val, 1, ",")
+            } else {
+                0
+            };
             // MatrixConfig.cpp:532 — if friend_damage column absent,
             // it defaults to `damage`, not 0.
-            let friend_damage =
-                if nn > 2 { wstr::int_par(&val, 2, ",") } else { damage };
-            out.table[idx] = WeaponDamage { damage, mindamage, friend_damage };
+            let friend_damage = if nn > 2 {
+                wstr::int_par(&val, 2, ",")
+            } else {
+                damage
+            };
+            out.table[idx] = WeaponDamage {
+                damage,
+                mindamage,
+                friend_damage,
+            };
         }
         Some(out)
     }
 
-    pub fn get(
-        &self,
-        weap: crate::matrix_game::effects::weapon::Weapon,
-    ) -> Option<WeaponDamage> {
+    pub fn get(&self, weap: crate::matrix_game::effects::weapon::Weapon) -> Option<WeaponDamage> {
         let idx = crate::matrix_game::effects::weapon::weap_to_index(weap)?;
         Some(self.table[idx])
     }
@@ -211,13 +228,19 @@ impl ChassisChars {
         for i in 0..n {
             let name = keys.get_as_wstr(i);
             let val = values.get_as_wstr(i);
-            let Some(rest) = name.strip_prefix("CHASSIS") else { continue };
+            let Some(rest) = name.strip_prefix("CHASSIS") else {
+                continue;
+            };
             let (digit, field) = match rest.split_once('_') {
                 Some(v) => v,
                 None => continue,
             };
-            let Ok(n) = digit.parse::<usize>() else { continue };
-            if n < 1 || n > 5 { continue; }
+            let Ok(n) = digit.parse::<usize>() else {
+                continue;
+            };
+            if !(1..=5).contains(&n) {
+                continue;
+            }
             let v: f32 = val.parse().unwrap_or(0.0);
             match field {
                 "MOVE_SPEED" => out.move_speed[n - 1] = v,
@@ -275,15 +298,31 @@ mod tests {
     #[test]
     fn get_maps_through_weap_to_index() {
         let mut d = ObjectDamages::default();
-        d.table[5] = WeaponDamage { damage: 400, mindamage: 100, friend_damage: 0 }; // BIGBOOM
+        d.table[5] = WeaponDamage {
+            damage: 400,
+            mindamage: 100,
+            friend_damage: 0,
+        }; // BIGBOOM
         assert_eq!(
             d.get(WEAPON_BIGBOOM),
-            Some(WeaponDamage { damage: 400, mindamage: 100, friend_damage: 0 }),
+            Some(WeaponDamage {
+                damage: 400,
+                mindamage: 100,
+                friend_damage: 0
+            }),
         );
-        d.table[0] = WeaponDamage { damage: 80, mindamage: 40, friend_damage: 0 };   // PLASMA
+        d.table[0] = WeaponDamage {
+            damage: 80,
+            mindamage: 40,
+            friend_damage: 0,
+        }; // PLASMA
         assert_eq!(
             d.get(WEAPON_PLASMA),
-            Some(WeaponDamage { damage: 80, mindamage: 40, friend_damage: 0 }),
+            Some(WeaponDamage {
+                damage: 80,
+                mindamage: 40,
+                friend_damage: 0
+            }),
         );
         // `WEAPON_NONE` has no table slot.
         assert_eq!(d.get(WEAPON_NONE), None);

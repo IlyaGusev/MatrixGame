@@ -120,7 +120,7 @@ mod tests {
         assert_eq!(str_par(s, 0, "*"), "palm");
         assert_eq!(str_par(s, 1, "*"), "palm.vo");
         assert_eq!(str_par(s, 2, "*"), "palm.png");
-        assert_eq!(str_par(s, 3, "*"), "");  // empty fields between ** **
+        assert_eq!(str_par(s, 3, "*"), ""); // empty fields between ** **
         assert_eq!(str_par(s, 5, "*"), "Burn,Tex,Burn01");
     }
 
@@ -151,7 +151,7 @@ mod tests {
         assert_eq!(int_par("Break,2,5000,Terron", 1, ","), 2);
         assert_eq!(int_par("Break,2,5000,Terron", 2, ","), 5000);
         assert_eq!(int_par("Break,-3,5000", 1, ","), -3);
-        assert_eq!(int_par("Break,abc", 1, ","), 0);  // malformed → 0
+        assert_eq!(int_par("Break,abc", 1, ","), 0); // malformed → 0
         assert_eq!(int_par("", 0, ","), 0);
     }
 

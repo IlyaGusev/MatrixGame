@@ -13,9 +13,9 @@ use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3, Vec4};
 use wgpu::util::DeviceExt;
 
-use crate::matrix_lib::base::storage::Storage;
-use crate::matrix_game::common::unpack_rgb;
 use crate::matrix_game::camera::Camera;
+use crate::matrix_game::common::unpack_rgb;
+use crate::matrix_lib::base::storage::Storage;
 use crate::matrix_lib::three_g::texture::{
     create_texture_from_rgba, create_texture_from_rgba_mipped, decode_texture_bytes,
 };
@@ -670,10 +670,34 @@ fn push_face(
     v0: f32,
     v1: f32,
 ) {
-    let tl = BoxVertex { xy: xy_tl, bottom_w: 0.0, u: u_left,  v0, v1 };
-    let tr = BoxVertex { xy: xy_tr, bottom_w: 0.0, u: u_right, v0, v1 };
-    let bl = BoxVertex { xy: xy_bl, bottom_w: 1.0, u: u_left,  v0, v1 };
-    let br = BoxVertex { xy: xy_br, bottom_w: 1.0, u: u_right, v0, v1 };
+    let tl = BoxVertex {
+        xy: xy_tl,
+        bottom_w: 0.0,
+        u: u_left,
+        v0,
+        v1,
+    };
+    let tr = BoxVertex {
+        xy: xy_tr,
+        bottom_w: 0.0,
+        u: u_right,
+        v0,
+        v1,
+    };
+    let bl = BoxVertex {
+        xy: xy_bl,
+        bottom_w: 1.0,
+        u: u_left,
+        v0,
+        v1,
+    };
+    let br = BoxVertex {
+        xy: xy_br,
+        bottom_w: 1.0,
+        u: u_right,
+        v0,
+        v1,
+    };
     // Two triangles per face (TL, BL, TR) and (TR, BL, BR).
     out.push(tl);
     out.push(bl);

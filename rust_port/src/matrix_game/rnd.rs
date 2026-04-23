@@ -15,9 +15,9 @@
 /// the classic Schrage-factored MINSTD step. Output is `m_Rnd - 1` so
 /// the stream starts at 0 instead of 1.
 const MINSTD_A: i32 = 16_807;
-const MINSTD_Q: i32 = 127_773;  // 2^31-1 / A
-const MINSTD_R: i32 = 2_836;    // 2^31-1 % A
-const MINSTD_M_MINUS_1: i32 = 2_147_483_647;  // 2^31 - 1
+const MINSTD_Q: i32 = 127_773; // 2^31-1 / A
+const MINSTD_R: i32 = 2_836; // 2^31-1 % A
+const MINSTD_M_MINUS_1: i32 = 2_147_483_647; // 2^31 - 1
 
 pub struct Rnd {
     /// Matches `m_Rnd` in CMatrixMapLogic (MatrixLogic.hpp:75).
@@ -52,6 +52,11 @@ impl Rnd {
 
     /// Raw `CMatrixMapLogic::Rnd()` — one step of the generator.
     /// Result in `[0, 2^31-2]` (matches the C++ `return m_Rnd-1`).
+    ///
+    /// Named after the C++ API (`Rnd::next`) rather than
+    /// `std::iter::Iterator::next`; this is a free-running PRNG, not
+    /// an iterator.
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> i32 {
         self.state = MINSTD_A.wrapping_mul(self.state % MINSTD_Q)
             - MINSTD_R.wrapping_mul(self.state / MINSTD_Q);
@@ -102,11 +107,11 @@ mod tests {
         let mut r = Rnd::new(42);
         for _ in 0..200 {
             let v = r.range(-5, 10);
-            assert!(v >= -5 && v <= 10);
+            assert!((-5..=10).contains(&v));
         }
         for _ in 0..200 {
-            let v = r.range(10, -5);   // swapped — matches C++
-            assert!(v >= -5 && v <= 10);
+            let v = r.range(10, -5); // swapped — matches C++
+            assert!((-5..=10).contains(&v));
         }
     }
 
@@ -132,11 +137,13 @@ mod tests {
         // Reconstruct expected with pen-and-paper recurrence.
         let step = |s: &mut i32| {
             *s = MINSTD_A.wrapping_mul(*s % MINSTD_Q) - MINSTD_R.wrapping_mul(*s / MINSTD_Q);
-            if *s <= 0 { *s = s.wrapping_add(MINSTD_M_MINUS_1); }
+            if *s <= 0 {
+                *s = s.wrapping_add(MINSTD_M_MINUS_1);
+            }
         };
         let mut expect = 1i32;
-        step(&mut expect);       // ctor's Rnd(0,1) call
-        let _ = expect;          // discarded inside range()
+        step(&mut expect); // ctor's Rnd(0,1) call
+        let _ = expect; // discarded inside range()
         step(&mut expect);
         assert_eq!(v0, expect - 1);
         step(&mut expect);

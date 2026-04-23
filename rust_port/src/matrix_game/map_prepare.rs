@@ -3,9 +3,11 @@
 
 use std::collections::HashMap;
 
-use crate::matrix_lib::base::storage::Storage;
-use crate::matrix_lib::base::bitmap::{blit_tile, copy_col, copy_row, merge_by_mask, merge_with_alpha};
 use crate::matrix_game::common::TEX_BOTTOM_SIZE;
+use crate::matrix_lib::base::bitmap::{
+    blit_tile, copy_col, copy_row, merge_by_mask, merge_with_alpha,
+};
+use crate::matrix_lib::base::storage::Storage;
 use crate::matrix_lib::three_g::texture::{create_texture_from_rgba_mipped, decode_texture_bytes};
 
 /// Ports BuildTexUnions (MatrixMapPrepare.cpp:108-293).

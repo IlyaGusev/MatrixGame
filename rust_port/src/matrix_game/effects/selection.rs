@@ -172,7 +172,11 @@ impl SelectionEffect {
             let move_dir = {
                 let t = pi.cross(Vec3::Z);
                 let ml = t.length();
-                if ml > 1e-6 { t / ml } else { Vec3::ZERO }
+                if ml > 1e-6 {
+                    t / ml
+                } else {
+                    Vec3::ZERO
+                }
             };
             dir += move_dir * SEL_SPEED;
 
@@ -205,9 +209,7 @@ impl SelectionEffect {
 /// ARGB u32s.
 fn lerp_color(to: u32, from: u32, t: f32) -> u32 {
     let ch = |c: u32, sh: u32| ((c >> sh) & 0xFF) as f32;
-    let mix = |a: f32, b: f32| {
-        (a * (1.0 - t) + b * t).clamp(0.0, 255.0) as u32
-    };
+    let mix = |a: f32, b: f32| (a * (1.0 - t) + b * t).clamp(0.0, 255.0) as u32;
     let r = mix(ch(to, 16), ch(from, 16));
     let g = mix(ch(to, 8), ch(from, 8));
     let b = mix(ch(to, 0), ch(from, 0));
@@ -345,10 +347,16 @@ impl SelectionRingRenderer {
 
         // Static unit quad.
         let quad_verts = [
-            QuadVertex { corner: [-1.0, -1.0] },
-            QuadVertex { corner: [ 1.0, -1.0] },
-            QuadVertex { corner: [ 1.0,  1.0] },
-            QuadVertex { corner: [-1.0,  1.0] },
+            QuadVertex {
+                corner: [-1.0, -1.0],
+            },
+            QuadVertex {
+                corner: [1.0, -1.0],
+            },
+            QuadVertex { corner: [1.0, 1.0] },
+            QuadVertex {
+                corner: [-1.0, 1.0],
+            },
         ];
         let quad_vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Selection Quad VB"),
@@ -378,9 +386,9 @@ impl SelectionRingRenderer {
             contents: bytemuck::bytes_of(&Uniforms {
                 view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
                 cam_right: [1.0, 0.0, 0.0, 0.0],
-                cam_up:    [0.0, 0.0, 1.0, 0.0],
-                color:     [0.0, 1.0, 0.0, 0.8],
-                size:      [SEL_SIZE, 0.0, 0.0, 0.0],
+                cam_up: [0.0, 0.0, 1.0, 0.0],
+                color: [0.0, 1.0, 0.0, 0.8],
+                size: [SEL_SIZE, 0.0, 0.0, 0.0],
             }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -424,7 +432,8 @@ impl SelectionRingRenderer {
         desired: &[(crate::matrix_game::map_static::ObjectId, Vec3, f32, u32)],
     ) {
         // Drop stale.
-        self.effects.retain(|(id, _)| desired.iter().any(|d| d.0 == *id));
+        self.effects
+            .retain(|(id, _)| desired.iter().any(|d| d.0 == *id));
         // Add / update.
         for &(id, center, radius, color) in desired {
             match self.effects.iter_mut().find(|e| e.0 == id) {
@@ -436,7 +445,8 @@ impl SelectionRingRenderer {
                     }
                 }
                 None => {
-                    self.effects.push((id, SelectionEffect::new(center, radius, color)));
+                    self.effects
+                        .push((id, SelectionEffect::new(center, radius, color)));
                 }
             }
         }
@@ -484,9 +494,13 @@ impl SelectionRingRenderer {
 
         let mut centers: Vec<InstanceData> = Vec::new();
         for (_, e) in &self.effects {
-            if centers.len() >= self.instance_cap { break; }
+            if centers.len() >= self.instance_cap {
+                break;
+            }
             for p in e.world_positions() {
-                if centers.len() >= self.instance_cap { break; }
+                if centers.len() >= self.instance_cap {
+                    break;
+                }
                 centers.push(InstanceData {
                     center: [p.x - map_center.x, p.y - map_center.y, p.z],
                     _pad: 0.0,
@@ -511,9 +525,9 @@ impl SelectionRingRenderer {
             bytemuck::bytes_of(&Uniforms {
                 view_proj: view_proj.to_cols_array_2d(),
                 cam_right: [cam_right.x, cam_right.y, cam_right.z, 0.0],
-                cam_up:    [cam_up.x,    cam_up.y,    cam_up.z,    0.0],
-                color:     [r, g, b, alpha],
-                size:      [SEL_SIZE, 0.0, 0.0, 0.0],
+                cam_up: [cam_up.x, cam_up.y, cam_up.z, 0.0],
+                color: [r, g, b, alpha],
+                size: [SEL_SIZE, 0.0, 0.0, 0.0],
             }),
         );
     }

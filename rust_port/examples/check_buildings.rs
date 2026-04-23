@@ -1,6 +1,6 @@
 //! Verify BuildingInstance parsing + CVO resolution against the shipped pkg.
-use matrixgame_rs::matrix_lib::base::pack::PkgArchive;
 use matrixgame_rs::matrix_game::map::GameMap;
+use matrixgame_rs::matrix_lib::base::pack::PkgArchive;
 use matrixgame_rs::matrix_lib::three_g::vector_object;
 
 fn main() {

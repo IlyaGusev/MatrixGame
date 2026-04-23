@@ -59,11 +59,15 @@ pub struct MapLogic {
 }
 
 impl Default for MapLogic {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MapLogic {
-    pub fn new() -> Self { Self::with_seed(1) }
+    pub fn new() -> Self {
+        Self::with_seed(1)
+    }
 
     /// Deterministic-seed constructor — tests and replay use this
     /// so the generator state is reproducible.
@@ -81,10 +85,13 @@ impl MapLogic {
     /// (`MatrixLogic.cpp:2722-2734`). Full 10ms slices, then the
     /// remainder — matching the trailing `if (portions) ProceedLogic(portions);`.
     pub fn takt(&mut self, step_ms: i32) {
-        if step_ms <= 0 { return; }
+        if step_ms <= 0 {
+            return;
+        }
         let full = step_ms / LOGIC_TAKT_PERIOD_MS;
         for _ in 0..full {
-            self.objects.proceed_logic(LOGIC_TAKT_PERIOD_MS, &mut self.rng);
+            self.objects
+                .proceed_logic(LOGIC_TAKT_PERIOD_MS, &mut self.rng);
             self.tick += 1;
         }
         let rem = step_ms - full * LOGIC_TAKT_PERIOD_MS;
@@ -97,7 +104,9 @@ impl MapLogic {
     /// Port of `CMatrixMap::Takt`'s `SortEndGraphicTakt` call
     /// (MatrixMap.cpp:2501 → MatrixMapStatic.cpp:755-765).
     pub fn graphic_takt(&mut self, step_ms: i32) {
-        if step_ms <= 0 { return; }
+        if step_ms <= 0 {
+            return;
+        }
         self.objects.graphic_takt(step_ms, &mut self.rng);
     }
 
@@ -130,7 +139,9 @@ impl MapLogic {
         for inst in &map.objects {
             let mut obj = MapObject::from_instance(inst);
             let ids_row = if (inst.type_id as usize) < ids_count {
-                strings.map(|s| s.get_as_wstr(inst.type_id as usize)).unwrap_or_default()
+                strings
+                    .map(|s| s.get_as_wstr(inst.type_id as usize))
+                    .unwrap_or_default()
             } else {
                 String::new()
             };
@@ -161,7 +172,9 @@ impl MapLogic {
         for inst in &map.buildings {
             let mut b = Building::from_instance(inst);
             let kind_idx = b.kind as usize;
-            let hp = self.objects.building_damages
+            let hp = self
+                .objects
+                .building_damages
                 .hitpoint
                 .get(kind_idx)
                 .copied()
@@ -171,9 +184,8 @@ impl MapLogic {
             }
             let id = self.objects.spawn(Box::new(b));
             if let Some(obj) = self.objects.get_mut(id) {
-                let b_mut: &mut Building = unsafe {
-                    &mut *(obj as *mut dyn MapStatic as *mut Building)
-                };
+                let b_mut: &mut Building =
+                    unsafe { &mut *(obj as *mut dyn MapStatic as *mut Building) };
                 b_mut.self_id = Some(id);
             }
             self.objects.add_lt(id);
@@ -188,19 +200,26 @@ impl MapLogic {
     fn curr_sel_for(&self, id: ObjectId) -> CurrSel {
         match self.objects.get(id).map(|o| o.core().obj_type) {
             Some(ObjectType::Building) => {
-                let is_base = self.objects.get(id)
+                let is_base = self
+                    .objects
+                    .get(id)
                     .and_then(|o| {
                         let p = o as *const dyn MapStatic
                             as *const crate::matrix_game::object_building::Building;
-                        unsafe { p.as_ref() }
-                            .map(|b| b.kind == crate::matrix_game::object_building::BuildingType::Base)
+                        unsafe { p.as_ref() }.map(|b| {
+                            b.kind == crate::matrix_game::object_building::BuildingType::Base
+                        })
                     })
                     .unwrap_or(false);
-                if is_base { CurrSel::BaseSelected } else { CurrSel::BuildingSelected }
+                if is_base {
+                    CurrSel::BaseSelected
+                } else {
+                    CurrSel::BuildingSelected
+                }
             }
-            Some(ObjectType::RobotAi)   => CurrSel::RobotsSelected,
-            Some(ObjectType::Cannon)    => CurrSel::CannonSelected,
-            Some(ObjectType::Flyer)     => CurrSel::FlyerSelected,
+            Some(ObjectType::RobotAi) => CurrSel::RobotsSelected,
+            Some(ObjectType::Cannon) => CurrSel::CannonSelected,
+            Some(ObjectType::Flyer) => CurrSel::FlyerSelected,
             _ => CurrSel::Nothing,
         }
     }
@@ -230,8 +249,8 @@ impl MapLogic {
                 // SideSelectionCallBack filters on `IsLiveRobot() &&
                 // GetSide()==PLAYER_SIDE`). Ctrl+click on a building
                 // etc. still does single-select like the C++.
-                let own_robot = sel == CurrSel::RobotsSelected
-                    && self.object_side(id) == self.player_side.id;
+                let own_robot =
+                    sel == CurrSel::RobotsSelected && self.object_side(id) == self.player_side.id;
                 if shift && own_robot {
                     self.player_side.select_toggle(id, sel);
                 } else {
@@ -286,23 +305,31 @@ impl MapLogic {
         };
 
         for id in self.objects.iter_live() {
-            let Some(obj) = self.objects.get(id) else { continue };
-            if !matches!(obj.core().obj_type, ObjectType::RobotAi) { continue; }
-            if self.object_side(id) != self.player_side.id { continue; }
+            let Some(obj) = self.objects.get(id) else {
+                continue;
+            };
+            if !matches!(obj.core().obj_type, ObjectType::RobotAi) {
+                continue;
+            }
+            if self.object_side(id) != self.player_side.id {
+                continue;
+            }
             let c = obj.core().geo_center;
             // View-proj expects centered world (see camera::view_proj
             // + selection shader — map_center subtracted everywhere).
-            let clip = vp * glam::Vec4::new(
-                c.x - map_cx, c.y - map_cy, c.z, 1.0,
-            );
-            if clip.w <= 0.0 { continue; } // behind camera
+            let clip = vp * glam::Vec4::new(c.x - map_cx, c.y - map_cy, c.z, 1.0);
+            if clip.w <= 0.0 {
+                continue;
+            } // behind camera
             let ndc_x = clip.x / clip.w;
             let ndc_y = clip.y / clip.w;
             // NDC → screen (Y flip, same as screen_to_world_ray).
             let sx = (ndc_x * 0.5 + 0.5) * screen_w;
             let sy = (1.0 - (ndc_y * 0.5 + 0.5)) * screen_h;
-            if sx >= rect_min[0] && sx <= rect_max[0]
-                && sy >= rect_min[1] && sy <= rect_max[1]
+            if sx >= rect_min[0]
+                && sx <= rect_max[0]
+                && sy >= rect_min[1]
+                && sy <= rect_max[1]
                 && !hits.contains(&id)
             {
                 hits.push(id);
@@ -310,7 +337,8 @@ impl MapLogic {
         }
         let n = hits.len();
         let primary = hits.last().copied();
-        self.player_side.select_replace(hits, primary, CurrSel::RobotsSelected);
+        self.player_side
+            .select_replace(hits, primary, CurrSel::RobotsSelected);
         n
     }
 
@@ -343,12 +371,18 @@ impl MapLogic {
         let ids: Vec<ObjectId> = self.player_side.selected.clone();
         let mut n = 0;
         for id in ids {
-            let Some(obj) = self.objects.get_mut(id) else { continue };
-            if !matches!(obj.core().obj_type, ObjectType::RobotAi) { continue; }
+            let Some(obj) = self.objects.get_mut(id) else {
+                continue;
+            };
+            if !matches!(obj.core().obj_type, ObjectType::RobotAi) {
+                continue;
+            }
             let r: &mut crate::matrix_game::robot::Robot = unsafe {
                 &mut *(obj as *mut dyn MapStatic as *mut crate::matrix_game::robot::Robot)
             };
-            if r.side != self.player_side.id { continue; }
+            if r.side != self.player_side.id {
+                continue;
+            }
             r.move_to(mx, my);
             n += 1;
         }
@@ -358,7 +392,11 @@ impl MapLogic {
     /// Return the active-selection id if it's still a live object.
     pub fn active_object(&self) -> Option<ObjectId> {
         let id = self.player_side.active_object?;
-        if self.objects.is_valid(id) { Some(id) } else { None }
+        if self.objects.is_valid(id) {
+            Some(id)
+        } else {
+            None
+        }
     }
 
     /// Side id of `obj`, or `0` (neutral) if not resolvable.
@@ -384,7 +422,9 @@ pub fn screen_to_terrain_xy(
     screen_h: f32,
 ) -> Option<(f32, f32)> {
     let (origin, dir) = camera.screen_to_world_ray(sx, sy, screen_w, screen_h);
-    if dir.z >= -1.0e-4 { return None; } // pointing up / parallel
+    if dir.z >= -1.0e-4 {
+        return None;
+    } // pointing up / parallel
 
     // First hit at z=0.
     let mut t = -origin.z / dir.z;
@@ -419,15 +459,13 @@ pub fn screen_to_terrain_xy(
 /// Returns true when the precomputed size-N bit for `chassis_kind`
 /// is CLEAR at `(mx, my)` — i.e. no wall blocks a placement of
 /// `size` cells square here.
-pub fn is_absence_wall(
-    map: &GameMap,
-    chassis_kind: usize,
-    size: i32,
-    mx: i32,
-    my: i32,
-) -> bool {
-    if mx < 0 || (mx + size) as usize > map.size_move_x { return false; }
-    if my < 0 || (my + size) as usize > map.size_move_y { return false; }
+pub fn is_absence_wall(map: &GameMap, chassis_kind: usize, size: i32, mx: i32, my: i32) -> bool {
+    if mx < 0 || (mx + size) as usize > map.size_move_x {
+        return false;
+    }
+    if my < 0 || (my + size) as usize > map.size_move_y {
+        return false;
+    }
     map.is_passable_size(mx, my, chassis_kind, size)
 }
 
@@ -448,7 +486,9 @@ pub fn place_is_empty(
     my: i32,
     skip: Option<ObjectId>,
 ) -> bool {
-    if !is_absence_wall(map, chassis_kind, size, mx, my) { return false; }
+    if !is_absence_wall(map, chassis_kind, size, mx, my) {
+        return false;
+    }
 
     let kof = GameMap::GLOBAL_SCALE_MOVE * (ROBOT_MOVECELLS_PER_SIZE as f32) / 2.0;
     let cx = GameMap::GLOBAL_SCALE_MOVE * mx as f32 + kof;
@@ -458,26 +498,36 @@ pub fn place_is_empty(
     use crate::matrix_game::robot::Robot;
 
     for id in objs.iter_live() {
-        if skip.map_or(false, |s| s == id) { continue; }
+        if skip == Some(id) {
+            continue;
+        }
         let Some(obj) = objs.get(id) else { continue };
-        if !matches!(obj.core().obj_type, ObjectType::RobotAi) { continue; }
+        if !matches!(obj.core().obj_type, ObjectType::RobotAi) {
+            continue;
+        }
         let r: &Robot = unsafe { &*(obj as *const dyn MapStatic as *const Robot) };
 
         let dx = cx - r.pos_x;
         let dy = cy - r.pos_y;
-        if dx * dx + dy * dy < r2 { return false; }
+        if dx * dx + dy * dy < r2 {
+            return false;
+        }
 
         // GetMoveToCoords — check robot's current MOVE_TO destination.
         if let Some(pt) = r.move_to_coords() {
             let tx = GameMap::GLOBAL_SCALE_MOVE * pt.0 as f32 + kof;
             let ty = GameMap::GLOBAL_SCALE_MOVE * pt.1 as f32 + kof;
-            if (cx - tx).powi(2) + (cy - ty).powi(2) < r2 { return false; }
+            if (cx - tx).powi(2) + (cy - ty).powi(2) < r2 {
+                return false;
+            }
         }
         // GetReturnCoords — check robot's MOVE_RETURN anchor if any.
         if let Some(pt) = r.return_coords() {
             let tx = GameMap::GLOBAL_SCALE_MOVE * pt.0 as f32 + kof;
             let ty = GameMap::GLOBAL_SCALE_MOVE * pt.1 as f32 + kof;
-            if (cx - tx).powi(2) + (cy - ty).powi(2) < r2 { return false; }
+            if (cx - tx).powi(2) + (cy - ty).powi(2) < r2 {
+                return false;
+            }
         }
     }
     true
@@ -489,6 +539,7 @@ pub fn place_is_empty(
 /// avoidance; we defer that). Spirals outward looking for a cell
 /// that passes `place_is_empty` for `(chassis_kind, size)`.
 /// Returns the nearest valid cell as `(mx, my)`.
+#[allow(clippy::too_many_arguments)]
 pub fn place_find_near(
     map: &GameMap,
     objs: &Objects,
@@ -505,7 +556,9 @@ pub fn place_find_near(
     for r in 1..=radius {
         for dy in -r..=r {
             for dx in -r..=r {
-                if dx.abs() != r && dy.abs() != r { continue; } // ring only
+                if dx.abs() != r && dy.abs() != r {
+                    continue;
+                } // ring only
                 let nx = mx + dx;
                 let ny = my + dy;
                 if place_is_empty(map, objs, chassis_kind, size, nx, ny, skip) {
@@ -547,8 +600,14 @@ impl SpawnStats {
     }
 
     pub fn total(&self) -> u32 {
-        self.r#static + self.burn + self.r#break + self.anim
-            + self.sens + self.spawner + self.terron + self.portret
+        self.r#static
+            + self.burn
+            + self.r#break
+            + self.anim
+            + self.sens
+            + self.spawner
+            + self.terron
+            + self.portret
     }
 }
 
@@ -568,21 +627,50 @@ mod tests {
         calls: Rc<RefCell<Vec<i32>>>,
     }
     impl MapStatic for Counter {
-        fn core(&self) -> &ObjectCore { &self.core }
-        fn core_mut(&mut self) -> &mut ObjectCore { &mut self.core }
-        fn rchange(&self) -> u32 { self.rchange }
-        fn rchange_set(&mut self, b: u32) { self.rchange |= b; }
-        fn rchange_clear(&mut self, b: u32) { self.rchange &= !b; }
-        fn object_state(&self) -> u32 { self.state }
-        fn object_state_set(&mut self, b: u32) { self.state |= b; }
-        fn object_state_clear(&mut self, b: u32) { self.state &= !b; }
-        fn ablaze_ttl(&self) -> i32 { self.ablaze }
-        fn set_ablaze_ttl(&mut self, t: i32) { self.ablaze = t; }
-        fn shorted_ttl(&self) -> i32 { self.shorted }
-        fn set_shorted_ttl(&mut self, t: i32) { self.shorted = t; }
+        fn core(&self) -> &ObjectCore {
+            &self.core
+        }
+        fn core_mut(&mut self) -> &mut ObjectCore {
+            &mut self.core
+        }
+        fn rchange(&self) -> u32 {
+            self.rchange
+        }
+        fn rchange_set(&mut self, b: u32) {
+            self.rchange |= b;
+        }
+        fn rchange_clear(&mut self, b: u32) {
+            self.rchange &= !b;
+        }
+        fn object_state(&self) -> u32 {
+            self.state
+        }
+        fn object_state_set(&mut self, b: u32) {
+            self.state |= b;
+        }
+        fn object_state_clear(&mut self, b: u32) {
+            self.state &= !b;
+        }
+        fn ablaze_ttl(&self) -> i32 {
+            self.ablaze
+        }
+        fn set_ablaze_ttl(&mut self, t: i32) {
+            self.ablaze = t;
+        }
+        fn shorted_ttl(&self) -> i32 {
+            self.shorted
+        }
+        fn set_shorted_ttl(&mut self, t: i32) {
+            self.shorted = t;
+        }
         fn r_need(&mut self, _: u32) {}
         fn takt(&mut self, _: i32, _: &mut Rnd, _: &mut crate::matrix_game::map_static::Objects) {}
-        fn logic_takt(&mut self, cms: i32, _: &mut Rnd, _: &mut crate::matrix_game::map_static::Objects) {
+        fn logic_takt(
+            &mut self,
+            cms: i32,
+            _: &mut Rnd,
+            _: &mut crate::matrix_game::map_static::Objects,
+        ) {
             self.calls.borrow_mut().push(cms);
         }
     }
@@ -592,8 +680,14 @@ mod tests {
         let mut w = MapLogic::new();
         let calls = Rc::new(RefCell::new(Vec::new()));
         let id = w.objects.spawn(Box::new(Counter {
-            core: ObjectCore { obj_type: ObjectType::MapObject, ..Default::default() },
-            rchange: 0, state: 0, ablaze: 0, shorted: 0,
+            core: ObjectCore {
+                obj_type: ObjectType::MapObject,
+                ..Default::default()
+            },
+            rchange: 0,
+            state: 0,
+            ablaze: 0,
+            shorted: 0,
             calls: calls.clone(),
         }));
         w.objects.add_lt(id);
@@ -610,8 +704,14 @@ mod tests {
         let mut w = MapLogic::new();
         let calls = Rc::new(RefCell::new(Vec::new()));
         let id = w.objects.spawn(Box::new(Counter {
-            core: ObjectCore { obj_type: ObjectType::MapObject, ..Default::default() },
-            rchange: 0, state: 0, ablaze: 0, shorted: 0,
+            core: ObjectCore {
+                obj_type: ObjectType::MapObject,
+                ..Default::default()
+            },
+            rchange: 0,
+            state: 0,
+            ablaze: 0,
+            shorted: 0,
             calls: calls.clone(),
         }));
         w.objects.add_lt(id);
@@ -626,8 +726,14 @@ mod tests {
         let mut w = MapLogic::new();
         let calls = Rc::new(RefCell::new(Vec::new()));
         let id = w.objects.spawn(Box::new(Counter {
-            core: ObjectCore { obj_type: ObjectType::MapObject, ..Default::default() },
-            rchange: 0, state: 0, ablaze: 0, shorted: 0,
+            core: ObjectCore {
+                obj_type: ObjectType::MapObject,
+                ..Default::default()
+            },
+            rchange: 0,
+            state: 0,
+            ablaze: 0,
+            shorted: 0,
             calls: calls.clone(),
         }));
         w.objects.add_lt(id);

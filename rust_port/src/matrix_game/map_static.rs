@@ -22,8 +22,7 @@
 use glam::{Mat4, Vec2, Vec3};
 
 use crate::matrix_game::common::{
-    TRACE_BUILDING, TRACE_CANNON, TRACE_FLYER, TRACE_OBJECT, TRACE_ROBOT,
-    TRACE_SKIP_INVISIBLE,
+    TRACE_BUILDING, TRACE_CANNON, TRACE_FLYER, TRACE_OBJECT, TRACE_ROBOT, TRACE_SKIP_INVISIBLE,
 };
 use crate::matrix_game::config::{BuildingDamages, ObjectDamages};
 use crate::matrix_game::rnd::Rnd;
@@ -35,15 +34,15 @@ use crate::matrix_game::rnd::Rnd;
 // dirty bits and clears them. Default at construction is `ALL` (matches
 // `m_RChange(0xffffffff)`, MatrixMapStatic.hpp:346).
 
-pub const MR_GRAPH:             u32 = 1 << 0;
-pub const MR_MATRIX:            u32 = 1 << 1;
-pub const MR_POS:               u32 = 1 << 2;
-pub const MR_ROTATE:            u32 = 1 << 3;
-pub const MR_SHADOW_STENCIL:    u32 = 1 << 4;
-pub const MR_SHADOW_PROJ_GEOM:  u32 = 1 << 6;
-pub const MR_SHADOW_PROJ_TEX:   u32 = 1 << 7;
-pub const MR_MINIMAP:           u32 = 1 << 8;
-pub const MR_ALL:               u32 = 0xFFFF_FFFF;
+pub const MR_GRAPH: u32 = 1 << 0;
+pub const MR_MATRIX: u32 = 1 << 1;
+pub const MR_POS: u32 = 1 << 2;
+pub const MR_ROTATE: u32 = 1 << 3;
+pub const MR_SHADOW_STENCIL: u32 = 1 << 4;
+pub const MR_SHADOW_PROJ_GEOM: u32 = 1 << 6;
+pub const MR_SHADOW_PROJ_TEX: u32 = 1 << 7;
+pub const MR_MINIMAP: u32 = 1 << 8;
+pub const MR_ALL: u32 = 0xFFFF_FFFF;
 
 // ── Object state bits (MatrixMapStatic.hpp:46-85) ────────────────────────
 //
@@ -52,30 +51,37 @@ pub const MR_ALL:               u32 = 0xFFFF_FFFF;
 // the overlays as `#[allow(dead_code)]` constants so subclass ports can
 // reference them by their original names.
 
-pub const OBJECT_STATE_ABLAZE:              u32 = 1 << 0;
-pub const OBJECT_STATE_SHORTED:             u32 = 1 << 1;
-pub const OBJECT_STATE_INVISIBLE:           u32 = 1 << 2;
-pub const OBJECT_STATE_INTERFACE:           u32 = 1 << 3;
-pub const OBJECT_STATE_INVULNERABLE:        u32 = 1 << 3;
-pub const OBJECT_STATE_SHADOW_SPECIAL:      u32 = 1 << 4;
-pub const OBJECT_STATE_TRACE_INVISIBLE:     u32 = 1 << 5;
-pub const OBJECT_STATE_DIP:                 u32 = 1 << 6;
+pub const OBJECT_STATE_ABLAZE: u32 = 1 << 0;
+pub const OBJECT_STATE_SHORTED: u32 = 1 << 1;
+pub const OBJECT_STATE_INVISIBLE: u32 = 1 << 2;
+pub const OBJECT_STATE_INTERFACE: u32 = 1 << 3;
+pub const OBJECT_STATE_INVULNERABLE: u32 = 1 << 3;
+pub const OBJECT_STATE_SHADOW_SPECIAL: u32 = 1 << 4;
+pub const OBJECT_STATE_TRACE_INVISIBLE: u32 = 1 << 5;
+pub const OBJECT_STATE_DIP: u32 = 1 << 6;
 
 // Mesh-only (CMatrixMapObject).
-#[allow(dead_code)] pub const OBJECT_STATE_BURNED:            u32 = 1 << 10;
-#[allow(dead_code)] pub const OBJECT_STATE_EXPLOSIVE:         u32 = 1 << 11;
-#[allow(dead_code)] pub const OBJECT_STATE_NORMALIZENORMALS:  u32 = 1 << 12;
-#[allow(dead_code)] pub const OBJECT_STATE_SPECIAL:           u32 = 1 << 13;
-#[allow(dead_code)] pub const OBJECT_STATE_TERRON_EXPL:       u32 = 1 << 14;
-#[allow(dead_code)] pub const OBJECT_STATE_TERRON_EXPL1:      u32 = 1 << 15;
-#[allow(dead_code)] pub const OBJECT_STATE_TERRON_EXPL2:      u32 = 1 << 16;
+#[allow(dead_code)]
+pub const OBJECT_STATE_BURNED: u32 = 1 << 10;
+#[allow(dead_code)]
+pub const OBJECT_STATE_EXPLOSIVE: u32 = 1 << 11;
+#[allow(dead_code)]
+pub const OBJECT_STATE_NORMALIZENORMALS: u32 = 1 << 12;
+#[allow(dead_code)]
+pub const OBJECT_STATE_SPECIAL: u32 = 1 << 13;
+#[allow(dead_code)]
+pub const OBJECT_STATE_TERRON_EXPL: u32 = 1 << 14;
+#[allow(dead_code)]
+pub const OBJECT_STATE_TERRON_EXPL1: u32 = 1 << 15;
+#[allow(dead_code)]
+pub const OBJECT_STATE_TERRON_EXPL2: u32 = 1 << 16;
 
 // Robot-only (`ROBOT_FLAG_*` — MatrixMapStatic.hpp:62-77).
 /// `ROBOT_FLAG_ONWATER` (`SETBIT(14)`, MatrixMapStatic.hpp:76). Set by
 /// `Z_From_Pos` (MatrixObjectRobot.cpp:282) whenever the terrain height
 /// at the robot's XY is below `WATER_LEVEL`. Read by `Seek`
 /// (MatrixRobot.cpp:2420) to apply the chassis `m_SpeedWaterCorr`.
-pub const ROBOT_FLAG_ONWATER:  u32 = 1 << 14;
+pub const ROBOT_FLAG_ONWATER: u32 = 1 << 14;
 /// `ROBOT_FLAG_COLLISION` — set by LowLevelMove when a collision
 /// correction kicked in this tick (MatrixRobot.cpp:2623).
 #[allow(dead_code)]
@@ -84,24 +90,27 @@ pub const ROBOT_FLAG_COLLISION: u32 = 1 << 15;
 // Building-only (overlays bits 10..=12 from MatrixMapStatic.hpp:88-90).
 /// `BUILDING_NEW_INCOME` — a resource tick just fired; Takt emits a
 /// billboard-score effect on the next frame (MatrixObjectBuilding.cpp:355).
-#[allow(dead_code)] pub const OBJECT_STATE_BUILDING_NEW_INCOME:        u32 = 1 << 10;
+#[allow(dead_code)]
+pub const OBJECT_STATE_BUILDING_NEW_INCOME: u32 = 1 << 10;
 /// `BUILDING_SPAWNBOT` — base door is open and a robot is being
 /// delivered; prevents `Close()` mid-spawn (MatrixObjectBuilding.hpp:269-270).
-#[allow(dead_code)] pub const OBJECT_STATE_BUILDING_SPAWNBOT:          u32 = 1 << 11;
+#[allow(dead_code)]
+pub const OBJECT_STATE_BUILDING_SPAWNBOT: u32 = 1 << 11;
 /// `BUILDING_CAPTURE_IN_PROGRESS` — a robot of another side is
 /// capturing the base (MatrixObjectBuilding.hpp:191).
-#[allow(dead_code)] pub const OBJECT_STATE_BUILDING_CAPTURE_IN_PROGRESS: u32 = 1 << 12;
+#[allow(dead_code)]
+pub const OBJECT_STATE_BUILDING_CAPTURE_IN_PROGRESS: u32 = 1 << 12;
 
 /// `EObjectType` (MatrixMapStatic.hpp:29-39). Discriminants match the C++.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum ObjectType {
-    Empty     = 0,
+    Empty = 0,
     MapObject = 2,
-    RobotAi   = 3,
-    Building  = 4,
-    Cannon    = 5,
-    Flyer     = 6,
+    RobotAi = 3,
+    Building = 4,
+    Cannon = 5,
+    Flyer = 6,
 }
 
 /// Ports `SObjectCore` (MatrixMapStatic.hpp:133-199). Ref-counting is
@@ -111,12 +120,12 @@ pub enum ObjectType {
 /// (not implemented in scope A).
 #[derive(Debug, Clone)]
 pub struct ObjectCore {
-    pub matrix: Mat4,          // m_Matrix
-    pub inv_matrix: Mat4,      // m_IMatrix
-    pub radius: f32,           // m_Radius
-    pub geo_center: Vec3,      // m_GeoCenter
-    pub obj_type: ObjectType,  // m_Type
-    pub terrain_color: u32,    // m_TerainColor  (0xFFFFFFFF default)
+    pub matrix: Mat4,         // m_Matrix
+    pub inv_matrix: Mat4,     // m_IMatrix
+    pub radius: f32,          // m_Radius
+    pub geo_center: Vec3,     // m_GeoCenter
+    pub obj_type: ObjectType, // m_Type
+    pub terrain_color: u32,   // m_TerainColor  (0xFFFFFFFF default)
 }
 
 impl Default for ObjectCore {
@@ -145,7 +154,7 @@ pub trait MapStatic {
     fn core(&self) -> &ObjectCore;
     fn core_mut(&mut self) -> &mut ObjectCore;
     fn rchange(&self) -> u32;
-    fn rchange_set(&mut self, bits: u32);   // RChange(zn)  — OR-in
+    fn rchange_set(&mut self, bits: u32); // RChange(zn)  — OR-in
     fn rchange_clear(&mut self, bits: u32); // RNoNeed(zn)  — AND-NOT
     fn object_state(&self) -> u32;
     fn object_state_set(&mut self, bits: u32);
@@ -174,8 +183,12 @@ pub trait MapStatic {
     // Default-noop virtuals so subclasses can opt in as they're ported.
     fn before_draw(&mut self) {}
     fn free_dynamic_resources(&mut self) {}
-    fn side(&self) -> i32 { -1 }
-    fn need_repair(&self) -> bool { false }
+    fn side(&self) -> i32 {
+        -1
+    }
+    fn need_repair(&self) -> bool {
+        false
+    }
 
     /// Port of `virtual bool Pick(orig, dir, float *outt)`
     /// (MatrixMapStatic.hpp:462). Ray / object intersection. The
@@ -201,6 +214,7 @@ pub trait MapStatic {
     /// `objs` is the arena sans this object's slot — same contract as
     /// `takt`/`logic_takt`. Callees use it to enroll themselves into
     /// the logic-temp list (AddLT) or spawn effects.
+    #[allow(clippy::too_many_arguments)]
     fn damage(
         &mut self,
         _weap: crate::matrix_game::effects::weapon::Weapon,
@@ -259,18 +273,16 @@ pub fn is_map_object(obj: &dyn MapStatic) -> bool {
 pub fn fit_to_mask(obj: &dyn MapStatic, mask: u32) -> bool {
     // `TRACE_SKIP_INVISIBLE`: objects opting out of trace visibility
     // (MatrixMapStatic.hpp:51, set by OTP_INVLOGIC="1") are filtered.
-    if mask & TRACE_SKIP_INVISIBLE != 0
-        && obj.object_state() & OBJECT_STATE_TRACE_INVISIBLE != 0
-    {
+    if mask & TRACE_SKIP_INVISIBLE != 0 && obj.object_state() & OBJECT_STATE_TRACE_INVISIBLE != 0 {
         return false;
     }
     match obj.core().obj_type {
-        ObjectType::RobotAi   => mask & TRACE_ROBOT    != 0,
-        ObjectType::Cannon    => mask & TRACE_CANNON   != 0,
-        ObjectType::Building  => mask & TRACE_BUILDING != 0,
-        ObjectType::MapObject => mask & TRACE_OBJECT   != 0,
-        ObjectType::Flyer     => mask & TRACE_FLYER    != 0,
-        ObjectType::Empty     => false,
+        ObjectType::RobotAi => mask & TRACE_ROBOT != 0,
+        ObjectType::Cannon => mask & TRACE_CANNON != 0,
+        ObjectType::Building => mask & TRACE_BUILDING != 0,
+        ObjectType::MapObject => mask & TRACE_OBJECT != 0,
+        ObjectType::Flyer => mask & TRACE_FLYER != 0,
+        ObjectType::Empty => false,
     }
 }
 
@@ -395,7 +407,10 @@ impl Objects {
             slot.in_lt = false;
             slot.prev_lt = None;
             slot.next_lt = None;
-            ObjectId { index, generation: slot.generation }
+            ObjectId {
+                index,
+                generation: slot.generation,
+            }
         } else {
             let index = self.slots.len() as u32;
             self.slots.push(Slot {
@@ -405,7 +420,10 @@ impl Objects {
                 prev_lt: None,
                 next_lt: None,
             });
-            ObjectId { index, generation: 1 }
+            ObjectId {
+                index,
+                generation: 1,
+            }
         }
     }
 
@@ -570,7 +588,10 @@ impl Objects {
     /// `del_lt` is undefined for this method; use `proceed_logic` for
     /// that contract).
     pub fn iter_logic(&self) -> LogicIter<'_> {
-        LogicIter { objs: self, cursor: self.first_lt }
+        LogicIter {
+            objs: self,
+            cursor: self.first_lt,
+        }
     }
 
     /// All live objects (arena order). Cheap `O(slots)`; skips freed
@@ -619,7 +640,10 @@ impl Objects {
                 Some(o) => o,
                 None => continue,
             };
-            let id = ObjectId { index: i as u32, generation: slot.generation };
+            let id = ObjectId {
+                index: i as u32,
+                generation: slot.generation,
+            };
             if Some(id) == skip {
                 continue;
             }
@@ -680,7 +704,10 @@ impl Objects {
                 Some(o) => o,
                 None => continue,
             };
-            let id = ObjectId { index: i as u32, generation: slot.generation };
+            let id = ObjectId {
+                index: i as u32,
+                generation: slot.generation,
+            };
             if Some(id) == skip || !fit_to_mask(obj, mask) {
                 continue;
             }
@@ -714,9 +741,13 @@ impl Objects {
         attacker_side: i32,
         attacker: Option<ObjectId>,
     ) -> bool {
-        let mut boxed = match self.slots.get_mut(target.index as usize)
-            .and_then(|s| if s.generation == target.generation { s.obj.take() } else { None })
-        {
+        let mut boxed = match self.slots.get_mut(target.index as usize).and_then(|s| {
+            if s.generation == target.generation {
+                s.obj.take()
+            } else {
+                None
+            }
+        }) {
             Some(b) => b,
             None => return false,
         };
@@ -768,8 +799,16 @@ impl Objects {
 /// If the head/tail pointer was pointing at the removed node, repoint it
 /// at the replacement. Otherwise leave it alone — the removed node was
 /// somewhere mid-list and the caller already patched its neighbours.
-fn patch_head(current: Option<ObjectId>, removed: ObjectId, replacement: Option<ObjectId>) -> Option<ObjectId> {
-    if current == Some(removed) { replacement } else { current }
+fn patch_head(
+    current: Option<ObjectId>,
+    removed: ObjectId,
+    replacement: Option<ObjectId>,
+) -> Option<ObjectId> {
+    if current == Some(removed) {
+        replacement
+    } else {
+        current
+    }
 }
 
 pub struct LogicIter<'a> {
@@ -797,9 +836,13 @@ fn static_takt(objs: &mut Objects, id: ObjectId, ms: i32, rng: &mut Rnd) {
     // Take-the-box pattern — see `proceed_logic`. This also handles the
     // case where `id` points at a freed slot (returns early, same as
     // the C++ tombstone branch).
-    let mut boxed = match objs.slots.get_mut(id.index as usize)
-        .and_then(|s| if s.generation == id.generation { s.obj.take() } else { None })
-    {
+    let mut boxed = match objs.slots.get_mut(id.index as usize).and_then(|s| {
+        if s.generation == id.generation {
+            s.obj.take()
+        } else {
+            None
+        }
+    }) {
         Some(b) => b,
         None => return,
     };
@@ -857,7 +900,10 @@ mod tests {
     impl Stub {
         fn new(name: &'static str, log: Rc<RefCell<Vec<(&'static str, i32)>>>) -> Self {
             Self {
-                core: ObjectCore { obj_type: ObjectType::MapObject, ..Default::default() },
+                core: ObjectCore {
+                    obj_type: ObjectType::MapObject,
+                    ..Default::default()
+                },
                 rchange: MR_ALL,
                 state: 0,
                 ablaze: 0,
@@ -869,18 +915,42 @@ mod tests {
     }
 
     impl MapStatic for Stub {
-        fn core(&self) -> &ObjectCore { &self.core }
-        fn core_mut(&mut self) -> &mut ObjectCore { &mut self.core }
-        fn rchange(&self) -> u32 { self.rchange }
-        fn rchange_set(&mut self, b: u32) { self.rchange |= b; }
-        fn rchange_clear(&mut self, b: u32) { self.rchange &= !b; }
-        fn object_state(&self) -> u32 { self.state }
-        fn object_state_set(&mut self, b: u32) { self.state |= b; }
-        fn object_state_clear(&mut self, b: u32) { self.state &= !b; }
-        fn ablaze_ttl(&self) -> i32 { self.ablaze }
-        fn set_ablaze_ttl(&mut self, t: i32) { self.ablaze = t; }
-        fn shorted_ttl(&self) -> i32 { self.shorted }
-        fn set_shorted_ttl(&mut self, t: i32) { self.shorted = t; }
+        fn core(&self) -> &ObjectCore {
+            &self.core
+        }
+        fn core_mut(&mut self) -> &mut ObjectCore {
+            &mut self.core
+        }
+        fn rchange(&self) -> u32 {
+            self.rchange
+        }
+        fn rchange_set(&mut self, b: u32) {
+            self.rchange |= b;
+        }
+        fn rchange_clear(&mut self, b: u32) {
+            self.rchange &= !b;
+        }
+        fn object_state(&self) -> u32 {
+            self.state
+        }
+        fn object_state_set(&mut self, b: u32) {
+            self.state |= b;
+        }
+        fn object_state_clear(&mut self, b: u32) {
+            self.state &= !b;
+        }
+        fn ablaze_ttl(&self) -> i32 {
+            self.ablaze
+        }
+        fn set_ablaze_ttl(&mut self, t: i32) {
+            self.ablaze = t;
+        }
+        fn shorted_ttl(&self) -> i32 {
+            self.shorted
+        }
+        fn set_shorted_ttl(&mut self, t: i32) {
+            self.shorted = t;
+        }
         fn r_need(&mut self, _need: u32) {}
         fn takt(&mut self, _cms: i32, _rng: &mut Rnd, _objs: &mut Objects) {}
         fn logic_takt(&mut self, cms: i32, _rng: &mut Rnd, _objs: &mut Objects) {
@@ -888,7 +958,10 @@ mod tests {
         }
     }
 
-    fn mk_stub(name: &'static str, log: Rc<RefCell<Vec<(&'static str, i32)>>>) -> Box<dyn MapStatic> {
+    fn mk_stub(
+        name: &'static str,
+        log: Rc<RefCell<Vec<(&'static str, i32)>>>,
+    ) -> Box<dyn MapStatic> {
         Box::new(Stub::new(name, log))
     }
 
@@ -921,10 +994,7 @@ mod tests {
         objs.add_lt(c);
 
         objs.proceed_logic(10, &mut Rnd::new(1));
-        assert_eq!(
-            log.borrow().clone(),
-            vec![("a", 10), ("b", 10), ("c", 10)]
-        );
+        assert_eq!(log.borrow().clone(), vec![("a", 10), ("b", 10), ("c", 10)]);
     }
 
     #[test]
@@ -951,15 +1021,15 @@ mod tests {
         assert!(fit_to_mask(&*bld, TRACE_BUILDING));
         assert!(fit_to_mask(&*obj, TRACE_OBJECT));
         assert!(fit_to_mask(&*fly, TRACE_FLYER));
-        assert!(!fit_to_mask(&*emp, u32::MAX));   // Empty always fails.
-        // OR'd mask — robot also passes against a TRACE_ANYOBJECT-style mask.
+        assert!(!fit_to_mask(&*emp, u32::MAX)); // Empty always fails.
+                                                // OR'd mask — robot also passes against a TRACE_ANYOBJECT-style mask.
         assert!(fit_to_mask(&*rob, TRACE_ROBOT | TRACE_OBJECT));
     }
 
     #[test]
     fn fit_to_mask_respects_skip_invisible() {
         use crate::matrix_game::common::{TRACE_OBJECT, TRACE_SKIP_INVISIBLE};
-        let visible   = Stub::new("v", Rc::new(RefCell::new(Vec::new())));
+        let visible = Stub::new("v", Rc::new(RefCell::new(Vec::new())));
         let mut invis = Stub::new("i", Rc::new(RefCell::new(Vec::new())));
         invis.state = OBJECT_STATE_TRACE_INVISIBLE;
         // Matching type, skip-invisible set: invisible object is excluded.
@@ -982,14 +1052,14 @@ mod tests {
         };
         let a = make(0.0, 0.0);
         let b = make(5.0, 0.0);
-        let c = make(20.0, 0.0);     // outside radius 10
-        let _d = make(3.0, 4.0);     // distance 5, inside
+        let c = make(20.0, 0.0); // outside radius 10
+        let _d = make(3.0, 4.0); // distance 5, inside
 
         let mut hits = Vec::new();
-        let got = objs.find_objects(
-            glam::Vec2::ZERO, 10.0, 1.0, TRACE_OBJECT, None,
-            |_, id| { hits.push(id); Control::Continue },
-        );
+        let got = objs.find_objects(glam::Vec2::ZERO, 10.0, 1.0, TRACE_OBJECT, None, |_, id| {
+            hits.push(id);
+            Control::Continue
+        });
         assert!(got, "at least one hit");
         // `a`, `b`, `d` expected; `c` excluded.
         assert!(hits.contains(&a));
@@ -999,8 +1069,15 @@ mod tests {
         // Skip `a` → it's excluded from the enumeration.
         hits.clear();
         objs.find_objects(
-            glam::Vec2::ZERO, 10.0, 1.0, TRACE_OBJECT, Some(a),
-            |_, id| { hits.push(id); Control::Continue },
+            glam::Vec2::ZERO,
+            10.0,
+            1.0,
+            TRACE_OBJECT,
+            Some(a),
+            |_, id| {
+                hits.push(id);
+                Control::Continue
+            },
         );
         assert!(!hits.contains(&a));
     }
@@ -1017,10 +1094,10 @@ mod tests {
             objs.spawn(Box::new(s));
         }
         let mut visited = 0;
-        let got = objs.find_objects(
-            glam::Vec2::ZERO, 10.0, 1.0, TRACE_OBJECT, None,
-            |_, _| { visited += 1; Control::Break },
-        );
+        let got = objs.find_objects(glam::Vec2::ZERO, 10.0, 1.0, TRACE_OBJECT, None, |_, _| {
+            visited += 1;
+            Control::Break
+        });
         assert!(got);
         assert_eq!(visited, 1, "Break stops after the first hit");
 
@@ -1038,13 +1115,9 @@ mod tests {
         mapobj.core.geo_center = glam::Vec3::ZERO;
         objs.spawn(Box::new(mapobj));
         // Asking for robots: no match.
-        assert!(!objs.any_object_in_radius(
-            glam::Vec2::ZERO, 10.0, 1.0, TRACE_ROBOT, None,
-        ));
+        assert!(!objs.any_object_in_radius(glam::Vec2::ZERO, 10.0, 1.0, TRACE_ROBOT, None,));
         // Asking for objects: hit.
-        assert!(objs.any_object_in_radius(
-            glam::Vec2::ZERO, 10.0, 1.0, TRACE_OBJECT, None,
-        ));
+        assert!(objs.any_object_in_radius(glam::Vec2::ZERO, 10.0, 1.0, TRACE_OBJECT, None,));
     }
 
     #[test]
@@ -1095,22 +1168,28 @@ mod tests {
             s.core.radius = r;
             objs.spawn(Box::new(s))
         };
-        let _near = mk(5.0, ObjectType::MapObject, 1.0);      // t=4
-        let mid   = mk(10.0, ObjectType::Building, 1.0);      // t=9
-        let _far  = mk(20.0, ObjectType::Building, 1.0);      // t=19
+        let _near = mk(5.0, ObjectType::MapObject, 1.0); // t=4
+        let mid = mk(10.0, ObjectType::Building, 1.0); // t=9
+        let _far = mk(20.0, ObjectType::Building, 1.0); // t=19
 
         // TRACE_OBJECT: should hit the MapObject at t≈4.
-        let (_, t) = objs.pick_object(Vec3::ZERO, Vec3::X, TRACE_OBJECT, None).unwrap();
+        let (_, t) = objs
+            .pick_object(Vec3::ZERO, Vec3::X, TRACE_OBJECT, None)
+            .unwrap();
         assert!((t - 4.0).abs() < 1e-5);
 
         // TRACE_BUILDING: should hit the NEAREST building (mid, t≈9)
         // not the farther one.
-        let (hit_id, t) = objs.pick_object(Vec3::ZERO, Vec3::X, TRACE_BUILDING, None).unwrap();
+        let (hit_id, t) = objs
+            .pick_object(Vec3::ZERO, Vec3::X, TRACE_BUILDING, None)
+            .unwrap();
         assert_eq!(hit_id, mid);
         assert!((t - 9.0).abs() < 1e-5);
 
         // TRACE_ROBOT: nothing matches.
-        assert!(objs.pick_object(Vec3::ZERO, Vec3::X, TRACE_ROBOT, None).is_none());
+        assert!(objs
+            .pick_object(Vec3::ZERO, Vec3::X, TRACE_ROBOT, None)
+            .is_none());
     }
 
     #[test]
@@ -1120,25 +1199,53 @@ mod tests {
         // it opted into the logic-temp list. The Rust stub below tracks
         // takt calls — we add `a` and `c` to logic-temp but leave `b`
         // off, and assert all three get their `takt` called.
+        type TaktLog = Rc<RefCell<Vec<(&'static str, &'static str, i32)>>>;
         struct TaktCounter {
-            core: ObjectCore, rchange: u32, state: u32,
-            ablaze: i32, shorted: i32,
+            core: ObjectCore,
+            rchange: u32,
+            state: u32,
+            ablaze: i32,
+            shorted: i32,
             name: &'static str,
-            log: Rc<RefCell<Vec<(&'static str, &'static str, i32)>>>,
+            log: TaktLog,
         }
         impl MapStatic for TaktCounter {
-            fn core(&self) -> &ObjectCore { &self.core }
-            fn core_mut(&mut self) -> &mut ObjectCore { &mut self.core }
-            fn rchange(&self) -> u32 { self.rchange }
-            fn rchange_set(&mut self, b: u32) { self.rchange |= b; }
-            fn rchange_clear(&mut self, b: u32) { self.rchange &= !b; }
-            fn object_state(&self) -> u32 { self.state }
-            fn object_state_set(&mut self, b: u32) { self.state |= b; }
-            fn object_state_clear(&mut self, b: u32) { self.state &= !b; }
-            fn ablaze_ttl(&self) -> i32 { self.ablaze }
-            fn set_ablaze_ttl(&mut self, t: i32) { self.ablaze = t; }
-            fn shorted_ttl(&self) -> i32 { self.shorted }
-            fn set_shorted_ttl(&mut self, t: i32) { self.shorted = t; }
+            fn core(&self) -> &ObjectCore {
+                &self.core
+            }
+            fn core_mut(&mut self) -> &mut ObjectCore {
+                &mut self.core
+            }
+            fn rchange(&self) -> u32 {
+                self.rchange
+            }
+            fn rchange_set(&mut self, b: u32) {
+                self.rchange |= b;
+            }
+            fn rchange_clear(&mut self, b: u32) {
+                self.rchange &= !b;
+            }
+            fn object_state(&self) -> u32 {
+                self.state
+            }
+            fn object_state_set(&mut self, b: u32) {
+                self.state |= b;
+            }
+            fn object_state_clear(&mut self, b: u32) {
+                self.state &= !b;
+            }
+            fn ablaze_ttl(&self) -> i32 {
+                self.ablaze
+            }
+            fn set_ablaze_ttl(&mut self, t: i32) {
+                self.ablaze = t;
+            }
+            fn shorted_ttl(&self) -> i32 {
+                self.shorted
+            }
+            fn set_shorted_ttl(&mut self, t: i32) {
+                self.shorted = t;
+            }
             fn r_need(&mut self, _: u32) {}
             fn takt(&mut self, cms: i32, _: &mut Rnd, _: &mut Objects) {
                 self.log.borrow_mut().push(("takt", self.name, cms));
@@ -1147,12 +1254,18 @@ mod tests {
                 self.log.borrow_mut().push(("logic", self.name, cms));
             }
         }
-        fn mk(name: &'static str, log: Rc<RefCell<Vec<(&'static str, &'static str, i32)>>>)
-            -> Box<dyn MapStatic>
-        {
+        fn mk(name: &'static str, log: TaktLog) -> Box<dyn MapStatic> {
             Box::new(TaktCounter {
-                core: ObjectCore { obj_type: ObjectType::MapObject, ..Default::default() },
-                rchange: 0, state: 0, ablaze: 0, shorted: 0, name, log,
+                core: ObjectCore {
+                    obj_type: ObjectType::MapObject,
+                    ..Default::default()
+                },
+                rchange: 0,
+                state: 0,
+                ablaze: 0,
+                shorted: 0,
+                name,
+                log,
             })
         }
 
@@ -1162,15 +1275,16 @@ mod tests {
         let _b = objs.spawn(mk("b", log.clone()));
         let c = objs.spawn(mk("c", log.clone()));
         objs.add_lt(a);
-        objs.add_lt(c);   // `b` stays off the logic list.
+        objs.add_lt(c); // `b` stays off the logic list.
 
         let mut rng = Rnd::new(1);
         objs.graphic_takt(33, &mut rng);
         // All three reached by graphic_takt.
         let got: Vec<_> = log.borrow().iter().cloned().collect();
-        assert_eq!(got, vec![
-            ("takt", "a", 33), ("takt", "b", 33), ("takt", "c", 33)
-        ]);
+        assert_eq!(
+            got,
+            vec![("takt", "a", 33), ("takt", "b", 33), ("takt", "c", 33)]
+        );
 
         log.borrow_mut().clear();
         objs.proceed_logic(10, &mut rng);
@@ -1213,7 +1327,9 @@ mod tests {
         let log = Rc::new(RefCell::new(Vec::new()));
         let mut objs = Objects::new();
         let a = objs.spawn(mk_stub("a", log.clone()));
-        objs.get_mut(a).unwrap().object_state_set(OBJECT_STATE_ABLAZE);
+        objs.get_mut(a)
+            .unwrap()
+            .object_state_set(OBJECT_STATE_ABLAZE);
         objs.get_mut(a).unwrap().set_ablaze_ttl(10);
         objs.add_lt(a);
 
@@ -1228,7 +1344,9 @@ mod tests {
         let log = Rc::new(RefCell::new(Vec::new()));
         let mut objs = Objects::new();
         let a = objs.spawn(mk_stub("a", log.clone()));
-        objs.get_mut(a).unwrap().object_state_set(OBJECT_STATE_ABLAZE);
+        objs.get_mut(a)
+            .unwrap()
+            .object_state_set(OBJECT_STATE_ABLAZE);
         objs.get_mut(a).unwrap().set_ablaze_ttl(15);
         objs.add_lt(a);
 
@@ -1244,22 +1362,50 @@ mod tests {
     #[test]
     fn del_lt_of_next_during_takt_does_not_crash_walk() {
         struct Remover {
-            core: ObjectCore, rchange: u32, state: u32, ablaze: i32, shorted: i32,
+            core: ObjectCore,
+            rchange: u32,
+            state: u32,
+            ablaze: i32,
+            shorted: i32,
             target: ObjectId,
         }
         impl MapStatic for Remover {
-            fn core(&self) -> &ObjectCore { &self.core }
-            fn core_mut(&mut self) -> &mut ObjectCore { &mut self.core }
-            fn rchange(&self) -> u32 { self.rchange }
-            fn rchange_set(&mut self, b: u32) { self.rchange |= b; }
-            fn rchange_clear(&mut self, b: u32) { self.rchange &= !b; }
-            fn object_state(&self) -> u32 { self.state }
-            fn object_state_set(&mut self, b: u32) { self.state |= b; }
-            fn object_state_clear(&mut self, b: u32) { self.state &= !b; }
-            fn ablaze_ttl(&self) -> i32 { self.ablaze }
-            fn set_ablaze_ttl(&mut self, t: i32) { self.ablaze = t; }
-            fn shorted_ttl(&self) -> i32 { self.shorted }
-            fn set_shorted_ttl(&mut self, t: i32) { self.shorted = t; }
+            fn core(&self) -> &ObjectCore {
+                &self.core
+            }
+            fn core_mut(&mut self) -> &mut ObjectCore {
+                &mut self.core
+            }
+            fn rchange(&self) -> u32 {
+                self.rchange
+            }
+            fn rchange_set(&mut self, b: u32) {
+                self.rchange |= b;
+            }
+            fn rchange_clear(&mut self, b: u32) {
+                self.rchange &= !b;
+            }
+            fn object_state(&self) -> u32 {
+                self.state
+            }
+            fn object_state_set(&mut self, b: u32) {
+                self.state |= b;
+            }
+            fn object_state_clear(&mut self, b: u32) {
+                self.state &= !b;
+            }
+            fn ablaze_ttl(&self) -> i32 {
+                self.ablaze
+            }
+            fn set_ablaze_ttl(&mut self, t: i32) {
+                self.ablaze = t;
+            }
+            fn shorted_ttl(&self) -> i32 {
+                self.shorted
+            }
+            fn set_shorted_ttl(&mut self, t: i32) {
+                self.shorted = t;
+            }
             fn r_need(&mut self, _n: u32) {}
             fn takt(&mut self, _c: i32, _r: &mut Rnd, _o: &mut Objects) {}
             fn logic_takt(&mut self, _c: i32, _r: &mut Rnd, objs: &mut Objects) {
@@ -1274,9 +1420,18 @@ mod tests {
         let mut objs = Objects::new();
 
         let a_id = objs.spawn(Box::new(Remover {
-            core: ObjectCore { obj_type: ObjectType::MapObject, ..Default::default() },
-            rchange: 0, state: 0, ablaze: 0, shorted: 0,
-            target: ObjectId { index: 999, generation: 0 }, // patched below
+            core: ObjectCore {
+                obj_type: ObjectType::MapObject,
+                ..Default::default()
+            },
+            rchange: 0,
+            state: 0,
+            ablaze: 0,
+            shorted: 0,
+            target: ObjectId {
+                index: 999,
+                generation: 0,
+            }, // patched below
         }));
         let b_id = objs.spawn(mk_stub("b", log.clone()));
         let c_id = objs.spawn(mk_stub("c", log.clone()));
@@ -1304,22 +1459,50 @@ mod tests {
     #[test]
     fn add_lt_during_takt_visits_on_next_call_only() {
         struct Adder {
-            core: ObjectCore, rchange: u32, state: u32, ablaze: i32, shorted: i32,
+            core: ObjectCore,
+            rchange: u32,
+            state: u32,
+            ablaze: i32,
+            shorted: i32,
             new_id: ObjectId,
         }
         impl MapStatic for Adder {
-            fn core(&self) -> &ObjectCore { &self.core }
-            fn core_mut(&mut self) -> &mut ObjectCore { &mut self.core }
-            fn rchange(&self) -> u32 { self.rchange }
-            fn rchange_set(&mut self, b: u32) { self.rchange |= b; }
-            fn rchange_clear(&mut self, b: u32) { self.rchange &= !b; }
-            fn object_state(&self) -> u32 { self.state }
-            fn object_state_set(&mut self, b: u32) { self.state |= b; }
-            fn object_state_clear(&mut self, b: u32) { self.state &= !b; }
-            fn ablaze_ttl(&self) -> i32 { self.ablaze }
-            fn set_ablaze_ttl(&mut self, t: i32) { self.ablaze = t; }
-            fn shorted_ttl(&self) -> i32 { self.shorted }
-            fn set_shorted_ttl(&mut self, t: i32) { self.shorted = t; }
+            fn core(&self) -> &ObjectCore {
+                &self.core
+            }
+            fn core_mut(&mut self) -> &mut ObjectCore {
+                &mut self.core
+            }
+            fn rchange(&self) -> u32 {
+                self.rchange
+            }
+            fn rchange_set(&mut self, b: u32) {
+                self.rchange |= b;
+            }
+            fn rchange_clear(&mut self, b: u32) {
+                self.rchange &= !b;
+            }
+            fn object_state(&self) -> u32 {
+                self.state
+            }
+            fn object_state_set(&mut self, b: u32) {
+                self.state |= b;
+            }
+            fn object_state_clear(&mut self, b: u32) {
+                self.state &= !b;
+            }
+            fn ablaze_ttl(&self) -> i32 {
+                self.ablaze
+            }
+            fn set_ablaze_ttl(&mut self, t: i32) {
+                self.ablaze = t;
+            }
+            fn shorted_ttl(&self) -> i32 {
+                self.shorted
+            }
+            fn set_shorted_ttl(&mut self, t: i32) {
+                self.shorted = t;
+            }
             fn r_need(&mut self, _n: u32) {}
             fn takt(&mut self, _c: i32, _r: &mut Rnd, _o: &mut Objects) {}
             fn logic_takt(&mut self, _c: i32, _r: &mut Rnd, objs: &mut Objects) {
@@ -1332,17 +1515,27 @@ mod tests {
         // Pre-create the "future" object but keep it out of the list.
         let future_id = objs.spawn(mk_stub("future", log.clone()));
         let adder_id = objs.spawn(Box::new(Adder {
-            core: ObjectCore { obj_type: ObjectType::MapObject, ..Default::default() },
-            rchange: 0, state: 0, ablaze: 0, shorted: 0,
+            core: ObjectCore {
+                obj_type: ObjectType::MapObject,
+                ..Default::default()
+            },
+            rchange: 0,
+            state: 0,
+            ablaze: 0,
+            shorted: 0,
             new_id: future_id,
         }));
         objs.add_lt(adder_id);
 
         objs.proceed_logic(10, &mut Rnd::new(1)); // 1st call: only `adder` runs.
-        assert!(log.borrow().is_empty(), "future tick ran in 1st walk: {:?}", log.borrow());
+        assert!(
+            log.borrow().is_empty(),
+            "future tick ran in 1st walk: {:?}",
+            log.borrow()
+        );
         assert!(objs.in_lt(future_id));
 
-        objs.proceed_logic(7, &mut Rnd::new(1));  // 2nd call: `adder` + `future`.
+        objs.proceed_logic(7, &mut Rnd::new(1)); // 2nd call: `adder` + `future`.
         assert_eq!(log.borrow().clone(), vec![("future", 7)]);
     }
 }

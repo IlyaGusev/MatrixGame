@@ -20,7 +20,7 @@ use crate::matrix_game::camera::Camera;
 use crate::matrix_game::common::{unpack_rgb, FOG_END, FOG_START};
 use crate::matrix_game::effects::point_light::PointLightSystem;
 use crate::matrix_game::map::GameMap;
-use crate::matrix_game::map_static::{MapStatic, Objects, ObjectType};
+use crate::matrix_game::map_static::{MapStatic, ObjectType, Objects};
 use crate::matrix_game::robot::{Animation, ChassisKind, Robot};
 use crate::matrix_lib::three_g::texture::{
     create_solid_texture, create_texture_from_rgba, decode_texture_bytes,
@@ -217,7 +217,11 @@ impl RobotsRenderer {
             let vertices: Vec<Vertex> = vo_mesh
                 .vertices
                 .iter()
-                .map(|v| Vertex { position: v.position, normal: v.normal, uv: v.uv })
+                .map(|v| Vertex {
+                    position: v.position,
+                    normal: v.normal,
+                    uv: v.uv,
+                })
                 .collect();
             let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("Robots Mesh VB"),
@@ -233,16 +237,17 @@ impl RobotsRenderer {
             for frame in &vo_mesh.frames {
                 let mut surfaces = Vec::with_capacity(frame.surfaces.len());
                 for surf in &frame.surfaces {
-                    if surf.indices.is_empty() { continue; }
+                    if surf.indices.is_empty() {
+                        continue;
+                    }
                     let mut material: MaterialSpec = MaterialSpec {
                         diffuse: Some(top_diffuse.clone()),
                         gloss: Some(top_gloss.clone()),
                         ..Default::default()
                     };
                     if let Some(spec) = surf.texture_ref.as_deref() {
-                        let surface_mat = vector_object::parse_material_spec_with_prefix(
-                            spec, vo_dir.as_deref(),
-                        );
+                        let surface_mat =
+                            vector_object::parse_material_spec_with_prefix(spec, vo_dir.as_deref());
                         material = vector_object::merge_materials(&surface_mat, Some(&material));
                     }
 
@@ -250,44 +255,82 @@ impl RobotsRenderer {
                         resolve_diffuse(&material, device, queue, &mut tex_cache, read_texture)
                             .unwrap_or_else(|| (fallback_tex.clone(), false));
                     let gloss_view = resolve_texture(
-                        material.gloss.as_ref(), device, queue, &mut tex_cache, read_texture,
-                    ).unwrap_or_else(|| black_tex.clone());
+                        material.gloss.as_ref(),
+                        device,
+                        queue,
+                        &mut tex_cache,
+                        read_texture,
+                    )
+                    .unwrap_or_else(|| black_tex.clone());
                     let back_view = resolve_texture(
-                        material.back.as_ref(), device, queue, &mut tex_cache, read_texture,
-                    ).unwrap_or_else(|| black_tex.clone());
+                        material.back.as_ref(),
+                        device,
+                        queue,
+                        &mut tex_cache,
+                        read_texture,
+                    )
+                    .unwrap_or_else(|| black_tex.clone());
                     let mask_view = resolve_texture(
-                        material.mask.as_ref(), device, queue, &mut tex_cache, read_texture,
-                    ).unwrap_or_else(|| transparent_tex.clone());
+                        material.mask.as_ref(),
+                        device,
+                        queue,
+                        &mut tex_cache,
+                        read_texture,
+                    )
+                    .unwrap_or_else(|| transparent_tex.clone());
 
-                    let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("Robots Mesh IB"),
-                        contents: bytemuck::cast_slice(&surf.indices),
-                        usage: wgpu::BufferUsages::INDEX,
-                    });
-                    let mat_uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("Robots Material UB"),
-                        contents: bytemuck::bytes_of(&MaterialUniform {
-                            flags: [
-                                material.gloss.is_some() as u32,
-                                material.back.is_some() as u32,
-                                material.mask.is_some() as u32,
-                                alpha_test as u32,
-                            ],
-                            scroll: [material.scroll[0], material.scroll[1], 0.0, 0.0],
-                        }),
-                        usage: wgpu::BufferUsages::UNIFORM,
-                    });
+                    let index_buffer =
+                        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("Robots Mesh IB"),
+                            contents: bytemuck::cast_slice(&surf.indices),
+                            usage: wgpu::BufferUsages::INDEX,
+                        });
+                    let mat_uniform =
+                        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("Robots Material UB"),
+                            contents: bytemuck::bytes_of(&MaterialUniform {
+                                flags: [
+                                    material.gloss.is_some() as u32,
+                                    material.back.is_some() as u32,
+                                    material.mask.is_some() as u32,
+                                    alpha_test as u32,
+                                ],
+                                scroll: [material.scroll[0], material.scroll[1], 0.0, 0.0],
+                            }),
+                            usage: wgpu::BufferUsages::UNIFORM,
+                        });
                     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: Some("Robots BG"),
                         layout: &bgl,
                         entries: &[
-                            wgpu::BindGroupEntry { binding: 0, resource: uniform_buffer.as_entire_binding() },
-                            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&diffuse_view) },
-                            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&gloss_view) },
-                            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&back_view) },
-                            wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&mask_view) },
-                            wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::Sampler(&sampler) },
-                            wgpu::BindGroupEntry { binding: 6, resource: mat_uniform.as_entire_binding() },
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: uniform_buffer.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::TextureView(&diffuse_view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: wgpu::BindingResource::TextureView(&gloss_view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 3,
+                                resource: wgpu::BindingResource::TextureView(&back_view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 4,
+                                resource: wgpu::BindingResource::TextureView(&mask_view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 5,
+                                resource: wgpu::BindingResource::Sampler(&sampler),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 6,
+                                resource: mat_uniform.as_entire_binding(),
+                            },
                         ],
                     });
                     surfaces.push(SurfaceGpu {
@@ -304,13 +347,16 @@ impl RobotsRenderer {
                 "robots: chassis{} frames={} anims: {:?}",
                 n,
                 vo_mesh.frames.len(),
-                vo_mesh.animations.iter()
+                vo_mesh
+                    .animations
+                    .iter()
                     .map(|a| (a.name.clone(), a.frames.len()))
                     .collect::<Vec<_>>(),
             );
             let vo_mesh = std::sync::Arc::new(vo_mesh);
             crate::matrix_lib::three_g::animation::set_chassis_vo(
-                chassis_kind_index(ck), vo_mesh.clone(),
+                chassis_kind_index(ck),
+                vo_mesh.clone(),
             );
             chassis[chassis_kind_index(ck)] = Some(ChassisGpu {
                 vo_mesh,
@@ -324,7 +370,9 @@ impl RobotsRenderer {
             chassis.iter().filter(|c| c.is_some()).count(),
             total_surfaces,
         );
-        if chassis.iter().all(|c| c.is_none()) { return None; }
+        if chassis.iter().all(|c| c.is_none()) {
+            return None;
+        }
 
         Some(Self {
             pipeline,
@@ -374,11 +422,13 @@ impl RobotsRenderer {
         // iterate (need &mut for anim advance).
         let ids: Vec<_> = objs.iter_live().collect();
         for id in ids {
-            let Some(obj) = objs.get_mut(id) else { continue };
-            if !matches!(obj.core().obj_type, ObjectType::RobotAi) { continue; }
-            let robot: &mut Robot = unsafe {
-                &mut *(obj as *mut dyn MapStatic as *mut Robot)
+            let Some(obj) = objs.get_mut(id) else {
+                continue;
             };
+            if !matches!(obj.core().obj_type, ObjectType::RobotAi) {
+                continue;
+            }
+            let robot: &mut Robot = unsafe { &mut *(obj as *mut dyn MapStatic as *mut Robot) };
             let ck_idx = chassis_kind_index(robot.chassis);
             let Some(chassis_gpu) = self.chassis.get(ck_idx).and_then(|o| o.as_ref()) else {
                 continue;
@@ -391,20 +441,21 @@ impl RobotsRenderer {
             // cursor at all (falls through past every branch to the
             // `endanim` label), leaving the chassis frame frozen.
             let vo_mesh = chassis_gpu.vo_mesh.as_ref();
-            let now_ms =
-                crate::matrix_game::map::current_elapsed_ms() as f64;
+            let now_ms = crate::matrix_game::map::current_elapsed_ms() as f64;
             do_chassis_animation(robot, vo_mesh, now_ms, cms);
             // BeginMove → Move chaining (MatrixObjectRobot.cpp:1414).
-            if robot.animation == Animation::BeginMove
-                && robot.chassis_anim.is_anim_end(vo_mesh)
-            {
+            if robot.animation == Animation::BeginMove && robot.chassis_anim.is_anim_end(vo_mesh) {
                 robot.animation = Animation::Move;
                 robot.chassis_anim.set_anim_by_name(vo_mesh, "Move", true);
             }
-            let vo_frame = robot.chassis_anim.vo_frame
+            let vo_frame = robot
+                .chassis_anim
+                .vo_frame
                 .min(chassis_gpu.frames.len().saturating_sub(1));
 
-            if offset >= self.instance_capacity { break; }
+            if offset >= self.instance_capacity {
+                break;
+            }
             instance_data.push(robot_instance(robot, cx, cy, map, Some(point_lights)));
             self.draws.push(RobotDraw {
                 chassis: robot.chassis,
@@ -415,7 +466,11 @@ impl RobotsRenderer {
         }
 
         if !instance_data.is_empty() {
-            queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(&instance_data));
+            queue.write_buffer(
+                &self.instance_buffer,
+                0,
+                bytemuck::cast_slice(&instance_data),
+            );
         }
     }
 
@@ -448,7 +503,9 @@ impl RobotsRenderer {
             let Some(chassis_gpu) = self.chassis.get(ck_idx).and_then(|o| o.as_ref()) else {
                 continue;
             };
-            let Some(frame) = chassis_gpu.frames.get(draw.vo_frame) else { continue };
+            let Some(frame) = chassis_gpu.frames.get(draw.vo_frame) else {
+                continue;
+            };
             pass.set_vertex_buffer(0, chassis_gpu.vertex_buffer.slice(..));
             pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
             for surface in &frame.surfaces {
@@ -483,12 +540,7 @@ impl RobotsRenderer {
 ///
 /// ROTATE handling is stubbed — full rotation lands with the Seek
 /// rotation branch.
-fn do_chassis_animation(
-    robot: &mut Robot,
-    vo: &vector_object::VoMesh,
-    now_ms: f64,
-    cms: i32,
-) {
+fn do_chassis_animation(robot: &mut Robot, vo: &vector_object::VoMesh, now_ms: f64, cms: i32) {
     use crate::matrix_game::robot::ChassisKind::*;
     let anim = robot.animation;
 
@@ -500,9 +552,7 @@ fn do_chassis_animation(
             | Animation::BeginMoveBack
             | Animation::EndMoveBack
     );
-    if is_stay_like
-        && matches!(robot.chassis, Hovercraft | Pneumatic | AntiGravity)
-    {
+    if is_stay_like && matches!(robot.chassis, Hovercraft | Pneumatic | AntiGravity) {
         robot.chassis_anim.takt(vo, cms);
         return;
     }
@@ -520,7 +570,7 @@ fn do_chassis_animation(
         // MatrixObjectRobot.hpp:59-61.
         const ANIMSPEED_TRACK: f32 = 0.20;
         const ANIMSPEED_WHEEL: f32 = 0.36;
-        const ANIMSPEED_PNEU:  f32 = 0.155;
+        const ANIMSPEED_PNEU: f32 = 0.155;
         let animspeed = match robot.chassis {
             Track => ANIMSPEED_TRACK,
             Wheel => ANIMSPEED_WHEEL,
@@ -597,7 +647,11 @@ fn robot_instance(
     let f = {
         let v = r.forward;
         let l = v.length();
-        if l > 1e-6 { v / l } else { glam::Vec2::new(0.0, 1.0) }
+        if l > 1e-6 {
+            v / l
+        } else {
+            glam::Vec2::new(0.0, 1.0)
+        }
     };
     let forward = glam::Vec3::new(f.x, f.y, 0.0);
     let up = glam::Vec3::new(0.0, 0.0, 1.0);
@@ -609,9 +663,9 @@ fn robot_instance(
     let fwd_out = up.cross(side).normalize_or_zero();
 
     InstanceData {
-        row0: [side.x,    fwd_out.x, up.x, r.pos_x - cx],
-        row1: [side.y,    fwd_out.y, up.y, r.pos_y - cy],
-        row2: [side.z,    fwd_out.z, up.z, r.pos_z],
+        row0: [side.x, fwd_out.x, up.x, r.pos_x - cx],
+        row1: [side.y, fwd_out.y, up.y, r.pos_y - cy],
+        row2: [side.z, fwd_out.z, up.z, r.pos_z],
         row3: [0.0, 0.0, 0.0, 1.0],
         terrain_color: [terrain_r, terrain_g, terrain_b, 1.0],
         unit_offset: [0.0, 0.0, 0.0, 0.0],

@@ -344,6 +344,9 @@ mod tests {
         raw.extend_from_slice(&12u32.to_le_bytes());
         raw.extend_from_slice(&0u32.to_le_bytes());
         raw.extend_from_slice(&0i32.to_le_bytes());
-        assert!(DataBuf::parse(&raw).is_ok(), "zero element_size should parse");
+        assert!(
+            DataBuf::parse(&raw).is_ok(),
+            "zero element_size should parse"
+        );
     }
 }

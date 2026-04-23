@@ -29,7 +29,7 @@ use bytemuck::{Pod, Zeroable};
 
 /// MS_RAMKA_COLOR  (MatrixMultiSelection.cpp:18) — ARGB 0xFF00FF00,
 /// bright opaque green. The exact-rect line strip color.
-const MS_RAMKA_COLOR_RGBA:  [f32; 4] = [0.0, 1.0, 0.0, 1.0];
+const MS_RAMKA_COLOR_RGBA: [f32; 4] = [0.0, 1.0, 0.0, 1.0];
 /// MS_RAMKA_COLOR2 (MatrixMultiSelection.cpp:19) — ARGB 0x80000000,
 /// 50%-alpha black. The ±1px line-strip color — the two dark strips
 /// make the bright green line read as a beveled edge.
@@ -142,20 +142,19 @@ impl MarqueeRenderer {
             mapped_at_creation: false,
         });
 
-        Self { pipeline, vertex_buffer, vertex_count: 0, dip_release_ms: None }
+        Self {
+            pipeline,
+            vertex_buffer,
+            vertex_count: 0,
+            dip_release_ms: None,
+        }
     }
 
     /// Push a live marquee rect (the user is still dragging). Pixel
     /// coords, top-left origin, axis-aligned. `rect = [x0, y0, x1, y1]`
     /// with no ordering constraint — the C++ `Update` normalises via
     /// the XOR swap at :70-71 so `(LT, RB)` always maps to the min/max.
-    pub fn set_rect(
-        &mut self,
-        queue: &wgpu::Queue,
-        rect: [f32; 4],
-        screen_w: f32,
-        screen_h: f32,
-    ) {
+    pub fn set_rect(&mut self, queue: &wgpu::Queue, rect: [f32; 4], screen_w: f32, screen_h: f32) {
         self.dip_release_ms = None;
         self.upload_rect(queue, rect, screen_w, screen_h, 1.0);
     }
@@ -179,7 +178,9 @@ impl MarqueeRenderer {
         screen_w: f32,
         screen_h: f32,
     ) {
-        let Some(t0) = self.dip_release_ms else { return };
+        let Some(t0) = self.dip_release_ms else {
+            return;
+        };
         let cdt = (elapsed_ms - t0).max(0.0);
         if cdt > MS_DIP_TIME_MS {
             self.clear();
@@ -218,8 +219,8 @@ impl MarqueeRenderer {
         // an independent strip (the primitive-restart / breaking logic
         // in wgpu is otherwise implicit — subsequent draws re-start
         // the strip).
-        pass.draw(0..5, 0..1);   // exact rect    — green
-        pass.draw(5..10, 0..1);  // outer (+1 px) — 50% black
+        pass.draw(0..5, 0..1); // exact rect    — green
+        pass.draw(5..10, 0..1); // outer (+1 px) — 50% black
         pass.draw(10..15, 0..1); // inner (−1 px) — 50% black
     }
 
@@ -240,8 +241,12 @@ impl MarqueeRenderer {
         let [mut x0, mut y0, mut x1, mut y1] = rect;
         // MatrixMultiSelection.cpp:70-71 normalises the rect so
         // `(LT, RB)` always bound the min/max corners — same intent.
-        if x0 > x1 { std::mem::swap(&mut x0, &mut x1); }
-        if y0 > y1 { std::mem::swap(&mut y0, &mut y1); }
+        if x0 > x1 {
+            std::mem::swap(&mut x0, &mut x1);
+        }
+        if y0 > y1 {
+            std::mem::swap(&mut y0, &mut y1);
+        }
 
         let sw = screen_w;
         let sh = screen_h;
@@ -255,19 +260,89 @@ impl MarqueeRenderer {
             // Strip 2: outer rect (+1 px on every side) — MS_RAMKA_COLOR2.
             // Post-shifts from the C++ :168-178 applied to v2[0..3]:
             //   TL −= (1, 1), TR += (1, -1), BR += (1, 1), BL += (-1, 1).
-            strip_vertex(x0 - 1.0, y0 - 1.0, sw, sh, MS_RAMKA_COLOR2_RGBA, alpha_scale),
-            strip_vertex(x1 + 1.0, y0 - 1.0, sw, sh, MS_RAMKA_COLOR2_RGBA, alpha_scale),
-            strip_vertex(x1 + 1.0, y1 + 1.0, sw, sh, MS_RAMKA_COLOR2_RGBA, alpha_scale),
-            strip_vertex(x0 - 1.0, y1 + 1.0, sw, sh, MS_RAMKA_COLOR2_RGBA, alpha_scale),
-            strip_vertex(x0 - 1.0, y0 - 1.0, sw, sh, MS_RAMKA_COLOR2_RGBA, alpha_scale),
+            strip_vertex(
+                x0 - 1.0,
+                y0 - 1.0,
+                sw,
+                sh,
+                MS_RAMKA_COLOR2_RGBA,
+                alpha_scale,
+            ),
+            strip_vertex(
+                x1 + 1.0,
+                y0 - 1.0,
+                sw,
+                sh,
+                MS_RAMKA_COLOR2_RGBA,
+                alpha_scale,
+            ),
+            strip_vertex(
+                x1 + 1.0,
+                y1 + 1.0,
+                sw,
+                sh,
+                MS_RAMKA_COLOR2_RGBA,
+                alpha_scale,
+            ),
+            strip_vertex(
+                x0 - 1.0,
+                y1 + 1.0,
+                sw,
+                sh,
+                MS_RAMKA_COLOR2_RGBA,
+                alpha_scale,
+            ),
+            strip_vertex(
+                x0 - 1.0,
+                y0 - 1.0,
+                sw,
+                sh,
+                MS_RAMKA_COLOR2_RGBA,
+                alpha_scale,
+            ),
             // Strip 3: inner rect (−1 px on every side) — MS_RAMKA_COLOR2.
             // Post-shifts from :185-196: outer shifts + (2, 2) / (-2, 2) /
             // (-2, -2) / (2, -2) land each corner 1 px inside the exact rect.
-            strip_vertex(x0 + 1.0, y0 + 1.0, sw, sh, MS_RAMKA_COLOR2_RGBA, alpha_scale),
-            strip_vertex(x1 - 1.0, y0 + 1.0, sw, sh, MS_RAMKA_COLOR2_RGBA, alpha_scale),
-            strip_vertex(x1 - 1.0, y1 - 1.0, sw, sh, MS_RAMKA_COLOR2_RGBA, alpha_scale),
-            strip_vertex(x0 + 1.0, y1 - 1.0, sw, sh, MS_RAMKA_COLOR2_RGBA, alpha_scale),
-            strip_vertex(x0 + 1.0, y0 + 1.0, sw, sh, MS_RAMKA_COLOR2_RGBA, alpha_scale),
+            strip_vertex(
+                x0 + 1.0,
+                y0 + 1.0,
+                sw,
+                sh,
+                MS_RAMKA_COLOR2_RGBA,
+                alpha_scale,
+            ),
+            strip_vertex(
+                x1 - 1.0,
+                y0 + 1.0,
+                sw,
+                sh,
+                MS_RAMKA_COLOR2_RGBA,
+                alpha_scale,
+            ),
+            strip_vertex(
+                x1 - 1.0,
+                y1 - 1.0,
+                sw,
+                sh,
+                MS_RAMKA_COLOR2_RGBA,
+                alpha_scale,
+            ),
+            strip_vertex(
+                x0 + 1.0,
+                y1 - 1.0,
+                sw,
+                sh,
+                MS_RAMKA_COLOR2_RGBA,
+                alpha_scale,
+            ),
+            strip_vertex(
+                x0 + 1.0,
+                y0 + 1.0,
+                sw,
+                sh,
+                MS_RAMKA_COLOR2_RGBA,
+                alpha_scale,
+            ),
         ];
         self.vertex_count = MAX_VERTS as u32;
         queue.write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&verts));

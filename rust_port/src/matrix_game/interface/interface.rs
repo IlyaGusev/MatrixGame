@@ -97,7 +97,7 @@ impl CInterface {
                 let Some(kind) = (match kind_name.as_str() {
                     "Button" => Some(ElementKind::Button),
                     "Static" => Some(ElementKind::Static),
-                    "Image"  => Some(ElementKind::Image),
+                    "Image" => Some(ElementKind::Image),
                     _ => None,
                 }) else {
                     continue;
@@ -110,7 +110,11 @@ impl CInterface {
 
         log::info!(
             "iface: loaded {} design=({},{}) id={} elements={}",
-            name, design_x, design_y, id, elements.len()
+            name,
+            design_x,
+            design_y,
+            id,
+            elements.len()
         );
         Some(Self {
             name: name.to_string(),
@@ -128,19 +132,17 @@ impl CInterface {
     /// Find a named element in this panel. Case-sensitive (matches
     /// the C++ `CWStr::operator==` comparison at CInterface.cpp:
     /// 1442, :1501, etc.).
-    pub fn element_by_name(&self, name: &str) -> Option<&crate::matrix_game::interface::iface_element::IFaceElement> {
+    pub fn element_by_name(
+        &self,
+        name: &str,
+    ) -> Option<&crate::matrix_game::interface::iface_element::IFaceElement> {
         self.elements.iter().find(|e| e.name == name)
     }
 
     /// Screen-space pixel rect of a named element. Computed from the
     /// panel's resolved_pos + the element's local (pos_x, pos_y,
     /// size_x, size_y) scaled by `scale`.
-    pub fn element_rect(
-        &self,
-        name: &str,
-        screen_w: f32,
-        screen_h: f32,
-    ) -> Option<[f32; 4]> {
+    pub fn element_rect(&self, name: &str, screen_w: f32, screen_h: f32) -> Option<[f32; 4]> {
         let e = self.element_by_name(name)?;
         let scale = (screen_h / DESIGN_H).max(0.1);
         let panel = self.resolved_pos(screen_w, screen_h, scale);
@@ -194,7 +196,10 @@ impl CInterface {
         }
 
         // Step 4 — building-specific art (CInterface.cpp:1576-1634).
-        if matches!(ctx.curr_sel, CurrSel::BaseSelected | CurrSel::BuildingSelected) {
+        if matches!(
+            ctx.curr_sel,
+            CurrSel::BaseSelected | CurrSel::BuildingSelected
+        ) {
             let kind = ctx.building_kind;
             let empty = ctx.building_stack_empty;
             let has_items = ctx.building_stack_items > 0;
@@ -203,16 +208,18 @@ impl CInterface {
                     "bopis" if empty => e.set_visible(true),
                     "mbres" if empty && kind == Some(BuildingType::Base) => e.set_visible(true),
                     "tfres" if empty && kind == Some(BuildingType::Titan) => e.set_visible(true),
-                    "elfres" if empty && kind == Some(BuildingType::Electronic) => e.set_visible(true),
+                    "elfres" if empty && kind == Some(BuildingType::Electronic) => {
+                        e.set_visible(true)
+                    }
                     "enfres" if empty && kind == Some(BuildingType::Energy) => e.set_visible(true),
                     "pfres" if empty && kind == Some(BuildingType::Plasma) => e.set_visible(true),
                     // Per-kind platform / plant art.
                     "basepl" if kind == Some(BuildingType::Base) => e.set_visible(true),
-                    "titpl"  if kind == Some(BuildingType::Titan) => e.set_visible(true),
+                    "titpl" if kind == Some(BuildingType::Titan) => e.set_visible(true),
                     "plaspl" if kind == Some(BuildingType::Plasma) => e.set_visible(true),
                     "elecpl" if kind == Some(BuildingType::Electronic) => e.set_visible(true),
-                    "batpl"  if kind == Some(BuildingType::Energy) => e.set_visible(true),
-                    "reppl"  if kind == Some(BuildingType::Repair) => e.set_visible(true),
+                    "batpl" if kind == Some(BuildingType::Energy) => e.set_visible(true),
+                    "reppl" if kind == Some(BuildingType::Repair) => e.set_visible(true),
                     // Build buttons.
                     "buro" if kind == Some(BuildingType::Base) => e.set_visible(true),
                     "buca" => e.set_visible(true),
@@ -259,11 +266,7 @@ impl CInterface {
 /// Port of the per-kind element-parse branches in `CInterface::Load`
 /// (CInterface.cpp:222 onward — `Static` at :540+, `Button` at :236+,
 /// `Image` at :630+).
-fn load_element(
-    stor: &Storage,
-    rec: &str,
-    kind: ElementKind,
-) -> Option<IFaceElement> {
+fn load_element(stor: &Storage, rec: &str, kind: ElementKind) -> Option<IFaceElement> {
     let name = stor.block_param(rec, "Name").unwrap_or_default();
     let id = parse_i32(stor, rec, "id").unwrap_or(0);
     let group = parse_i32(stor, rec, "group").unwrap_or(0);

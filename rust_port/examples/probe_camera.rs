@@ -16,7 +16,11 @@ fn main() {
         "CamInRobotForward0",
         "CamInRobotForward1",
     ] {
-        println!("  {} = {:?}", key, stor.block_param(&cam_rec, key).as_deref());
+        println!(
+            "  {} = {:?}",
+            key,
+            stor.block_param(&cam_rec, key).as_deref()
+        );
     }
 
     for sub in ["Strategy", "InRobot"] {

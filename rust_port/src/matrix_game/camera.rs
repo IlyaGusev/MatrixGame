@@ -477,9 +477,13 @@ impl Camera {
     /// Map center X the camera subtracts from every world position
     /// before projection (so renderers + hit-tests operate in the
     /// same centered space). Equals `world_width / 2`.
-    pub fn map_cx(&self) -> f32 { self.map_cx }
+    pub fn map_cx(&self) -> f32 {
+        self.map_cx
+    }
     /// Map center Y — see [`map_cx`].
-    pub fn map_cy(&self) -> f32 { self.map_cy }
+    pub fn map_cy(&self) -> f32 {
+        self.map_cy
+    }
 
     pub fn view_proj(&self) -> Mat4 {
         let proj = Mat4::perspective_lh(CAM_FOV, self.aspect, self.near, self.far);
@@ -527,9 +531,9 @@ impl Camera {
         let ny = 1.0 - 2.0 * sy / screen_h;
         let inv_vp = self.view_proj().inverse();
         let near_w = inv_vp * glam::Vec4::new(nx, ny, 0.0, 1.0);
-        let far_w  = inv_vp * glam::Vec4::new(nx, ny, 1.0, 1.0);
+        let far_w = inv_vp * glam::Vec4::new(nx, ny, 1.0, 1.0);
         let near = near_w.truncate() / near_w.w;
-        let far  = far_w.truncate()  / far_w.w;
+        let far = far_w.truncate() / far_w.w;
         // The camera operates in *centered* world space (view_matrix
         // translates by `-link_point`, which itself subtracts map
         // center). Shift back to uncentered so callers can hit-test

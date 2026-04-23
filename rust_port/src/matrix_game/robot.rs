@@ -8,11 +8,11 @@
 //! selection queries do the right thing. AI and combat land with
 //! their owning subsystems.
 
+use crate::matrix_game::logic::{self, ROBOT_MOVECELLS_PER_SIZE};
 use crate::matrix_game::map::GameMap;
 use crate::matrix_game::map_static::{
-    MapStatic, ObjectCore, ObjectId, Objects, ObjectType, MR_ALL, MR_MATRIX,
+    MapStatic, ObjectCore, ObjectId, ObjectType, Objects, MR_ALL, MR_MATRIX,
 };
-use crate::matrix_game::logic::{self, ROBOT_MOVECELLS_PER_SIZE};
 use crate::matrix_game::map_trace::{self, MovePath, ROBOT_FOOTPRINT_HALF};
 use crate::matrix_game::orders::{Order, OrderList, OrderPhase, OrderType};
 use crate::matrix_game::rnd::Rnd;
@@ -42,11 +42,11 @@ pub enum RobotState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ChassisKind {
-    Pneumatic   = 0,
-    Wheel       = 1,
-    Track       = 2,
+    Pneumatic = 0,
+    Wheel = 1,
+    Track = 2,
     AntiGravity = 3,
-    Hovercraft  = 4,
+    Hovercraft = 4,
 }
 
 impl ChassisKind {
@@ -55,11 +55,11 @@ impl ChassisKind {
     /// scattered through MatrixRobot.cpp).
     pub fn spawn_z_offset(self) -> f32 {
         match self {
-            ChassisKind::Pneumatic   => 9.0,
-            ChassisKind::Wheel       => 8.0,
-            ChassisKind::Track       => 5.0,
+            ChassisKind::Pneumatic => 9.0,
+            ChassisKind::Wheel => 8.0,
+            ChassisKind::Track => 5.0,
             ChassisKind::AntiGravity => 5.0,
-            ChassisKind::Hovercraft  => 7.0,
+            ChassisKind::Hovercraft => 7.0,
         }
     }
 }
@@ -281,8 +281,7 @@ impl Robot {
         // that differs from current, reset `m_NextAnimTime` to the
         // current game time so speed-based advancement starts fresh.
         if target != self.animation {
-            self.chassis_anim.next_anim_time =
-                crate::matrix_game::map::current_elapsed_ms() as f64;
+            self.chassis_anim.next_anim_time = crate::matrix_game::map::current_elapsed_ms() as f64;
         }
 
         if target == Animation::Move {
@@ -400,9 +399,8 @@ impl Robot {
         self.orders.remove_type(OrderType::MoveTo);
         self.orders.remove_type(OrderType::MoveToBack);
         self.orders.remove_type(OrderType::StopMove);
-        self.orders.push_top(Order::set(
-            OrderType::MoveTo, mx as f32, my as f32, 0.0, 0,
-        ));
+        self.orders
+            .push_top(Order::set(OrderType::MoveTo, mx as f32, my as f32, 0.0, 0));
         self.des_x = mx;
         self.des_y = my;
         self.move_path.clear();
@@ -450,8 +448,8 @@ impl Robot {
     /// between forward and dest, fed back into Seek's
     /// end-of-path taper.
     pub fn rotate_robot(&mut self, cms: i32, dest: glam::Vec2) -> (bool, f32) {
-        let max_rot = crate::matrix_game::config::global()
-            .chassis.rotation_speed[self.chassis as usize];
+        let max_rot =
+            crate::matrix_game::config::global().chassis.rotation_speed[self.chassis as usize];
         let sync_mul = (cms as f32) / 10.0;
         let rot_speed = max_rot * sync_mul;
 
@@ -460,8 +458,7 @@ impl Robot {
         let forward = self.forward.normalize_or_zero();
 
         // cos of angle between forward and dest direction.
-        let cos1 = (forward.x * dest_dir_n.x + forward.y * dest_dir_n.y)
-            .clamp(-1.0, 1.0);
+        let cos1 = (forward.x * dest_dir_n.x + forward.y * dest_dir_n.y).clamp(-1.0, 1.0);
         let angle1 = cos1.acos();
 
         // `vec` = forward rotated 90° clockwise (= forward.y, -forward.x).
@@ -513,13 +510,7 @@ impl Robot {
     /// The C++ variant also has a "rotate if forward angle >70°"
     /// early-out; we skip the RotateRobot branch (rotation lands
     /// with the full Seek port).
-    pub fn get_lost(
-        &mut self,
-        map: &GameMap,
-        objs: &Objects,
-        v: glam::Vec2,
-        rng: &mut Rnd,
-    ) {
+    pub fn get_lost(&mut self, map: &GameMap, objs: &Objects, v: glam::Vec2, rng: &mut Rnd) {
         // Left / right perpendiculars.
         let v_left = glam::Vec2::new(v.y, -v.x);
         let v_right = -v_left;
@@ -535,11 +526,21 @@ impl Robot {
         let (mx, my) = map.world_to_move(lost.x, lost.y);
         let chassis = self.chassis as usize;
         let Some((dx, dy)) = logic::place_find_near(
-            map, objs, chassis, ROBOT_MOVECELLS_PER_SIZE, mx, my, 4, None,
+            map,
+            objs,
+            chassis,
+            ROBOT_MOVECELLS_PER_SIZE,
+            mx,
+            my,
+            4,
+            None,
         ) else {
             return;
         };
-        if !self.orders.has_with_phase(OrderType::MoveTo, OrderPhase::GetingLost) {
+        if !self
+            .orders
+            .has_with_phase(OrderType::MoveTo, OrderPhase::GetingLost)
+        {
             self.move_to(dx, dy);
             // Tag the newly-pushed order with ROP_GETING_LOST
             // (MatrixRobot.cpp:5230-5234).
@@ -568,31 +569,43 @@ impl Robot {
     /// 1112 — minus the arcade / capture-chain branches. If there's
     /// no active move-path, computes one via A*; if there is, hands
     /// off to `move_by_move_path`.
-    fn dispatch_move_to(
-        &mut self,
-        cms: i32,
-        map: &GameMap,
-        objs: &Objects,
-        elapsed_ms: i64,
-    ) {
+    fn dispatch_move_to(&mut self, cms: i32, map: &GameMap, objs: &Objects, elapsed_ms: i64) {
         self.map_pos_calc(map);
 
         // Recompute path if stale / empty.
         if !self.move_path.is_active() {
             let chassis = self.chassis as usize;
             let start = match logic::place_find_near(
-                map, objs, chassis, ROBOT_MOVECELLS_PER_SIZE,
-                self.map_x, self.map_y, 4, None,
+                map,
+                objs,
+                chassis,
+                ROBOT_MOVECELLS_PER_SIZE,
+                self.map_x,
+                self.map_y,
+                4,
+                None,
             ) {
                 Some((x, y)) => map_trace::MovePt::new(x, y),
-                None => { self.stop_moving(); return; }
+                None => {
+                    self.stop_moving();
+                    return;
+                }
             };
             let goal = match logic::place_find_near(
-                map, objs, chassis, ROBOT_MOVECELLS_PER_SIZE,
-                self.des_x, self.des_y, 4, None,
+                map,
+                objs,
+                chassis,
+                ROBOT_MOVECELLS_PER_SIZE,
+                self.des_x,
+                self.des_y,
+                4,
+                None,
             ) {
                 Some((x, y)) => map_trace::MovePt::new(x, y),
-                None => { self.stop_moving(); return; }
+                None => {
+                    self.stop_moving();
+                    return;
+                }
             };
             // Port of the `other_des` / `other_path_list` collection
             // at MatrixRobot.cpp:1613-1645. Each other live robot /
@@ -602,15 +615,17 @@ impl Robot {
             // the C++ weight-30/200 scheme at MatrixLogic.cpp:1285,1297.
             let mut blockers: Vec<map_trace::Blocker> = Vec::new();
             for id in objs.iter_live() {
-                let Some(other_obj) = objs.get(id) else { continue };
-                if !matches!(other_obj.core().obj_type, ObjectType::RobotAi) { continue; }
-                let other: &Robot = unsafe {
-                    &*(other_obj as *const dyn MapStatic as *const Robot)
+                let Some(other_obj) = objs.get(id) else {
+                    continue;
                 };
+                if !matches!(other_obj.core().obj_type, ObjectType::RobotAi) {
+                    continue;
+                }
+                let other: &Robot =
+                    unsafe { &*(other_obj as *const dyn MapStatic as *const Robot) };
                 let (omx, omy) = map.world_to_move(other.pos_x, other.pos_y);
-                let pos = map_trace::MovePt::new(
-                    omx - ROBOT_FOOTPRINT_HALF, omy - ROBOT_FOOTPRINT_HALF,
-                );
+                let pos =
+                    map_trace::MovePt::new(omx - ROBOT_FOOTPRINT_HALF, omy - ROBOT_FOOTPRINT_HALF);
                 // C++ :1626-1645: if MoveTo exists, blocker =
                 // (current_pos, move_to_dest); otherwise blocker =
                 // (none, current_pos) — robot is stationary at its
@@ -657,13 +672,7 @@ impl Robot {
     /// when the projected progress along the segment exceeds the
     /// segment length (stop on the final waypoint). The stuck-watchdog
     /// + terrain-Z + ONWATER flag update all live here too.
-    fn move_by_move_path(
-        &mut self,
-        cms: i32,
-        map: &GameMap,
-        objs: &Objects,
-        elapsed_ms: i64,
-    ) {
+    fn move_by_move_path(&mut self, cms: i32, map: &GameMap, objs: &Objects, elapsed_ms: i64) {
         let Some((sou_pt, des_pt)) = self.move_path.current_segment() else {
             self.stop_moving();
             return;
@@ -695,8 +704,7 @@ impl Robot {
         let proj = me.dot(seg) / seg_len_sq.sqrt();
         let seg_len = seg_len_sq.sqrt();
         let reached = if last_seg {
-            (glam::Vec2::new(self.pos_x - des_x, self.pos_y - des_y))
-                .length_squared() < 0.2
+            (glam::Vec2::new(self.pos_x - des_x, self.pos_y - des_y)).length_squared() < 0.2
         } else {
             proj >= seg_len
         };
@@ -844,8 +852,7 @@ impl Robot {
         // Water + slope correction (MatrixRobot.cpp:2420-2442).
         let cfg = crate::matrix_game::config::global();
         let chassis_idx = self.chassis as usize;
-        let mut k = if (self.object_state
-            & crate::matrix_game::map_static::ROBOT_FLAG_ONWATER) != 0
+        let mut k = if (self.object_state & crate::matrix_game::map_static::ROBOT_FLAG_ONWATER) != 0
         {
             cfg.chassis.water_corr[chassis_idx]
         } else {
@@ -908,11 +915,7 @@ impl Robot {
     /// original but simplified to pairwise separation until the full
     /// group AI lands (m_ColSpeed still resets to 100 in the no-far
     /// branch at :3070 — the observable speed clamp).
-    fn robot_to_object_collision(
-        &mut self,
-        objs: &Objects,
-        vel: glam::Vec2,
-    ) -> glam::Vec2 {
+    fn robot_to_object_collision(&mut self, objs: &Objects, vel: glam::Vec2) -> glam::Vec2 {
         const COLLIDE_BOT_R: f32 = 18.0;
         const COLLIDE_BOT_2R: f32 = COLLIDE_BOT_R + COLLIDE_BOT_R;
 
@@ -925,11 +928,13 @@ impl Robot {
         let mut far_col = false;
 
         for id in objs.iter_live() {
-            let Some(other_obj) = objs.get(id) else { continue };
-            if !matches!(other_obj.core().obj_type, ObjectType::RobotAi) { continue; }
-            let other: &Robot = unsafe {
-                &*(other_obj as *const dyn MapStatic as *const Robot)
+            let Some(other_obj) = objs.get(id) else {
+                continue;
             };
+            if !matches!(other_obj.core().obj_type, ObjectType::RobotAi) {
+                continue;
+            }
+            let other: &Robot = unsafe { &*(other_obj as *const dyn MapStatic as *const Robot) };
             let their_pos = glam::Vec2::new(other.pos_x, other.pos_y);
             let dv = my_pos - their_pos;
             let dist = dv.length();
@@ -971,7 +976,10 @@ impl Robot {
         let mut z = map.get_z(self.pos_x, self.pos_y);
         if z < WATER_LEVEL {
             self.object_state |= ROBOT_FLAG_ONWATER;
-            if matches!(self.chassis, ChassisKind::Hovercraft | ChassisKind::AntiGravity) {
+            if matches!(
+                self.chassis,
+                ChassisKind::Hovercraft | ChassisKind::AntiGravity
+            ) {
                 z = WATER_LEVEL;
             }
             // C++ also calls `MustDie()` when `z < WATER_LEVEL - 100`
@@ -1012,7 +1020,9 @@ fn rotate_vec2(v: glam::Vec2, angle: f32) -> glam::Vec2 {
 /// Port of the `LERPFLOAT(k, c1, c2)` macro from
 /// `MatrixLib/3G/include/Math3D.hpp:22` — `((k) * (c2-c1) + c1)`.
 #[inline]
-fn lerp(k: f32, c1: f32, c2: f32) -> f32 { k * (c2 - c1) + c1 }
+fn lerp(k: f32, c1: f32, c2: f32) -> f32 {
+    k * (c2 - c1) + c1
+}
 
 /// Port of the slope term in `Seek` (MatrixRobot.cpp:2425-2430). The
 /// C++ reads `m_Core->m_Matrix._21/_22/_23` — the Y-axis of the
@@ -1026,7 +1036,7 @@ fn lerp(k: f32, c1: f32, c2: f32) -> f32 { k * (c2 - c1) + c1 }
 fn terrain_slope_along(map: &GameMap, x: f32, y: f32, forward: glam::Vec2) -> f32 {
     const EPS: f32 = 1.0;
     let z_forward = map.get_z(x + EPS * forward.x, y + EPS * forward.y);
-    let z_back    = map.get_z(x - EPS * forward.x, y - EPS * forward.y);
+    let z_back = map.get_z(x - EPS * forward.x, y - EPS * forward.y);
     let tan_pitch = (z_forward - z_back) / (2.0 * EPS);
     tan_pitch / (1.0 + tan_pitch * tan_pitch).sqrt()
 }
@@ -1048,9 +1058,9 @@ const COLLIDE_SPHERE_R: f32 = GameMap::GLOBAL_SCALE_MOVE / 2.1_f32;
 /// `COLLIDE_BOT_R` at `p` overlaps the closed AABB `[v_min, v_max]`.
 /// On overlap returns `Some((distance_sq, dsx, dsy))` where:
 ///   - `distance_sq` — squared distance from `p` to the nearest point
-///      on the AABB (0 when `p` is inside);
+///     on the AABB (0 when `p` is inside);
 ///   - `dsx` / `dsy` — per-axis squared distances (used by the corner
-///      picker at :3459 to decide whether to push along X or Y).
+///     picker at :3459 to decide whether to push along X or Y).
 fn sphere_to_aabb_check(
     p: glam::Vec2,
     v_min: glam::Vec2,
@@ -1107,7 +1117,10 @@ fn sphere_to_aabb(
 ) -> glam::Vec2 {
     const GLOBAL_SCALE_MOVE: f32 = GameMap::GLOBAL_SCALE_MOVE;
 
-    let lu = glam::Vec2::new(cell_x as f32 * GLOBAL_SCALE_MOVE, cell_y as f32 * GLOBAL_SCALE_MOVE);
+    let lu = glam::Vec2::new(
+        cell_x as f32 * GLOBAL_SCALE_MOVE,
+        cell_y as f32 * GLOBAL_SCALE_MOVE,
+    );
     let rd = lu + glam::Vec2::new(GLOBAL_SCALE_MOVE, GLOBAL_SCALE_MOVE);
 
     let Some((dcol, _dsx_init, _dsy_init)) = sphere_to_aabb_check(pos, lu, rd) else {
@@ -1124,15 +1137,31 @@ fn sphere_to_aabb(
         let half = GLOBAL_SCALE_MOVE * 0.5;
         if pos.x > lu.x + half {
             if pos.y < lu.y + half {
-                if (corner & 16) != 0 { zb = corner & 16; } else { cr = corner & 1; }
+                if (corner & 16) != 0 {
+                    zb = corner & 16;
+                } else {
+                    cr = corner & 1;
+                }
             } else {
-                if (corner & 32) != 0 { zb = corner & 32; } else { cr = corner & 2; }
+                if (corner & 32) != 0 {
+                    zb = corner & 32;
+                } else {
+                    cr = corner & 2;
+                }
             }
         } else {
             if pos.y < lu.y + half {
-                if (corner & 128) != 0 { zb = corner & 128; } else { cr = corner & 8; }
+                if (corner & 128) != 0 {
+                    zb = corner & 128;
+                } else {
+                    cr = corner & 8;
+                }
             } else {
-                if (corner & 64)  != 0 { zb = corner & 64;  } else { cr = corner & 4; }
+                if (corner & 64) != 0 {
+                    zb = corner & 64;
+                } else {
+                    cr = corner & 4;
+                }
             }
         }
 
@@ -1147,8 +1176,10 @@ fn sphere_to_aabb(
                 let point = lu + proj;
                 let res = pos - point;
                 let res_len = res.length();
-                if point.x >= lu.x && point.x <= rd.x
-                    && point.y >= lu.y && point.y <= rd.y
+                if point.x >= lu.x
+                    && point.x <= rd.x
+                    && point.y >= lu.y
+                    && point.y <= rd.y
                     && res_len < COLLIDE_BOT_R
                 {
                     let cor = COLLIDE_BOT_R - res_len;
@@ -1162,8 +1193,10 @@ fn sphere_to_aabb(
                 let point = glam::Vec2::new(rd.x + proj.x, lu.y + proj.y);
                 let res = pos - point;
                 let res_len = res.length();
-                if point.x >= lu.x && point.x <= rd.x
-                    && point.y >= lu.y && point.y <= rd.y
+                if point.x >= lu.x
+                    && point.x <= rd.x
+                    && point.y >= lu.y
+                    && point.y <= rd.y
                     && res_len < COLLIDE_BOT_R
                 {
                     let cor = COLLIDE_BOT_R - res_len;
@@ -1200,11 +1233,23 @@ fn sphere_to_aabb(
     let mut angle: i32 = 8;
 
     let a = (pos - glam::Vec2::new(rd.x, lu.y)).length_squared();
-    if a < prev_min { prev_min = a; min_corner = glam::Vec2::new(rd.x, lu.y); angle = 1; }
+    if a < prev_min {
+        prev_min = a;
+        min_corner = glam::Vec2::new(rd.x, lu.y);
+        angle = 1;
+    }
     let a = (pos - rd).length_squared();
-    if a < prev_min { prev_min = a; min_corner = rd; angle = 2; }
+    if a < prev_min {
+        prev_min = a;
+        min_corner = rd;
+        angle = 2;
+    }
     let a = (pos - glam::Vec2::new(lu.x, rd.y)).length_squared();
-    if a < prev_min { prev_min = a; min_corner = glam::Vec2::new(lu.x, rd.y); angle = 4; }
+    if a < prev_min {
+        prev_min = a;
+        min_corner = glam::Vec2::new(lu.x, rd.y);
+        angle = 4;
+    }
     let _ = prev_min;
 
     // Neighbor-cell consultation: the C++ reads the two adjacent
@@ -1212,20 +1257,36 @@ fn sphere_to_aabb(
     // (both neighbors blocked → no push; one blocked → switch from
     // single-axis push to full vector push via `_GOTCHA_`).
     let neighbor_type = |nx: i32, ny: i32| -> u8 {
-        if nx < 0 || ny < 0 { return 0xff; }
+        if nx < 0 || ny < 0 {
+            return 0xff;
+        }
         if (nx as usize) >= map.size_move_x || (ny as usize) >= map.size_move_y {
             return 0xff;
         }
-        map.move_cell(nx, ny).map(|c| c.get_type(chassis_idx)).unwrap_or(0xff)
+        map.move_cell(nx, ny)
+            .map(|c| c.get_type(chassis_idx))
+            .unwrap_or(0xff)
     };
     let (a1, a2) = match angle {
-        1 => (neighbor_type(cell_x + 1, cell_y), neighbor_type(cell_x, cell_y - 1)),
-        2 => (neighbor_type(cell_x + 1, cell_y), neighbor_type(cell_x, cell_y + 1)),
-        4 => (neighbor_type(cell_x - 1, cell_y), neighbor_type(cell_x, cell_y + 1)),
-        _ => (neighbor_type(cell_x - 1, cell_y), neighbor_type(cell_x, cell_y - 1)),
+        1 => (
+            neighbor_type(cell_x + 1, cell_y),
+            neighbor_type(cell_x, cell_y - 1),
+        ),
+        2 => (
+            neighbor_type(cell_x + 1, cell_y),
+            neighbor_type(cell_x, cell_y + 1),
+        ),
+        4 => (
+            neighbor_type(cell_x - 1, cell_y),
+            neighbor_type(cell_x, cell_y + 1),
+        ),
+        _ => (
+            neighbor_type(cell_x - 1, cell_y),
+            neighbor_type(cell_x, cell_y - 1),
+        ),
     };
     let blocked_both = (a1 > 15 && a1 != 255) && (a2 > 15 && a2 != 255);
-    let blocked_any  = (a1 > 15 && a1 != 255) || (a2 > 15 && a2 != 255);
+    let blocked_any = (a1 > 15 && a1 != 255) || (a2 > 15 && a2 != 255);
     if blocked_both {
         return glam::Vec2::ZERO;
     }
@@ -1305,10 +1366,7 @@ fn sphere_robot_to_aabb_obstacle_collision(
     const GLOBAL_SCALE_MOVE: f32 = GameMap::GLOBAL_SCALE_MOVE;
     let inv_scale_move = 1.0 / GLOBAL_SCALE_MOVE;
 
-    let mut robot_pos = glam::Vec2::new(
-        pos_x + corr.x + vel.x,
-        pos_y + corr.y + vel.y,
-    );
+    let mut robot_pos = glam::Vec2::new(pos_x + corr.x + vel.x, pos_y + corr.y + vel.y);
     let oldpos = robot_pos;
 
     // Corner cache: 6×6 of `GetType(chassis)` bytes (COLLIDE_FIELD_R=3).
@@ -1329,8 +1387,12 @@ fn sphere_robot_to_aabb_obstacle_collision(
         let y1_raw = y0_raw + COLLIDE_FIELD_R * 2;
 
         // Outside map at all — mirror C++ early-exit at :2752-2755.
-        if x1_raw < 0 || y1_raw < 0 { break; }
-        if x0_raw > size_move_x || y0_raw > size_move_y { break; }
+        if x1_raw < 0 || y1_raw < 0 {
+            break;
+        }
+        if x0_raw > size_move_x || y0_raw > size_move_y {
+            break;
+        }
 
         let x0 = x0_raw.max(0);
         let y0 = y0_raw.max(0);
@@ -1339,13 +1401,18 @@ fn sphere_robot_to_aabb_obstacle_collision(
 
         // Recompute the corner cache only when the window shifted.
         if calc_for_x != x0_raw || calc_for_y != y0_raw {
-            for i in corners.iter_mut() { *i = 0xff; }
+            for i in corners.iter_mut() {
+                *i = 0xff;
+            }
             for y in y0..y1 {
                 for x in x0..x1 {
                     let lx = (x - x0_raw) as usize;
                     let ly = (y - y0_raw) as usize;
-                    if lx >= side || ly >= side { continue; }
-                    let ct = map.move_cell(x, y)
+                    if lx >= side || ly >= side {
+                        continue;
+                    }
+                    let ct = map
+                        .move_cell(x, y)
                         .map(|c| c.get_type(chassis_idx))
                         .unwrap_or(0xff);
                     corners[ly * side + lx] = ct;
@@ -1360,9 +1427,13 @@ fn sphere_robot_to_aabb_obstacle_collision(
             for x in x0..x1 {
                 let lx = (x - x0_raw) as usize;
                 let ly = (y - y0_raw) as usize;
-                if lx >= side || ly >= side { continue; }
+                if lx >= side || ly >= side {
+                    continue;
+                }
                 let corner = corners[ly * side + lx];
-                if corner == 0xff { continue; }
+                if corner == 0xff {
+                    continue;
+                }
                 let col = sphere_to_aabb(map, chassis_idx, robot_pos, x, y, corner);
                 if col != glam::Vec2::ZERO {
                     robot_pos += col;
@@ -1377,18 +1448,42 @@ fn sphere_robot_to_aabb_obstacle_collision(
 }
 
 impl MapStatic for Robot {
-    fn core(&self) -> &ObjectCore { &self.core }
-    fn core_mut(&mut self) -> &mut ObjectCore { &mut self.core }
-    fn rchange(&self) -> u32 { self.rchange }
-    fn rchange_set(&mut self, b: u32) { self.rchange |= b; }
-    fn rchange_clear(&mut self, b: u32) { self.rchange &= !b; }
-    fn object_state(&self) -> u32 { self.object_state }
-    fn object_state_set(&mut self, b: u32) { self.object_state |= b; }
-    fn object_state_clear(&mut self, b: u32) { self.object_state &= !b; }
-    fn ablaze_ttl(&self) -> i32 { self.ablaze_ttl }
-    fn set_ablaze_ttl(&mut self, t: i32) { self.ablaze_ttl = t; }
-    fn shorted_ttl(&self) -> i32 { self.shorted_ttl }
-    fn set_shorted_ttl(&mut self, t: i32) { self.shorted_ttl = t; }
+    fn core(&self) -> &ObjectCore {
+        &self.core
+    }
+    fn core_mut(&mut self) -> &mut ObjectCore {
+        &mut self.core
+    }
+    fn rchange(&self) -> u32 {
+        self.rchange
+    }
+    fn rchange_set(&mut self, b: u32) {
+        self.rchange |= b;
+    }
+    fn rchange_clear(&mut self, b: u32) {
+        self.rchange &= !b;
+    }
+    fn object_state(&self) -> u32 {
+        self.object_state
+    }
+    fn object_state_set(&mut self, b: u32) {
+        self.object_state |= b;
+    }
+    fn object_state_clear(&mut self, b: u32) {
+        self.object_state &= !b;
+    }
+    fn ablaze_ttl(&self) -> i32 {
+        self.ablaze_ttl
+    }
+    fn set_ablaze_ttl(&mut self, t: i32) {
+        self.ablaze_ttl = t;
+    }
+    fn shorted_ttl(&self) -> i32 {
+        self.shorted_ttl
+    }
+    fn set_shorted_ttl(&mut self, t: i32) {
+        self.shorted_ttl = t;
+    }
 
     fn r_need(&mut self, _need: u32) {
         // MR_MATRIX rebuild — the C++ assembles
@@ -1431,9 +1526,7 @@ impl MapStatic for Robot {
                     self.state = RobotState::Idle;
                     return;
                 }
-                let b: &Building = unsafe {
-                    &*(obj as *const dyn MapStatic as *const Building)
-                };
+                let b: &Building = unsafe { &*(obj as *const dyn MapStatic as *const Building) };
                 // Port of `CMatrixBuilding::GetFloorZ` (MatrixObjectBuilding.cpp:
                 // 1002-1005) + the ROBOT_IN_SPAWN assignment at
                 // MatrixObjectRobot.cpp:381 (`roboz = base->GetFloorZ()`).
@@ -1484,9 +1577,7 @@ impl MapStatic for Robot {
                     self.base = None;
                     return;
                 }
-                let b: &Building = unsafe {
-                    &*(obj as *const dyn MapStatic as *const Building)
-                };
+                let b: &Building = unsafe { &*(obj as *const dyn MapStatic as *const Building) };
                 // Port of MatrixObjectRobot.cpp:412-422 — pick Z
                 // from the terrain when the robot is on a land/water
                 // cell, otherwise (i.e. still on the base's own
@@ -1503,7 +1594,8 @@ impl MapStatic for Robot {
                 if on_land_or_water {
                     self.pos_z = map.get_z(self.pos_x, self.pos_y);
                 } else {
-                    self.pos_z = b.build_z + (1.0 - b.base_floor_progress) * BASE_FLOOR_Z - 3.0 + 2.7;
+                    self.pos_z =
+                        b.build_z + (1.0 - b.base_floor_progress) * BASE_FLOOR_Z - 3.0 + 2.7;
                 }
 
                 let dx = self.pos_x - b.pos.x;
@@ -1523,9 +1615,8 @@ impl MapStatic for Robot {
                     // up from here.
                     if let Some(obj_mut) = objs.get_mut(base_id) {
                         if matches!(obj_mut.core().obj_type, ObjectType::Building) {
-                            let b_mut: &mut Building = unsafe {
-                                &mut *(obj_mut as *mut dyn MapStatic as *mut Building)
-                            };
+                            let b_mut: &mut Building =
+                                unsafe { &mut *(obj_mut as *mut dyn MapStatic as *mut Building) };
                             b_mut.object_state_clear(
                                 crate::matrix_game::map_static::OBJECT_STATE_BUILDING_SPAWNBOT,
                             );
@@ -1594,7 +1685,10 @@ impl MapStatic for Robot {
         }
     }
 
-    fn side(&self) -> i32 { self.side }
-    fn need_repair(&self) -> bool { self.hit_point < self.hit_point_max }
+    fn side(&self) -> i32 {
+        self.side
+    }
+    fn need_repair(&self) -> bool {
+        self.hit_point < self.hit_point_max
+    }
 }
-

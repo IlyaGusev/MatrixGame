@@ -108,7 +108,9 @@ impl AnimState {
 
     /// Port of `IsAnimEnd` (VectorObject.hpp:553).
     pub fn is_anim_end(&self, vo: &VoMesh) -> bool {
-        if self.looped { return false; }
+        if self.looped {
+            return false;
+        }
         match vo.animations.get(self.anim as usize) {
             Some(a) => self.frame as usize == a.frames.len().saturating_sub(1),
             None => true,
@@ -130,10 +132,14 @@ impl AnimState {
         self.time_ms += cms as i64;
         let old_frame = self.frame;
 
-        let fcnt = vo.animations.get(self.anim as usize)
+        let fcnt = vo
+            .animations
+            .get(self.anim as usize)
             .map(|a| a.frames.len() as i32)
             .unwrap_or(0);
-        if fcnt == 0 { return false; }
+        if fcnt == 0 {
+            return false;
+        }
 
         let max_iters = (fcnt as i64) * 2 + 2;
         let mut iters = 0i64;
@@ -141,7 +147,9 @@ impl AnimState {
             iters += 1;
             self.frame += 1;
             if self.looped {
-                if self.frame >= fcnt { self.frame = 0; }
+                if self.frame >= fcnt {
+                    self.frame = 0;
+                }
             } else if self.frame >= fcnt {
                 self.time_next_ms += 1000;
                 self.frame = fcnt - 1;
@@ -184,19 +192,27 @@ impl AnimState {
     /// frame's duration — the caller uses that to compute how much
     /// to bump `next_anim_time` by.
     pub fn next_frame(&mut self, vo: &VoMesh) -> i32 {
-        let fcnt = vo.animations.get(self.anim as usize)
+        let fcnt = vo
+            .animations
+            .get(self.anim as usize)
             .map(|a| a.frames.len() as i32)
             .unwrap_or(0);
-        if fcnt == 0 { return 0; }
+        if fcnt == 0 {
+            return 0;
+        }
         if self.looped {
             self.frame += 1;
-            if self.frame >= fcnt { self.frame = 0; }
+            if self.frame >= fcnt {
+                self.frame = 0;
+            }
         } else if self.frame < fcnt - 1 {
             self.frame += 1;
         } else {
             // Last frame of a non-looped anim — return its
             // duration and don't advance.
-            return anim_frame(vo, self.anim, self.frame).map(|(_, t)| t).unwrap_or(0);
+            return anim_frame(vo, self.anim, self.frame)
+                .map(|(_, t)| t)
+                .unwrap_or(0);
         }
         let (idx, t) = anim_frame(vo, self.anim, self.frame).unwrap_or((0, 0));
         self.vo_frame = idx;

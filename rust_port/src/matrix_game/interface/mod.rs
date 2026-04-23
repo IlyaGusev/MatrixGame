@@ -5,6 +5,7 @@
 
 pub mod iface_element;
 pub mod iface_list;
+#[allow(clippy::module_inception)]
 pub mod interface;
 pub mod renderer;
 

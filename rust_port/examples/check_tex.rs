@@ -15,7 +15,8 @@ fn main() {
         let fourcc = std::str::from_utf8(&data[84..88]).unwrap_or("????");
         println!("  {}x{}, fourcc={}", w, h, fourcc);
 
-        if let Some(img) = matrixgame_rs::matrix_lib::three_g::texture::decode_texture_bytes(&data) {
+        if let Some(img) = matrixgame_rs::matrix_lib::three_g::texture::decode_texture_bytes(&data)
+        {
             let mut min_a = 255u8;
             let mut max_a = 0u8;
             let mut sum_a = 0u64;

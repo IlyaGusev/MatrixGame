@@ -79,10 +79,12 @@ impl BlockPar {
 
     /// Parse a pre-decoded string.
     pub fn parse(text: &str) -> Self {
-        let mut root = BlockPar::default();
         // The original treats the root block as sorted by default
         // (`CBlockPar` ctor sets `m_Sort = true` — see CBlockPar.hpp).
-        root.sort = true;
+        let mut root = BlockPar {
+            sort: true,
+            ..BlockPar::default()
+        };
         let chars: Vec<char> = text.chars().collect();
         let mut cursor = 0;
         parse_block_body(&chars, &mut cursor, &mut root, /*nested=*/ false);
@@ -163,9 +165,7 @@ impl BlockPar {
     fn push_entry(&mut self, entry: Entry) {
         let idx = self.entries.len();
         let key = match &entry {
-            Entry::Par { name, .. } | Entry::Block { name, .. } => {
-                Some(name.to_ascii_lowercase())
-            }
+            Entry::Par { name, .. } | Entry::Block { name, .. } => Some(name.to_ascii_lowercase()),
             Entry::Comment(_) => None,
         };
         self.entries.push(entry);
@@ -335,12 +335,7 @@ fn parse_block_body(chars: &[char], cursor: &mut usize, block: &mut BlockPar, ne
 }
 
 fn find_char(chars: &[char], start: usize, end: usize, target: char) -> Option<usize> {
-    for i in start..end {
-        if chars[i] == target {
-            return Some(i);
-        }
-    }
-    None
+    (start..end).find(|&i| chars[i] == target)
 }
 
 fn parse_named_param(

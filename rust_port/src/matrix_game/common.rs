@@ -34,17 +34,18 @@ pub const CELLFLAG_DOWN: u8 = 1 << 5;
 // object-type bits (+ optional flags like `TRACE_SKIP_INVISIBLE`) to
 // filter candidates.
 
-pub const TRACE_LANDSCAPE:       u32 = 1 << 0;
-pub const TRACE_WATER:           u32 = 1 << 1;
-pub const TRACE_ROBOT:           u32 = 1 << 2;
-pub const TRACE_BUILDING:        u32 = 1 << 3;
-pub const TRACE_OBJECT:          u32 = 1 << 4;
-pub const TRACE_CANNON:          u32 = 1 << 5;
-pub const TRACE_FLYER:           u32 = 1 << 6;
-pub const TRACE_ANYOBJECT:       u32 = TRACE_OBJECT | TRACE_BUILDING | TRACE_ROBOT | TRACE_CANNON | TRACE_FLYER;
-pub const TRACE_OBJECTSPHERE:    u32 = 1 << 10;
-pub const TRACE_SKIP_INVISIBLE:  u32 = 1 << 11;
-pub const TRACE_NONOBJECT:       u32 = TRACE_LANDSCAPE | TRACE_WATER;
+pub const TRACE_LANDSCAPE: u32 = 1 << 0;
+pub const TRACE_WATER: u32 = 1 << 1;
+pub const TRACE_ROBOT: u32 = 1 << 2;
+pub const TRACE_BUILDING: u32 = 1 << 3;
+pub const TRACE_OBJECT: u32 = 1 << 4;
+pub const TRACE_CANNON: u32 = 1 << 5;
+pub const TRACE_FLYER: u32 = 1 << 6;
+pub const TRACE_ANYOBJECT: u32 =
+    TRACE_OBJECT | TRACE_BUILDING | TRACE_ROBOT | TRACE_CANNON | TRACE_FLYER;
+pub const TRACE_OBJECTSPHERE: u32 = 1 << 10;
+pub const TRACE_SKIP_INVISIBLE: u32 = 1 << 11;
+pub const TRACE_NONOBJECT: u32 = TRACE_LANDSCAPE | TRACE_WATER;
 
 // ── EObjectTypeProperty (Common.hpp:176-191) ─────────────────────────────
 //
@@ -52,17 +53,17 @@ pub const TRACE_NONOBJECT:       u32 = TRACE_LANDSCAPE | TRACE_WATER;
 // like "palm\*palm.vo\*palm.png\*\*\*\*\*Burn,Tex,Burn01\*\*0.05\*0"
 // where each `*`-delimited field corresponds to one of these properties.
 // Used by `CMatrixMapObject::Init` and friends.
-pub const OTP_PATH:           usize = 0;
-pub const OTP_VO:             usize = 1;
-pub const OTP_TEXTURE:        usize = 2;
-pub const OTP_TEXTURE_GLOSS:  usize = 3;
-pub const OTP_TEXTURE_BACK:   usize = 4;
-pub const OTP_TEXTURE_MASK:   usize = 5;
+pub const OTP_PATH: usize = 0;
+pub const OTP_VO: usize = 1;
+pub const OTP_TEXTURE: usize = 2;
+pub const OTP_TEXTURE_GLOSS: usize = 3;
+pub const OTP_TEXTURE_BACK: usize = 4;
+pub const OTP_TEXTURE_MASK: usize = 5;
 pub const OTP_TEXTURE_SCROLL: usize = 6;
-pub const OTP_SHADOW:         usize = 7;
-pub const OTP_BEHAVIOUR:      usize = 8;
-pub const OTP_BIAS:           usize = 9;
-pub const OTP_INVLOGIC:       usize = 10;
+pub const OTP_SHADOW: usize = 7;
+pub const OTP_BEHAVIOUR: usize = 8;
+pub const OTP_BIAS: usize = 9;
+pub const OTP_INVLOGIC: usize = 10;
 
 /// Side IDs — MatrixSide.hpp:16. Side 0 is neutral/world-owned; side 1
 /// is the player; higher numbers are AI-controlled factions.

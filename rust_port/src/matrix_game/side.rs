@@ -129,7 +129,11 @@ impl Side {
     ) {
         self.selected = ids;
         self.active_object = primary;
-        self.curr_sel = if primary.is_some() { curr_sel } else { CurrSel::Nothing };
+        self.curr_sel = if primary.is_some() {
+            curr_sel
+        } else {
+            CurrSel::Nothing
+        };
     }
 
     /// Clear the selection — C++ `CMatrixSide::UnSelect` equivalent.
@@ -141,6 +145,6 @@ impl Side {
 
     /// Is `id` currently in the multi-selection?
     pub fn is_selected(&self, id: ObjectId) -> bool {
-        self.selected.iter().any(|&x| x == id)
+        self.selected.contains(&id)
     }
 }

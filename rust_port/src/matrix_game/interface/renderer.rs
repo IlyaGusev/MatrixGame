@@ -19,8 +19,8 @@ use wgpu::util::DeviceExt;
 
 use crate::matrix_lib::three_g::texture::{create_texture_from_rgba, decode_texture_bytes};
 
-use super::interface::{CInterface, DESIGN_H};
 use super::iface_element::ElementState;
+use super::interface::{CInterface, DESIGN_H};
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
@@ -232,8 +232,12 @@ impl InterfaceRenderer {
         }
         // Resolve bytes across all case/slash/extension variants.
         let fwd = atlas_path.replace('\\', "/");
-        let with_iface = fwd.replace("/IFace/", "/Iface/").replace("IFace/", "Iface/");
-        let with_lower = fwd.replace("/IFace/", "/iface/").replace("IFace/", "iface/");
+        let with_iface = fwd
+            .replace("/IFace/", "/Iface/")
+            .replace("IFace/", "Iface/");
+        let with_lower = fwd
+            .replace("/IFace/", "/iface/")
+            .replace("IFace/", "iface/");
         let upper = fwd.to_uppercase();
         let mut candidates: Vec<String> = Vec::new();
         for base in [&fwd, &with_iface, &with_lower, &upper] {
@@ -272,7 +276,12 @@ impl InterfaceRenderer {
                 },
             ],
         });
-        log::info!("interface: atlas {} ({} bytes) bound as {}", atlas_path, bytes.len(), key);
+        log::info!(
+            "interface: atlas {} ({} bytes) bound as {}",
+            atlas_path,
+            bytes.len(),
+            key
+        );
         self.atlases.insert(
             key,
             Atlas {
@@ -338,7 +347,9 @@ impl InterfaceRenderer {
                 if !elem.visible() {
                     continue;
                 }
-                let Some(img) = elem.current_image() else { continue };
+                let Some(img) = elem.current_image() else {
+                    continue;
+                };
                 let key = normalise_atlas_key(&img.tex_path);
                 if !self.atlases.contains_key(&key) {
                     continue;
@@ -355,12 +366,36 @@ impl InterfaceRenderer {
                     ElementState::Normal => [1.0, 1.0, 1.0, 1.0],
                 };
                 let v = [
-                    Vertex { pos: [x, y], uv: [u0, v0], tint },
-                    Vertex { pos: [x + w, y], uv: [u1, v0], tint },
-                    Vertex { pos: [x, y + h], uv: [u0, v1], tint },
-                    Vertex { pos: [x + w, y], uv: [u1, v0], tint },
-                    Vertex { pos: [x + w, y + h], uv: [u1, v1], tint },
-                    Vertex { pos: [x, y + h], uv: [u0, v1], tint },
+                    Vertex {
+                        pos: [x, y],
+                        uv: [u0, v0],
+                        tint,
+                    },
+                    Vertex {
+                        pos: [x + w, y],
+                        uv: [u1, v0],
+                        tint,
+                    },
+                    Vertex {
+                        pos: [x, y + h],
+                        uv: [u0, v1],
+                        tint,
+                    },
+                    Vertex {
+                        pos: [x + w, y],
+                        uv: [u1, v0],
+                        tint,
+                    },
+                    Vertex {
+                        pos: [x + w, y + h],
+                        uv: [u1, v1],
+                        tint,
+                    },
+                    Vertex {
+                        pos: [x, y + h],
+                        uv: [u0, v1],
+                        tint,
+                    },
                 ];
                 buckets.entry(key).or_default().extend_from_slice(&v);
             }
@@ -399,7 +434,9 @@ impl InterfaceRenderer {
         pass.set_bind_group(0, &self.uniform_bg, &[]);
         pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         for g in &self.draw_groups {
-            let Some(atlas) = self.atlases.get(&g.atlas_key) else { continue };
+            let Some(atlas) = self.atlases.get(&g.atlas_key) else {
+                continue;
+            };
             pass.set_bind_group(1, &atlas.bind_group, &[]);
             pass.draw(g.start..g.start + g.count, 0..1);
         }

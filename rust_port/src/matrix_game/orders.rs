@@ -77,7 +77,14 @@ impl Order {
     /// `Reset()` first, which memsets the struct, so the phase
     /// starts fresh.
     pub fn set(ty: OrderType, p1: f32, p2: f32, p3: f32, p4: i32) -> Self {
-        Self { ty, phase: OrderPhase::Empty, p1, p2, p3, p4 }
+        Self {
+            ty,
+            phase: OrderPhase::Empty,
+            p1,
+            p2,
+            p3,
+            p4,
+        }
     }
 }
 
@@ -94,16 +101,32 @@ pub struct OrderList {
 }
 
 impl OrderList {
-    pub fn new() -> Self { Self { orders: Vec::with_capacity(MAX_ORDERS) } }
+    pub fn new() -> Self {
+        Self {
+            orders: Vec::with_capacity(MAX_ORDERS),
+        }
+    }
 
-    pub fn len(&self) -> usize { self.orders.len() }
-    pub fn is_empty(&self) -> bool { self.orders.is_empty() }
-    pub fn is_full(&self) -> bool { self.orders.len() >= MAX_ORDERS }
+    pub fn len(&self) -> usize {
+        self.orders.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.orders.is_empty()
+    }
+    pub fn is_full(&self) -> bool {
+        self.orders.len() >= MAX_ORDERS
+    }
 
-    pub fn top(&self) -> Option<&Order> { self.orders.first() }
-    pub fn top_mut(&mut self) -> Option<&mut Order> { self.orders.first_mut() }
+    pub fn top(&self) -> Option<&Order> {
+        self.orders.first()
+    }
+    pub fn top_mut(&mut self) -> Option<&mut Order> {
+        self.orders.first_mut()
+    }
 
-    pub fn iter(&self) -> std::slice::Iter<'_, Order> { self.orders.iter() }
+    pub fn iter(&self) -> std::slice::Iter<'_, Order> {
+        self.orders.iter()
+    }
     pub fn iter_mut(&mut self) -> std::slice::IterMut<'_, Order> {
         self.orders.iter_mut()
     }
@@ -111,7 +134,9 @@ impl OrderList {
     /// Port of `CMatrixRobotAI::AllocPlaceForOrderOnTop`
     /// (MatrixRobot.cpp:4554-4570). Rejects if pool full.
     pub fn push_top(&mut self, order: Order) -> bool {
-        if self.is_full() { return false; }
+        if self.is_full() {
+            return false;
+        }
         self.orders.insert(0, order);
         true
     }
@@ -119,7 +144,11 @@ impl OrderList {
     /// Port of `CMatrixRobotAI::RemoveOrderFromTop`
     /// (MatrixRobot.cpp equivalent around :4612). Pops the head.
     pub fn pop_top(&mut self) -> Option<Order> {
-        if self.orders.is_empty() { None } else { Some(self.orders.remove(0)) }
+        if self.orders.is_empty() {
+            None
+        } else {
+            Some(self.orders.remove(0))
+        }
     }
 
     /// Port of `CMatrixRobotAI::RemoveOrder(OrderType)`

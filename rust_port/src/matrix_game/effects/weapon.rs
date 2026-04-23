@@ -12,36 +12,35 @@
 
 pub type Weapon = u32;
 
-pub const WEAPON_NONE:            Weapon = 0;
-pub const WEAPON_VOLCANO:         Weapon = 70;
-pub const WEAPON_PLASMA:          Weapon = 200;
-pub const WEAPON_HOMING_MISSILE:  Weapon = 1000;
-pub const WEAPON_BOMB:            Weapon = 2500;
-pub const WEAPON_FLAMETHROWER:    Weapon = 60;
-pub const WEAPON_BIGBOOM:         Weapon = 10_000;
-pub const WEAPON_LIGHTENING:      Weapon = 99;
-pub const WEAPON_LASER:           Weapon = 98;
-pub const WEAPON_GUN:             Weapon = 598;
-pub const WEAPON_REPAIR:          Weapon = 57;
+pub const WEAPON_NONE: Weapon = 0;
+pub const WEAPON_VOLCANO: Weapon = 70;
+pub const WEAPON_PLASMA: Weapon = 200;
+pub const WEAPON_HOMING_MISSILE: Weapon = 1000;
+pub const WEAPON_BOMB: Weapon = 2500;
+pub const WEAPON_FLAMETHROWER: Weapon = 60;
+pub const WEAPON_BIGBOOM: Weapon = 10_000;
+pub const WEAPON_LIGHTENING: Weapon = 99;
+pub const WEAPON_LASER: Weapon = 98;
+pub const WEAPON_GUN: Weapon = 598;
+pub const WEAPON_REPAIR: Weapon = 57;
 
-pub const WEAPON_CANNON0:         Weapon = 300;
-pub const WEAPON_CANNON1:         Weapon = 998;
-pub const WEAPON_CANNON2:         Weapon = 97;
-pub const WEAPON_CANNON3:         Weapon = 1002;
+pub const WEAPON_CANNON0: Weapon = 300;
+pub const WEAPON_CANNON1: Weapon = 998;
+pub const WEAPON_CANNON2: Weapon = 97;
+pub const WEAPON_CANNON3: Weapon = 1002;
 
-pub const WEAPON_ABLAZE:          Weapon = 10_000_000;
-pub const WEAPON_SHORTED:         Weapon = 10_000_001;
-pub const WEAPON_DEBRIS:          Weapon = 10_000_002;
+pub const WEAPON_ABLAZE: Weapon = 10_000_000;
+pub const WEAPON_SHORTED: Weapon = 10_000_001;
+pub const WEAPON_DEBRIS: Weapon = 10_000_002;
 
-pub const WEAPON_INSTANT_DEATH:   Weapon = 0x7FFF_FFFE;
+pub const WEAPON_INSTANT_DEATH: Weapon = 0x7FFF_FFFE;
 
 /// Ports the fire-weapon predicate used by `CMatrixMapObject::Damage`
 /// (MatrixObject.cpp:115) — the C++ spells out the OR chain literally.
 pub fn is_fire_weapon(w: Weapon) -> bool {
     matches!(
         w,
-        WEAPON_BIGBOOM | WEAPON_HOMING_MISSILE | WEAPON_BOMB
-          | WEAPON_PLASMA | WEAPON_FLAMETHROWER
+        WEAPON_BIGBOOM | WEAPON_HOMING_MISSILE | WEAPON_BOMB | WEAPON_PLASMA | WEAPON_FLAMETHROWER
     )
 }
 
@@ -56,23 +55,23 @@ pub const WEAPON_COUNT: usize = 17;
 /// `WEAPON_INSTANT_DEATH`).
 pub fn weap_to_index(w: Weapon) -> Option<usize> {
     Some(match w {
-        WEAPON_PLASMA         => 0,
-        WEAPON_VOLCANO        => 1,
+        WEAPON_PLASMA => 0,
+        WEAPON_VOLCANO => 1,
         WEAPON_HOMING_MISSILE => 2,
-        WEAPON_BOMB           => 3,
-        WEAPON_FLAMETHROWER   => 4,
-        WEAPON_BIGBOOM        => 5,
-        WEAPON_LIGHTENING     => 6,
-        WEAPON_LASER          => 7,
-        WEAPON_GUN            => 8,
-        WEAPON_ABLAZE         => 9,
-        WEAPON_SHORTED        => 10,
-        WEAPON_DEBRIS         => 11,
-        WEAPON_REPAIR         => 12,
-        WEAPON_CANNON0        => 13,
-        WEAPON_CANNON1        => 14,
-        WEAPON_CANNON2        => 15,
-        WEAPON_CANNON3        => 16,
+        WEAPON_BOMB => 3,
+        WEAPON_FLAMETHROWER => 4,
+        WEAPON_BIGBOOM => 5,
+        WEAPON_LIGHTENING => 6,
+        WEAPON_LASER => 7,
+        WEAPON_GUN => 8,
+        WEAPON_ABLAZE => 9,
+        WEAPON_SHORTED => 10,
+        WEAPON_DEBRIS => 11,
+        WEAPON_REPAIR => 12,
+        WEAPON_CANNON0 => 13,
+        WEAPON_CANNON1 => 14,
+        WEAPON_CANNON2 => 15,
+        WEAPON_CANNON3 => 16,
         _ => return None,
     })
 }
@@ -83,23 +82,23 @@ pub fn weap_to_index(w: Weapon) -> Option<usize> {
 /// matching weapon discriminant.
 pub fn weap_name_to_index(name: &str) -> Option<usize> {
     Some(match name {
-        "WEAPON_PLASMA"         => 0,
-        "WEAPON_VOLCANO"        => 1,
+        "WEAPON_PLASMA" => 0,
+        "WEAPON_VOLCANO" => 1,
         "WEAPON_HOMING_MISSILE" => 2,
-        "WEAPON_BOMB"           => 3,
-        "WEAPON_FLAMETHROWER"   => 4,
-        "WEAPON_BIGBOOM"        => 5,
-        "WEAPON_LIGHTENING"     => 6,
-        "WEAPON_LASER"          => 7,
-        "WEAPON_GUN"            => 8,
-        "WEAPON_ABLAZE"         => 9,
-        "WEAPON_SHORTED"        => 10,
-        "WEAPON_DEBRIS"         => 11,
-        "WEAPON_REPAIR"         => 12,
-        "WEAPON_CANNON0"        => 13,
-        "WEAPON_CANNON1"        => 14,
-        "WEAPON_CANNON2"        => 15,
-        "WEAPON_CANNON3"        => 16,
+        "WEAPON_BOMB" => 3,
+        "WEAPON_FLAMETHROWER" => 4,
+        "WEAPON_BIGBOOM" => 5,
+        "WEAPON_LIGHTENING" => 6,
+        "WEAPON_LASER" => 7,
+        "WEAPON_GUN" => 8,
+        "WEAPON_ABLAZE" => 9,
+        "WEAPON_SHORTED" => 10,
+        "WEAPON_DEBRIS" => 11,
+        "WEAPON_REPAIR" => 12,
+        "WEAPON_CANNON0" => 13,
+        "WEAPON_CANNON1" => 14,
+        "WEAPON_CANNON2" => 15,
+        "WEAPON_CANNON3" => 16,
         _ => return None,
     })
 }

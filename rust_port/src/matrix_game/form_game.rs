@@ -8,13 +8,13 @@ use winit::{
     window::{Window, WindowAttributes, WindowId},
 };
 
-use crate::matrix_game::effects::point_light::PointLightSystem;
-use crate::matrix_game::map::GameMap;
-use crate::matrix_game::logic::MapLogic;
-use crate::matrix_game::camera::Camera;
 use crate::gfx::context::GfxContext;
-use crate::matrix_game::minimap::Minimap;
+use crate::matrix_game::camera::Camera;
+use crate::matrix_game::effects::point_light::PointLightSystem;
+use crate::matrix_game::logic::MapLogic;
+use crate::matrix_game::map::GameMap;
 use crate::matrix_game::map::MapRenderer;
+use crate::matrix_game::minimap::Minimap;
 struct AppState {
     window: Arc<Window>,
     gfx: GfxContext,
@@ -174,22 +174,20 @@ impl ApplicationHandler for App {
                 game.objects.iter_logic().count(),
             );
 
-            let selection_ring =
-                crate::matrix_game::effects::selection::SelectionRingRenderer::new(
-                    &gfx.device, &gfx.config,
-                );
-            let marquee =
-                crate::matrix_game::effects::marquee::MarqueeRenderer::new(
-                    &gfx.device, &gfx.config,
-                );
+            let selection_ring = crate::matrix_game::effects::selection::SelectionRingRenderer::new(
+                &gfx.device,
+                &gfx.config,
+            );
+            let marquee = crate::matrix_game::effects::marquee::MarqueeRenderer::new(
+                &gfx.device,
+                &gfx.config,
+            );
 
             let iface_list =
                 crate::matrix_game::interface::IFaceList::load_default_panels(&matrix_data);
             log::info!("iface: loaded {} panels", iface_list.panels.len());
             let mut iface_renderer =
-                crate::matrix_game::interface::InterfaceRenderer::new(
-                    &gfx.device, &gfx.config,
-                );
+                crate::matrix_game::interface::InterfaceRenderer::new(&gfx.device, &gfx.config);
             // Preload every atlas referenced by any element of any
             // loaded panel. `if/Main` alone pulls from interface1/2/3,
             // base_1, base_4, text_1; other panels add base_2/3/5/6.
@@ -209,10 +207,10 @@ impl ApplicationHandler for App {
                 &read,
                 iface_list.panels.iter(),
             );
-            let mut progress_bars =
-                crate::matrix_game::progress_bar::ProgressBarRenderer::new(
-                    &gfx.device, &gfx.config,
-                );
+            let mut progress_bars = crate::matrix_game::progress_bar::ProgressBarRenderer::new(
+                &gfx.device,
+                &gfx.config,
+            );
             progress_bars.load_atlas(&gfx.device, &gfx.queue, &read);
 
             *self.state.borrow_mut() = Some(AppState {
@@ -308,10 +306,7 @@ impl ApplicationHandler for App {
                     // set_aspect mirrors the *surface* size so cursor (which
                     // we rescale from winit coords on the fly) and edge-pan
                     // thresholds share the same coord system.
-                    camera.set_aspect(
-                        gfx.config.width as f32,
-                        gfx.config.height as f32,
-                    );
+                    camera.set_aspect(gfx.config.width as f32, gfx.config.height as f32);
                 }
 
                 let mut game = MapLogic::new();
@@ -331,33 +326,30 @@ impl ApplicationHandler for App {
 
                 let selection_ring =
                     crate::matrix_game::effects::selection::SelectionRingRenderer::new(
-                        &gfx.device, &gfx.config,
+                        &gfx.device,
+                        &gfx.config,
                     );
-                let marquee =
-                    crate::matrix_game::effects::marquee::MarqueeRenderer::new(
-                        &gfx.device, &gfx.config,
-                    );
+                let marquee = crate::matrix_game::effects::marquee::MarqueeRenderer::new(
+                    &gfx.device,
+                    &gfx.config,
+                );
 
                 let iface_list =
                     crate::matrix_game::interface::IFaceList::load_default_panels(&matrix_data);
                 log::info!("iface: loaded {} panels", iface_list.panels.len());
                 let mut iface_renderer =
-                    crate::matrix_game::interface::InterfaceRenderer::new(
-                        &gfx.device, &gfx.config,
-                    );
-                let read = |p: &str| -> Option<Vec<u8>> {
-                    bundle.read_file(p).map(|b| b.to_vec())
-                };
+                    crate::matrix_game::interface::InterfaceRenderer::new(&gfx.device, &gfx.config);
+                let read = |p: &str| -> Option<Vec<u8>> { bundle.read_file(p).map(|b| b.to_vec()) };
                 iface_renderer.preload_for_panels(
                     &gfx.device,
                     &gfx.queue,
                     &read,
                     iface_list.panels.iter(),
                 );
-                let mut progress_bars =
-                    crate::matrix_game::progress_bar::ProgressBarRenderer::new(
-                        &gfx.device, &gfx.config,
-                    );
+                let mut progress_bars = crate::matrix_game::progress_bar::ProgressBarRenderer::new(
+                    &gfx.device,
+                    &gfx.config,
+                );
                 progress_bars.load_atlas(&gfx.device, &gfx.queue, &read);
 
                 *state_slot.borrow_mut() = Some(AppState {
@@ -441,9 +433,10 @@ impl ApplicationHandler for App {
                         && pressed
                         && !state.game.player_side.selected.is_empty()
                     {
-                        let n = state.game.order_move_to_at(
-                            &state.camera, cx, cy, w, h, &state.map,
-                        );
+                        let n =
+                            state
+                                .game
+                                .order_move_to_at(&state.camera, cx, cy, w, h, &state.map);
                         if n > 0 {
                             log::info!("move order: issued to {} robot(s)", n);
                         }
@@ -498,7 +491,11 @@ impl ApplicationHandler for App {
                                     const DRAG_PX: f32 = 4.0;
                                     if dx <= DRAG_PX && dy <= DRAG_PX {
                                         let hit = state.game.click_at_screen(
-                                            &state.camera, cx, cy, w, h,
+                                            &state.camera,
+                                            cx,
+                                            cy,
+                                            w,
+                                            h,
                                             state.shift_down,
                                         );
                                         match hit {
@@ -516,18 +513,18 @@ impl ApplicationHandler for App {
                                         let rmin = [ax.min(cx), ay.min(cy)];
                                         let rmax = [ax.max(cx), ay.max(cy)];
                                         let n = state.game.marquee_select(
-                                            &state.camera, rmin, rmax, w, h,
+                                            &state.camera,
+                                            rmin,
+                                            rmax,
+                                            w,
+                                            h,
                                             state.shift_down,
                                         );
-                                        log::info!(
-                                            "marquee: selected {} robot(s)", n,
-                                        );
+                                        log::info!("marquee: selected {} robot(s)", n,);
                                         // Start the 50ms DIP fade — port
                                         // of `CMultiSelection::End` at
                                         // MatrixMultiSelection.cpp:278-279.
-                                        state.marquee.begin_dip_fade(
-                                            state.game.elapsed_ms as f32,
-                                        );
+                                        state.marquee.begin_dip_fade(state.game.elapsed_ms as f32);
                                     }
                                 }
                             }
@@ -662,10 +659,8 @@ impl ApplicationHandler for App {
                     // the logic + graphic takt so dispatched
                     // `logic_takt` / `takt` methods can call
                     // `current_map()` (ports `g_MatrixMap`).
-                    let _scope = crate::matrix_game::map::MapScope::enter(
-                        &state.map,
-                        state.game.elapsed_ms,
-                    );
+                    let _scope =
+                        crate::matrix_game::map::MapScope::enter(&state.map, state.game.elapsed_ms);
                     state.game.takt(step_ms);
                     state.game.graphic_takt(step_ms);
                 }
@@ -688,7 +683,8 @@ impl ApplicationHandler for App {
                         &state.gfx.queue,
                         state.game.elapsed_ms as f32,
                         state.marquee_last_rect,
-                        w, h,
+                        w,
+                        h,
                     );
                 }
 
@@ -781,35 +777,34 @@ impl ApplicationHandler for App {
                                 state.map.world_width() * 0.5,
                                 state.map.world_height() * 0.5,
                             );
-                            state.selection_ring.upload(&state.gfx.queue, vp, cr, cu, mc);
-                            let mut pass =
-                                encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                                    label: Some("Selection Ring Pass"),
-                                    color_attachments: &[Some(
-                                        wgpu::RenderPassColorAttachment {
-                                            view: &view,
-                                            resolve_target: None,
-                                            depth_slice: None,
-                                            ops: wgpu::Operations {
-                                                load: wgpu::LoadOp::Load,
-                                                store: wgpu::StoreOp::Store,
-                                            },
-                                        },
-                                    )],
-                                    depth_stencil_attachment: Some(
-                                        wgpu::RenderPassDepthStencilAttachment {
-                                            view: state.terrain.depth_view(),
-                                            depth_ops: Some(wgpu::Operations {
-                                                load: wgpu::LoadOp::Load,
-                                                store: wgpu::StoreOp::Store,
-                                            }),
-                                            stencil_ops: None,
-                                        },
-                                    ),
-                                    timestamp_writes: None,
-                                    occlusion_query_set: None,
-                                    multiview_mask: None,
-                                });
+                            state
+                                .selection_ring
+                                .upload(&state.gfx.queue, vp, cr, cu, mc);
+                            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                label: Some("Selection Ring Pass"),
+                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                    view: &view,
+                                    resolve_target: None,
+                                    depth_slice: None,
+                                    ops: wgpu::Operations {
+                                        load: wgpu::LoadOp::Load,
+                                        store: wgpu::StoreOp::Store,
+                                    },
+                                })],
+                                depth_stencil_attachment: Some(
+                                    wgpu::RenderPassDepthStencilAttachment {
+                                        view: state.terrain.depth_view(),
+                                        depth_ops: Some(wgpu::Operations {
+                                            load: wgpu::LoadOp::Load,
+                                            store: wgpu::StoreOp::Store,
+                                        }),
+                                        stencil_ops: None,
+                                    },
+                                ),
+                                timestamp_writes: None,
+                                occlusion_query_set: None,
+                                multiview_mask: None,
+                            });
                             state.selection_ring.render(&mut pass);
                             // Marquee shares the overlay color target +
                             // depth attachment with the selection ring;
@@ -817,25 +812,22 @@ impl ApplicationHandler for App {
                             state.marquee.render(&mut pass);
                         }
                         {
-                            let mut pass =
-                                encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                                    label: Some("Minimap Pass"),
-                                    color_attachments: &[Some(
-                                        wgpu::RenderPassColorAttachment {
-                                            view: &view,
-                                            resolve_target: None,
-                                            depth_slice: None,
-                                            ops: wgpu::Operations {
-                                                load: wgpu::LoadOp::Load,
-                                                store: wgpu::StoreOp::Store,
-                                            },
-                                        },
-                                    )],
-                                    depth_stencil_attachment: None,
-                                    timestamp_writes: None,
-                                    occlusion_query_set: None,
-                                    multiview_mask: None,
-                                });
+                            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                label: Some("Minimap Pass"),
+                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                    view: &view,
+                                    resolve_target: None,
+                                    depth_slice: None,
+                                    ops: wgpu::Operations {
+                                        load: wgpu::LoadOp::Load,
+                                        store: wgpu::StoreOp::Store,
+                                    },
+                                })],
+                                depth_stencil_attachment: None,
+                                timestamp_writes: None,
+                                occlusion_query_set: None,
+                                multiview_mask: None,
+                            });
                             state.minimap.render(
                                 &state.gfx.queue,
                                 &mut pass,
@@ -857,25 +849,22 @@ impl ApplicationHandler for App {
                                 state.gfx.config.width as f32,
                                 state.gfx.config.height as f32,
                             );
-                            let mut pass =
-                                encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                                    label: Some("Interface Pass"),
-                                    color_attachments: &[Some(
-                                        wgpu::RenderPassColorAttachment {
-                                            view: &view,
-                                            resolve_target: None,
-                                            depth_slice: None,
-                                            ops: wgpu::Operations {
-                                                load: wgpu::LoadOp::Load,
-                                                store: wgpu::StoreOp::Store,
-                                            },
-                                        },
-                                    )],
-                                    depth_stencil_attachment: None,
-                                    timestamp_writes: None,
-                                    occlusion_query_set: None,
-                                    multiview_mask: None,
-                                });
+                            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                label: Some("Interface Pass"),
+                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                    view: &view,
+                                    resolve_target: None,
+                                    depth_slice: None,
+                                    ops: wgpu::Operations {
+                                        load: wgpu::LoadOp::Load,
+                                        store: wgpu::StoreOp::Store,
+                                    },
+                                })],
+                                depth_stencil_attachment: None,
+                                timestamp_writes: None,
+                                occlusion_query_set: None,
+                                multiview_mask: None,
+                            });
                             state.iface_renderer.render(&mut pass);
                         }
                         // Progress-bar overlay pass — on top of the UI.
@@ -886,25 +875,22 @@ impl ApplicationHandler for App {
                                 state.gfx.config.width as f32,
                                 state.gfx.config.height as f32,
                             );
-                            let mut pass =
-                                encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                                    label: Some("ProgressBar Pass"),
-                                    color_attachments: &[Some(
-                                        wgpu::RenderPassColorAttachment {
-                                            view: &view,
-                                            resolve_target: None,
-                                            depth_slice: None,
-                                            ops: wgpu::Operations {
-                                                load: wgpu::LoadOp::Load,
-                                                store: wgpu::StoreOp::Store,
-                                            },
-                                        },
-                                    )],
-                                    depth_stencil_attachment: None,
-                                    timestamp_writes: None,
-                                    occlusion_query_set: None,
-                                    multiview_mask: None,
-                                });
+                            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                label: Some("ProgressBar Pass"),
+                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                    view: &view,
+                                    resolve_target: None,
+                                    depth_slice: None,
+                                    ops: wgpu::Operations {
+                                        load: wgpu::LoadOp::Load,
+                                        store: wgpu::StoreOp::Store,
+                                    },
+                                })],
+                                depth_stencil_attachment: None,
+                                timestamp_writes: None,
+                                occlusion_query_set: None,
+                                multiview_mask: None,
+                            });
                             state.progress_bars.render(&mut pass);
                         }
                         state.gfx.end_frame(output, encoder);
@@ -931,15 +917,16 @@ impl ApplicationHandler for App {
     }
 }
 
-/// Load map — native reads from pkg, returns map + map storage + global
-/// matrix data storage (robots.dat) + pkg for texture loading.
-///
-/// Matches the original startup contract (MatrixGame.cpp:240-257, 383-399):
-/// the caller can request a specific map via the first CLI argument; if
-/// absent, we fall back to `Config/Map` in the global data. Global data
-/// itself is a required dependency (MatrixGame.cpp:240-257) — the engine
-/// dereferences `g_MatrixData->BlockGet(...)` without NULL guards all over
-/// Init, so missing `robots.dat` is a fatal startup error.
+// Load map — native reads from pkg, returns map + map storage + global
+// matrix data storage (robots.dat) + pkg for texture loading.
+//
+// Matches the original startup contract (MatrixGame.cpp:240-257, 383-399):
+// the caller can request a specific map via the first CLI argument; if
+// absent, we fall back to `Config/Map` in the global data. Global data
+// itself is a required dependency (MatrixGame.cpp:240-257) — the engine
+// dereferences `g_MatrixData->BlockGet(...)` without NULL guards all over
+// Init, so missing `robots.dat` is a fatal startup error. See `load_map`
+// (native) and `load_map_async` (wasm) further below.
 
 /// Keep per-robot visibility point lights in sync with the arena.
 /// Every frame: spawn a light for each new `ObjectType::RobotAi`,
@@ -961,7 +948,9 @@ fn sync_robot_lights(state: &mut AppState) {
     // Add lights for new robots + update positions for existing ones
     // so the light follows the robot rising out of the silo.
     for id in &live_robots {
-        let Some(obj) = state.game.objects.get(*id) else { continue };
+        let Some(obj) = state.game.objects.get(*id) else {
+            continue;
+        };
         let pos = obj.core().geo_center;
         let lit_pos = [pos.x, pos.y, pos.z + 6.0];
         if let Some(light_id) = state.robot_lights.get(id).copied() {
@@ -973,7 +962,9 @@ fn sync_robot_lights(state: &mut AppState) {
             } else {
                 0xFF3333
             };
-            let light_id = state.point_lights.add_light(&state.map, lit_pos, 25.0, color);
+            let light_id = state
+                .point_lights
+                .add_light(&state.map, lit_pos, 25.0, color);
             state.robot_lights.insert(*id, light_id);
         }
     }
@@ -983,7 +974,11 @@ fn sync_robot_lights(state: &mut AppState) {
         .robot_lights
         .iter()
         .filter_map(|(id, light_id)| {
-            if state.game.objects.is_valid(*id) { None } else { Some((*id, *light_id)) }
+            if state.game.objects.is_valid(*id) {
+                None
+            } else {
+                Some((*id, *light_id))
+            }
         })
         .collect();
     for (id, light_id) in dead {
@@ -1004,8 +999,8 @@ fn dispatch_ui_click(state: &mut AppState, click: &crate::matrix_game::interface
     use crate::matrix_game::interface::Click;
     use crate::matrix_game::map_static::{MapStatic, ObjectType};
     use crate::matrix_game::object_building::{Building, BuildingType};
-    use crate::matrix_game::side::CurrSel;
     use crate::matrix_game::robot::ChassisKind;
+    use crate::matrix_game::side::CurrSel;
 
     match click {
         Click::Button(name) if name == "buro" => {
@@ -1013,16 +1008,20 @@ fn dispatch_ui_click(state: &mut AppState, click: &crate::matrix_game::interface
                 log::info!("buro: no base selected, ignoring");
                 return;
             }
-            let Some(id) = state.game.active_object() else { return };
+            let Some(id) = state.game.active_object() else {
+                return;
+            };
             // Downcast the active MapStatic to Building and queue a
             // robot. `ChassisKind::Track` is a reasonable default
             // (the C++ defaults vary by constructor state; Track is
             // the cheapest one).
-            let Some(obj) = state.game.objects.get_mut(id) else { return };
-            if !matches!(obj.core().obj_type, ObjectType::Building) { return }
-            let b: &mut Building = unsafe {
-                &mut *(obj as *mut dyn MapStatic as *mut Building)
+            let Some(obj) = state.game.objects.get_mut(id) else {
+                return;
             };
+            if !matches!(obj.core().obj_type, ObjectType::Building) {
+                return;
+            }
+            let b: &mut Building = unsafe { &mut *(obj as *mut dyn MapStatic as *mut Building) };
             if b.kind != BuildingType::Base {
                 log::info!("buro: can only build from a base, got {:?}", b.kind);
                 return;
@@ -1030,7 +1029,9 @@ fn dispatch_ui_click(state: &mut AppState, click: &crate::matrix_game::interface
             if b.queue_robot(ChassisKind::Track) {
                 log::info!(
                     "buro: queued robot on base at ({:.0},{:.0}); stack now has {} items",
-                    b.pos.x, b.pos.y, b.build_stack.items(),
+                    b.pos.x,
+                    b.pos.y,
+                    b.build_stack.items(),
                 );
             } else {
                 log::info!("buro: stack full, click rejected");
@@ -1063,8 +1064,12 @@ fn refresh_progress_bars(state: &mut AppState) {
     ) {
         return;
     }
-    let Some(id) = state.game.active_object() else { return };
-    let Some(obj) = state.game.objects.get(id) else { return };
+    let Some(id) = state.game.active_object() else {
+        return;
+    };
+    let Some(obj) = state.game.objects.get(id) else {
+        return;
+    };
     if !matches!(obj.core().obj_type, ObjectType::Building) {
         return;
     }
@@ -1099,7 +1104,11 @@ fn refresh_progress_bars(state: &mut AppState) {
     let [panel_x, panel_y] = main.resolved_pos(w, h, scale);
     let bar_h_design = {
         let d = state.progress_bars.bar_height_design();
-        if d > 0.0 { d } else { 16.0 }
+        if d > 0.0 {
+            d
+        } else {
+            16.0
+        }
     };
     let rect = [
         panel_x + PB_OFFSET_X * scale,
@@ -1113,7 +1122,11 @@ fn refresh_progress_bars(state: &mut AppState) {
     if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
         log::info!(
             "progress: pushing bar rect=({:.0},{:.0},{:.0},{:.0}) fill={:.2}",
-            rect[0], rect[1], rect[2], rect[3], b.build_stack.progress(),
+            rect[0],
+            rect[1],
+            rect[2],
+            rect[3],
+            b.build_stack.progress(),
         );
     }
 
@@ -1144,9 +1157,7 @@ fn refresh_interface_visibility(state: &mut AppState) {
                 .and_then(|id| state.game.objects.get(id))
                 .filter(|o| matches!(o.core().obj_type, ObjectType::Building))
                 .map(|o| {
-                    let b: &Building = unsafe {
-                        &*(o as *const dyn MapStatic as *const Building)
-                    };
+                    let b: &Building = unsafe { &*(o as *const dyn MapStatic as *const Building) };
                     let n = b.build_stack.items() as i32;
                     (Some(b.kind), n == 0, n, b.turrets_max)
                 })
@@ -1183,8 +1194,10 @@ fn sync_selection_ring(state: &mut AppState, step_ms: f32) {
     let mut desired: Vec<(ObjectId, glam::Vec3, f32, u32)> = Vec::new();
     let ids: Vec<ObjectId> = state.game.player_side.selected.clone();
     for id in ids {
-        if !state.game.objects.is_valid(id) { continue; }
-        let placement = state.game.objects.get(id).and_then(|obj| {
+        if !state.game.objects.is_valid(id) {
+            continue;
+        }
+        let placement = state.game.objects.get(id).map(|obj| {
             let ot = obj.core().obj_type;
             if ot == ObjectType::Building {
                 let b: &Building = unsafe {
@@ -1194,9 +1207,9 @@ fn sync_selection_ring(state: &mut AppState, step_ms: f32) {
                 let (c, r) = selection_placement(b.pos, b.build_z, b.angle, b.kind);
                 let z = state.map.get_z(c.x, c.y).max(c.z);
                 let _ = BuildingType::Base; // keep import live
-                Some((glam::Vec3::new(c.x, c.y, z), r))
+                (glam::Vec3::new(c.x, c.y, z), r)
             } else {
-                Some((obj.core().geo_center, obj.core().radius.max(12.0)))
+                (obj.core().geo_center, obj.core().radius.max(12.0))
             }
         });
         if let Some((c, r)) = placement {
@@ -1204,7 +1217,9 @@ fn sync_selection_ring(state: &mut AppState, step_ms: f32) {
         }
     }
     state.selection_ring.set_selections(&desired);
-    state.selection_ring.takt(step_ms, |x, y| state.map.get_z(x, y));
+    state
+        .selection_ring
+        .takt(step_ms, |x, y| state.map.get_z(x, y));
 }
 
 /// Pick a highlight color for the selection ring by side. The C++
@@ -1217,11 +1232,11 @@ fn sync_selection_ring(state: &mut AppState, step_ms: f32) {
 fn side_selection_color(side: i32) -> u32 {
     use crate::matrix_game::effects::selection::SEL_COLOR_DEFAULT;
     match side {
-        1 => SEL_COLOR_DEFAULT,      // player — green
-        2 => 0xFFFF_3333,            // enemy red (placeholder)
-        3 => 0xFFFF_AA00,            // enemy orange (placeholder)
-        4 => 0xFFFF_FF33,            // enemy yellow (placeholder)
-        _ => 0xFFFF_FFFF,            // neutral / default — white
+        1 => SEL_COLOR_DEFAULT, // player — green
+        2 => 0xFFFF_3333,       // enemy red (placeholder)
+        3 => 0xFFFF_AA00,       // enemy orange (placeholder)
+        4 => 0xFFFF_FF33,       // enemy yellow (placeholder)
+        _ => 0xFFFF_FFFF,       // neutral / default — white
     }
 }
 
@@ -1259,13 +1274,10 @@ fn load_map() -> (
     let dat_path = dat_candidates
         .iter()
         .find(|c| std::path::Path::new(c).exists())
-        .expect(
-            "robots.dat is required; place it next to robots.pkg (e.g. ../Data/robots.dat)",
-        );
+        .expect("robots.dat is required; place it next to robots.pkg (e.g. ../Data/robots.dat)");
     log::info!("loading matrix data: {}", dat_path);
     let dat_bytes = std::fs::read(dat_path).expect("failed to read robots.dat");
-    let matrix_data =
-        Storage::from_bytes(&dat_bytes).expect("failed to parse robots.dat CStorage");
+    let matrix_data = Storage::from_bytes(&dat_bytes).expect("failed to parse robots.dat CStorage");
 
     // Pick the map the same way the original does (MatrixGame.cpp:383-394):
     // CLI arg wins; otherwise read `Config/Map` from the global data.
@@ -1360,9 +1372,9 @@ async fn load_map_async() -> (
     let map = GameMap::from_cmap_bytes(&cmap_data).expect("failed to parse CMAP");
 
     // robots.dat is required here too — see the native loader comment.
-    let dat_bytes = bundle.read_file("robots.dat").expect(
-        "bundle must contain robots.dat; rebuild the bundle with examples/pack_bundle.rs",
-    );
+    let dat_bytes = bundle
+        .read_file("robots.dat")
+        .expect("bundle must contain robots.dat; rebuild the bundle with examples/pack_bundle.rs");
     let matrix_data =
         Storage::from_bytes(dat_bytes).expect("failed to parse bundled robots.dat CStorage");
     log::info!("loaded matrix data from bundle (robots.dat)");

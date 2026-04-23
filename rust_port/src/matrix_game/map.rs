@@ -12,8 +12,6 @@ use anyhow::{bail, Context, Result};
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
-use crate::matrix_lib::base::storage::Storage;
-use crate::matrix_lib::three_g::texture::*;
 use crate::matrix_game::camera::Camera;
 use crate::matrix_game::common::{
     unpack_rgb, CELLFLAG_BRIDGE, CELLFLAG_FLAT, CELLFLAG_LAND, CELLFLAG_WATER, FOG_END, FOG_START,
@@ -26,6 +24,8 @@ use crate::matrix_game::ter_surface::{
     build_surface_overlays, GlossOverlayBatch, GlossResources, GlossVertex, OverlayBatch,
 };
 use crate::matrix_game::water::visible_groups_mask;
+use crate::matrix_lib::base::storage::Storage;
+use crate::matrix_lib::three_g::texture::*;
 
 pub const GLOBAL_SCALE: f32 = 20.0;
 
@@ -44,8 +44,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
 static CURRENT_MAP: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
-static CURRENT_ELAPSED_MS: std::sync::atomic::AtomicI64 =
-    std::sync::atomic::AtomicI64::new(0);
+static CURRENT_ELAPSED_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
 /// RAII guard — sets `CURRENT_MAP` + `CURRENT_ELAPSED_MS` on
 /// construction, clears on drop. Use:
@@ -74,7 +73,11 @@ impl Drop for MapScope {
 /// which always sits inside a scope.
 pub fn current_map<'a>() -> Option<&'a GameMap> {
     let ptr = CURRENT_MAP.load(Ordering::Acquire) as *const GameMap;
-    if ptr.is_null() { None } else { unsafe { Some(&*ptr) } }
+    if ptr.is_null() {
+        None
+    } else {
+        unsafe { Some(&*ptr) }
+    }
 }
 
 /// Game-time elapsed (ms) as registered by the active `MapScope`.
@@ -140,6 +143,7 @@ impl MoveCell {
     /// into one byte:
     ///   - bits 0..3 = `m_Sphere` corner mask (sphere corners at LU/RU/RD/LD)
     ///   - bits 4..7 = `m_Zubchik` corner mask (triangular `zubchik` corners)
+    ///
     /// Returns `0xff` when the size-1 cell is *passable* for `nsh`
     /// (`m_Stop` bit for size-1 is not set — shift=0). That sentinel is
     /// what `SphereRobotToAABBObstacleCollision` tests at :2791.
@@ -149,14 +153,30 @@ impl MoveCell {
             return 0xff;
         }
         let mut rv: u8 = 0;
-        if (self.sphere & ((1u32 << nsh) <<  0)) != 0 { rv |= 1; }
-        if (self.sphere & ((1u32 << nsh) <<  8)) != 0 { rv |= 2; }
-        if (self.sphere & ((1u32 << nsh) << 16)) != 0 { rv |= 4; }
-        if (self.sphere & ((1u32 << nsh) << 24)) != 0 { rv |= 8; }
-        if (self.zubchik & ((1u32 << nsh) <<  0)) != 0 { rv |= 16; }
-        if (self.zubchik & ((1u32 << nsh) <<  8)) != 0 { rv |= 32; }
-        if (self.zubchik & ((1u32 << nsh) << 16)) != 0 { rv |= 64; }
-        if (self.zubchik & ((1u32 << nsh) << 24)) != 0 { rv |= 128; }
+        if (self.sphere & (1u32 << nsh)) != 0 {
+            rv |= 1;
+        }
+        if (self.sphere & ((1u32 << nsh) << 8)) != 0 {
+            rv |= 2;
+        }
+        if (self.sphere & ((1u32 << nsh) << 16)) != 0 {
+            rv |= 4;
+        }
+        if (self.sphere & ((1u32 << nsh) << 24)) != 0 {
+            rv |= 8;
+        }
+        if (self.zubchik & (1u32 << nsh)) != 0 {
+            rv |= 16;
+        }
+        if (self.zubchik & ((1u32 << nsh) << 8)) != 0 {
+            rv |= 32;
+        }
+        if (self.zubchik & ((1u32 << nsh) << 16)) != 0 {
+            rv |= 64;
+        }
+        if (self.zubchik & ((1u32 << nsh) << 24)) != 0 {
+            rv |= 128;
+        }
         rv
     }
 }
@@ -484,10 +504,14 @@ impl GameMap {
         let mut track_blocked = [0usize; 5];
         let mut all_zero = 0usize;
         for c in &move_cells {
-            if c.stop == 0 { all_zero += 1; }
+            if c.stop == 0 {
+                all_zero += 1;
+            }
             for size in 1..=5 {
                 let mask = (1u32 << 2) << (6 * (size - 1));
-                if c.stop & mask != 0 { track_blocked[size - 1] += 1; }
+                if c.stop & mask != 0 {
+                    track_blocked[size - 1] += 1;
+                }
             }
         }
         log::info!(
@@ -622,9 +646,13 @@ impl GameMap {
     /// `UnitGetTest(x, y)` helper at MatrixMap.hpp. Returns `None`
     /// for off-map / negative coords.
     pub fn unit_flags(&self, x: i32, y: i32) -> Option<u8> {
-        if x < 0 || y < 0 { return None; }
+        if x < 0 || y < 0 {
+            return None;
+        }
         let (x, y) = (x as usize, y as usize);
-        if x >= self.size_x || y >= self.size_y { return None; }
+        if x >= self.size_x || y >= self.size_y {
+            return None;
+        }
         Some(self.units[y * self.size_x + x].flags)
     }
 
@@ -660,9 +688,13 @@ impl GameMap {
     }
 
     pub fn move_cell(&self, mx: i32, my: i32) -> Option<&MoveCell> {
-        if mx < 0 || my < 0 { return None; }
+        if mx < 0 || my < 0 {
+            return None;
+        }
         let (mx, my) = (mx as usize, my as usize);
-        if mx >= self.size_move_x || my >= self.size_move_y { return None; }
+        if mx >= self.size_move_x || my >= self.size_move_y {
+            return None;
+        }
         Some(&self.move_cells[my * self.size_move_x + mx])
     }
 
@@ -1020,10 +1052,16 @@ fn load_move_cells(
     let compiled_count = data.len() / CELL_SIZE;
 
     let read_move = |off: usize| -> (i32, u32, u32, u32) {
-        let zone    = i32::from_le_bytes([data[off],    data[off+1],  data[off+2],  data[off+3]]);
-        let stop    = u32::from_le_bytes([data[off+4],  data[off+5],  data[off+6],  data[off+7]]);
-        let sphere  = u32::from_le_bytes([data[off+8],  data[off+9],  data[off+10], data[off+11]]);
-        let zubchik = u32::from_le_bytes([data[off+12], data[off+13], data[off+14], data[off+15]]);
+        let zone = i32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
+        let stop = u32::from_le_bytes([data[off + 4], data[off + 5], data[off + 6], data[off + 7]]);
+        let sphere =
+            u32::from_le_bytes([data[off + 8], data[off + 9], data[off + 10], data[off + 11]]);
+        let zubchik = u32::from_le_bytes([
+            data[off + 12],
+            data[off + 13],
+            data[off + 14],
+            data[off + 15],
+        ]);
         (zone, stop, sphere, zubchik)
     };
 
@@ -1031,7 +1069,9 @@ fn load_move_cells(
     for y in 0..size_y {
         for x in 0..size_x {
             let mi = points[y * stride + x].move_idx;
-            if mi < 0 || (mi as usize) >= compiled_count { continue; }
+            if mi < 0 || (mi as usize) >= compiled_count {
+                continue;
+            }
             let base_off = (mi as usize) * CELL_SIZE;
             // Four sub-cells c[0..3] at local positions:
             //   c[0] = (x*2,   y*2)
@@ -1043,7 +1083,12 @@ fn load_move_cells(
                 let mx = x * 2 + dx;
                 let my = y * 2 + dy;
                 if mx < size_move_x && my < size_move_y {
-                    cells[my * size_move_x + mx] = MoveCell { zone, sphere, zubchik, stop };
+                    cells[my * size_move_x + mx] = MoveCell {
+                        zone,
+                        sphere,
+                        zubchik,
+                        stop,
+                    };
                 }
             }
         }
@@ -2045,8 +2090,13 @@ impl MapRenderer {
         let objects =
             super::object::ObjectsRenderer::new(device, queue, config, map, stor, read_texture);
         // Starting buildings from the CMAP `buildings/*` table.
-        let buildings =
-            super::object_building::BuildingsRenderer::new(device, queue, config, map, read_texture);
+        let buildings = super::object_building::BuildingsRenderer::new(
+            device,
+            queue,
+            config,
+            map,
+            read_texture,
+        );
         // Robot chassis meshes — built once from `Matrix/Robot/ChassisN.vo`
         // (MatrixObjectRobot.cpp:352). Instances are synced per-frame
         // from the arena.
@@ -2563,6 +2613,7 @@ impl MapRenderer {
     /// Sky, objects, buildings, point lights are intentionally skipped — the
     /// original sets `MMFLAG_DISABLE_DRAW_OBJECT_LIGHTS` for the bake and
     /// stamps buildings via `RenderObjectToBackground` separately.
+    #[allow(clippy::too_many_arguments)]
     pub fn bake_minimap(
         &mut self,
         device: &wgpu::Device,

@@ -23,10 +23,10 @@
 
 use wgpu::util::DeviceExt;
 
-use crate::matrix_lib::base::storage::Storage;
-use crate::matrix_game::map::{GameMap, GLOBAL_SCALE};
 use crate::matrix_game::camera::Camera;
 use crate::matrix_game::map::MapRenderer;
+use crate::matrix_game::map::{GameMap, GLOBAL_SCALE};
+use crate::matrix_lib::base::storage::Storage;
 use crate::matrix_lib::three_g::texture::{create_texture_from_rgba, decode_texture_bytes};
 
 /// Matches `MINIMAP_SIZE` in MatrixMinimap.hpp:14.
@@ -245,8 +245,7 @@ impl Minimap {
             // Matches surface format so `MapRenderer::bake_minimap` can
             // reuse its color pipeline targets without a second pipeline.
             format: surface_format,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
         });
         let bg_view = bg_tex.create_view(&wgpu::TextureViewDescriptor::default());
@@ -446,11 +445,21 @@ impl Minimap {
 
         let zi_button = parse_minim_button(matrix_data, "zi").unwrap_or(Button {
             local: [149.0, 187.0, 12.0, 12.0],
-            uv: IconUv { u0: 446.0/512.0, v0: 44.0/512.0, u1: 458.0/512.0, v1: 56.0/512.0 },
+            uv: IconUv {
+                u0: 446.0 / 512.0,
+                v0: 44.0 / 512.0,
+                u1: 458.0 / 512.0,
+                v1: 56.0 / 512.0,
+            },
         });
         let zo_button = parse_minim_button(matrix_data, "zo").unwrap_or(Button {
             local: [10.0, 187.0, 12.0, 12.0],
-            uv: IconUv { u0: 398.0/512.0, v0: 44.0/512.0, u1: 410.0/512.0, v1: 56.0/512.0 },
+            uv: IconUv {
+                u0: 398.0 / 512.0,
+                v0: 44.0 / 512.0,
+                u1: 410.0 / 512.0,
+                v1: 56.0 / 512.0,
+            },
         });
 
         // ── Pipelines ───────────────────────────────────────────────────────
@@ -498,7 +507,7 @@ impl Minimap {
                 vertex: wgpu::VertexState {
                     module: &shader,
                     entry_point: Some("vs_main"),
-                    buffers: &[vertex_layout.clone()],
+                    buffers: std::slice::from_ref(&vertex_layout),
                     compilation_options: Default::default(),
                 },
                 fragment: Some(wgpu::FragmentState {
@@ -517,8 +526,10 @@ impl Minimap {
                 cache: None,
             })
         };
-        let tex_pipeline =
-            make_pipeline(wgpu::PrimitiveTopology::TriangleList, "minimap tri pipeline");
+        let tex_pipeline = make_pipeline(
+            wgpu::PrimitiveTopology::TriangleList,
+            "minimap tri pipeline",
+        );
         let line_pipeline =
             make_pipeline(wgpu::PrimitiveTopology::LineStrip, "minimap line pipeline");
 
@@ -600,12 +611,11 @@ impl Minimap {
             self.events.push(ev);
             return;
         }
-        if let Some((idx, _)) = self
-            .events
-            .iter()
-            .enumerate()
-            .min_by(|(_, a), (_, b)| a.ttl.partial_cmp(&b.ttl).unwrap_or(std::cmp::Ordering::Equal))
-        {
+        if let Some((idx, _)) = self.events.iter().enumerate().min_by(|(_, a), (_, b)| {
+            a.ttl
+                .partial_cmp(&b.ttl)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }) {
             self.events[idx] = ev;
         }
     }
@@ -641,6 +651,7 @@ impl Minimap {
     ///   - eye at (mapCX, mapCY, 1300), target (mapCX, mapCY, 1299), up=(0,-1,0)
     ///   - view X/Y columns scaled by 1/fsz (fsz = max map dim × GLOBAL_SCALE)
     ///   - ortho projection 1×1, near 1, far 10000
+    ///
     /// Terrain vertices here are pre-centered on the map origin, so the
     /// translation terms for mapCX/mapCY drop out.
     pub fn bake_background(
@@ -679,10 +690,22 @@ impl Minimap {
         //   clip.z = (eye_z - near - wz)/(far - near) → LH depth
         //   clip.w = 1
         let vp = glam::Mat4::from_cols_array(&[
-            s, 0.0, 0.0, 0.0,
-            0.0, -s, 0.0, 0.0,
-            0.0, 0.0, -inv_depth, 0.0,
-            0.0, 0.0, (eye_z - near) * inv_depth, 1.0,
+            s,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            -s,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            -inv_depth,
+            0.0,
+            0.0,
+            0.0,
+            (eye_z - near) * inv_depth,
+            1.0,
         ]);
 
         // Clear to black, matching MatrixMinimap.cpp:983:
@@ -696,7 +719,9 @@ impl Minimap {
             a: 1.0,
         };
 
-        let color_view = self._bg_tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let color_view = self
+            ._bg_tex
+            .create_view(&wgpu::TextureViewDescriptor::default());
         let depth_view = self
             .bg_depth_tex
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -890,15 +915,15 @@ impl Minimap {
     /// Port of `CMinimap::ButtonZoomIn` (MatrixMinimap.cpp:1344-1348).
     /// `scale *= 1.8`, clamped to [MINIMAP_MIN_SCALE, MINIMAP_MAX_SCALE].
     pub fn zoom_in(&mut self) {
-        self.tgt_scale = (self.tgt_scale * MINIMAP_ZOOM_IN_FACTOR)
-            .clamp(MINIMAP_MIN_SCALE, MINIMAP_MAX_SCALE);
+        self.tgt_scale =
+            (self.tgt_scale * MINIMAP_ZOOM_IN_FACTOR).clamp(MINIMAP_MIN_SCALE, MINIMAP_MAX_SCALE);
     }
 
     /// Port of `CMinimap::ButtonZoomOut` (MatrixMinimap.cpp:1350-1354).
     /// `scale *= 0.5`, clamped the same way.
     pub fn zoom_out(&mut self) {
-        self.tgt_scale = (self.tgt_scale * MINIMAP_ZOOM_OUT_FACTOR)
-            .clamp(MINIMAP_MIN_SCALE, MINIMAP_MAX_SCALE);
+        self.tgt_scale =
+            (self.tgt_scale * MINIMAP_ZOOM_OUT_FACTOR).clamp(MINIMAP_MIN_SCALE, MINIMAP_MAX_SCALE);
     }
 
     /// Port of `CMinimap::BeforeDraw` (MatrixMinimap.cpp:182-248) — computes
@@ -1059,8 +1084,7 @@ impl Minimap {
         let panel_w = MINIMAP_PANEL_W * ui_scale;
         let panel_h = MINIMAP_PANEL_H * ui_scale;
         let panel_x = 0.0;
-        let panel_y =
-            screen_h - (DESIGN_HEIGHT_PX - MINIMAP_PANEL_Y_BASE) * ui_scale;
+        let panel_y = screen_h - (DESIGN_HEIGHT_PX - MINIMAP_PANEL_Y_BASE) * ui_scale;
         self.size_x = MINIMAP_SIZE_PX * ui_scale;
         self.size_y = MINIMAP_SIZE_PX * ui_scale;
         self.pos_x = panel_x + MINIMAP_OFFSET_X * ui_scale;
@@ -1159,7 +1183,8 @@ impl Minimap {
             Self::push_marker(&mut markers, px_px, radius, icon, color);
         }
         for ev in &self.events {
-            let pos = self.apply_rotation(self.world_to_map(ev.pos_in_world[0], ev.pos_in_world[1]));
+            let pos =
+                self.apply_rotation(self.world_to_map(ev.pos_in_world[0], ev.pos_in_world[1]));
             if pos[0] < self.pos_x
                 || pos[0] > self.pos_x + self.size_x
                 || pos[1] < self.pos_y
@@ -1312,7 +1337,10 @@ impl Minimap {
             }
             break;
         }
-        [cx - dir[0] * MINIMAP_OUT_SCALE, cy - dir[1] * MINIMAP_OUT_SCALE]
+        [
+            cx - dir[0] * MINIMAP_OUT_SCALE,
+            cy - dir[1] * MINIMAP_OUT_SCALE,
+        ]
     }
 }
 
@@ -1448,11 +1476,7 @@ fn parse_mmp_static(matrix_data: &Storage) -> Option<SubRect> {
     for i in 0..names.arrays_count() {
         if names.get_as_wstr(i) == "Static" {
             let child = records.get_as_wstr(i);
-            if matrix_data
-                .block_param(&child, "Name")
-                .as_deref()
-                == Some("mmp")
-            {
+            if matrix_data.block_param(&child, "Name").as_deref() == Some("mmp") {
                 let x = parse_f32_param(matrix_data, &child, "sNormalX")?;
                 let y = parse_f32_param(matrix_data, &child, "sNormalY")?;
                 let w = parse_f32_param(matrix_data, &child, "xSize")?;
@@ -1490,7 +1514,9 @@ fn parse_minimap_block(
         log::warn!("minimap: no `Minimap` block in robots.dat — icons will be blank");
         return (128, rects);
     };
-    let keys: &[&'static str] = &["point", "arrow", "flyer", "robot", "turret", "base", "factory"];
+    let keys: &[&'static str] = &[
+        "point", "arrow", "flyer", "robot", "turret", "base", "factory",
+    ];
     for key in keys {
         let Some(val) = matrix_data.block_param(&mm_rec, key) else {
             continue;

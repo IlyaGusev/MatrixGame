@@ -360,14 +360,22 @@ impl ProgressBarRenderer {
         for (i, bar) in self.pending.iter().enumerate() {
             let [rx, ry, rw, rh] = bar.rect;
             let empty_verts = build_segments(
-                rx, ry, rw, rh, cap_world,
+                rx,
+                ry,
+                rw,
+                rh,
+                cap_world,
                 // V strip [0, 0.25] — empty body (MatrixProgressBar.cpp:167-174).
                 [0.0, 0.25],
             );
             let fill = bar.fill.clamp(0.0, 1.0);
             let fill_width = rw * fill;
             let filled_verts = build_segments(
-                rx, ry, fill_width, rh, cap_world,
+                rx,
+                ry,
+                fill_width,
+                rh,
+                cap_world,
                 // V strip [0.25, 0.5] — filled body (MatrixProgressBar.cpp:251-258).
                 [0.25, 0.5],
             );
@@ -431,14 +439,7 @@ impl ProgressBarRenderer {
 /// left-cap [0..0.25]×v, body [0.25..0.75]×v, right-cap [0.75..1]×v
 /// — the fixed horizontal layout of the pb atlas
 /// (MatrixProgressBar.cpp:167-174 default UV set).
-fn build_segments(
-    x: f32,
-    y: f32,
-    w: f32,
-    h: f32,
-    cap: f32,
-    v_range: [f32; 2],
-) -> Vec<Vertex> {
+fn build_segments(x: f32, y: f32, w: f32, h: f32, cap: f32, v_range: [f32; 2]) -> Vec<Vertex> {
     let mut verts = Vec::with_capacity(18);
     if w <= 0.0 {
         return verts;
@@ -449,7 +450,7 @@ fn build_segments(
     // Sub-rect X breakpoints. If the bar is narrower than two caps,
     // the body collapses — we still draw each segment but the body's
     // width falls to ≤ 0 (skipped).
-    let x_left_end  = x + cap.min(w * 0.5);
+    let x_left_end = x + cap.min(w * 0.5);
     let x_right_beg = x + (w - cap.min(w * 0.5));
     let x_right_end = x + w;
 
@@ -457,10 +458,22 @@ fn build_segments(
         if x1 - x0 <= 0.0 {
             return;
         }
-        let p00 = Vertex { pos: [x0, y + h], uv: [u0, v1] };
-        let p10 = Vertex { pos: [x0, y    ], uv: [u0, v0] };
-        let p01 = Vertex { pos: [x1, y + h], uv: [u1, v1] };
-        let p11 = Vertex { pos: [x1, y    ], uv: [u1, v0] };
+        let p00 = Vertex {
+            pos: [x0, y + h],
+            uv: [u0, v1],
+        };
+        let p10 = Vertex {
+            pos: [x0, y],
+            uv: [u0, v0],
+        };
+        let p01 = Vertex {
+            pos: [x1, y + h],
+            uv: [u1, v1],
+        };
+        let p11 = Vertex {
+            pos: [x1, y],
+            uv: [u1, v0],
+        };
         verts.extend_from_slice(&[p00, p10, p11, p00, p11, p01]);
     };
 

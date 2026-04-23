@@ -6,9 +6,9 @@
 //! `assets/<name>.bundle`, matching the `?bundle=<url>` query the WASM loader
 //! accepts.
 use matrixgame_rs::gfx::bundle::AssetBundle;
+use matrixgame_rs::matrix_game::map::GameMap;
 use matrixgame_rs::matrix_lib::base::pack::PkgArchive;
 use matrixgame_rs::matrix_lib::base::storage::Storage;
-use matrixgame_rs::matrix_game::map::GameMap;
 use matrixgame_rs::matrix_lib::three_g::vector_object;
 
 fn main() {
@@ -249,10 +249,7 @@ fn main() {
     let mut vo_tex_seen = std::collections::HashSet::<String>::new();
 
     let try_pack_texture =
-        |bundle: &mut AssetBundle,
-         seen: &mut std::collections::HashSet<String>,
-         t: &str|
-         -> bool {
+        |bundle: &mut AssetBundle, seen: &mut std::collections::HashSet<String>, t: &str| -> bool {
             if !seen.insert(t.to_string()) {
                 return false;
             }
@@ -412,7 +409,8 @@ fn main() {
                     .map(|(d, _)| format!("{d}/"));
                 for s in &vo.surfaces {
                     if let Some(spec) = s.texture_ref.as_deref() {
-                        let m = vector_object::parse_material_spec_with_prefix(spec, dir.as_deref());
+                        let m =
+                            vector_object::parse_material_spec_with_prefix(spec, dir.as_deref());
                         for t in [
                             m.diffuse.as_ref(),
                             m.gloss.as_ref(),
@@ -466,9 +464,7 @@ fn main() {
             }
         }
         if let Ok(vo) = vector_object::parse_vo(&vo_bytes) {
-            let dir = vo_path
-                .rsplit_once('/')
-                .map(|(d, _)| format!("{d}/"));
+            let dir = vo_path.rsplit_once('/').map(|(d, _)| format!("{d}/"));
             for s in &vo.surfaces {
                 if let Some(spec) = s.texture_ref.as_deref() {
                     let m = vector_object::parse_material_spec_with_prefix(spec, dir.as_deref());

@@ -7,9 +7,9 @@ use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
 use super::map_group::{DrawBatch, Vertex};
-use crate::matrix_lib::base::storage::Storage;
 use crate::matrix_game::common::{rd_f32, rd_i32, rd_u16, rd_u32};
 use crate::matrix_game::map::GameMap;
+use crate::matrix_lib::base::storage::Storage;
 use crate::matrix_lib::three_g::texture::{
     create_solid_texture, create_texture_from_rgba_mipped, decode_texture_bytes,
 };
@@ -153,158 +153,158 @@ pub fn build_surface_overlays(
     for (srfm, has_macro_uv) in &sources {
         let vert_size = if *has_macro_uv { 32 } else { 24 };
         for i in 0..srfm.arrays_count() {
-        let raw = srfm.get_bytes(i);
-        if raw.len() < 32 {
-            continue;
-        }
-        let mut off = 0;
+            let raw = srfm.get_bytes(i);
+            if raw.len() < 32 {
+                continue;
+            }
+            let mut off = 0;
 
-        let ids = rd_i32(raw, &mut off);
-        let index = rd_i32(raw, &mut off);
-        let color_dw = rd_u32(raw, &mut off);
-        let vcnt = rd_u32(raw, &mut off) as usize;
-        let idxsz = rd_u32(raw, &mut off) as usize;
-        let grpsc = rd_u32(raw, &mut off) as usize;
-        let disp_x = rd_f32(raw, &mut off);
-        let disp_y = rd_f32(raw, &mut off);
+            let ids = rd_i32(raw, &mut off);
+            let index = rd_i32(raw, &mut off);
+            let color_dw = rd_u32(raw, &mut off);
+            let vcnt = rd_u32(raw, &mut off) as usize;
+            let idxsz = rd_u32(raw, &mut off) as usize;
+            let grpsc = rd_u32(raw, &mut off) as usize;
+            let disp_x = rd_f32(raw, &mut off);
+            let disp_y = rd_f32(raw, &mut off);
 
-        let ids_str = if ids >= 0 && (ids as usize) < strings.arrays_count() {
-            strings.get_as_wstr(ids as usize)
-        } else {
-            continue;
-        };
-
-        let (tex_path, params) = ids_str
-            .split_once('?')
-            .map(|(t, p)| (t.to_string(), p.to_string()))
-            .unwrap_or((ids_str.clone(), String::new()));
-
-        let tex_path = tex_path.replace('\\', "/");
-
-        let gloss_path = gloss.as_ref().and_then(|_| {
-            parse_gloss_param(&params).and_then(|name| resolve_gloss_path(&tex_path, &name))
-        });
-
-        let r = ((color_dw >> 16) & 0xFF) as f32 / 255.0;
-        let g = ((color_dw >> 8) & 0xFF) as f32 / 255.0;
-        let b = (color_dw & 0xFF) as f32 / 255.0;
-        let a = ((color_dw >> 24) & 0xFF) as f32 / 255.0;
-
-        let needed = off + vcnt * vert_size + idxsz + grpsc * 4;
-        if needed > raw.len() {
-            continue;
-        }
-
-        let mut verts = Vec::with_capacity(vcnt);
-        let mut gloss_verts = if gloss_path.is_some() {
-            Vec::with_capacity(vcnt)
-        } else {
-            Vec::new()
-        };
-        let mut wrap_y = false;
-        for _ in 0..vcnt {
-            let px = rd_f32(raw, &mut off);
-            let py = rd_f32(raw, &mut off);
-            let pz = rd_f32(raw, &mut off);
-            let vcol = rd_u32(raw, &mut off);
-            let tu = rd_f32(raw, &mut off);
-            let tv = rd_f32(raw, &mut off);
-            // Plain (non-M) surfaces don't carry macro UVs in their vertex
-            // stream — `CTerSurface::Load` uses `STerSurfVertex` (24 bytes)
-            // versus `STerSurfVertexM` (32 bytes) in `LoadM`. Skip reading
-            // the tum/tvm pair and emit (0, 0) instead; the draw path's
-            // macrotexture is disabled on maps that use plain surfaces
-            // (training has MacroTexture=""), so the value is irrelevant.
-            let (_tum, _tvm) = if *has_macro_uv {
-                (rd_f32(raw, &mut off), rd_f32(raw, &mut off))
+            let ids_str = if ids >= 0 && (ids as usize) < strings.arrays_count() {
+                strings.get_as_wstr(ids as usize)
             } else {
-                (0.0, 0.0)
+                continue;
             };
 
-            let vr = ((vcol >> 16) & 0xFF) as f32 / 255.0;
-            let vg = ((vcol >> 8) & 0xFF) as f32 / 255.0;
-            let vb = (vcol & 0xFF) as f32 / 255.0;
-            let va = ((vcol >> 24) & 0xFF) as f32 / 255.0;
-            if !(0.0..=1.0).contains(&tv) {
-                wrap_y = true;
-            }
+            let (tex_path, params) = ids_str
+                .split_once('?')
+                .map(|(t, p)| (t.to_string(), p.to_string()))
+                .unwrap_or((ids_str.clone(), String::new()));
 
-            let world_x = px + disp_x - cx;
-            let world_y = py + disp_y - cy;
-            let world_z = pz + 0.05;
+            let tex_path = tex_path.replace('\\', "/");
 
-            verts.push(Vertex {
-                position: [world_x, world_y, world_z],
-                color: [vr * r, vg * g, vb * b, va * a],
-                uv: [tu, tv],
-                macro_uv: [_tum, _tvm],
+            let gloss_path = gloss.as_ref().and_then(|_| {
+                parse_gloss_param(&params).and_then(|name| resolve_gloss_path(&tex_path, &name))
             });
 
-            if gloss_path.is_some() {
-                let n = map.get_normal(px + disp_x, py + disp_y, false);
-                gloss_verts.push(GlossVertex {
+            let r = ((color_dw >> 16) & 0xFF) as f32 / 255.0;
+            let g = ((color_dw >> 8) & 0xFF) as f32 / 255.0;
+            let b = (color_dw & 0xFF) as f32 / 255.0;
+            let a = ((color_dw >> 24) & 0xFF) as f32 / 255.0;
+
+            let needed = off + vcnt * vert_size + idxsz + grpsc * 4;
+            if needed > raw.len() {
+                continue;
+            }
+
+            let mut verts = Vec::with_capacity(vcnt);
+            let mut gloss_verts = if gloss_path.is_some() {
+                Vec::with_capacity(vcnt)
+            } else {
+                Vec::new()
+            };
+            let mut wrap_y = false;
+            for _ in 0..vcnt {
+                let px = rd_f32(raw, &mut off);
+                let py = rd_f32(raw, &mut off);
+                let pz = rd_f32(raw, &mut off);
+                let vcol = rd_u32(raw, &mut off);
+                let tu = rd_f32(raw, &mut off);
+                let tv = rd_f32(raw, &mut off);
+                // Plain (non-M) surfaces don't carry macro UVs in their vertex
+                // stream — `CTerSurface::Load` uses `STerSurfVertex` (24 bytes)
+                // versus `STerSurfVertexM` (32 bytes) in `LoadM`. Skip reading
+                // the tum/tvm pair and emit (0, 0) instead; the draw path's
+                // macrotexture is disabled on maps that use plain surfaces
+                // (training has MacroTexture=""), so the value is irrelevant.
+                let (_tum, _tvm) = if *has_macro_uv {
+                    (rd_f32(raw, &mut off), rd_f32(raw, &mut off))
+                } else {
+                    (0.0, 0.0)
+                };
+
+                let vr = ((vcol >> 16) & 0xFF) as f32 / 255.0;
+                let vg = ((vcol >> 8) & 0xFF) as f32 / 255.0;
+                let vb = (vcol & 0xFF) as f32 / 255.0;
+                let va = ((vcol >> 24) & 0xFF) as f32 / 255.0;
+                if !(0.0..=1.0).contains(&tv) {
+                    wrap_y = true;
+                }
+
+                let world_x = px + disp_x - cx;
+                let world_y = py + disp_y - cy;
+                let world_z = pz + 0.05;
+
+                verts.push(Vertex {
                     position: [world_x, world_y, world_z],
-                    normal: n,
+                    color: [vr * r, vg * g, vb * b, va * a],
                     uv: [tu, tv],
+                    macro_uv: [_tum, _tvm],
                 });
-            }
-        }
 
-        let idx_count = idxsz / 2;
-        let mut strip = Vec::with_capacity(idx_count);
-        for _ in 0..idx_count {
-            if off + 2 > raw.len() {
-                break;
-            }
-            strip.push(rd_u16(raw, &mut off));
-        }
-
-        // Trailing `grpsc` DWORDs: indices into the linear group array
-        // (`m_Group[idx]`, MatrixTerSurface.cpp:187-193 / 274-280). Each
-        // index matches `gy * group_w + gx` on our side — same ordering
-        // as `visible_groups_mask`.
-        let mut groups = Vec::with_capacity(grpsc);
-        for _ in 0..grpsc {
-            if off + 4 > raw.len() {
-                break;
-            }
-            groups.push(rd_u32(raw, &mut off));
-        }
-
-        if !tex_cache.contains_key(&tex_path) {
-            if let Some(data) = read_texture(&tex_path) {
-                if let Some(rgba) = decode_texture_bytes(&data) {
-                    tex_cache.insert(
-                        tex_path.clone(),
-                        create_texture_from_rgba_mipped(device, queue, &rgba, 6),
-                    );
+                if gloss_path.is_some() {
+                    let n = map.get_normal(px + disp_x, py + disp_y, false);
+                    gloss_verts.push(GlossVertex {
+                        position: [world_x, world_y, world_z],
+                        normal: n,
+                        uv: [tu, tv],
+                    });
                 }
             }
-        }
 
-        if let Some(gp) = gloss_path.as_ref() {
-            if !gloss_cache.contains_key(gp) {
-                if let Some(data) = read_texture(gp) {
+            let idx_count = idxsz / 2;
+            let mut strip = Vec::with_capacity(idx_count);
+            for _ in 0..idx_count {
+                if off + 2 > raw.len() {
+                    break;
+                }
+                strip.push(rd_u16(raw, &mut off));
+            }
+
+            // Trailing `grpsc` DWORDs: indices into the linear group array
+            // (`m_Group[idx]`, MatrixTerSurface.cpp:187-193 / 274-280). Each
+            // index matches `gy * group_w + gx` on our side — same ordering
+            // as `visible_groups_mask`.
+            let mut groups = Vec::with_capacity(grpsc);
+            for _ in 0..grpsc {
+                if off + 4 > raw.len() {
+                    break;
+                }
+                groups.push(rd_u32(raw, &mut off));
+            }
+
+            if !tex_cache.contains_key(&tex_path) {
+                if let Some(data) = read_texture(&tex_path) {
                     if let Some(rgba) = decode_texture_bytes(&data) {
-                        gloss_cache.insert(
-                            gp.clone(),
+                        tex_cache.insert(
+                            tex_path.clone(),
                             create_texture_from_rgba_mipped(device, queue, &rgba, 6),
                         );
                     }
                 }
             }
-        }
 
-        surfaces.push(SurfData {
-            index,
-            tex_path,
-            gloss_path,
-            wrap_y,
-            verts,
-            indices: strip,
-            gloss_verts,
-            groups,
-        });
+            if let Some(gp) = gloss_path.as_ref() {
+                if !gloss_cache.contains_key(gp) {
+                    if let Some(data) = read_texture(gp) {
+                        if let Some(rgba) = decode_texture_bytes(&data) {
+                            gloss_cache.insert(
+                                gp.clone(),
+                                create_texture_from_rgba_mipped(device, queue, &rgba, 6),
+                            );
+                        }
+                    }
+                }
+            }
+
+            surfaces.push(SurfData {
+                index,
+                tex_path,
+                gloss_path,
+                wrap_y,
+                verts,
+                indices: strip,
+                gloss_verts,
+                groups,
+            });
         }
     }
 
