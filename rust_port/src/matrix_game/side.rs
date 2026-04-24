@@ -19,6 +19,12 @@
 use crate::matrix_game::map_static::ObjectId;
 use crate::matrix_game::robot_units::{Resource, MAX_RESOURCES};
 
+/// Port of the hard-coded 9000 cap inside `CMatrixSideUnit::AddResourceAmount`
+/// (MatrixSide.hpp:438-443). Every `AddResourceAmount` call clamps the
+/// final value to this ceiling; the HUD also displays `9000` when the
+/// pool saturates.
+pub const RESOURCE_CAP: i32 = 9000;
+
 /// Port of `ESelectedType` (MatrixSide.hpp). Tracks what the player's
 /// side is currently pointing at — the C++ interface panel dispatches
 /// on this to decide which menu to draw.
@@ -73,6 +79,18 @@ pub struct Side {
     /// (CConstructor.cpp:239-242).
     pub resources: [i32; MAX_RESOURCES],
 
+    /// `m_RobotsCnt` (MatrixSide.hpp:404) — cached count of live
+    /// robots owned by this side. Refreshed each logic takt by
+    /// `MapLogic::refresh_robots_cnt`. The C++ increments/decrements
+    /// it from robot spawn / death call sites; we recompute once per
+    /// tick which is simpler and equivalent for UI display.
+    pub robots_cnt: i32,
+
+    /// `m_BaseResForce` (MatrixSide.hpp:392) — the base-resource
+    /// "force-up" multiplier in percent. Default 100 = normal income.
+    /// Used by `GetResourceForceUp` at MatrixSide.cpp:346 etc.
+    pub base_res_force: i32,
+
     /// Port of the `CConstructorPanel` slice of `CMatrixSide`. Held
     /// inline since each side has its own robot configurator in the
     /// C++ (`m_ConstructPanel`). Filled lazily — the actual
@@ -94,17 +112,35 @@ impl Side {
             // robot so the constructor UI is exercisable until the
             // map-side seeding lands.
             resources: [500, 500, 500, 500],
+            robots_cnt: 0,
+            base_res_force: 100,
             builder: Some(crate::matrix_game::interface::constructor::RobotBuilder::new()),
         }
     }
 
-    /// Port of `CMatrixSideUnit::AddResourceAmount` (MatrixSide.cpp).
-    /// Clamps to ≥ 0 — the original also floors at zero and logs
-    /// an error for negative totals.
+    /// Port of `CMatrixSideUnit::AddResourceAmount` (MatrixSide.hpp:
+    /// 438-443). Caps at 9000 per resource (hard-coded in the original
+    /// setter); floors at 0 so decrements can't go negative.
     pub fn add_resource_amount(&mut self, res: Resource, amount: i32) {
         let i = res as usize;
         let v = self.resources[i].saturating_add(amount);
-        self.resources[i] = v.max(0);
+        self.resources[i] = v.clamp(0, RESOURCE_CAP);
+    }
+
+    /// Port of `CMatrixSideUnit::GetResourceForceUp` (MatrixSide.hpp:442).
+    pub fn get_resource_force_up(&self) -> i32 {
+        self.base_res_force
+    }
+
+    /// Port of `CMatrixSideUnit::SetResourceForceUp` (MatrixSide.hpp:441).
+    pub fn set_resource_force_up(&mut self, fu: i32) {
+        self.base_res_force = fu;
+    }
+
+    /// Port of `CMatrixSideUnit::GetSideRobots` (MatrixSide.hpp:436) —
+    /// cached live-robot count. Refreshed each tick.
+    pub fn get_side_robots(&self) -> i32 {
+        self.robots_cnt
     }
 
     /// Port of `CMatrixSideUnit::GetResourceAmount` (MatrixSide.cpp).

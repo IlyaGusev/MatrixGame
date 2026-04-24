@@ -19,10 +19,24 @@ use crate::matrix_game::config::{
 use crate::matrix_game::map::GameMap;
 use crate::matrix_game::map_static::{MapStatic, ObjectId, ObjectType, Objects};
 use crate::matrix_game::object::MapObject;
-use crate::matrix_game::object_building::Building;
+use crate::matrix_game::object_building::{Building, BuildingType};
 use crate::matrix_game::rnd::Rnd;
+use crate::matrix_game::robot_units::Resource;
 use crate::matrix_game::side::{CurrSel, Side};
 use crate::matrix_lib::base::storage::Storage;
+
+/// Per-building income constants — port of
+/// MatrixObjectBuilding.hpp:22-23.
+pub const RESOURCES_INCOME: i32 = 10;
+pub const RESOURCES_INCOME_BASE: i32 = 3;
+
+/// Port of ROBOTS_BY_BASE / ROBOTS_BY_MAIN (MatrixSide.hpp:24-26).
+/// `ROBOT_BY_FACTORY` is defined in the C++ but the `GetMaxSideRobots`
+/// formula uses `factories * 1` directly (the multiplier is commented
+/// out at MatrixSide.cpp:1666), so we inline the `* 1` and don't carry
+/// the constant.
+pub const ROBOTS_BY_BASE: i32 = 3;
+pub const ROBOTS_BY_MAIN: i32 = 4;
 
 /// `LOGIC_TAKT_PERIOD` from `MatrixLogic.hpp:13`.
 pub const LOGIC_TAKT_PERIOD_MS: i32 = 10;
@@ -100,6 +114,13 @@ impl MapLogic {
         if rem > 0 {
             self.objects.proceed_logic(rem, &mut self.rng);
         }
+        // Port of the per-building `m_ResourcePeriod` tick at
+        // MatrixObjectBuilding.cpp:605-667. The C++ advances the
+        // counter from inside each building's `LogicTakt`; we run it
+        // once per outer slice so the per-building state ports 1:1
+        // without threading the player Side through `proceed_logic`.
+        self.accrue_resources(step_ms);
+        self.refresh_side_robots();
         self.elapsed_ms += step_ms as i64;
     }
 
@@ -512,6 +533,230 @@ impl MapLogic {
     fn object_side(&self, id: ObjectId) -> i32 {
         self.objects.get(id).map(|o| o.side()).unwrap_or(0)
     }
+
+    /// Port of `CMatrixSideUnit::GetMaxSideRobots` (MatrixSide.cpp:
+    /// 1653-1667). Walks the live-object list, counts this side's
+    /// bases + factories, and returns
+    /// `bases*ROBOTS_BY_BASE + (bases>0 ? ROBOTS_BY_MAIN : 0) + factories`.
+    pub fn compute_max_side_robots(&self, side_id: i32) -> i32 {
+        let (bases, factories) = self.count_bases_factories(side_id);
+        bases * ROBOTS_BY_BASE + if bases > 0 { ROBOTS_BY_MAIN } else { 0 } + factories
+    }
+
+    /// Live-robot count for `side_id` — walks the arena and counts
+    /// robots whose `side` matches. The C++ keeps `m_RobotsCnt`
+    /// incremented / decremented at spawn / death; we recompute once
+    /// per tick which is equivalent for the HUD.
+    pub fn compute_side_robots(&self, side_id: i32) -> i32 {
+        let mut n = 0;
+        for id in self.objects.iter_live() {
+            let Some(obj) = self.objects.get(id) else {
+                continue;
+            };
+            if !matches!(obj.core().obj_type, ObjectType::RobotAi) {
+                continue;
+            }
+            if obj.side() == side_id {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// Port of `CMatrixSideUnit::GetResourceIncome` (MatrixSide.cpp:
+    /// 307-350). Returns `(base_income, factory_income)` in units per
+    /// tick-period — the HUD shows their sum.
+    ///
+    /// `fu` is the force-up multiplier (percent); factories' income is
+    /// constant (`RESOURCES_INCOME`), bases' income scales with `fu`.
+    pub fn compute_resource_income(&self, side_id: i32, resource: Resource) -> (i32, i32) {
+        let target = match resource {
+            Resource::Titan => BuildingType::Titan,
+            Resource::Electronics => BuildingType::Electronic,
+            Resource::Energy => BuildingType::Energy,
+            Resource::Plasma => BuildingType::Plasma,
+        };
+        let (mut bases, mut factories) = (0, 0);
+        for id in self.objects.iter_live() {
+            let Some(obj) = self.objects.get(id) else {
+                continue;
+            };
+            if !matches!(obj.core().obj_type, ObjectType::Building) {
+                continue;
+            }
+            if obj.side() != side_id {
+                continue;
+            }
+            // SAFETY: ObjectType::Building slots only hold `Building`.
+            let b: &Building =
+                unsafe { &*(obj as *const dyn MapStatic as *const Building) };
+            if matches!(b.state, crate::matrix_game::object_building::BaseState::Dip
+                | crate::matrix_game::object_building::BaseState::DipExploded)
+            {
+                continue;
+            }
+            if b.kind == BuildingType::Base {
+                bases += 1;
+            } else if b.kind == target {
+                factories += 1;
+            }
+        }
+        let fu = self.side_force_up(side_id);
+        let fa_i = factories * RESOURCES_INCOME;
+        let base_i = bases * RESOURCES_INCOME_BASE * fu / 100;
+        (base_i, fa_i)
+    }
+
+    /// Force-up lookup keyed by side id. Only the player side is
+    /// modelled for now; other sides fall back to `100` (unmodified).
+    fn side_force_up(&self, side_id: i32) -> i32 {
+        if side_id == self.player_side.id {
+            self.player_side.get_resource_force_up()
+        } else {
+            100
+        }
+    }
+
+    /// Tally bases and non-base buildings owned by `side_id`. Shared
+    /// helper between [`compute_max_side_robots`] and the income
+    /// accrual pass.
+    fn count_bases_factories(&self, side_id: i32) -> (i32, i32) {
+        let (mut bases, mut factories) = (0, 0);
+        for id in self.objects.iter_live() {
+            let Some(obj) = self.objects.get(id) else {
+                continue;
+            };
+            if !matches!(obj.core().obj_type, ObjectType::Building) {
+                continue;
+            }
+            if obj.side() != side_id {
+                continue;
+            }
+            let b: &Building =
+                unsafe { &*(obj as *const dyn MapStatic as *const Building) };
+            if matches!(b.state, crate::matrix_game::object_building::BaseState::Dip
+                | crate::matrix_game::object_building::BaseState::DipExploded)
+            {
+                continue;
+            }
+            if b.kind == BuildingType::Base {
+                bases += 1;
+            } else {
+                factories += 1;
+            }
+        }
+        (bases, factories)
+    }
+
+    /// Port of the `m_ResourcePeriod` tick block in
+    /// `CMatrixBuilding::LogicTakt` (MatrixObjectBuilding.cpp:605-667).
+    ///
+    /// Walks every live building, advances its per-instance
+    /// `resource_period` by `cms`, and on threshold crossings emits
+    /// income to the owning side. Ports the per-kind branches:
+    ///
+    /// * Factories (TITAN / ELECTRONIC / ENERGY / PLASMA) emit
+    ///   `RESOURCES_INCOME` of the matching resource.
+    /// * BASE emits `RESOURCES_INCOME_BASE * fu / 100` of **all four**
+    ///   resources.
+    ///
+    /// Only the player side has a full `Side` struct today; income for
+    /// other sides is skipped until `CMatrixSideUnit` proper lands. The
+    /// per-building timer still advances (so when AI sides are wired,
+    /// their buildings won't all emit a first payout on the same tick).
+    pub fn accrue_resources(&mut self, cms: i32) {
+        let timings = config::global().timings;
+        if cms <= 0 {
+            return;
+        }
+        // Collect building ids first so we can take &mut on Objects /
+        // Side without re-entering the arena iterator.
+        let ids: Vec<ObjectId> = self
+            .objects
+            .iter_live()
+            .filter(|&id| {
+                self.objects
+                    .get(id)
+                    .map(|o| matches!(o.core().obj_type, ObjectType::Building))
+                    .unwrap_or(false)
+            })
+            .collect();
+
+        let player_id = self.player_side.id;
+        let fu = self.player_side.get_resource_force_up();
+        for id in ids {
+            let Some(obj) = self.objects.get_mut(id) else {
+                continue;
+            };
+            // SAFETY: filtered to ObjectType::Building above.
+            let b: &mut Building =
+                unsafe { &mut *(obj as *mut dyn MapStatic as *mut Building) };
+            if matches!(b.state, crate::matrix_game::object_building::BaseState::Dip
+                | crate::matrix_game::object_building::BaseState::DipExploded)
+            {
+                continue;
+            }
+            if b.side == 0 {
+                continue; // neutral / unclaimed — C++ guards on `m_Side`.
+            }
+            b.resource_period += cms;
+
+            // Per-kind threshold lookup.
+            let (threshold, payout): (i32, Payout) = match b.kind {
+                BuildingType::Titan => {
+                    (timings.resource_titan, Payout::Single(Resource::Titan, RESOURCES_INCOME))
+                }
+                BuildingType::Electronic => (
+                    timings.resource_electronics,
+                    Payout::Single(Resource::Electronics, RESOURCES_INCOME),
+                ),
+                BuildingType::Energy => (
+                    timings.resource_energy,
+                    Payout::Single(Resource::Energy, RESOURCES_INCOME),
+                ),
+                BuildingType::Plasma => {
+                    (timings.resource_plasma, Payout::Single(Resource::Plasma, RESOURCES_INCOME))
+                }
+                BuildingType::Base => {
+                    let ra = RESOURCES_INCOME_BASE * fu / 100;
+                    (timings.resource_base, Payout::All(ra))
+                }
+                BuildingType::Repair => continue,
+            };
+            if threshold <= 0 || b.resource_period < threshold {
+                continue;
+            }
+            b.resource_period = 0;
+            if b.side != player_id {
+                // Non-player sides have no Side struct yet; timer still
+                // resets so future per-side accrual starts in phase.
+                continue;
+            }
+            match payout {
+                Payout::Single(res, amt) => self.player_side.add_resource_amount(res, amt),
+                Payout::All(amt) => {
+                    for r in Resource::ALL {
+                        self.player_side.add_resource_amount(r, amt);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Refresh `m_RobotsCnt` on the player side from the live arena.
+    /// Called from [`takt`] each logic slice so the HUD robot counter
+    /// is always in sync.
+    pub fn refresh_side_robots(&mut self) {
+        self.player_side.robots_cnt = self.compute_side_robots(self.player_side.id);
+    }
+}
+
+/// Shape of one per-kind income emission. Internal to `accrue_resources`.
+enum Payout {
+    /// Factory — single resource type.
+    Single(Resource, i32),
+    /// Base — same amount to all four resources.
+    All(i32),
 }
 
 /// Intersect the view ray at `(sx, sy)` with the terrain heightmap.
@@ -934,4 +1179,141 @@ mod tests {
         assert_eq!(w.tick, 0);
         assert_eq!(w.elapsed_ms, 0);
     }
+
+    // ── Economy / robot-limit tests ───────────────────────────────
+    //
+    // These seed a fresh `MapLogic` with hand-rolled `Building`
+    // instances so the ports of GetMaxSideRobots / GetResourceIncome /
+    // the per-building resource tick can be exercised without the full
+    // map-load path.
+    use crate::matrix_game::map::BuildingInstance;
+    use crate::matrix_game::object_building::{Building, BuildingType};
+
+    fn spawn_building(
+        w: &mut MapLogic,
+        side: i32,
+        kind: BuildingType,
+        x: f32,
+        y: f32,
+    ) -> ObjectId {
+        let inst = BuildingInstance {
+            x,
+            y,
+            build_z: 0.0,
+            angle: 0,
+            side: side as u8,
+            kind: kind as u8,
+            turrets_places_cnt: 4,
+            shadow_kind: 0,
+            shadow_size: 128,
+        };
+        let b = Building::from_instance(&inst);
+        let id = w.objects.spawn(Box::new(b));
+        if let Some(obj) = w.objects.get_mut(id) {
+            let b_mut: &mut Building =
+                unsafe { &mut *(obj as *mut dyn MapStatic as *mut Building) };
+            b_mut.self_id = Some(id);
+        }
+        w.objects.add_lt(id);
+        id
+    }
+
+    #[test]
+    fn max_side_robots_counts_bases_and_factories() {
+        let mut w = MapLogic::new();
+        // Empty side: no robots allowed.
+        assert_eq!(w.compute_max_side_robots(PLAYER_SIDE), 0);
+
+        // One base alone: 3 + 4 = 7.
+        spawn_building(&mut w, PLAYER_SIDE, BuildingType::Base, 0.0, 0.0);
+        assert_eq!(w.compute_max_side_robots(PLAYER_SIDE), 7);
+
+        // Add a factory: + 1 = 8.
+        spawn_building(&mut w, PLAYER_SIDE, BuildingType::Titan, 50.0, 0.0);
+        assert_eq!(w.compute_max_side_robots(PLAYER_SIDE), 8);
+
+        // Add a second base: 2*3 + 4 + 1 = 11.
+        spawn_building(&mut w, PLAYER_SIDE, BuildingType::Base, 100.0, 0.0);
+        assert_eq!(w.compute_max_side_robots(PLAYER_SIDE), 11);
+
+        // Neutral-owned building doesn't count.
+        spawn_building(&mut w, 0, BuildingType::Plasma, 200.0, 0.0);
+        assert_eq!(w.compute_max_side_robots(PLAYER_SIDE), 11);
+    }
+
+    #[test]
+    fn resource_income_matches_cpp_formula() {
+        let mut w = MapLogic::new();
+        w.player_side.set_resource_force_up(100);
+        spawn_building(&mut w, PLAYER_SIDE, BuildingType::Base, 0.0, 0.0);
+        spawn_building(&mut w, PLAYER_SIDE, BuildingType::Titan, 50.0, 0.0);
+        spawn_building(&mut w, PLAYER_SIDE, BuildingType::Titan, 100.0, 0.0);
+
+        // One base (3 @ 100%) + two titan factories (10 each) =
+        //   base_i = 1*3*100/100 = 3
+        //   fa_i   = 2*10 = 20
+        let (base_i, fa_i) = w.compute_resource_income(PLAYER_SIDE, Resource::Titan);
+        assert_eq!(base_i, 3);
+        assert_eq!(fa_i, 20);
+
+        // Plasma factory missing → only base income.
+        let (base_i, fa_i) = w.compute_resource_income(PLAYER_SIDE, Resource::Plasma);
+        assert_eq!(base_i, 3);
+        assert_eq!(fa_i, 0);
+
+        // Force-up doubles the base contribution (factories are flat).
+        w.player_side.set_resource_force_up(200);
+        let (base_i, fa_i) = w.compute_resource_income(PLAYER_SIDE, Resource::Titan);
+        assert_eq!(base_i, 6);
+        assert_eq!(fa_i, 20);
+    }
+
+    #[test]
+    fn accrue_resources_emits_on_threshold() {
+        // Preseed a lightweight Timings — in tests we don't run
+        // `load_config`, so the globals default to 0 and nothing fires.
+        // Inject directly via `config::set_global` using values close
+        // to the shipping robots.dat (titan=10_000 ms, base=15_000 ms).
+        let mut g = config::global();
+        g.timings.resource_titan = 10_000;
+        g.timings.resource_electronics = 10_000;
+        g.timings.resource_energy = 10_000;
+        g.timings.resource_plasma = 10_000;
+        g.timings.resource_base = 15_000;
+        config::set_global(g);
+
+        let mut w = MapLogic::new();
+        w.player_side.resources = [0; crate::matrix_game::robot_units::MAX_RESOURCES];
+        w.player_side.set_resource_force_up(100);
+        spawn_building(&mut w, PLAYER_SIDE, BuildingType::Titan, 0.0, 0.0);
+        spawn_building(&mut w, PLAYER_SIDE, BuildingType::Base, 50.0, 0.0);
+
+        // Under threshold: nothing credited.
+        w.accrue_resources(5_000);
+        assert_eq!(w.player_side.resources, [0; crate::matrix_game::robot_units::MAX_RESOURCES]);
+
+        // Past titan threshold only (10_000 < 15_000): +10 titan,
+        // 0 elsewhere.
+        w.accrue_resources(6_000); // total 11_000 for titan / base
+        assert_eq!(
+            w.player_side.resources[Resource::Titan as usize],
+            RESOURCES_INCOME
+        );
+        assert_eq!(w.player_side.resources[Resource::Plasma as usize], 0);
+
+        // Past base threshold too: base emits +3 to all four.
+        w.accrue_resources(5_000); // base now at 16_000
+        assert_eq!(
+            w.player_side.resources[Resource::Titan as usize],
+            RESOURCES_INCOME + RESOURCES_INCOME_BASE
+        );
+        for r in [Resource::Electronics, Resource::Energy, Resource::Plasma] {
+            assert_eq!(
+                w.player_side.resources[r as usize],
+                RESOURCES_INCOME_BASE,
+                "base income missing for {r:?}"
+            );
+        }
+    }
 }
+

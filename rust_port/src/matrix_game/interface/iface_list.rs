@@ -122,7 +122,11 @@ impl IFaceList {
             "PopupMenu",
         ] {
             if let Some(mut p) = CInterface::load(matrix_data, name) {
-                p.visible = name == "Main";
+                // `Top` holds the always-on resource + robot-limit HUD;
+                // `Main` holds the selection-driven command panel. Both
+                // are visible from start. Others are toggled in by their
+                // respective selection / hint paths.
+                p.visible = matches!(name, "Main" | "Top");
                 list.panels.push(p);
             }
         }

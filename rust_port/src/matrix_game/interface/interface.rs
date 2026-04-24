@@ -682,6 +682,46 @@ impl CInterface {
         }
     }
 
+    /// Refresh the dynamic captions on the `Top` panel — the permanent
+    /// top-of-screen HUD showing current resource pools + live/limit
+    /// robot count. Ports the hint-replacement substitution path at
+    /// CInterface.cpp:4439-4462 (`thz` / `enhz1` / `elhz` / `phz` /
+    /// `rvhz`), but applied to the Top panel's always-visible
+    /// `tit` / `elect` / `energ` / `plasm` / `rval` value labels.
+    ///
+    /// * `titan` / `elect` / `energy` / `plasma` — current
+    ///   `m_Resources[]` values on the player side.
+    /// * `(side_robots, max_side_robots)` — current live robot count
+    ///   and the cap returned by `GetMaxSideRobots`.
+    pub fn apply_top_hud_text(
+        &mut self,
+        titan: i32,
+        elect: i32,
+        energy: i32,
+        plasma: i32,
+        side_robots: i32,
+        max_side_robots: i32,
+    ) {
+        if self.name != "Top" {
+            return;
+        }
+        let rval_text = format!("{}/{}", side_robots, max_side_robots);
+        for e in &mut self.elements {
+            let new_text: Option<String> = match e.name.as_str() {
+                "tit" => Some(titan.to_string()),
+                "elect" => Some(elect.to_string()),
+                "energ" => Some(energy.to_string()),
+                "plasm" => Some(plasma.to_string()),
+                "rval" => Some(rval_text.clone()),
+                _ => None,
+            };
+            let Some(new_text) = new_text else { continue };
+            for lbl in &mut e.labels {
+                lbl.text = new_text.clone();
+            }
+        }
+    }
+
     /// Refresh the dynamic captions on the `Main` panel when a base or
     /// factory is selected. Port of the per-element caption assignments
     /// at CInterface.cpp:1369-1499 — name / bopis / bresg get the

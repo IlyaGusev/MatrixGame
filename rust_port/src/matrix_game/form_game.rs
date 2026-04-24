@@ -2071,6 +2071,23 @@ fn refresh_interface_visibility(state: &mut AppState) {
             p.apply_main_building_text(k, hit_point, hit_point_max, income_per_minute, &strings.buildings);
         }
     }
+    // Top-of-screen permanent HUD — resource pools + robot count. Port
+    // of the CInterface::AddHintReplacements-driven `thz/enhz1/elhz/
+    // phz/rvhz` substitution at CInterface.cpp:4444-4462, applied to
+    // the Top panel's always-visible value labels.
+    {
+        use crate::matrix_game::robot_units::Resource;
+        let side = &state.game.player_side;
+        let titan = side.get_resource_amount(Resource::Titan);
+        let elect = side.get_resource_amount(Resource::Electronics);
+        let energy = side.get_resource_amount(Resource::Energy);
+        let plasma = side.get_resource_amount(Resource::Plasma);
+        let robots = side.get_side_robots();
+        let max_robots = state.game.compute_max_side_robots(side.id);
+        if let Some(p) = state.iface_list.panel_mut("Top") {
+            p.apply_top_hud_text(titan, elect, energy, plasma, robots, max_robots);
+        }
+    }
     // Snapshot the live preset so we can feed it to `apply_constructor_to_pylons`
     // without holding a borrow across the panel_mut call.
     let live_cfg = state.game.player_side.builder.as_ref().map(|b| *b.cfg());
