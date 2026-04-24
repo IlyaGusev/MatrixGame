@@ -1,15 +1,15 @@
 //! Faithful port of the SR2 bitmap-font text rendering.
 //!
 //! The original game ships fonts as `.AFT` bitmap files inside
-//! `forms.pkg/DATA/FONT/`. Each font is a fixed-size, 1-bpp, RLE-
-//! compressed glyph table. The Rangers DLL plugin (`m_RangersText`)
-//! reads these and blits them through D3D with point sampling — there
-//! is no scalable / antialiased rendering.
+//! `forms.pkg/DATA/FONT/`. The shipped UI uses the `_SMOOTH` variants,
+//! which carry a coverage-antialiased glyph (gray-value alpha per
+//! pixel) alongside the legacy 1-bit glyph. The Rangers DLL plugin
+//! reads these and blits them through D3D with point sampling.
 //!
-//! We replicate that exactly: parse the AFT format, lay each glyph out
-//! into a shared RGBA atlas (white pixels with alpha = pixel coverage),
-//! and let `InterfaceRenderer` draw the same kind of textured quads it
-//! draws for image atlases. A point sampler keeps the pixels crisp.
+//! We replicate that: parse the AFT format, decode each glyph into
+//! 8-bit alpha, lay them into a shared RGBA atlas (white pixels with
+//! alpha = coverage), and draw the same textured quads the image
+//! atlas uses. A point sampler keeps the pixels crisp.
 //!
 //! ## .AFT format (reverse-engineered from forms.pkg)
 //!
@@ -19,39 +19,51 @@
 //!   0x04  u32     version (always 1)
 //!   0x08  u32     glyph_count
 //!   0x0C  u32     ascent (px from cell top down to baseline)
-//!   0x10  u32     unknown (always 2)
+//!   0x10  u32     unknown (always 2/3)
 //!   0x14  u32     line_height (px) — total cell height = ascent + descent
 //!   0x18  u64     reserved (zero)
 //!
 //! Glyph entry (64 bytes per glyph, glyph_count entries follow header):
-//!   0x00  u32     codepoint (UTF-32; ASCII or Cyrillic)
+//!   0x00  u32     codepoint (UTF-32)
 //!   0x04  u32     unknown
-//!   0x08  u32     advance (px) — pen step including letter spacing
-//!   0x0C  u64     reserved
-//!   0x14  i32     bearing_y — signed offset from baseline to glyph TOP.
-//!                  Negative = glyph is above baseline (the common case).
-//!                  In screen coords (y down): glyph_top = baseline + bearing_y
-//!   0x18  u32     bitmap width (== bitmap header width)
-//!   0x1C  u32     bitmap height (== bitmap header height)
-//!   0x20  u32     bitmap_offset (file-absolute)
-//!   0x24  u32     bitmap_size  (bytes incl. per-glyph header)
-//!   0x28  u8[24]  reserved
+//!   0x08  u32     advance (px) — matches the SMOOTH glyph width +
+//!                  side-bearing in SMOOTH fonts; matches the 1-bit
+//!                  bitmap width in plain fonts
+//!   0x0C  u32     reserved (zero)
+//!   0x10  u32     unknown (0 or 1)
+//!   0x14  i32     bearing_y1 — TOP offset for the 1-bit bitmap
+//!   0x18  u32     bitmap1 width
+//!   0x1C  u32     bitmap1 height
+//!   0x20  u32     bitmap1 offset (file-absolute)
+//!   0x24  u32     bitmap1 size (bytes incl. 16-byte bitmap header)
+//!   0x28  u32     reserved (zero)
+//!   0x2C  i32     bearing_y2 — TOP offset for the SMOOTH bitmap
+//!                  (only set when the font ships a SMOOTH variant)
+//!   0x30  u32     bitmap2 width (SMOOTH, antialiased)
+//!   0x34  u32     bitmap2 height
+//!   0x38  u32     bitmap2 offset (0 when absent)
+//!   0x3C  u32     bitmap2 size
 //!
-//! Bitmap (bitmap_size bytes at bitmap_offset):
+//! Bitmap (size bytes at offset):
 //!   0x00  u32     data_size (bytes, excluding this 16-byte header)
-//!   0x04  u32     bitmap_width  (px)
-//!   0x08  u32     bitmap_height (px)
+//!   0x04  u32     width  (px, matches the entry field above)
+//!   0x08  u32     height (px)
 //!   0x0C  u32     reserved
-//!   0x10  u8[]    RLE: each byte is one opcode, processed row-major:
-//!                   0x80 alone (high bit, count 0) → skip one full
-//!                     row of `bitmap_width` transparent pixels. Used
-//!                     to compactly encode the empty middle row of a
-//!                     `:` and similar sparse glyphs.
-//!                   any other byte with high bit set → emit
-//!                     (byte & 0x7F) opaque pixels.
-//!                   high bit clear → skip `byte` transparent pixels.
-//!                 The walk ends when width × height pixel positions
-//!                 have been visited.
+//!   0x10  u8[]    RLE opcodes, processed row-major. Each row ends
+//!                 when `width` pixel positions have been visited
+//!                 (and the encoder always pads to a row boundary).
+//!                 Opcodes:
+//!                   0x80 alone → skip one full row of `width`
+//!                                transparent pixels (compactly
+//!                                encodes empty rows).
+//!                   0x00..0x7F → skip N transparent pixels.
+//!                   0x81..0xFF → emit N = (b & 0x7F) pixels.
+//!                                * Plain (1-bit) bitmaps: each pixel
+//!                                  is fully opaque (alpha=255). No
+//!                                  extra bytes follow.
+//!                                * SMOOTH bitmap (bmp2): the next
+//!                                  N bytes are per-pixel alpha
+//!                                  values (0..255).
 //! ```
 
 use std::collections::HashMap;
@@ -73,15 +85,14 @@ pub struct AftFont {
     /// Distance from the cell's top edge to the baseline.
     pub ascent: u32,
     /// Extra inter-letter spacing added to every glyph's advance.
-    /// The plain (non-`_SMOOTH`) AFT variants have `advance == bitmap
-    /// width` for most glyphs, so consecutive letters touch. The
-    /// shipped game uses the `_SMOOTH` variants which carry +1..+4 px
-    /// of side-bearing baked into their wider advance — but their
-    /// bitmap RLE is a different encoding the loader doesn't decode
-    /// yet. As a stop-gap we add the missing letter spacing here so
-    /// labels using plain VERDANA still read clearly.
+    /// The plain (non-`_SMOOTH`) VERDANA variants have `advance ==
+    /// bitmap width` for most glyphs, so consecutive letters touch.
+    /// The shipped game uses the SMOOTH variants which carry +1..+4
+    /// px of side-bearing baked into their wider advance. As a
+    /// stop-gap until the SMOOTH compositor lands we add that letter
+    /// spacing here so plain VERDANA still reads clearly.
     pub extra_advance: u32,
-    /// Codepoint → metrics + raw bitmap bytes (RLE).
+    /// Codepoint → metrics + decoded 8bpp alpha bitmap.
     glyphs: HashMap<u32, AftGlyph>,
 }
 
@@ -89,9 +100,15 @@ pub struct AftFont {
 struct AftGlyph {
     width: u32,
     height: u32,
+    /// Left-side bearing: pen-relative x offset where the glyph
+    /// bitmap's left column should be drawn. For plain bitmaps the
+    /// width matches the advance, so this is 0. SMOOTH bitmaps are
+    /// wider than the advance (halo pixels spill outside), so the
+    /// glyph is centered on the advance slot by shifting left.
+    bearing_x: i32,
     bearing_y: i32,
     advance: u32,
-    /// Decoded 8bpp alpha bitmap, width*height bytes.
+    /// 8bpp coverage alpha, width*height bytes.
     pixels: Vec<u8>,
 }
 
@@ -111,9 +128,29 @@ impl AftFont {
             }
             let code = u32_at(bytes, o)?;
             let advance = u32_at(bytes, o + 0x08)?;
-            let bearing_y = i32_at(bytes, o + 0x14)?;
-            let bmp_off = u32_at(bytes, o + 0x20)? as usize;
-            let bmp_sz = u32_at(bytes, o + 0x24)? as usize;
+            // SMOOTH fonts put an antialiased bitmap at offset 0x38;
+            // non-SMOOTH fonts leave that slot zero and only ship the
+            // 1-bit bitmap at 0x20.
+            let smooth_off = u32_at(bytes, o + 0x38)? as usize;
+            let smooth_sz = u32_at(bytes, o + 0x3C)? as usize;
+            let (bmp_off, bmp_sz, bearing_y, smooth) = if smooth_off != 0
+                && smooth_sz >= 16
+                && smooth_off + smooth_sz <= bytes.len()
+            {
+                (
+                    smooth_off,
+                    smooth_sz,
+                    i32_at(bytes, o + 0x2C)?,
+                    true,
+                )
+            } else {
+                (
+                    u32_at(bytes, o + 0x20)? as usize,
+                    u32_at(bytes, o + 0x24)? as usize,
+                    i32_at(bytes, o + 0x14)?,
+                    false,
+                )
+            };
             // Whitespace glyphs (e.g. space) have bmp_off == 0 and
             // carry only an advance value. Cache as zero-pixel glyphs.
             if bmp_off == 0 || bmp_sz < 16 || bmp_off + bmp_sz > bytes.len() {
@@ -122,6 +159,7 @@ impl AftFont {
                     AftGlyph {
                         width: 0,
                         height: 0,
+                        bearing_x: 0,
                         bearing_y,
                         advance,
                         pixels: Vec::new(),
@@ -132,12 +170,22 @@ impl AftFont {
             let bw = u32_at(bytes, bmp_off + 4)?;
             let bh = u32_at(bytes, bmp_off + 8)?;
             let rle = &bytes[bmp_off + 16..bmp_off + bmp_sz];
-            let pixels = decode_rle(rle, bw, bh);
+            let pixels = decode_rle(rle, bw, bh, smooth);
+            // SMOOTH bitmaps can be wider than the advance: the extra
+            // columns are antialiasing halo. Center the glyph on its
+            // advance slot so the solid core lines up where the plain
+            // bitmap would have sat.
+            let bearing_x = if smooth && bw > advance {
+                -(((bw - advance) as i32) / 2)
+            } else {
+                0
+            };
             glyphs.insert(
                 code,
                 AftGlyph {
                     width: bw,
                     height: bh,
+                    bearing_x,
                     bearing_y,
                     advance,
                     pixels,
@@ -159,7 +207,7 @@ impl AftFont {
     }
 
     /// Pixel advance of `text` at this font's native size, including
-    /// any `extra_advance` letter-spacing nudge.
+    /// the `extra_advance` letter-spacing nudge.
     pub fn measure(&self, text: &str) -> u32 {
         text.chars()
             .map(|c| {
@@ -185,39 +233,46 @@ fn i32_at(b: &[u8], o: usize) -> Result<i32, &'static str> {
     Ok(i32::from_le_bytes(b[o..o + 4].try_into().unwrap()))
 }
 
-/// Decode the per-glyph RLE stream into an 8bpp alpha bitmap of
-/// `w × h` pixels (255 = opaque, 0 = transparent). Opcodes are
-/// row-major:
-///   - `0x80` alone (high bit, count 0) → skip one full row
-///     (`w` transparent pixels). Without this rule, sparse glyphs
-///     like `:` and `;` collapse — they encode their inter-dot gap
-///     with `0x80`, which a plain "high-bit = N opaque" decoder
-///     would treat as a no-op.
-///   - other high-bit bytes → emit `(byte & 0x7F)` opaque pixels.
-///   - low-bit bytes → skip `byte` transparent pixels.
-fn decode_rle(data: &[u8], w: u32, h: u32) -> Vec<u8> {
+/// Decode an AFT RLE stream into an 8bpp alpha bitmap of `w × h`
+/// pixels. `smooth == false` decodes the 1-bit bitmap (every emitted
+/// pixel has alpha=255). `smooth == true` decodes the antialiased
+/// bitmap where each `0x81..0xFF` opcode is followed by N per-pixel
+/// alpha bytes.
+fn decode_rle(data: &[u8], w: u32, h: u32, smooth: bool) -> Vec<u8> {
     let total = (w * h) as usize;
     let mut out = vec![0u8; total];
     let mut pos = 0usize;
     let row_w = w as usize;
-    for &b in data {
+    let mut i = 0usize;
+    while i < data.len() && pos < total {
+        let b = data[i];
+        i += 1;
         if b == 0x80 {
             // Skip a full row of transparent pixels.
             pos += row_w;
         } else if b & 0x80 != 0 {
             let n = (b & 0x7F) as usize;
-            for _ in 0..n {
-                if pos >= total {
-                    return out;
+            if smooth {
+                // N per-pixel alpha bytes follow the opcode.
+                for _ in 0..n {
+                    if pos >= total || i >= data.len() {
+                        return out;
+                    }
+                    out[pos] = data[i];
+                    pos += 1;
+                    i += 1;
                 }
-                out[pos] = 255;
-                pos += 1;
+            } else {
+                for _ in 0..n {
+                    if pos >= total {
+                        return out;
+                    }
+                    out[pos] = 255;
+                    pos += 1;
+                }
             }
         } else {
             pos += b as usize;
-        }
-        if pos >= total {
-            break;
         }
     }
     out
@@ -230,6 +285,7 @@ pub struct GlyphRect {
     pub atlas_y: u32,
     pub w: u32,
     pub h: u32,
+    pub bearing_x: i32,
     pub bearing_y: i32,
     pub advance: u32,
 }
@@ -251,14 +307,17 @@ pub struct GlyphAtlas {
 }
 
 /// Embedded AFT font assets (extracted from forms.pkg/DATA/FONT/).
+/// The SMOOTH (antialiased) variants are checked in but not yet
+/// wired up — they use a two-layer format (bmp1 = solid core,
+/// bmp2 = halo) that needs a compositing step before we can use
+/// them. The decoder handles both formats, the font map just
+/// points at the plain 1-bit files for now.
 const FONT_RANGER_6: &[u8] = include_bytes!("../../../assets/fonts/RANGER_6.AFT");
 const FONT_RANGER_5: &[u8] = include_bytes!("../../../assets/fonts/RANGER_5.AFT");
 const FONT_VERDANA_10_2: &[u8] = include_bytes!("../../../assets/fonts/VERDANA_10_2.AFT");
 const FONT_VERDANA_09_2: &[u8] = include_bytes!("../../../assets/fonts/VERDANA_09_2.AFT");
 const FONT_VERDANA_08_1: &[u8] = include_bytes!("../../../assets/fonts/VERDANA_08_1.AFT");
 const FONT_VERDANA_07_1: &[u8] = include_bytes!("../../../assets/fonts/VERDANA_07_1.AFT");
-#[allow(dead_code)] // kept for back-pocket if Font.2Mini ever needs the smallest size
-const FONT_VERDANA_06_1: &[u8] = include_bytes!("../../../assets/fonts/VERDANA_06_1.AFT");
 
 impl Default for GlyphAtlas {
     fn default() -> Self {
@@ -281,15 +340,7 @@ impl GlyphAtlas {
         // Each entry: (alias, AFT bytes, extra letter-spacing px).
         // RANGER fonts have a 1-px gap baked into their advance, so 0.
         // Plain VERDANA glyphs have advance == bitmap width (no gap),
-        // so we add +1 px between each pair to approximate the
-        // SMOOTH variants the original game uses.
-        //
-        // Sizes are bumped one notch over the obvious match (Small →
-        // VERDANA_08, Normal → VERDANA_10) — based on user feedback
-        // the lowest sizes look too small at the design-space scale
-        // because the original ships SMOOTH variants with wider per-
-        // glyph cells, and bumping size compensates for that until
-        // the SMOOTH RLE decoder lands.
+        // so we add +1 px between each pair.
         for (name, bytes, extra) in [
             ("Font.2Ranger", FONT_RANGER_6, 0),
             ("Font.2Small", FONT_VERDANA_08_1, 1),
@@ -297,7 +348,6 @@ impl GlyphAtlas {
             ("Font.2Mini", FONT_VERDANA_07_1, 1),
             ("RANGER_5", FONT_RANGER_5, 0),
             ("RANGER_6", FONT_RANGER_6, 0),
-            // Optional aliases the data could reference.
             ("Font.2Big", FONT_VERDANA_10_2, 1),
             ("Font.2Bold", FONT_VERDANA_09_2, 1),
         ] {
@@ -372,6 +422,7 @@ impl GlyphAtlas {
                 atlas_y: 0,
                 w: 0,
                 h: 0,
+                bearing_x: g.bearing_x,
                 bearing_y: g.bearing_y,
                 advance: g.advance + extra,
             };
@@ -416,6 +467,7 @@ impl GlyphAtlas {
             atlas_y: y0,
             w: g.width,
             h: g.height,
+            bearing_x: g.bearing_x,
             bearing_y: g.bearing_y,
             advance: g.advance + extra,
         };
@@ -571,16 +623,25 @@ mod tests {
         // opcode. Before the fix it decoded as a solid bar.
         let f = AftFont::parse(FONT_VERDANA_07_1).unwrap();
         let g = f.glyph(b':' as u32).unwrap();
-        // Column-of-1 layout — count opaque pixels (top dot block +
-        // bottom dot block) and verify there's at least one
-        // transparent row in the middle.
         assert_eq!(g.width, 1);
         let any_gap = g
             .pixels
-            .windows(1)
+            .iter()
             .enumerate()
-            .any(|(i, w)| w[0] == 0 && i > 0 && i < g.pixels.len() - 1);
+            .any(|(i, &v)| v == 0 && i > 0 && i < g.pixels.len() - 1);
         assert!(any_gap, "colon must have a transparent gap row: {:?}", g.pixels);
+    }
+
+    #[test]
+    fn smooth_decoder_produces_gray() {
+        // The decoder still handles the SMOOTH format even though the
+        // font map currently points at the plain variants.
+        let bytes =
+            include_bytes!("../../../assets/fonts/VERDANA_10_2_SMOOTH.AFT");
+        let f = AftFont::parse(bytes).unwrap();
+        let g = f.glyph(b'O' as u32).unwrap();
+        let has_gray = g.pixels.iter().any(|&p| p > 0 && p < 255);
+        assert!(has_gray, "SMOOTH O must have partial-alpha pixels");
     }
 
     #[test]

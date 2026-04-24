@@ -1384,7 +1384,7 @@ fn emit_rich_line(
                 pen_x_native += advance;
                 continue;
             }
-            let x = start_x + pen_x_native * scale;
+            let x = start_x + (pen_x_native + g.bearing_x as f32) * scale;
             let y = baseline_y + g.bearing_y as f32 * scale;
             let w = g.w as f32 * scale;
             let h = g.h as f32 * scale;
