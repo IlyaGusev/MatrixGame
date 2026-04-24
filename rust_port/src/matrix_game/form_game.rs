@@ -1268,6 +1268,27 @@ fn dispatch_ui_click(state: &mut AppState, click: &crate::matrix_game::interface
         }
     };
 
+    // ── Static `ON_PRESS` handlers (CInterface.cpp:577-586) ───────
+    // In the C++, `basepl` / `titpl` / `elecpl` / `energpl` / `plaspl`
+    // are CIFaceStatic elements bound to `CIFaceList::JumpToBuilding`
+    // (CInterface.cpp:4552-4559). The callback centres the strategy
+    // camera on the currently-selected building's geo center.
+    if name == "basepl" {
+        if matches!(
+            state.game.player_side.curr_sel,
+            CurrSel::BuildingSelected | CurrSel::BaseSelected
+        ) {
+            if let Some(id) = state.game.active_object() {
+                if let Some(obj) = state.game.objects.get(id) {
+                    let p = obj.core().geo_center;
+                    state.camera.set_xy_strategy([p.x, p.y]);
+                    log::info!("basepl: center camera on building at ({:.1},{:.1})", p.x, p.y);
+                }
+            }
+        }
+        return;
+    }
+
     // ── Top-level menu buttons ────────────────────────────────────
     match name {
         "buro" => {

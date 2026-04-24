@@ -195,12 +195,18 @@ impl IFaceList {
         // 'Pressed' and no others are focused (CIFaceList::OnMouseMove
         // :3100-3150 roughly). We approximate: pressed element stays
         // pressed; other elements go Normal unless under the cursor.
+        //
+        // CIFaceStatic::OnMouseMove (CIFaceStatic.cpp:26-51) never
+        // changes `m_CurState`; only CIFaceButton does. Gate every
+        // transition on `ElementKind::Button` so static frames like
+        // `conl`/`conr`/`conf` don't brighten on hover/press.
         if self.focused != new_focus {
             if let Some((pi, ei)) = self.focused {
                 let pressed_self = self.pressed == Some((pi, ei));
                 if let Some(p) = self.panels.get_mut(pi) {
                     if let Some(e) = p.elements.get_mut(ei) {
-                        if !pressed_self {
+                        let is_button = matches!(e.kind, super::iface_element::ElementKind::Button);
+                        if is_button && !pressed_self {
                             e.cur_state = e.def_state;
                         }
                         prev_pair = Some((p.name.clone(), e.name.clone()));
@@ -212,13 +218,12 @@ impl IFaceList {
                     if let Some(e) = p.elements.get_mut(ei) {
                         let was_normal = matches!(e.cur_state, ElementState::Normal);
                         let is_button = matches!(e.kind, super::iface_element::ElementKind::Button);
-                        // Hovered: go Focused (unless this element is
-                        // the currently-pressed one — in which case
-                        // stay Pressed).
-                        if self.pressed != Some((pi, ei)) {
-                            e.cur_state = ElementState::Focused;
-                        } else {
-                            e.cur_state = ElementState::Pressed;
+                        if is_button {
+                            if self.pressed != Some((pi, ei)) {
+                                e.cur_state = ElementState::Focused;
+                            } else {
+                                e.cur_state = ElementState::Pressed;
+                            }
                         }
                         new_pair = Some((p.name.clone(), e.name.clone()));
                         // CIFaceButton.cpp:147-169 — focus transition
@@ -306,9 +311,16 @@ impl IFaceList {
                 if was_disabled {
                     return true;
                 }
-                if let Some(p) = self.panels.get_mut(pi) {
-                    if let Some(e) = p.elements.get_mut(ei) {
-                        e.cur_state = ElementState::Pressed;
+                // Only CIFaceButton flips state on LBDown (CIFaceButton
+                // .cpp:33-95). CIFaceStatic::OnMouseLBDown runs the
+                // ON_PRESS action without touching `m_CurState`
+                // (CIFaceStatic.cpp:53-57) — so `conl`/`conr`/`conf`
+                // etc. must stay at `def_state` when clicked.
+                if is_button {
+                    if let Some(p) = self.panels.get_mut(pi) {
+                        if let Some(e) = p.elements.get_mut(ei) {
+                            e.cur_state = ElementState::Pressed;
+                        }
                     }
                 }
                 self.pressed = Some((pi, ei));
@@ -365,20 +377,30 @@ impl IFaceList {
         let release_hit = self.hit_test(sx, sy, screen_w, screen_h);
         if let Some(p) = self.panels.get_mut(pi) {
             if let Some(e) = p.elements.get_mut(ei) {
+                let is_button = matches!(e.kind, super::iface_element::ElementKind::Button);
                 if matches!(e.cur_state, ElementState::Disabled)
                     || matches!(e.def_state, ElementState::Disabled)
                 {
                     e.cur_state = ElementState::Disabled;
                     return None;
                 }
-                e.cur_state = if release_hit == Some((pi, ei)) {
-                    ElementState::Focused
-                } else {
-                    e.def_state
-                };
-                if release_hit == Some((pi, ei))
-                    && matches!(e.kind, super::iface_element::ElementKind::Button)
-                {
+                // Buttons cycle Pressed → Focused/Normal on release
+                // (CIFaceButton.cpp:105-109). Statics leave state
+                // untouched (CIFaceStatic.cpp:59-61 only fires
+                // Action(ON_UN_PRESS)) so don't reassign.
+                if is_button {
+                    e.cur_state = if release_hit == Some((pi, ei)) {
+                        ElementState::Focused
+                    } else {
+                        e.def_state
+                    };
+                }
+                if release_hit == Some((pi, ei)) {
+                    // Emit the click for buttons AND statics so the
+                    // dispatcher can route Static ON_PRESS hooks like
+                    // `basepl` (IF_BASE_PLANT → CIFaceList::JumpToBuilding,
+                    // CInterface.cpp:585) + the resource-plant statics
+                    // (titan/electr/energy/plasma).
                     return Some(Click::Button(e.name.clone()));
                 }
             }
