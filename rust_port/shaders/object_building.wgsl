@@ -34,6 +34,13 @@ struct VIn {
     // updates at MatrixObjectBuilding.cpp:842-850 (platform rise /
     // door slide on BASE open/close).
     @location(8) unit_offset: vec4<f32>,
+    // Per-instance side tint — ports `CMatrixBuilding::Draw`'s
+    // `m_GGraph->Draw(coltex)` where `coltex` = `GetSideColorTexture(m_Side)`
+    // (MatrixObjectBuilding.cpp:968-971). The original samples the 1×1
+    // side-color texture on the stage the team-marker material binds to;
+    // we reduce its strength below to approximate a whole-mesh tint
+    // since we don't parse which surfaces opt in.
+    @location(9) side_color: vec4<f32>,
 };
 struct VOut {
     @builtin(position) clip_position: vec4<f32>,
@@ -42,6 +49,7 @@ struct VOut {
     @location(2) view_dist: f32,
     @location(3) terrain_color: vec3<f32>,
     @location(4) world_pos: vec3<f32>,
+    @location(5) side_color: vec3<f32>,
 };
 
 @vertex fn vs_main(in: VIn) -> VOut {
@@ -57,6 +65,7 @@ struct VOut {
     out.view_dist = clip.w;
     out.terrain_color = in.terrain_color.rgb;
     out.world_pos = world.xyz;
+    out.side_color = in.side_color.rgb;
     return out;
 }
 
@@ -68,13 +77,30 @@ struct VOut {
     let l = normalize(-u.light_dir.xyz);
     let ndotl = max(dot(n, l), 0.0);
     let lighting = clamp(u.ambient_color.rgb + u.light_color.rgb * ndotl, vec3<f32>(0.0), vec3<f32>(1.0));
-    var rgb = tex.rgb * in.terrain_color * lighting;
+    // Side-colour patches — ports the `obj_side*` skin stage pipeline
+    // in MatrixSkinManager.cpp:568-616 / :702-781. The C++ sets:
+    //   stage0: D3DTOP_MODULATE(tex, TFACTOR)   -> tex.rgb × terrain
+    //           alpha = D3DTA_TEXTURE           -> passes tex.alpha
+    //   stage1: D3DTOP_BLENDCURRENTALPHA(CURRENT, coltex)
+    //                                           -> where tex.alpha=0,
+    //                                              show side colour
+    //   stage2: D3DTOP_MODULATE(CURRENT, DIFFUSE) -> apply lighting
+    // The diffuse texture's alpha channel is authored as a team-marker
+    // MASK: alpha=255 keeps base colour, alpha=0 reveals side colour.
+    // Textures without an alpha channel (GSP_SIDE_NOALPHA path at
+    // MatrixSkinManager.cpp:97) skip the stage-1 blend — that ports
+    // naturally because their alpha reads as 1.0.
+    let base = tex.rgb * in.terrain_color;
+    let tinted = mix(in.side_color, base, tex.a);
+    var rgb = tinted * lighting;
     let scroll_uv = in.uv + m.scroll.xy * u.time_ms.x;
 
     if (m.flags.z != 0u) {
         let mask = textureSample(t_mask, s_diffuse, scroll_uv);
         let back = textureSample(t_back, s_diffuse, scroll_uv);
-        let back_rgb = back.rgb * in.terrain_color * lighting;
+        let back_base = back.rgb * in.terrain_color;
+        let back_tinted = mix(in.side_color, back_base, back.a);
+        let back_rgb = back_tinted * lighting;
         let blend = max(mask.a, max(mask.r, max(mask.g, mask.b)));
         rgb = mix(rgb, back_rgb, clamp(blend, 0.0, 1.0));
     }

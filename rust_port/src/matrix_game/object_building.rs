@@ -1028,6 +1028,15 @@ struct InstanceData {
     /// BASE. Populated for BASE sub-unit IDs 1/2/3 (platform / left
     /// door / right door) each frame by `BuildingsRenderer::takt`.
     unit_offset: [f32; 4],
+    /// Per-side diffuse colour applied on top of the texture —
+    /// ports `CMatrixBuilding::Draw`'s `m_GGraph->Draw(coltex)` where
+    /// `coltex` is `GetSideColorTexture(m_Side)` (MatrixObjectBuilding.cpp:
+    /// 968-971). The original only modulates specific team-marker
+    /// surfaces (selected via CVO material flags); without the skin
+    /// stage info in the Rust port we tint the whole building at
+    /// reduced strength in the shader to keep each faction's bases
+    /// visually distinct.
+    side_color: [f32; 4],
 }
 
 #[repr(C)]
@@ -1541,6 +1550,7 @@ fn instance_matrix(
     );
     let [terrain_r, terrain_g, terrain_b] =
         unpack_rgb(map.static_object_color_with_lighting(b.x, b.y, point_lights));
+    let [sr, sg, sb] = crate::matrix_game::side::side_color_rgb(b.side as i32);
     InstanceData {
         row0: [rot.x_axis.x, rot.y_axis.x, rot.z_axis.x, b.x - cx],
         row1: [rot.x_axis.y, rot.y_axis.y, rot.z_axis.y, b.y - cy],
@@ -1548,6 +1558,7 @@ fn instance_matrix(
         row3: [0.0, 0.0, 0.0, 1.0],
         terrain_color: [terrain_r, terrain_g, terrain_b, 1.0],
         unit_offset: [0.0, 0.0, 0.0, 0.0],
+        side_color: [sr, sg, sb, 1.0],
     }
 }
 
@@ -1747,6 +1758,11 @@ fn create_pipeline(
                         wgpu::VertexAttribute {
                             offset: 80,
                             shader_location: 8,
+                            format: wgpu::VertexFormat::Float32x4,
+                        },
+                        wgpu::VertexAttribute {
+                            offset: 96,
+                            shader_location: 9,
                             format: wgpu::VertexFormat::Float32x4,
                         },
                     ],

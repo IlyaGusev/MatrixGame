@@ -195,6 +195,10 @@ struct InstanceData {
     row3: [f32; 4],
     terrain_color: [f32; 4],
     unit_offset: [f32; 4],
+    /// Per-side tint — same role as the buildings / robots instance
+    /// data. Cannons also carry `m_Side` in the C++ and get the
+    /// `GetSideColorTexture` treatment on team-marker surfaces.
+    side_color: [f32; 4],
 }
 
 #[repr(C)]
@@ -517,6 +521,7 @@ impl CannonsRenderer {
 
 fn cannon_instance(c: &Cannon, cx: f32, cy: f32, _map: &GameMap) -> InstanceData {
     let (s, co) = c.angle.sin_cos();
+    let [sr, sg, sb] = crate::matrix_game::side::side_color_rgb(c.side);
     InstanceData {
         row0: [co, s, 0.0, 0.0],
         row1: [-s, co, 0.0, 0.0],
@@ -524,6 +529,7 @@ fn cannon_instance(c: &Cannon, cx: f32, cy: f32, _map: &GameMap) -> InstanceData
         row3: [c.pos.x - cx, c.pos.y - cy, c.pos_z, 1.0],
         terrain_color: [1.0, 1.0, 1.0, 1.0],
         unit_offset: [0.0, 0.0, 0.0, 0.0],
+        side_color: [sr, sg, sb, 1.0],
     }
 }
 
@@ -842,6 +848,11 @@ fn create_pipeline(
             wgpu::VertexAttribute {
                 offset: 80,
                 shader_location: 8,
+                format: wgpu::VertexFormat::Float32x4,
+            },
+            wgpu::VertexAttribute {
+                offset: 96,
+                shader_location: 9,
                 format: wgpu::VertexFormat::Float32x4,
             },
         ],

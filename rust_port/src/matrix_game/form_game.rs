@@ -1667,6 +1667,17 @@ fn try_place_turret(state: &mut AppState, cx: f32, cy: f32, w: f32, h: f32) {
             return;
         }
         let b: &mut Building = unsafe { &mut *(obj as *mut dyn MapStatic as *mut Building) };
+        // Same player-side guard as robot builds (CConstructor.cpp:225-227) —
+        // enemy bases can be clicked but not built on.
+        if b.side != state.game.player_side.id {
+            log::info!(
+                "turret: refused — base is side {}, not player side {}",
+                b.side,
+                state.game.player_side.id
+            );
+            state.iface_list.turret_build.cancel();
+            return;
+        }
         if !b.queue_turret(kind as i32) {
             log::info!("turret: all turret slots full on base");
             state.iface_list.turret_build.cancel();
@@ -1840,6 +1851,18 @@ fn commit_and_queue_robot(state: &mut AppState) {
     if b.kind != BuildingType::Base {
         return;
     }
+    // Port of `CConstructor::RemoteBuild`'s guard at CConstructor.cpp:
+    // 225-227 — `m_Base->m_Side != PLAYER_SIDE` returns early, so you
+    // can't queue robots on enemy / neutral bases even if the panel is
+    // somehow open.
+    if b.side != state.game.player_side.id {
+        log::info!(
+            "cobuild: refused — base side {} != player side {}",
+            b.side,
+            state.game.player_side.id
+        );
+        return;
+    }
     // CConstructor.cpp:233-235 — push `counter` robots onto the base
     // stack (StackRobot drops the request if the stack is full).
     let mut queued = 0;
@@ -2007,29 +2030,37 @@ fn refresh_interface_visibility(state: &mut AppState) {
     use crate::matrix_game::side::CurrSel;
 
     let curr_sel = state.game.player_side.curr_sel;
-    // Pull building context when the selection is a Building.
-    let (kind, stack_empty, stack_items, turrets_max, hit_point, hit_point_max) = match curr_sel {
-        CurrSel::BaseSelected | CurrSel::BuildingSelected => {
-            let active = state.game.active_object();
-            active
-                .and_then(|id| state.game.objects.get(id))
-                .filter(|o| matches!(o.core().obj_type, ObjectType::Building))
-                .map(|o| {
-                    let b: &Building = unsafe { &*(o as *const dyn MapStatic as *const Building) };
-                    let n = b.build_stack.items() as i32;
-                    (
-                        Some(b.kind),
-                        n == 0,
-                        n,
-                        b.turrets_max,
-                        b.hit_point,
-                        b.hit_point_max,
-                    )
-                })
-                .unwrap_or((None::<BuildingType>, true, 0, 0, 0.0, 0.0))
-        }
-        _ => (None, true, 0, 0, 0.0, 0.0),
-    };
+    let player_side_id = state.game.player_side.id;
+    // Pull building context when the selection is a Building. Also
+    // carry the selected building's `m_Side` so the Base-panel build
+    // button can gate on "is this our base?" — port of the
+    // `m_Base->m_Side == PLAYER_SIDE` guard at CConstructor.cpp:225-227.
+    let (kind, stack_empty, stack_items, turrets_max, hit_point, hit_point_max, active_side) =
+        match curr_sel {
+            CurrSel::BaseSelected | CurrSel::BuildingSelected => {
+                let active = state.game.active_object();
+                active
+                    .and_then(|id| state.game.objects.get(id))
+                    .filter(|o| matches!(o.core().obj_type, ObjectType::Building))
+                    .map(|o| {
+                        let b: &Building =
+                            unsafe { &*(o as *const dyn MapStatic as *const Building) };
+                        let n = b.build_stack.items() as i32;
+                        (
+                            Some(b.kind),
+                            n == 0,
+                            n,
+                            b.turrets_max,
+                            b.hit_point,
+                            b.hit_point_max,
+                            b.side,
+                        )
+                    })
+                    .unwrap_or((None::<BuildingType>, true, 0, 0, 0.0, 0.0, 0))
+            }
+            _ => (None, true, 0, 0, 0.0, 0.0, 0),
+        };
+    let active_is_player_owned = active_side == player_side_id;
 
     // Port of `CMatrixSideUnit::GetIncomePerTime(kind, 60000)`
     // (MatrixSide.cpp:352-377). The original's per-ms scaling is
@@ -2128,7 +2159,11 @@ fn refresh_interface_visibility(state: &mut AppState) {
             let buildable_base = matches!(kind, Some(BuildingType::Base));
             let under_cap =
                 counter_ctx.side_robots + counter_ctx.robots_in_stack < counter_ctx.max_side_robots;
-            enough = enough && buildable_base && under_cap;
+            // Port of `CConstructor::RemoteBuild`'s player-side guard
+            // at CConstructor.cpp:225-227 — enemy / neutral bases can
+            // be selected for inspection but the build button must not
+            // fire on them.
+            enough = enough && buildable_base && under_cap && active_is_player_owned;
             (b.focused_price, total_cost, common, extra, enough)
         })
         .unwrap_or((

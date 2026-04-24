@@ -46,6 +46,12 @@ struct InstanceData {
     /// Unused for robots (no sub-unit animation) — kept only because
     /// we reuse the buildings shader, which reads this attribute.
     unit_offset: [f32; 4],
+    /// Per-side tint — same role as in buildings' `InstanceData`.
+    /// Robots also carry `m_Side` in the C++ and get the same
+    /// `GetSideColorTexture(m_Side)` treatment on team-marker
+    /// surfaces (the shipped VOs flag the pilot-cabin trim etc.);
+    /// we reuse the whole-mesh reduced-strength tint.
+    side_color: [f32; 4],
 }
 
 #[repr(C)]
@@ -992,6 +998,11 @@ impl RobotsRenderer {
                 row3: [m[0][3], m[1][3], m[2][3], m[3][3]],
                 terrain_color: [1.0, 1.0, 1.0, 1.0],
                 unit_offset: [0.0, 0.0, 0.0, 0.0],
+                // Constructor preview: no side tint. The C++'s
+                // `CConstructor::Render` draws the preview robot with
+                // the default white texture-factor, not via
+                // `GetSideColorTexture` (CConstructor.cpp:340-360).
+                side_color: [1.0, 1.0, 1.0, 1.0],
             }
         }
         // Upload all 8 instance slots. Slot assignment:
@@ -1352,6 +1363,7 @@ fn robot_instance(
     // faithfully so the slope port drops in unchanged.
     let fwd_out = up.cross(side).normalize_or_zero();
 
+    let [sr, sg, sb] = crate::matrix_game::side::side_color_rgb(r.side);
     InstanceData {
         row0: [side.x, fwd_out.x, up.x, r.pos_x - cx],
         row1: [side.y, fwd_out.y, up.y, r.pos_y - cy],
@@ -1359,6 +1371,7 @@ fn robot_instance(
         row3: [0.0, 0.0, 0.0, 1.0],
         terrain_color: [terrain_r, terrain_g, terrain_b, 1.0],
         unit_offset: [0.0, 0.0, 0.0, 0.0],
+        side_color: [sr, sg, sb, 1.0],
     }
 }
 
@@ -1542,6 +1555,11 @@ fn create_pipeline(
                         wgpu::VertexAttribute {
                             offset: 80,
                             shader_location: 8,
+                            format: wgpu::VertexFormat::Float32x4,
+                        },
+                        wgpu::VertexAttribute {
+                            offset: 96,
+                            shader_location: 9,
                             format: wgpu::VertexFormat::Float32x4,
                         },
                     ],

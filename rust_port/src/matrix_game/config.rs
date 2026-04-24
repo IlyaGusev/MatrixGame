@@ -513,24 +513,32 @@ pub struct Timings {
 }
 
 impl Timings {
+    /// Port of the three-block `BlockGet(Timings)->BlockGet(...)->ParGet(...)`
+    /// sequence in `CMatrixConfig::LoadConfig` (MatrixConfig.cpp:641-658).
+    /// Note the nesting: param keys live under `Timings/Resources/*` and
+    /// `Timings/Units/*`, not directly under `Timings`.
     pub fn from_matrix_data(stor: &Storage) -> Option<Self> {
-        let source_rec = stor.block_record("da", "Source")?;
-        let timings_rec = stor.block_record(&source_rec, "Timings")?;
-        let read = |key: &str| -> i32 {
-            stor.block_param(&timings_rec, key)
+        let timings_rec = stor.block_record("da", "Timings")?;
+        let resources_rec = stor.block_record(&timings_rec, "Resources")?;
+        let units_rec = stor.block_record(&timings_rec, "Units")?;
+        let read_at = |rec: &str, key: &str| -> i32 {
+            stor.block_param(rec, key)
                 .and_then(|s| s.trim().parse::<i32>().ok())
                 .unwrap_or(0)
         };
         Some(Self {
-            resource_titan: read("TITAN"),
-            resource_electronics: read("ELECTRONICS"),
-            resource_energy: read("ENERGY"),
-            resource_plasma: read("PLASMA"),
-            resource_base: read("BASE"),
-            unit_robot: read("ROBOT"),
-            unit_flyer: read("FLYER"),
-            unit_turret: read("TURRET"),
-            maintenance_period: read("MAINTENANCE_PERIOD"),
+            // Resources sub-block (MatrixConfig.cpp:648-653).
+            resource_titan: read_at(&resources_rec, "RESOURCE_TITAN"),
+            resource_electronics: read_at(&resources_rec, "RESOURCE_ELECTRONICS"),
+            resource_energy: read_at(&resources_rec, "RESOURCE_ENERGY"),
+            resource_plasma: read_at(&resources_rec, "RESOURCE_PLASMA"),
+            resource_base: read_at(&resources_rec, "RESOURCE_BASE"),
+            // Units sub-block (MatrixConfig.cpp:655-658).
+            unit_robot: read_at(&units_rec, "UNIT_ROBOT"),
+            unit_flyer: read_at(&units_rec, "UNIT_FLYER"),
+            unit_turret: read_at(&units_rec, "UNIT_TURRET"),
+            // Top-level Timings param (MatrixConfig.cpp:644).
+            maintenance_period: read_at(&timings_rec, "MAINTENANCE"),
         })
     }
 }
