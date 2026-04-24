@@ -487,10 +487,21 @@ impl InterfaceRenderer {
                 }
                 n_visible += 1;
                 let [x, y, w, h] = elem.rect_in_panel([px, py], scale);
-                let u0 = img.x / img.tex_w;
-                let v0 = img.y / img.tex_h;
-                let u1 = (img.x + img.w) / img.tex_w;
-                let v1 = (img.y + img.h) / img.tex_h;
+                // Half-pixel UV inset. The atlas textures aren't edge-
+                // padded: atlas col 511 (just outside mp1's sub-rect)
+                // and col 175 (just outside mp2's) are fully
+                // transparent. Linear filtering at UV=img.x/tex_w or
+                // (img.x+img.w)/tex_w lands exactly on the sub-rect
+                // edge, so the sampler blends 50/50 with the neighbour
+                // column — making mp1's rightmost ~1 px and mp2's
+                // leftmost ~1 px render at half alpha. Stacked at the
+                // mp1/mp2 screen junction this shows the map through a
+                // 1–2 px seam. Inset by 0.5 px so the filter stays
+                // inside the sub-rect.
+                let u0 = (img.x + 0.5) / img.tex_w;
+                let v0 = (img.y + 0.5) / img.tex_h;
+                let u1 = (img.x + img.w - 0.5) / img.tex_w;
+                let v1 = (img.y + img.h - 0.5) / img.tex_h;
                 let tint = match elem.cur_state {
                     ElementState::Focused => [1.0, 1.0, 1.0, 1.0],
                     ElementState::Pressed => [0.8, 0.8, 0.8, 1.0],
