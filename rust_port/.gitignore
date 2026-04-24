@@ -1,5 +1,6 @@
 /target
 /pkg
-/assets/
+/assets/*
+!/assets/fonts/
 /Data
 Cargo.lock

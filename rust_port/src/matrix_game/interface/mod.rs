@@ -14,6 +14,7 @@ pub mod iface_menu;
 pub mod interface;
 pub mod renderer;
 pub mod sound;
+pub mod text;
 pub mod turret_build;
 
 pub use constructor::{FocusTarget, RobotBuilder};

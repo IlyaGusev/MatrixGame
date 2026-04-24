@@ -48,6 +48,47 @@ pub struct StateImage {
     pub tex_path: String,
 }
 
+/// One caption attached to an [`IFaceElement`] for a particular state.
+///
+/// Port of one entry of the per-element `Labels` block (CInterface.cpp:
+/// 660-797): each entry carries a `Params` (x,y,sme_x,sme_y,align_x,
+/// align_y,perenos,clip_*) line, plus `Font`, `Color`, and `State`.
+/// The text itself comes from `LabelsText/<panel>/<elem>_<state>`.
+///
+/// `state` lives on the label (not in an array slot) so a single state
+/// can carry multiple labels — the C++ does this for cobuild / cocan /
+/// the menu buttons, which render a black drop-shadow caption AT
+/// `(x-1, y-1)` followed by the colored caption AT `(x, y)` for every
+/// state (CInterface.cpp:774-792).
+///
+/// All offsets are 1024×768 design-space pixels; the renderer scales
+/// to the surface size.
+#[derive(Debug, Clone)]
+pub struct ElementLabel {
+    pub state: ElementState,
+    pub text: String,
+    /// `Params[0..2]` — x/y inside the element rect (pre-shadow).
+    pub x: f32,
+    pub y: f32,
+    /// `Params[2..4]` — additional sme_x/sme_y offset (the C++ adds
+    /// these unconditionally before alignment).
+    pub sme_x: f32,
+    pub sme_y: f32,
+    /// 0 = left edge, 1 = centre, 2 = right edge of the element rect.
+    pub align_x: i32,
+    /// 0 = top edge, 1 = middle, 2 = bottom edge.
+    pub align_y: i32,
+    /// `Params[6]` — wordwrap when non-zero. Ignored for now (only
+    /// it_label1/2 set it; we don't yet do multi-line layout).
+    pub wrap: bool,
+    /// Font family identifier from the `Font` param (e.g.
+    /// `Font.2Ranger`, `Font.2Small`, `Font.2Normal`). Maps to a
+    /// pixel size in `text.rs`.
+    pub font: String,
+    /// RGBA from the C++ ARGB packed `Color` param.
+    pub color: [u8; 4],
+}
+
 /// `IFaceElementType` discriminants (Interface/Interface.h).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -90,6 +131,12 @@ pub struct IFaceElement {
     /// Per-state images. MAX_STATES slots; only the ones actually
     /// authored in the config are populated.
     pub images: [Option<StateImage>; MAX_STATES],
+    /// Per-element caption list — one entry per row of the element's
+    /// `Labels` block. Multiple rows can share a `state` (e.g. a
+    /// black drop-shadow row + the colored row for cobuild / cocan).
+    /// Order is preserved: rows render in the order they appear so
+    /// shadows draw before the foreground colour.
+    pub labels: Vec<ElementLabel>,
     pub cur_state: ElementState,
     pub def_state: ElementState,
 }
@@ -121,6 +168,17 @@ impl IFaceElement {
         } else {
             self.flags &= !IFEF_VISIBLE;
         }
+    }
+
+    /// Iterator over captions for the current state — falling back to
+    /// the `Normal`-state captions if no label was authored for the
+    /// current state. Yields multiple labels in declaration order so
+    /// drop-shadow rows draw before the foreground rows.
+    pub fn current_labels(&self) -> impl Iterator<Item = &ElementLabel> {
+        let cur = self.cur_state;
+        let any_for_cur = self.labels.iter().any(|l| l.state == cur);
+        let target = if any_for_cur { cur } else { ElementState::Normal };
+        self.labels.iter().filter(move |l| l.state == target)
     }
 
     /// Sub-rect for the current state. Falls back to `Normal` when

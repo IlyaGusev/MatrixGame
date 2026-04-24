@@ -962,6 +962,7 @@ impl ApplicationHandler for App {
                             let panels: Vec<&crate::matrix_game::interface::CInterface> =
                                 state.iface_list.panels.iter().collect();
                             state.iface_renderer.upload_with_popup(
+                                &state.gfx.device,
                                 &state.gfx.queue,
                                 &panels,
                                 state.iface_list.popup.as_ref(),
@@ -2085,6 +2086,12 @@ fn refresh_interface_visibility(state: &mut AppState) {
         if constructor_active {
             if let Some(cfg) = live_cfg.as_ref() {
                 p.apply_constructor_to_pylons(cfg);
+            }
+            // Push the focused-component label / description into the
+            // `it_label1` / `it_label2` statics so the text pass picks
+            // them up. Matches CInterface.cpp:1869-1884.
+            if let Some(b) = state.game.player_side.builder.as_ref() {
+                p.apply_focused_text(&b.focused_text.label, &b.focused_text.description);
             }
         }
         if was_visible != p.visible {

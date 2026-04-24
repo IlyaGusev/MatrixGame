@@ -9,7 +9,7 @@
 use crate::matrix_lib::base::storage::Storage;
 
 use super::iface_element::{
-    ElementKind, ElementState, IFaceElement, StateImage, IFEF_VISIBLE, MAX_STATES,
+    ElementKind, ElementLabel, ElementState, IFaceElement, StateImage, IFEF_VISIBLE, MAX_STATES,
 };
 
 /// Design-space dimensions the C++ positions/sizes are authored in
@@ -159,6 +159,15 @@ impl CInterface {
                 }
             }
         }
+
+        // Attach LabelsText/<panel>/<elem>_<state> captions to each
+        // element. Port of the labels-walking loop in CInterface::Load
+        // (CInterface.cpp:657-797). The C++ also stores per-state
+        // position / alignment / colour parsed from `Params` blocks
+        // nested per-element; for now we only carry the text +
+        // a default colour because the constructor's button captions
+        // all use the same centred-white layout.
+        attach_labels(matrix_data, &rec, name, &mut elements);
 
         log::info!(
             "iface: loaded {} design=({},{}) id={} elements={}",
@@ -344,7 +353,7 @@ impl CInterface {
                     | "hisleft" | "hisright" | "counthz"
                     | "bup" | "bdown"
                     | "itch" | "itprice"                       // item chars + price
-                    | "label1" | "label2" | "descrT" | "descrB"
+                    | "it_label1" | "it_label2" | "label1" | "label2" | "descrT" | "descrB"
                     | "weight" | "speed" | "struct" | "damage"
                     | "res_summ" | "res_unit"
                     | "titan" | "electr" | "energy" | "plasma"
@@ -614,6 +623,32 @@ impl CInterface {
         }
     }
 
+    /// Push the constructor's currently-focused-component label and
+    /// description into the `it_label1` / `it_label2` dynamic-label
+    /// elements so the renderer's text pass picks them up.
+    ///
+    /// Port of CInterface.cpp:1869-1884 — the C++ assigns
+    /// `m_FocusedLabel` / `m_FocusedDescription` to those elements'
+    /// `m_Caption` strings every panel-refresh tick. The Params /
+    /// Font / Color / alignment for those statics are seeded by
+    /// `attach_labels` from the data; we just overwrite the `text`
+    /// field on the matching label rows here.
+    pub fn apply_focused_text(&mut self, label: &str, description: &str) {
+        if self.name != "Base" {
+            return;
+        }
+        for e in &mut self.elements {
+            let new_text = match e.name.as_str() {
+                "it_label1" => label,
+                "it_label2" => description,
+                _ => continue,
+            };
+            for lbl in &mut e.labels {
+                lbl.text = new_text.to_string();
+            }
+        }
+    }
+
     /// Port of the `CInterface::CopyElements(src, dst)` calls in
     /// `CConstructor::SuperDjeans` (CConstructor.cpp:451-520). For each
     /// component slot (chassis, armor, head, 5 weapon pylons) read
@@ -799,9 +834,162 @@ fn load_element(stor: &Storage, rec: &str, kind: ElementKind) -> Option<IFaceEle
         size_x,
         size_y,
         images,
+        labels: Default::default(),
         cur_state: def_state,
         def_state,
     })
+}
+
+/// Faithful port of the labels-walking loop in CInterface::Load
+/// (CInterface.cpp:657-797). Each element under `if/<panel>` has an
+/// optional `Labels` sub-block whose children carry one
+/// `Params`/`State`/`Font`/`Color` triple per per-state caption.
+/// The text itself comes from `LabelsText/<panel>/<elem>_<state>`.
+///
+/// The C++ also adds a black DROP SHADOW for a small set of buttons —
+/// `cobuild` (CONST_BUILD), `cocan` (CONST_CANCEL), `mm` (MAIN_MENU),
+/// `inro` (ENTER_ROBOT), `lero` (LEAVE_ROBOT). For those, every state
+/// gets two label rows: the shadow at `(x-1, y-1)` colour `0xFF000000`
+/// and the colored row at `(x, y)` (CInterface.cpp:774-792). We
+/// replicate that here so the rendered constructor button looks like
+/// the original.
+fn attach_labels(stor: &Storage, panel_rec: &str, panel_name: &str, elements: &mut [IFaceElement]) {
+    let labels_text_rec = stor
+        .block_record(panel_rec, "LabelsText")
+        .and_then(|lt| stor.block_record(&lt, panel_name));
+
+    // Walk the panel's element children to find each element's `Labels`
+    // sub-block. Children live in cols "2" (names) / "3" (records).
+    let Some(child_names) = stor.get_buf(panel_rec, "2") else {
+        return;
+    };
+    let Some(child_recs) = stor.get_buf(panel_rec, "3") else {
+        return;
+    };
+    let mut attached = 0_usize;
+    for i in 0..child_names.arrays_count().min(child_recs.arrays_count()) {
+        let kind = child_names.get_as_wstr(i);
+        if kind != "Button" && kind != "Static" {
+            continue;
+        }
+        let elem_rec = child_recs.get_as_wstr(i);
+        let elem_name = stor.block_param(&elem_rec, "Name").unwrap_or_default();
+        let Some(labels_rec) = stor.block_record(&elem_rec, "Labels") else {
+            continue;
+        };
+        let Some(label_names) = stor.get_buf(&labels_rec, "2") else {
+            continue;
+        };
+        let Some(label_recs) = stor.get_buf(&labels_rec, "3") else {
+            continue;
+        };
+        // Find the destination IFaceElement (load_element may have
+        // skipped elements with no images, so this lookup can fail).
+        let Some(elem) = elements.iter_mut().find(|e| e.name == elem_name) else {
+            continue;
+        };
+        elem.labels.clear();
+        for k in 0..label_names.arrays_count().min(label_recs.arrays_count()) {
+            let label_kind = label_names.get_as_wstr(k);
+            // The C++ supports both StateStaticLabel and
+            // StateDynamicLabel — both go through SetStateLabelParams,
+            // they only differ in whether the text is present in
+            // `LabelsText` (static) or set later via `SetCaption` /
+            // `m_FocusedLabel` flow (dynamic). We attach the static
+            // text now; dynamic captions get filled in by
+            // `apply_focused_text` etc. each frame.
+            if label_kind != "StateStaticLabel" && label_kind != "StateDynamicLabel" {
+                continue;
+            }
+            let label_rec = label_recs.get_as_wstr(k);
+            let params = stor.block_param(&label_rec, "Params").unwrap_or_default();
+            let state_str = stor.block_param(&label_rec, "State").unwrap_or_default();
+            let font = stor.block_param(&label_rec, "Font").unwrap_or_default();
+            let color_str = stor.block_param(&label_rec, "Color").unwrap_or_default();
+            let parts: Vec<i32> = params
+                .split(',')
+                .filter_map(|s| s.trim().parse::<i32>().ok())
+                .collect();
+            if parts.len() < 7 {
+                continue;
+            }
+            let (x, y) = (parts[0] as f32, parts[1] as f32);
+            let (sme_x, sme_y) = (parts[2] as f32, parts[3] as f32);
+            let (align_x, align_y) = (parts[4], parts[5]);
+            let wrap = parts[6] != 0;
+            let state = match state_str.as_str() {
+                "sNormal" => ElementState::Normal,
+                "sFocused" => ElementState::Focused,
+                "sPressed" => ElementState::Pressed,
+                "sDisabled" => ElementState::Disabled,
+                _ => continue,
+            };
+            // Decode `A,R,G,B` (the C++ packs aRGB via the same field
+            // order at CInterface.cpp:691-696).
+            let color = parse_argb(&color_str).unwrap_or([255, 255, 255, 255]);
+            // Resolve the static text from `LabelsText/<panel>/<elem>_<state>`.
+            // Dynamic labels start empty.
+            let text = labels_text_rec
+                .as_ref()
+                .and_then(|rec| {
+                    let key = format!("{elem_name}_{state_str}");
+                    stor.block_param(rec, &key)
+                })
+                .unwrap_or_default();
+            // Drop-shadow special case (CInterface.cpp:774-792). Black
+            // shadow at (x-1, y-1) renders BEFORE the colored row.
+            // Applies to the small set of buttons the C++ hardcodes.
+            let with_shadow = matches!(
+                elem_name.as_str(),
+                "cobuild" | "cocan" | "mm" | "inro" | "lero"
+            );
+            if with_shadow && !text.is_empty() {
+                elem.labels.push(ElementLabel {
+                    state,
+                    text: text.clone(),
+                    x: x - 1.0,
+                    y: y - 1.0,
+                    sme_x,
+                    sme_y,
+                    align_x,
+                    align_y,
+                    wrap,
+                    font: font.clone(),
+                    color: [0, 0, 0, 255],
+                });
+            }
+            elem.labels.push(ElementLabel {
+                state,
+                text,
+                x,
+                y,
+                sme_x,
+                sme_y,
+                align_x,
+                align_y,
+                wrap,
+                font,
+                color,
+            });
+            attached += 1;
+        }
+    }
+    log::info!(
+        "iface labels: panel={panel_name} attached={attached} label rows"
+    );
+}
+
+/// Decode the C++ aRGB packed `Color` param. Format: `A,R,G,B` ints
+/// 0-255. Returns None on malformed input.
+fn parse_argb(s: &str) -> Option<[u8; 4]> {
+    let parts: Vec<u8> = s
+        .split(',')
+        .filter_map(|p| p.trim().parse::<u8>().ok())
+        .collect();
+    if parts.len() < 4 {
+        return None;
+    }
+    Some([parts[1], parts[2], parts[3], parts[0]])
 }
 
 fn parse_state_image(
