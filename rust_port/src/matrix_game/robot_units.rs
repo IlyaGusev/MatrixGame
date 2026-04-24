@@ -7,7 +7,7 @@
 //! (SPrice, SUnit, SWeaponUnit, SArmorUnit, SRobotConfig).
 //!
 //! These types are the common currency between the constructor panel
-//! (robot_builder.rs), the build stack (object_building.rs), and the
+//! (constructor.rs), the build stack (object_building.rs), and the
 //! price / stats lookup tables (config.rs). Everything here is plain
 //! data — no rendering, no globals.
 

@@ -674,19 +674,14 @@ impl RobotsRenderer {
         // original sets `m_CurrState = ROBOT_EMBRYO` which freezes the
         // animation cursor; see CConstructor.cpp:45).
         let Some(_frame) = chassis_gpu.frames.first() else {
-            static ONCE: std::sync::atomic::AtomicBool =
-                std::sync::atomic::AtomicBool::new(false);
+            static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !ONCE.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                log::warn!(
-                    "preview: chassis {:?} GPU mesh has zero frames",
-                    chassis
-                );
+                log::warn!("preview: chassis {:?} GPU mesh has zero frames", chassis);
             }
             return;
         };
         {
-            static ONCE: std::sync::atomic::AtomicBool =
-                std::sync::atomic::AtomicBool::new(false);
+            static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !ONCE.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 log::info!(
                     "preview: drawing chassis={:?} armor={:?} head={:?} weapons={:?} scissor={:?} surface={}x{}",

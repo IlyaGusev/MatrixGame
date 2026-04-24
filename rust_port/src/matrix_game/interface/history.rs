@@ -66,6 +66,7 @@ impl ConfigHistory {
     }
 
     /// Port of `CHistory::NextConfig` (CHistory.cpp:99-106).
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Option<RobotConfig> {
         if self.cursor < 0 || (self.cursor as usize) + 1 >= self.configs.len() {
             return None;
@@ -95,7 +96,7 @@ mod tests {
         let mut h = ConfigHistory::new();
         for i in 0..200 {
             let mut c = RobotConfig::new();
-            c.chassis.kind = RobotUnitKind((i + 1) as i32);
+            c.chassis.kind = RobotUnitKind(i + 1);
             h.add(c);
         }
         assert_eq!(h.configs.len(), 200);

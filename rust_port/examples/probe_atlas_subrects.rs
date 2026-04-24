@@ -24,7 +24,7 @@ fn main() {
 
         // Sample a sub-rect: print per-pixel alpha histogram + center
         // pixel RGB so we can tell if the area is non-empty.
-        let mut sample = |label: &str, x: usize, y: usize, sw: usize, sh: usize| {
+        let sample = |label: &str, x: usize, y: usize, sw: usize, sh: usize| {
             let mut nonempty = 0u32;
             let mut total = 0u32;
             for py in y..(y + sh).min(h) {

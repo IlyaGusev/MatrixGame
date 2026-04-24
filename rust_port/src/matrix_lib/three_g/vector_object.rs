@@ -63,7 +63,10 @@ impl VoMesh {
     /// Used by the map loader to build the weapon-slot table on armor VOs
     /// (MatrixMap.cpp:270-326) — armor bones with id >= 20 and name
     /// starting with `W` declare weapon attach points.
-    pub fn iter_matrices_at(&self, frame: usize) -> impl Iterator<Item = (&str, u32, [f32; 16])> + '_ {
+    pub fn iter_matrices_at(
+        &self,
+        frame: usize,
+    ) -> impl Iterator<Item = (&str, u32, [f32; 16])> + '_ {
         self.matrices.iter().filter_map(move |m| {
             self.all_matrices
                 .get(m.start as usize + frame)

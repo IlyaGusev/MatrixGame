@@ -1224,7 +1224,7 @@ fn sync_robot_lights(state: &mut AppState) {
 /// constructor UI isn't ported, so we skip straight to AddItem with
 /// a default chassis.
 fn dispatch_ui_click(state: &mut AppState, click: &crate::matrix_game::interface::Click) {
-    use crate::matrix_game::interface::robot_builder::parse_constructor_button;
+    use crate::matrix_game::interface::constructor::parse_constructor_button;
     use crate::matrix_game::interface::turret_build::TurretKind;
     use crate::matrix_game::interface::Click;
     use crate::matrix_game::map_static::{MapStatic, ObjectType};
@@ -1243,7 +1243,7 @@ fn dispatch_ui_click(state: &mut AppState, click: &crate::matrix_game::interface
         // (CIFaceMenu.cpp:530+) — calls SuperDjeans with the chosen
         // (type, kind, pilon) then closes the popup.
         Click::PopupItem { parent, kind } => {
-            use crate::matrix_game::interface::face_menu::EMenuParent;
+            use crate::matrix_game::interface::iface_menu::EMenuParent;
             let ty = parent.unit_type();
             let pilon = parent.pilon();
             // Pylon-empty kind (RUK_UNKNOWN) is a valid selection for
@@ -1431,7 +1431,7 @@ fn dispatch_ui_click(state: &mut AppState, click: &crate::matrix_game::interface
 /// the constructor popup menu (port of `CIFaceButton::OnMouseRBDown`
 /// at CIFaceButton.cpp:183-321).
 fn dispatch_ui_right_click(state: &mut AppState, click: &crate::matrix_game::interface::Click) {
-    use crate::matrix_game::interface::face_menu::popup_for_pylon;
+    use crate::matrix_game::interface::iface_menu::popup_for_pylon;
     use crate::matrix_game::interface::Click;
     use crate::matrix_game::side::CurrSel;
 
@@ -1476,8 +1476,8 @@ fn dispatch_ui_right_click(state: &mut AppState, click: &crate::matrix_game::int
 }
 
 fn preview_popup_hover(
-    builder: &mut crate::matrix_game::interface::robot_builder::RobotBuilder,
-    popup: Option<&mut crate::matrix_game::interface::face_menu::CIFaceMenu>,
+    builder: &mut crate::matrix_game::interface::constructor::RobotBuilder,
+    popup: Option<&mut crate::matrix_game::interface::iface_menu::CIFaceMenu>,
 ) {
     let Some(popup) = popup else {
         return;
@@ -2062,10 +2062,8 @@ fn refresh_interface_visibility(state: &mut AppState) {
     // base/building is the active selection; whether individual
     // constructor elements inside render is gated on
     // `constructor_active` via the per-element refresh below.
-    let base_panel_visible = matches!(
-        curr_sel,
-        CurrSel::BaseSelected | CurrSel::BuildingSelected
-    ) && kind.is_some();
+    let base_panel_visible =
+        matches!(curr_sel, CurrSel::BaseSelected | CurrSel::BuildingSelected) && kind.is_some();
     if let Some(p) = state.iface_list.panel_mut("Base") {
         let was_visible = p.visible;
         p.visible = base_panel_visible;

@@ -1,5 +1,5 @@
 use matrixgame_rs::matrix_game::interface::interface::DESIGN_H;
-use matrixgame_rs::matrix_game::interface::{Click, IFaceList};
+use matrixgame_rs::matrix_game::interface::IFaceList;
 use matrixgame_rs::matrix_lib::base::storage::Storage;
 
 fn main() {

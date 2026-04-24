@@ -11,10 +11,11 @@ wasm-pack build --dev --target web --out-dir pkg
 Then bump the cache-bust version in `index.html`:
 
 ```bash
-sed -i -E 's|(matrixgame_rs\.js\?v=)([0-9]+)|echo "\1$((\2+1))"|e' index.html
+perl -i -pe 's/(matrixgame_rs\.js\?v=)(\d+)/$1 . ($2+1)/e' index.html
 ```
 
-…or edit the `?v=N` by hand.
+…or edit the `?v=N` by hand. (Do **not** use `sed -i 's/.../.../e'` — GNU sed's
+`e` flag pipes the whole pattern space to the shell, which corrupts the line.)
 
 Release build (slower, ~46 s, smaller/faster wasm):
 
@@ -43,7 +44,7 @@ Open http://localhost:8081.
 
 ```bash
 wasm-pack build --dev --target web --out-dir pkg && \
-  sed -i -E 's|(matrixgame_rs\.js\?v=)([0-9]+)|echo "\1$((\2+1))"|e' index.html && \
+  perl -i -pe 's/(matrixgame_rs\.js\?v=)(\d+)/$1 . ($2+1)/e' index.html && \
   fuser -k 8081/tcp 2>/dev/null; \
   nohup python3 -m http.server 8081 > /dev/null 2>&1 &
 ```

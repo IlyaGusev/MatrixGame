@@ -76,9 +76,9 @@ pub struct Side {
     /// Port of the `CConstructorPanel` slice of `CMatrixSide`. Held
     /// inline since each side has its own robot configurator in the
     /// C++ (`m_ConstructPanel`). Filled lazily — the actual
-    /// `RobotBuilder` sub-struct lives in `interface::robot_builder`.
+    /// `RobotBuilder` sub-struct lives in `interface::constructor`.
     /// `None` for neutral / AI sides that don't need the player UI.
-    pub builder: Option<crate::matrix_game::interface::robot_builder::RobotBuilder>,
+    pub builder: Option<crate::matrix_game::interface::constructor::RobotBuilder>,
 }
 
 impl Side {
@@ -94,7 +94,7 @@ impl Side {
             // robot so the constructor UI is exercisable until the
             // map-side seeding lands.
             resources: [500, 500, 500, 500],
-            builder: Some(crate::matrix_game::interface::robot_builder::RobotBuilder::new()),
+            builder: Some(crate::matrix_game::interface::constructor::RobotBuilder::new()),
         }
     }
 

@@ -277,7 +277,7 @@ impl BuildStack {
                 robot.config = cfg;
                 // Port of CConstructor.cpp:218 — populate the display
                 // name (m_Name) using the construction-name helper.
-                robot.name = crate::matrix_game::interface::robot_builder::name_of_live(
+                robot.name = crate::matrix_game::interface::constructor::name_of_live(
                     &cfg.chassis,
                     &cfg.hull,
                     &cfg.head,

@@ -780,6 +780,7 @@ impl RobotBuilder {
         }
         // CConstructor.cpp:1087-1091 — only resources the new item
         // actually consumes act as gates.
+        #[allow(clippy::needless_range_loop)]
         for i in 0..4 {
             if side_bank[i] < total.resources[i] && item.resources[i] != 0 {
                 return false;

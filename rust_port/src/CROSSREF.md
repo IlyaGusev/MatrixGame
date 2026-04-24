@@ -94,16 +94,19 @@ SmokeAndFire, Weapon, Zahvat.
 
 | Rust file                               | Original                                           |
 |-----------------------------------------|----------------------------------------------------|
-| matrix_game/interface/iface_element.rs  | CIFaceElement.{cpp,h} (data portion + hit-test)    |
+| matrix_game/interface/builder_preview.rs| CConstructor::Render (CConstructor.cpp:264-360) — preview viewport + directional light slice |
+| matrix_game/interface/constructor.rs    | CConstructor.{cpp,h} (+ folded CConstructorPanel)  |
+| matrix_game/interface/counter.rs        | CCounter.{cpp,h}                                   |
+| matrix_game/interface/history.rs        | CHistory.{cpp,h}                                   |
+| matrix_game/interface/iface_element.rs  | CIFaceElement.{cpp,h} (folds CIFaceButton / CIFaceImage / CIFaceStatic) |
 | matrix_game/interface/iface_list.rs     | CInterface.h::CIFaceList (panel container + events)|
+| matrix_game/interface/iface_menu.rs     | CIFaceMenu.{cpp,h}                                 |
 | matrix_game/interface/interface.rs      | CInterface.{cpp,h} (panel struct + `if/<Name>` loader) |
 | matrix_game/interface/renderer.rs       | (no C++ peer — wgpu 2D quad pipeline for the HUD)  |
+| matrix_game/interface/sound.rs          | (no direct peer — dispatch wrapper for CSound::Play UI calls; backend deferred) |
+| matrix_game/interface/turret_build.rs   | CInterface::BeginBuildTurret slice (CInterface.cpp:4650+ + placement state) |
 
-Not yet ported: CAnimation → animation.rs, CConstructor → constructor.rs,
-CCounter → counter.rs, CHistory → history.rs, CIFaceButton → iface_button.rs
-(folded into iface_element.rs as a kind), CIFaceImage → iface_image.rs,
-CIFaceMenu → iface_menu.rs, CIFaceStatic → iface_static.rs (folded too),
-MatrixHint → hint.rs.
+Not yet ported: CAnimation → animation.rs, MatrixHint → hint.rs.
 
 ## matrix_game/logic/ (MatrixGame/src/Logic/)
 

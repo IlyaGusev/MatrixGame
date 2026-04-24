@@ -38,7 +38,7 @@ pub struct IFaceList {
     /// (Interface/CIFaceMenu.{cpp,h}). When `Some`, mouse events
     /// route to it before reaching the underlying panel; clicking
     /// outside the popup ramka closes it.
-    pub popup: Option<super::face_menu::CIFaceMenu>,
+    pub popup: Option<super::iface_menu::CIFaceMenu>,
     /// Saved config to restore after canceling a popup hover-preview.
     pub popup_restore_pending: Option<RobotConfig>,
     /// Port of `g_ConfigHistory` (CHistory.cpp:11) — global history
@@ -72,7 +72,7 @@ pub enum Click {
     /// Left-button release on an item inside an active popup menu.
     /// Port of `CIFaceMenu::OnMenuItemPress` (CIFaceMenu.cpp:530+).
     PopupItem {
-        parent: super::face_menu::EMenuParent,
+        parent: super::iface_menu::EMenuParent,
         kind: crate::matrix_game::robot_units::RobotUnitKind,
     },
 }

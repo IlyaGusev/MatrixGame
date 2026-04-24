@@ -162,11 +162,11 @@ impl MapLogic {
         });
         // AI robot catalogue (CConstructor.cpp:1361 / SSpecialBot::LoadAIRobotType).
         let ai_robots =
-            crate::matrix_game::interface::robot_builder::AIRobotCatalogue::from_matrix_data(
+            crate::matrix_game::interface::constructor::AIRobotCatalogue::from_matrix_data(
                 matrix_data,
             );
         log::info!("config: loaded {} AI robot templates", ai_robots.bots.len());
-        crate::matrix_game::interface::robot_builder::set_global_ai_robots(ai_robots);
+        crate::matrix_game::interface::constructor::set_global_ai_robots(ai_robots);
     }
 
     /// Populate the arena with one [`MapObject`] per decorative

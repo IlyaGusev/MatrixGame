@@ -309,7 +309,7 @@ impl CIFaceMenu {
     /// to apply.
     pub fn refresh_affordability(
         &mut self,
-        builder: &super::robot_builder::RobotBuilder,
+        builder: &super::constructor::RobotBuilder,
         side_bank: &[i32; 4],
     ) {
         let ty = self.parent.unit_type();
@@ -327,7 +327,7 @@ impl CIFaceMenu {
     /// the row whose `kind` matches the currently-equipped component
     /// for this pylon — the C++ uses `GetIndexFromTK` to derive the
     /// index, then renders the cursik arrow at that row.
-    pub fn refresh_current_pos(&mut self, builder: &super::robot_builder::RobotBuilder) {
+    pub fn refresh_current_pos(&mut self, builder: &super::constructor::RobotBuilder) {
         let cfg = builder.cfg();
         let equipped = match self.parent {
             EMenuParent::PylonChassis => cfg.chassis.kind,

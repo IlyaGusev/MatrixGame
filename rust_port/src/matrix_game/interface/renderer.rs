@@ -335,7 +335,7 @@ impl InterfaceRenderer {
         &mut self,
         queue: &wgpu::Queue,
         panels: &[&CInterface],
-        popup: Option<&super::face_menu::CIFaceMenu>,
+        popup: Option<&super::iface_menu::CIFaceMenu>,
         screen_w: f32,
         screen_h: f32,
     ) {
@@ -357,7 +357,7 @@ impl InterfaceRenderer {
         &mut self,
         queue: &wgpu::Queue,
         panels: &[&CInterface],
-        popup: Option<&super::face_menu::CIFaceMenu>,
+        popup: Option<&super::iface_menu::CIFaceMenu>,
         screen_w: f32,
         screen_h: f32,
     ) {
@@ -383,10 +383,10 @@ impl InterfaceRenderer {
         let mut current_key: Option<String> = None;
         let mut current_start: u32 = 0;
         let open_run = |key: &str,
-                            all_verts: &Vec<Vertex>,
-                            current_key: &mut Option<String>,
-                            current_start: &mut u32,
-                            draw_groups: &mut Vec<DrawGroup>| {
+                        all_verts: &Vec<Vertex>,
+                        current_key: &mut Option<String>,
+                        current_start: &mut u32,
+                        draw_groups: &mut Vec<DrawGroup>| {
             if current_key.as_deref() != Some(key) {
                 if let Some(k) = current_key.take() {
                     let end = all_verts.len() as u32;
@@ -506,15 +506,15 @@ impl InterfaceRenderer {
                 // so popup quads always stack on top.
                 let atlases = &self.atlases;
                 let emit_textured = |all_verts: &mut Vec<Vertex>,
-                                         current_key: &mut Option<String>,
-                                         current_start: &mut u32,
-                                         draw_groups: &mut Vec<DrawGroup>,
-                                         x: f32,
-                                         y: f32,
-                                         w: f32,
-                                         h: f32,
-                                         img: &super::iface_element::StateImage,
-                                         tint: [f32; 4]| {
+                                     current_key: &mut Option<String>,
+                                     current_start: &mut u32,
+                                     draw_groups: &mut Vec<DrawGroup>,
+                                     x: f32,
+                                     y: f32,
+                                     w: f32,
+                                     h: f32,
+                                     img: &super::iface_element::StateImage,
+                                     tint: [f32; 4]| {
                     let key = normalise_atlas_key(&img.tex_path);
                     if !atlases.contains_key(&key) {
                         return;
@@ -583,7 +583,7 @@ impl InterfaceRenderer {
                         .elements
                         .iter()
                         .find(|e| e.name == name)
-                        .and_then(|e| e.images.get(0)?.as_ref())
+                        .and_then(|e| e.images.first()?.as_ref())
                 };
                 let opaque = [1.0, 1.0, 1.0, 1.0];
                 if let Some(tl) = pop_img("topleft") {
@@ -593,7 +593,14 @@ impl InterfaceRenderer {
                         &mut all_verts,
                         &mut current_key,
                         &mut current_start,
-                        &mut self.draw_groups, ox, oy, cw, ch, tl, opaque);
+                        &mut self.draw_groups,
+                        ox,
+                        oy,
+                        cw,
+                        ch,
+                        tl,
+                        opaque,
+                    );
                 }
                 if let Some(tr) = pop_img("topright") {
                     let cw = tr.w * scale;
@@ -602,7 +609,14 @@ impl InterfaceRenderer {
                         &mut all_verts,
                         &mut current_key,
                         &mut current_start,
-                        &mut self.draw_groups, ox + total_w - cw, oy, cw, ch, tr, opaque);
+                        &mut self.draw_groups,
+                        ox + total_w - cw,
+                        oy,
+                        cw,
+                        ch,
+                        tr,
+                        opaque,
+                    );
                 }
                 if let Some(bl) = pop_img("bottomleft") {
                     let cw = bl.w * scale;
@@ -611,7 +625,14 @@ impl InterfaceRenderer {
                         &mut all_verts,
                         &mut current_key,
                         &mut current_start,
-                        &mut self.draw_groups, ox, oy + total_h - ch, cw, ch, bl, opaque);
+                        &mut self.draw_groups,
+                        ox,
+                        oy + total_h - ch,
+                        cw,
+                        ch,
+                        bl,
+                        opaque,
+                    );
                 }
                 if let Some(br) = pop_img("bottomright") {
                     let cw = br.w * scale;
@@ -644,7 +665,14 @@ impl InterfaceRenderer {
                         &mut all_verts,
                         &mut current_key,
                         &mut current_start,
-                        &mut self.draw_groups, ox + corner_w, oy, span, h, tline, opaque);
+                        &mut self.draw_groups,
+                        ox + corner_w,
+                        oy,
+                        span,
+                        h,
+                        tline,
+                        opaque,
+                    );
                 }
                 if let Some(bline) = pop_img("bottomline") {
                     let h = bline.h * scale;
@@ -669,7 +697,14 @@ impl InterfaceRenderer {
                         &mut all_verts,
                         &mut current_key,
                         &mut current_start,
-                        &mut self.draw_groups, ox, oy + corner_h, w, span, lline, opaque);
+                        &mut self.draw_groups,
+                        ox,
+                        oy + corner_h,
+                        w,
+                        span,
+                        lline,
+                        opaque,
+                    );
                 }
                 if let Some(rline) = pop_img("rightline") {
                     let w = rline.w * scale;
@@ -723,7 +758,7 @@ impl InterfaceRenderer {
                     let Some(src) = base_panel.template_by_kind(popup_ty, item.kind.0) else {
                         continue;
                     };
-                    let Some(img) = src.images.get(0).and_then(|x| x.as_ref()) else {
+                    let Some(img) = src.images.first().and_then(|x| x.as_ref()) else {
                         continue;
                     };
                     let x = ox;
@@ -750,7 +785,14 @@ impl InterfaceRenderer {
                         &mut all_verts,
                         &mut current_key,
                         &mut current_start,
-                        &mut self.draw_groups, x, y, w, h, img, tint);
+                        &mut self.draw_groups,
+                        x,
+                        y,
+                        w,
+                        h,
+                        img,
+                        tint,
+                    );
                 }
 
                 // (4) Cursik — the arrow indicator at the row matching
@@ -766,10 +808,17 @@ impl InterfaceRenderer {
                         let cx = ox + 8.0 * scale;
                         let cy = row_y + (popup.item_h * scale - ch) * 0.5;
                         emit_textured(
-                        &mut all_verts,
-                        &mut current_key,
-                        &mut current_start,
-                        &mut self.draw_groups, cx, cy, cw, ch, cursik, opaque);
+                            &mut all_verts,
+                            &mut current_key,
+                            &mut current_start,
+                            &mut self.draw_groups,
+                            cx,
+                            cy,
+                            cw,
+                            ch,
+                            cursik,
+                            opaque,
+                        );
                     }
                 }
             }

@@ -655,8 +655,7 @@ impl CInterface {
             })
             .collect();
 
-        static LOGGED: std::sync::atomic::AtomicBool =
-            std::sync::atomic::AtomicBool::new(false);
+        static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let log_once = !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed);
         if log_once {
             log::info!(
