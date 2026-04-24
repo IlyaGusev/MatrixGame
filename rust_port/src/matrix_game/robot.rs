@@ -199,6 +199,23 @@ pub struct Robot {
     /// rendered right now so we carry exactly one `AnimState`;
     /// armor / weapon / head each get their own when they land.
     pub chassis_anim: crate::matrix_lib::three_g::animation::AnimState,
+
+    /// Port of `CMatrixRobot::m_Name` (MatrixRobot.hpp). Display name
+    /// composed from chassis/armor/head label parts + total damage
+    /// suffix by `GetConstructionName` (CConstructor.cpp:1540-1572).
+    pub name: String,
+
+    /// Port of `CMatrixRobot::m_Team` (MatrixRobot.hpp). Team index
+    /// (0..=2) the robot belongs to within its side. Set by
+    /// `set_team` either when StackRobot/ProduceRobot assigns the
+    /// new bot to a team, or when group reassignment moves it.
+    pub team: i32,
+
+    /// Cached configuration the robot was built from — chassis kind /
+    /// armor / head / weapons / cached damage. Lets `do_animation`,
+    /// AI, and the building progress UI access the per-component
+    /// metadata without round-tripping through `g_Config`.
+    pub config: crate::matrix_game::robot_units::RobotConfig,
 }
 
 /// Port of `EAnimation` (MatrixObjectRobot.hpp:32-47).
@@ -268,7 +285,22 @@ impl Robot {
             place_add: None,
             animation: Animation::Off,
             chassis_anim: Default::default(),
+            name: String::new(),
+            team: 0,
+            config: crate::matrix_game::robot_units::RobotConfig::new(),
         }
+    }
+
+    /// Port of `CMatrixRobot::SetTeam(int)` (MatrixRobot.hpp). Used by
+    /// `CConstructor::ProduceRobot` / `BuildSpecialBot` to assign the
+    /// freshly-spawned robot to one of three groups.
+    pub fn set_team(&mut self, team: i32) {
+        self.team = team.clamp(0, 2);
+    }
+
+    /// Port of `CMatrixRobot::m_Team` accessor.
+    pub fn team(&self) -> i32 {
+        self.team
     }
 
     /// Port of `CMatrixRobot::SwitchAnimation(EAnimation a)`

@@ -490,6 +490,20 @@ impl Objects {
         slot.obj.as_deref_mut()
     }
 
+    /// Visit each live object in the arena.
+    pub fn for_each_live(&self, mut f: impl FnMut(ObjectId, &dyn MapStatic)) {
+        for (i, slot) in self.slots.iter().enumerate() {
+            let Some(obj) = slot.obj.as_deref() else {
+                continue;
+            };
+            let id = ObjectId {
+                index: i as u32,
+                generation: slot.generation,
+            };
+            f(id, obj);
+        }
+    }
+
     /// Ports `InLT` (MatrixMapStatic.hpp:440). Works even while the
     /// object's box is checked out by a takt driver — the list
     /// membership flag lives on the slot, not in the box.

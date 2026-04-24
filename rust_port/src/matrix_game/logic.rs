@@ -12,7 +12,9 @@ pub mod ai_group;
 use crate::matrix_game::camera::Camera;
 use crate::matrix_game::common::{PLAYER_SIDE, TRACE_ANYOBJECT};
 use crate::matrix_game::config::{
-    self, BuildingDamages, ChassisChars, GlobalConfig, ObjectDamages,
+    self, BuildingDamages, ChassisChars, GlobalConfig, HeadCharsTable, ItemCharsTable,
+    ItemDescriptions, ItemLabels, ObjectDamages, PriceTable, RobotDamages, RobotNameParts,
+    StringTables, Timings, TurretProps, WeaponCooldown, WeaponStrengthAI,
 };
 use crate::matrix_game::map::GameMap;
 use crate::matrix_game::map_static::{MapStatic, ObjectId, ObjectType, Objects};
@@ -119,7 +121,52 @@ impl MapLogic {
         self.objects.building_damages =
             BuildingDamages::from_matrix_data(matrix_data).unwrap_or_default();
         let chassis = ChassisChars::from_matrix_data(matrix_data).unwrap_or_default();
-        config::set_global(GlobalConfig { chassis });
+        let prices = PriceTable::from_matrix_data(matrix_data).unwrap_or_default();
+        let item_chars = ItemCharsTable::from_matrix_data(matrix_data).unwrap_or_default();
+        let timings = Timings::from_matrix_data(matrix_data).unwrap_or_default();
+        let turrets = TurretProps::from_matrix_data(matrix_data).unwrap_or_default();
+        let robot_damages = RobotDamages::from_matrix_data(matrix_data).unwrap_or_default();
+        let weapon_cooldown = WeaponCooldown::from_matrix_data(matrix_data).unwrap_or_default();
+        let weapon_strength_ai =
+            WeaponStrengthAI::from_matrix_data(matrix_data).unwrap_or_default();
+        let head_chars = HeadCharsTable::from_matrix_data(matrix_data).unwrap_or_default();
+        log::info!(
+            "config: loaded prices+chars+timings (unit_robot_ms={}, base_hp={})",
+            timings.unit_robot,
+            item_chars.chassis_structure.iter().sum::<i32>(),
+        );
+        config::set_global(GlobalConfig {
+            chassis,
+            prices,
+            item_chars,
+            timings,
+            turrets,
+            robot_damages,
+            weapon_cooldown,
+            weapon_strength_ai,
+            head_chars,
+        });
+        // String-heavy tables — labels, descriptions, robot-name parts.
+        let labels = ItemLabels::from_matrix_data(matrix_data).unwrap_or_default();
+        let descriptions = ItemDescriptions::from_matrix_data(matrix_data).unwrap_or_default();
+        let robot_names = RobotNameParts::from_matrix_data(matrix_data).unwrap_or_default();
+        log::info!(
+            "config: loaded labels (chassis[0]={:?}, robot_names[hull1]={:?})",
+            labels.chassis.first().map(|s| s.as_str()).unwrap_or(""),
+            robot_names.hull.first().map(|s| s.as_str()).unwrap_or(""),
+        );
+        config::set_global_strings(StringTables {
+            labels,
+            descriptions,
+            robot_names,
+        });
+        // AI robot catalogue (CConstructor.cpp:1361 / SSpecialBot::LoadAIRobotType).
+        let ai_robots =
+            crate::matrix_game::interface::robot_builder::AIRobotCatalogue::from_matrix_data(
+                matrix_data,
+            );
+        log::info!("config: loaded {} AI robot templates", ai_robots.bots.len());
+        crate::matrix_game::interface::robot_builder::set_global_ai_robots(ai_robots);
     }
 
     /// Populate the arena with one [`MapObject`] per decorative

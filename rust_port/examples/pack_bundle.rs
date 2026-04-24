@@ -490,6 +490,115 @@ fn main() {
         chassis_vo_count, chassis_tex_count
     );
 
+    // Pack robot armor / head / weapon meshes for the constructor
+    // preview. Paths follow `OBJECT_PATH_ROBOT_*` from
+    // StringConstants.hpp:177-180. The C++ also ships `_e` enemy-tint
+    // variants; we pack only the player-side base textures since the
+    // preview only renders for PLAYER_SIDE.
+    let mut robot_part_vo_count = 0;
+    let mut robot_part_tex_count = 0;
+    let part_specs: [(&str, u32); 3] = [("Armor", 6), ("Head", 4), ("Weapon", 10)];
+    for (folder, max_kind) in part_specs {
+        for n in 1..=max_kind {
+            let vo_path = format!("Matrix/Robot/{}{}.vo", folder, n);
+            let vo_key = vo_path.to_uppercase();
+            let vo_bytes = match pkg.read_file(&vo_key) {
+                Ok(data) => {
+                    bundle.add(&vo_path, data.clone());
+                    robot_part_vo_count += 1;
+                    data
+                }
+                Err(_) => {
+                    eprintln!("  MISS robot part vo: {}", vo_path);
+                    continue;
+                }
+            };
+            let stem = format!("Matrix/Robot/{}{}", folder, n);
+            for suffix in ["", "_gloss"] {
+                let t = format!("{}{}", stem, suffix);
+                if try_pack_texture(&mut bundle, &mut vo_tex_seen, &t) {
+                    robot_part_tex_count += 1;
+                }
+            }
+            if let Ok(vo) = vector_object::parse_vo(&vo_bytes) {
+                let dir = vo_path.rsplit_once('/').map(|(d, _)| format!("{d}/"));
+                for s in &vo.surfaces {
+                    if let Some(spec) = s.texture_ref.as_deref() {
+                        let m =
+                            vector_object::parse_material_spec_with_prefix(spec, dir.as_deref());
+                        for t in [
+                            m.diffuse.as_ref(),
+                            m.gloss.as_ref(),
+                            m.back.as_ref(),
+                            m.mask.as_ref(),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        {
+                            if try_pack_texture(&mut bundle, &mut vo_tex_seen, t) {
+                                robot_part_tex_count += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    println!(
+        "  robot parts: {} armor/head/weapon vo files, {} textures packed",
+        robot_part_vo_count, robot_part_tex_count
+    );
+
+    // Pack cannon/turret meshes — `Matrix/Cannon/{Basis,Turret{1-4},Shaft{1-4}}.vo`
+    // (MatrixObjectCannon.cpp:209,229). Referenced by `CannonsRenderer::new`.
+    let mut cannon_vo_count = 0;
+    let mut cannon_tex_count = 0;
+    let mut cannon_paths: Vec<String> = vec!["Matrix/Cannon/Basis.vo".into()];
+    for n in 1..=4 {
+        cannon_paths.push(format!("Matrix/Cannon/Turret{}.vo", n));
+        cannon_paths.push(format!("Matrix/Cannon/Shaft{}.vo", n));
+    }
+    for vo_path in &cannon_paths {
+        let vo_key = vo_path.to_uppercase();
+        let Ok(vo_bytes) = pkg.read_file(&vo_key) else {
+            eprintln!("  MISS cannon vo: {}", vo_path);
+            continue;
+        };
+        bundle.add(vo_path, vo_bytes.clone());
+        cannon_vo_count += 1;
+        let dir = vo_path.rsplit_once('/').map(|(d, _)| format!("{d}/"));
+        if let Ok(vo) = vector_object::parse_vo(&vo_bytes) {
+            for s in &vo.surfaces {
+                if let Some(spec) = s.texture_ref.as_deref() {
+                    let m = vector_object::parse_material_spec_with_prefix(spec, dir.as_deref());
+                    for t in [
+                        m.diffuse.as_ref(),
+                        m.gloss.as_ref(),
+                        m.back.as_ref(),
+                        m.mask.as_ref(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        if try_pack_texture(&mut bundle, &mut vo_tex_seen, t) {
+                            cannon_tex_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Also pack the base Basis diffuse/gloss in case VOs don't self-reference.
+    for t in ["Matrix/Cannon/Basis", "Matrix/Cannon/Basis_Gloss"] {
+        if try_pack_texture(&mut bundle, &mut vo_tex_seen, t) {
+            cannon_tex_count += 1;
+        }
+    }
+    println!(
+        "  cannons: {} vo files, {} textures packed",
+        cannon_vo_count, cannon_tex_count
+    );
+
     // Pack sibling `.txt` files so the alpha-test override path in
     // `vector_object::resolve_alpha_test_with_txt` (which ports
     // Texture.cpp:113-136) works in the WASM build. There are ~119 of these

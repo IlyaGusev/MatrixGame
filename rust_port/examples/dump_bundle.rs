@@ -20,4 +20,8 @@ fn main() {
     {
         println!("  WATER: {}", k);
     }
+    println!("---");
+    for k in keys.iter().filter(|k| k.to_lowercase().contains("iface")) {
+        println!("  IFACE: {}", k);
+    }
 }

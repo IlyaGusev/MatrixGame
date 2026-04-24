@@ -29,6 +29,48 @@ pub struct VoMesh {
     /// Named animations, each a sequence of (frame index, duration ms).
     /// Empty for non-animated objects.
     pub animations: Vec<VoAnimation>,
+    /// Named bone matrices. Ports `SVOMatrix[]` (VectorObject.hpp:227) +
+    /// `SVOMatrix::m_MatrixStart` indirection into `m_AllMatrixs` at
+    /// VectorObject.cpp:188-215. Used by `CMatrixRobot::Draw` for
+    /// weapon/head attach points on the parent armor/chassis graph
+    /// (MatrixObjectRobot.cpp:460-575).
+    pub matrices: Vec<VoMatrix>,
+    /// Flat `D3DXMATRIX[]` bone pose table. Each bone's per-frame
+    /// matrix lives at `matrices[i].start + frame` into this array.
+    /// Stored in D3D row-major layout (same 16 floats as on disk).
+    pub all_matrices: Vec<[f32; 16]>,
+}
+
+/// Port of `SVOMatrix` (VectorObject.hpp:227). `start` is the offset
+/// into `VoMesh::all_matrices` where this bone's frame list begins.
+#[derive(Clone, Debug)]
+pub struct VoMatrix {
+    pub name: String,
+    pub id: u32,
+    pub start: u32,
+}
+
+impl VoMesh {
+    /// Port of `CVectorObject::GetMatrixById` (VectorObject.cpp:459-470).
+    /// Returns the 16-float row-major D3DXMATRIX for the named bone at
+    /// the given frame, or `None` when no bone with that id exists.
+    pub fn matrix_by_id(&self, id: u32, frame: usize) -> Option<[f32; 16]> {
+        let m = self.matrices.iter().find(|m| m.id == id)?;
+        self.all_matrices.get(m.start as usize + frame).copied()
+    }
+
+    /// Iterate all bone matrices at `frame` with their `(name, id, mat16)`.
+    /// Used by the map loader to build the weapon-slot table on armor VOs
+    /// (MatrixMap.cpp:270-326) — armor bones with id >= 20 and name
+    /// starting with `W` declare weapon attach points.
+    pub fn iter_matrices_at(&self, frame: usize) -> impl Iterator<Item = (&str, u32, [f32; 16])> + '_ {
+        self.matrices.iter().filter_map(move |m| {
+            self.all_matrices
+                .get(m.start as usize + frame)
+                .copied()
+                .map(|mat| (m.name.as_str(), m.id, mat))
+        })
+    }
 }
 
 /// Per-frame geometry state. Mirrors SVOKadr (VectorObject.hpp:214) plus the
@@ -130,6 +172,7 @@ pub fn parse_vo(data: &[u8]) -> Result<VoMesh> {
 
     let frames = parse_frames(&stor, &indices).context("parsing VO frames")?;
     let animations = parse_animations(&stor);
+    let (matrices, all_matrices) = parse_matrices(&stor);
     let surfaces = frames
         .first()
         .map(|f| f.surfaces.clone())
@@ -140,7 +183,56 @@ pub fn parse_vo(data: &[u8]) -> Result<VoMesh> {
         surfaces,
         frames,
         animations,
+        matrices,
+        all_matrices,
     })
+}
+
+/// Port of the `matrices/{name,id,disp,data}` buffer reader at
+/// VectorObject.cpp:187-215. `name` is WCHAR, `id` + `disp` are u32,
+/// `data` is a flat D3DXMATRIX[] array (16 f32 per matrix, row-major).
+fn parse_matrices(stor: &Storage) -> (Vec<VoMatrix>, Vec<[f32; 16]>) {
+    let Some(names) = stor.get_buf("matrices", "name") else {
+        return (Vec::new(), Vec::new());
+    };
+    let Some(ids) = stor.get_buf("matrices", "id") else {
+        return (Vec::new(), Vec::new());
+    };
+    let Some(disps) = stor.get_buf("matrices", "disp") else {
+        return (Vec::new(), Vec::new());
+    };
+    let Some(data) = stor.get_buf("matrices", "data") else {
+        return (Vec::new(), Vec::new());
+    };
+    let n = names.arrays_count();
+    let mut matrices = Vec::with_capacity(n);
+    let id_bytes = ids.get_bytes(0);
+    let disp_bytes = disps.get_bytes(0);
+    let read_u32 = |buf: &[u8], i: usize| -> u32 {
+        let o = i * 4;
+        u32::from_le_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]])
+    };
+    for i in 0..n {
+        let name = names.get_as_wstr(i);
+        // Strip trailing NUL from wchar string (C++ wcslen semantics).
+        let name = name.trim_end_matches('\0').to_string();
+        let id = read_u32(id_bytes, i);
+        let start = read_u32(disp_bytes, i);
+        matrices.push(VoMatrix { name, id, start });
+    }
+    let raw = data.get_bytes(0);
+    let count = raw.len() / 64;
+    let mut all = Vec::with_capacity(count);
+    for i in 0..count {
+        let off = i * 64;
+        let mut m = [0.0f32; 16];
+        for (j, slot) in m.iter_mut().enumerate() {
+            let o = off + j * 4;
+            *slot = f32::from_le_bytes([raw[o], raw[o + 1], raw[o + 2], raw[o + 3]]);
+        }
+        all.push(m);
+    }
+    (matrices, all)
 }
 
 /// One sub-mesh declared inside a `.cvo` (CVectorObjectGroup) file. Ports

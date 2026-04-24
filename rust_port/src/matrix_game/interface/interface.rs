@@ -44,6 +44,41 @@ pub struct CInterface {
     /// in the original, but we cache it here when the focus is within
     /// this panel).
     pub focused: Option<usize>,
+    /// Port of the `ConstPresent` / `ConstX` / `ConstY` / `ConstWidth` /
+    /// `ConstHeight` top-level params (CInterface.cpp:204-214). When
+    /// `ConstPresent != 0`, the panel reserves a sub-rect for the
+    /// constructor's 3D-preview viewport; the rect is design-space
+    /// pixels relative to the panel origin. None when `ConstPresent`
+    /// is 0 or the panel doesn't host the constructor.
+    pub const_rect: Option<[f32; 4]>,
+}
+
+/// Subset of game state the Base-panel constructor visibility refresh
+/// reads. Ports the per-element conditions scattered across
+/// CInterface.cpp:1799-2200 — armor weapon-slot caps gate pylon
+/// visibility, history availability gates the prev/next buttons, and
+/// resource affordability gates the build button.
+#[derive(Debug, Clone, Copy)]
+pub struct BaseVisibilityCtx<'a> {
+    pub constructor_active: bool,
+    pub build_count: i32,
+    pub focused_price: Option<&'a crate::matrix_game::robot_units::UnitPrice>,
+    pub summ_price: &'a crate::matrix_game::robot_units::UnitPrice,
+    /// `g_MatrixMap->m_RobotWeaponMatrix[hull-1].common` —
+    /// 0 hides pi1..pi4. CInterface.cpp:1817.
+    pub armor_common_slots: i32,
+    /// `…extra` — 0 hides pi5. CInterface.cpp:1818.
+    pub armor_extra_slots: i32,
+    /// `g_ConfigHistory->IsPrev()` — false → hisleft becomes
+    /// IFACE_DISABLED. CInterface.cpp:1962.
+    pub history_has_prev: bool,
+    /// `g_ConfigHistory->IsNext()` — false → hisright disabled.
+    pub history_has_next: bool,
+    pub counter_up_enabled: bool,
+    pub counter_down_enabled: bool,
+    /// Side has enough resources for current preset and stack isn't
+    /// full and robot count under cap. CInterface.cpp:1859.
+    pub build_enabled: bool,
 }
 
 /// Subset of `CMatrixSide` state the Main panel's visibility dispatch
@@ -65,6 +100,11 @@ pub struct MainVisibilityCtx {
     /// `bld->m_BS.GetItemsCnt()` — number of queued items. Drives
     /// stack-icon visibility (CInterface.cpp:1592).
     pub building_stack_items: i32,
+    /// Constructor panel is open — show the chassis/armor/head/weapon
+    /// buttons + price readouts.
+    pub constructor_active: bool,
+    /// Turret-build mode active — show turret1..4 kind picker.
+    pub turret_build_active: bool,
 }
 
 impl CInterface {
@@ -82,6 +122,18 @@ impl CInterface {
         let design_z = parse_f32(matrix_data, &rec, "zPos").unwrap_or(0.0);
         let id = parse_i32(matrix_data, &rec, "id").unwrap_or(0);
         let on_top = parse_i32(matrix_data, &rec, "OnTop").unwrap_or(0) != 0;
+
+        // ConstPresent / ConstX / ConstY / ConstWidth / ConstHeight —
+        // the constructor 3D-preview sub-rect (CInterface.cpp:204-214).
+        let const_rect = if parse_i32(matrix_data, &rec, "ConstPresent").unwrap_or(0) != 0 {
+            let cx = parse_f32(matrix_data, &rec, "ConstX").unwrap_or(0.0);
+            let cy = parse_f32(matrix_data, &rec, "ConstY").unwrap_or(0.0);
+            let cw = parse_f32(matrix_data, &rec, "ConstWidth").unwrap_or(0.0);
+            let ch = parse_f32(matrix_data, &rec, "ConstHeight").unwrap_or(0.0);
+            Some([cx, cy, cw, ch])
+        } else {
+            None
+        };
 
         // Walk children — Buttons / Statics / Images each with their
         // own rect + state-images blob.
@@ -126,6 +178,7 @@ impl CInterface {
             visible: true,
             elements,
             focused: None,
+            const_rect,
         })
     }
 
@@ -137,6 +190,34 @@ impl CInterface {
         name: &str,
     ) -> Option<&crate::matrix_game::interface::iface_element::IFaceElement> {
         self.elements.iter().find(|e| e.name == name)
+    }
+
+    /// Look up a constructor-template element by `(type, kind)` —
+    /// where `type` is 1/2/3/4 for Chassis/Weapon/Armor/Head (the
+    /// `Param1` value) and `kind` is the specific sub-kind (`Param2`).
+    ///
+    /// Port of the `m_Chassis[]` / `m_Armor[]` / `m_Head[]` / `m_Weapon[]`
+    /// lookup tables the C++ builds during `CInterface::Load` at
+    /// CInterface.cpp:338-387. The C++ indexes those arrays by
+    /// `Param2` (or `Param2 - 1` for chassis/armor); we walk the
+    /// elements once on demand instead, which matches the same
+    /// semantic (name-based element lookup is wrong because the
+    /// template-button names don't correlate 1:1 with kinds —
+    /// e.g. `chas1.Param2 = 3`, `weap1.Param2 = 7`).
+    pub fn template_by_kind(
+        &self,
+        ty: i32,
+        kind: i32,
+    ) -> Option<&crate::matrix_game::interface::iface_element::IFaceElement> {
+        self.elements.iter().find(|e| {
+            (e.param1 as i32) == ty
+                && (e.param2 as i32) == kind
+                // Kind 0 is special — it resolves to `heade` / `weape`
+                // (the "empty" templates). The numeric-kind templates
+                // start at Param2 >= 1; we still allow kind==0 so the
+                // lookup finds `heade` / `weape` correctly.
+                && is_template_element_name(&e.name)
+        })
     }
 
     /// Screen-space pixel rect of a named element. Computed from the
@@ -241,6 +322,385 @@ impl CInterface {
                 }
             }
         }
+
+        // Step 5 — constructor sub-panel visibility. When the player
+        // opens the robot builder (`buro`), the Base panel's component
+        // buttons become visible. Ports the `if (m_Active)` branches
+        // scattered through CInterface.cpp:1215-1426.
+        if ctx.constructor_active {
+            for e in &mut self.elements {
+                let n = e.name.as_str();
+                let show = matches!(
+                    n,
+                    "conl" | "conr" | "conf"               // const left / right / foot frames
+                    | "cocan" | "cobuild"                    // cancel + build
+                    | "chas1" | "chas2" | "chas3" | "chas4" | "chas5"
+                    | "hull1" | "hull2" | "hull3" | "hull4" | "hull5" | "hull6"
+                    | "head1" | "head2" | "head3" | "head4" | "heade"
+                    | "weap1" | "weap2" | "weap3" | "weap4" | "weap5"
+                    | "weap6" | "weap7" | "weap8" | "weap9" | "weap10" | "weape"
+                    | "pi1" | "pi2" | "pi3" | "pi4" | "pi5"
+                    | "pihe" | "pihu" | "pich"
+                    | "hisleft" | "hisright" | "counthz"
+                    | "bup" | "bdown"
+                    | "itch" | "itprice"                       // item chars + price
+                    | "label1" | "label2" | "descrT" | "descrB"
+                    | "weight" | "speed" | "struct" | "damage"
+                    | "res_summ" | "res_unit"
+                    | "titan" | "electr" | "energy" | "plasma"
+                    | "titans" | "electrs" | "energys" | "plasmas"
+                    | "warning" | "warning1"
+                );
+                if show {
+                    e.set_visible(true);
+                }
+            }
+        }
+
+        // Step 6 — turret-build mode — show the turret-kind picker.
+        // Ports `CInterface::BeginBuildTurret` + the m_Turrets[4] button
+        // visibility at CInterface.cpp:3518-3542.
+        if ctx.turret_build_active {
+            for e in &mut self.elements {
+                let n = e.name.as_str();
+                if matches!(n, "tur1" | "tur2" | "tur3" | "tur4") {
+                    e.set_visible(true);
+                }
+            }
+        }
+    }
+
+    /// Per-frame visibility refresh for `if/Base`. Hides the overlapping
+    /// chas/hull/head/weap template images (they live at stacked
+    /// positions and are only laid out by the C++ popup overlay we
+    /// haven't ported yet) while keeping pylons, backgrounds, stats,
+    /// and the build/cancel buttons visible.
+    pub fn refresh_base_visibility(&mut self, constructor_active: bool) {
+        self.refresh_base_visibility_with(constructor_active, 1);
+    }
+
+    /// Same as [`refresh_base_visibility`] but additionally keeps only
+    /// the digit-image static matching `build_count` visible (port of
+    /// `CIFaceCounter::ManageButtons` + `GetImage`). The other digit
+    /// statics — `zero`, `one`, ... `six` — are hidden.
+    pub fn refresh_base_visibility_with(&mut self, constructor_active: bool, build_count: i32) {
+        self.refresh_base_visibility_full(
+            constructor_active,
+            build_count,
+            None,
+            &crate::matrix_game::robot_units::UnitPrice::zero(),
+        );
+    }
+
+    /// Full Base-panel visibility refresh including the per-resource
+    /// icon toggles for the focused / summary price popups.
+    ///
+    /// `focused_price` is the price of the currently-focused component
+    /// (or None when nothing is focused) — port of
+    /// `CreateItemPrice` (CInterface.cpp:3146).
+    ///
+    /// `summ_price` is the live preview total ×`build_count` —
+    /// port of `CreateSummPrice` (CInterface.cpp:3220).
+    ///
+    /// For each resource (titan / electr / energy / plasma) the
+    /// matching template icon stays visible iff its slot has a non-
+    /// zero value in either price. The C++ creates dynamic statics
+    /// per non-zero resource; we just toggle the existing
+    /// `titan`/`electr`/`energy`/`plasma` template-image elements
+    /// that the panel data already holds.
+    pub fn refresh_base_visibility_full(
+        &mut self,
+        constructor_active: bool,
+        build_count: i32,
+        focused_price: Option<&crate::matrix_game::robot_units::UnitPrice>,
+        summ_price: &crate::matrix_game::robot_units::UnitPrice,
+    ) {
+        self.refresh_base_visibility_v2(BaseVisibilityCtx {
+            constructor_active,
+            build_count,
+            focused_price,
+            summ_price,
+            armor_common_slots: 0,
+            armor_extra_slots: 0,
+            history_has_prev: false,
+            history_has_next: false,
+            counter_up_enabled: true,
+            counter_down_enabled: true,
+            build_enabled: true,
+        });
+    }
+
+    /// Full per-element visibility refresh — port of the `IF_BASE`
+    /// branch of `CInterface::LogicTakt` (CInterface.cpp:1799-2200).
+    /// Each constructor element is conditionally shown based on
+    /// armor weapon-slot caps, history availability, and resource
+    /// affordability. The C++ also disables (rather than hides) some
+    /// buttons via `SetState(IFACE_DISABLED)`; we mirror that on
+    /// HISTORY_LEFT/RIGHT and CONST_BUILD.
+    pub fn refresh_base_visibility_v2(&mut self, ctx: BaseVisibilityCtx) {
+        use crate::matrix_game::robot_units::Resource;
+
+        if self.name != "Base" {
+            return;
+        }
+        if !ctx.constructor_active {
+            for e in &mut self.elements {
+                e.set_visible(false);
+            }
+            return;
+        }
+        let build_count = ctx.build_count;
+        let focused_price = ctx.focused_price;
+        let summ_price = ctx.summ_price;
+        // Digit-image element names per CInterface.cpp:563-576.
+        const DIGIT_NAMES: [&str; 7] = ["zero", "one", "two", "three", "four", "five", "six"];
+        let active_digit = build_count.clamp(0, 6) as usize;
+
+        // Resource-icon visibility — show the icon when EITHER the
+        // summary-price OR the focused-price has a non-zero entry for
+        // that resource (matches CreateSummPrice + CreateItemPrice
+        // both rendering icons for non-zero rows).
+        let res_visible = |r: Resource| -> bool {
+            let summ_nz = summ_price.resources[r as usize] != 0;
+            let focus_nz = focused_price
+                .map(|p| p.resources[r as usize] != 0)
+                .unwrap_or(false);
+            summ_nz || focus_nz
+        };
+        let titan_v = res_visible(Resource::Titan);
+        let electr_v = res_visible(Resource::Electronics);
+        let energy_v = res_visible(Resource::Energy);
+        let plasma_v = res_visible(Resource::Plasma);
+
+        // Helper: detect template / popup-overlay element names that
+        // should stay hidden until the popup-menu is invoked. The C++
+        // stacks these at the same panel position and only one shows
+        // at a time during a popup interaction. Until the popup is
+        // ported we just hide them all.
+        //
+        // Pattern: a category prefix (chas/hull/head/weap) followed by
+        // a digit suffix (chas1..5, hull1..6, head1..7, weap1..10) OR
+        // the empty-slot variants `heade`/`weape`. Plain category
+        // labels like `chasl`, `weapl`, `hulll`, `headl` are STATIC
+        // text elements that remain visible.
+        fn is_kind_template(n: &str) -> bool {
+            for prefix in ["chas", "hull", "head", "weap"] {
+                if let Some(suffix) = n.strip_prefix(prefix) {
+                    // Digit suffix → numbered template button
+                    if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) {
+                        return true;
+                    }
+                    // Empty-slot variants `heade` / `weape`
+                    if suffix == "e" {
+                        return true;
+                    }
+                    // Decorative `*Nst` (hull1st, weapon3st, etc.) —
+                    // also `weaponNst` (note `weapon` not `weap`).
+                    if suffix.ends_with("st")
+                        && suffix
+                            .trim_end_matches("st")
+                            .chars()
+                            .any(|c| c.is_ascii_digit())
+                    {
+                        return true;
+                    }
+                }
+            }
+            // `weaponNst` siblings (see panel dump — uses `weapon` not
+            // `weap` prefix for the *st statics).
+            if let Some(rest) = n.strip_prefix("weapon") {
+                if rest.ends_with("st") {
+                    return true;
+                }
+            }
+            // Per-template info text statics: `iw1text`, `ihe2text`,
+            // `ihu3text`, `ich4text`. The bare `iwtext`/`ihetext`/etc.
+            // are headers — keep them visible.
+            for prefix in ["iw", "ihe", "ihu", "ich"] {
+                if let Some(suffix) = n.strip_prefix(prefix) {
+                    if suffix.ends_with("text")
+                        && suffix
+                            .trim_end_matches("text")
+                            .chars()
+                            .any(|c| c.is_ascii_digit())
+                    {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+
+        for e in &mut self.elements {
+            let n = e.name.as_str();
+            let is_template = is_kind_template(n);
+            let is_digit = DIGIT_NAMES.contains(&n);
+            // CInterface.cpp:889-892 — resource icon template names.
+            let res_v = match n {
+                "titan" | "titans" => Some(titan_v),
+                "electr" | "electrs" => Some(electr_v),
+                "energy" | "energys" => Some(energy_v),
+                "plasma" | "plasmas" => Some(plasma_v),
+                _ => None,
+            };
+
+            // Weapon-pylon visibility per CInterface.cpp:1972-2090.
+            // pi1..pi4 only visible when armor has common slots;
+            // pi5 only when armor has extra slots.
+            let pylon_v: Option<bool> = match n {
+                "pi1" | "pi2" | "pi3" | "pi4" => Some(ctx.armor_common_slots > 0),
+                "pi5" => Some(ctx.armor_extra_slots > 0),
+                _ => None,
+            };
+
+            // History button enabled state per CInterface.cpp:1954-1967.
+            // The C++ uses SetState(IFACE_DISABLED) and keeps the
+            // button visible; we mirror via cur_state.
+            match n {
+                "hisleft" => {
+                    if !ctx.history_has_prev {
+                        e.cur_state = ElementState::Disabled;
+                    } else if matches!(e.cur_state, ElementState::Disabled) {
+                        e.cur_state = ElementState::Normal;
+                    }
+                }
+                "hisright" => {
+                    if !ctx.history_has_next {
+                        e.cur_state = ElementState::Disabled;
+                    } else if matches!(e.cur_state, ElementState::Disabled) {
+                        e.cur_state = ElementState::Normal;
+                    }
+                }
+                "bup" => {
+                    if !ctx.counter_up_enabled {
+                        e.cur_state = ElementState::Disabled;
+                        e.def_state = ElementState::Disabled;
+                    } else if matches!(e.cur_state, ElementState::Disabled) {
+                        e.cur_state = ElementState::Normal;
+                        e.def_state = ElementState::Normal;
+                    }
+                }
+                "bdown" => {
+                    if !ctx.counter_down_enabled {
+                        e.cur_state = ElementState::Disabled;
+                        e.def_state = ElementState::Disabled;
+                    } else if matches!(e.cur_state, ElementState::Disabled) {
+                        e.cur_state = ElementState::Normal;
+                        e.def_state = ElementState::Normal;
+                    }
+                }
+                "cobuild" => {
+                    if !ctx.build_enabled {
+                        e.cur_state = ElementState::Disabled;
+                        e.def_state = ElementState::Disabled;
+                    } else if matches!(e.cur_state, ElementState::Disabled) {
+                        e.cur_state = ElementState::Normal;
+                        e.def_state = ElementState::Normal;
+                    }
+                }
+                _ => {}
+            }
+
+            if is_digit {
+                let idx = DIGIT_NAMES.iter().position(|&d| d == n).unwrap_or(0);
+                e.set_visible(idx == active_digit);
+            } else if let Some(v) = pylon_v {
+                e.set_visible(v);
+            } else if let Some(v) = res_v {
+                e.set_visible(v);
+            } else {
+                e.set_visible(!is_template);
+            }
+        }
+    }
+
+    /// Port of the `CInterface::CopyElements(src, dst)` calls in
+    /// `CConstructor::SuperDjeans` (CConstructor.cpp:451-520). For each
+    /// component slot (chassis, armor, head, 5 weapon pylons) read
+    /// the currently-selected kind from `cfg` and swap the pylon
+    /// element's images to match that template's images.
+    ///
+    /// Runs every frame while the constructor is active so preset
+    /// loads / history restores / wrap-around cycles all reflect in
+    /// the UI without bespoke call-site glue.
+    pub fn apply_constructor_to_pylons(
+        &mut self,
+        cfg: &crate::matrix_game::robot_units::RobotConfig,
+    ) {
+        if self.name != "Base" {
+            return;
+        }
+        // Faithful port of CConstructor.cpp:451/465/468/490 — each
+        // pylon copy-target reads its source element via the
+        // kind-indexed `m_Chassis[]` / `m_Armor[]` / `m_Head[]` /
+        // `m_Weapon[]` tables (built at CInterface.cpp:338-387).
+        // We resolve those indirectly through `template_by_kind` which
+        // walks elements filtered by `Param1` (type) + `Param2` (kind).
+        //
+        // Param1 values from the Base panel config:
+        //   1 = Chassis, 2 = Weapon, 3 = Armor, 4 = Head
+        let find_template = |ty: i32, kind: i32| -> Option<String> {
+            self.template_by_kind(ty, kind).map(|e| e.name.clone())
+        };
+        let chassis_src = find_template(1, cfg.chassis.kind.0);
+        let hull_src = find_template(3, cfg.hull.unit.kind.0);
+        // Head kind 0 resolves to the `heade` empty-head template
+        // (which has Param2=0). Weapon kind 0 → `weape`.
+        let head_src = find_template(4, cfg.head.kind.0);
+        let weapon_srcs: Vec<(Option<String>, String)> = (0..5)
+            .map(|i| {
+                let slot_name = format!("pi{}", i + 1);
+                let kind = cfg.weapon[i].kind.0;
+                (find_template(2, kind), slot_name)
+            })
+            .collect();
+
+        static LOGGED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        let log_once = !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed);
+        if log_once {
+            log::info!(
+                "apply_constructor_to_pylons: chassis(kind={})={:?} hull(kind={})={:?} head(kind={})={:?} weapons={:?}",
+                cfg.chassis.kind.0, chassis_src,
+                cfg.hull.unit.kind.0, hull_src,
+                cfg.head.kind.0, head_src,
+                weapon_srcs,
+            );
+        }
+        self.copy_pair(chassis_src.as_deref(), "pich");
+        self.copy_pair(hull_src.as_deref(), "pihu");
+        self.copy_pair(head_src.as_deref(), "pihe");
+        for (src, dst) in &weapon_srcs {
+            self.copy_pair(src.as_deref(), dst.as_str());
+        }
+    }
+
+    /// Port of `CInterface::CopyElements(src_name, dst_name)` by-name
+    /// lookup. Finds both elements in `self.elements`; copies src's
+    /// per-state images onto dst via `IFaceElement::copy_images_from`.
+    fn copy_pair(&mut self, src_name: Option<&str>, dst_name: &str) {
+        let Some(src_name) = src_name else {
+            return;
+        };
+        let Some(src_idx) = self.elements.iter().position(|e| e.name == src_name) else {
+            return;
+        };
+        let Some(dst_idx) = self.elements.iter().position(|e| e.name == dst_name) else {
+            return;
+        };
+        if src_idx == dst_idx {
+            return;
+        }
+        // Split borrows with `split_at_mut` so we can mutate dst while
+        // immutably reading src.
+        let (a, b) = if src_idx < dst_idx {
+            let (left, right) = self.elements.split_at_mut(dst_idx);
+            (&left[src_idx], &mut right[0])
+        } else {
+            let (left, right) = self.elements.split_at_mut(src_idx);
+            (&right[0], &mut left[dst_idx])
+        };
+        b.copy_images_from(a);
     }
 
     /// Resolve `(design_x, design_y)` to a top-left screen-space
@@ -261,6 +721,22 @@ impl CInterface {
         };
         [x, y]
     }
+}
+
+/// Returns true for element names that match the constructor
+/// template-button naming (`chas{N}`, `hull{N}`, `head{N}`/`heade`,
+/// `weap{N}`/`weape`). Used by `template_by_kind` so a plain pylon
+/// element like `pich` (which also has `Param1=1`) isn't returned as
+/// a chassis template.
+fn is_template_element_name(name: &str) -> bool {
+    for prefix in ["chas", "hull", "head", "weap"] {
+        if let Some(suffix) = name.strip_prefix(prefix) {
+            if suffix == "e" || suffix.chars().all(|c| c.is_ascii_digit()) {
+                return !suffix.is_empty();
+            }
+        }
+    }
+    false
 }
 
 /// Port of the per-kind element-parse branches in `CInterface::Load`

@@ -1710,6 +1710,7 @@ pub struct MapRenderer {
     objects: Option<super::object::ObjectsRenderer>,
     buildings: Option<super::object_building::BuildingsRenderer>,
     robots: Option<super::object_robot::RobotsRenderer>,
+    cannons: Option<super::object_cannon::CannonsRenderer>,
     point_lights: PointLightRenderer,
     water: Option<super::water::Water>,
     uniform_buffer: wgpu::Buffer,
@@ -1719,6 +1720,12 @@ pub struct MapRenderer {
 }
 
 impl MapRenderer {
+    /// Accessor for the chassis renderer — external passes (like the
+    /// constructor 3D preview) use `robots.render_preview` directly.
+    pub fn robots(&self) -> Option<&super::object_robot::RobotsRenderer> {
+        self.robots.as_ref()
+    }
+
     /// Shared depth buffer view — used by external effect renderers
     /// (e.g. the selection ring) that want to depth-test against the
     /// terrain drawn in the same frame without re-attaching a
@@ -2102,6 +2109,10 @@ impl MapRenderer {
         // from the arena.
         let robots =
             super::object_robot::RobotsRenderer::new(device, queue, config, map, read_texture);
+        // Cannons / turrets — MatrixObjectCannon.cpp:188-249 loads
+        // Basis.vo + Turret{N}.vo + Shaft{N}.vo on first `RNeed`.
+        let cannons =
+            super::object_cannon::CannonsRenderer::new(device, queue, config, map, read_texture);
 
         // Water (MatrixWater.cpp)
         let water =
@@ -2357,6 +2368,7 @@ impl MapRenderer {
             last_point_light_revision: 0,
             buildings,
             robots,
+            cannons,
         }
     }
 
@@ -2405,6 +2417,9 @@ impl MapRenderer {
         if let Some(robots) = &mut self.robots {
             robots.takt(dt_ms);
         }
+        if let Some(cannons) = &mut self.cannons {
+            cannons.takt(dt_ms);
+        }
         self.sky.takt(dt_ms);
         self.point_lights.sync(device, map, point_lights);
     }
@@ -2441,6 +2456,9 @@ impl MapRenderer {
     ) {
         if let Some(robots) = &mut self.robots {
             robots.sync_robots(queue, objs, map, point_lights, cms);
+        }
+        if let Some(cannons) = &mut self.cannons {
+            cannons.sync_cannons(queue, objs, map);
         }
     }
 
@@ -2593,6 +2611,9 @@ impl MapRenderer {
         }
         if let Some(buildings) = &self.buildings {
             buildings.render(queue, &mut pass, camera, view_proj);
+        }
+        if let Some(cannons) = &self.cannons {
+            cannons.render(queue, &mut pass, camera, view_proj);
         }
 
         // Visible additive point-light pass on terrain-conforming geometry.

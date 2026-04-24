@@ -17,6 +17,7 @@
 //! their call sites need them.
 
 use crate::matrix_game::map_static::ObjectId;
+use crate::matrix_game::robot_units::{Resource, MAX_RESOURCES};
 
 /// Port of `ESelectedType` (MatrixSide.hpp). Tracks what the player's
 /// side is currently pointing at — the C++ interface panel dispatches
@@ -64,6 +65,20 @@ pub struct Side {
     /// callers that iterate (e.g. move-order dispatch) keep a stable
     /// traversal. Always contains `active_object` when Some.
     pub selected: Vec<ObjectId>,
+
+    /// `m_Resources[MAX_RESOURCES]` (MatrixSide.hpp:393) — per-side
+    /// resource bank. Indexed by `Resource as usize`; starts empty
+    /// and is topped up by factory-building `AddResourceAmount` calls
+    /// (MatrixObjectBuilding.cpp:614 etc.) or drained by unit builds
+    /// (CConstructor.cpp:239-242).
+    pub resources: [i32; MAX_RESOURCES],
+
+    /// Port of the `CConstructorPanel` slice of `CMatrixSide`. Held
+    /// inline since each side has its own robot configurator in the
+    /// C++ (`m_ConstructPanel`). Filled lazily — the actual
+    /// `RobotBuilder` sub-struct lives in `interface::robot_builder`.
+    /// `None` for neutral / AI sides that don't need the player UI.
+    pub builder: Option<crate::matrix_game::interface::robot_builder::RobotBuilder>,
 }
 
 impl Side {
@@ -73,7 +88,39 @@ impl Side {
             active_object: None,
             curr_sel: CurrSel::Nothing,
             selected: Vec::new(),
+            // Each side starts with a plausible resource pool — the
+            // C++ seeds this from map `StartResources` which isn't
+            // parsed yet. Give every side enough to build a basic
+            // robot so the constructor UI is exercisable until the
+            // map-side seeding lands.
+            resources: [500, 500, 500, 500],
+            builder: Some(crate::matrix_game::interface::robot_builder::RobotBuilder::new()),
         }
+    }
+
+    /// Port of `CMatrixSideUnit::AddResourceAmount` (MatrixSide.cpp).
+    /// Clamps to ≥ 0 — the original also floors at zero and logs
+    /// an error for negative totals.
+    pub fn add_resource_amount(&mut self, res: Resource, amount: i32) {
+        let i = res as usize;
+        let v = self.resources[i].saturating_add(amount);
+        self.resources[i] = v.max(0);
+    }
+
+    /// Port of `CMatrixSideUnit::GetResourceAmount` (MatrixSide.cpp).
+    pub fn get_resource_amount(&self, res: Resource) -> i32 {
+        self.resources[res as usize]
+    }
+
+    /// True if the side can afford the cost (all four resources are
+    /// ≥ the requested amount).
+    pub fn can_afford(&self, cost: &crate::matrix_game::robot_units::UnitPrice) -> bool {
+        for r in Resource::ALL {
+            if self.resources[r as usize] < cost.resources[r as usize] {
+                return false;
+            }
+        }
+        true
     }
 
     /// Replace the selection with a single object. Matches

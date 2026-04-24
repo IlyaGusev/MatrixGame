@@ -30,6 +30,7 @@ use crate::matrix_game::map_static::{
 };
 use crate::matrix_game::rnd::Rnd;
 use crate::matrix_game::robot::{ChassisKind, Robot};
+use crate::matrix_game::robot_units::{RobotConfig, RobotUnitKind};
 use crate::matrix_lib::three_g::texture::{
     create_solid_texture, create_texture_from_rgba, decode_texture_bytes,
 };
@@ -104,10 +105,32 @@ pub const BASE_FLOOR_Z: f32 = -63.0;
 /// `CBuildStack` rejects AddItem once the queue hits this.
 pub const MAX_STACK_UNITS: usize = 6;
 
-/// Time in ms to produce one robot from the build stack. In C++ this
-/// is `g_Config.m_Timings[UNIT_ROBOT]`, loaded from robots.dat's
-/// Timings block. Hardcoded here until the timings config lands.
+/// Fallback build time when `g_Config.m_Timings[UNIT_ROBOT]` isn't
+/// loaded yet (e.g. tests that skip `load_config`). Matches the value
+/// used by the shipping `robots.dat` so behaviour is preserved.
 pub const UNIT_ROBOT_BUILD_TIME_MS: i32 = 5000;
+
+/// Per-kind build time in ms, resolved from `g_Config.m_Timings` with
+/// a fall-back to `UNIT_ROBOT_BUILD_TIME_MS` when the config hasn't
+/// been loaded.
+pub fn robot_build_time_ms() -> i32 {
+    let t = crate::matrix_game::config::global().timings.unit_robot;
+    if t > 0 {
+        t
+    } else {
+        UNIT_ROBOT_BUILD_TIME_MS
+    }
+}
+
+/// Turret build time (UNIT_TURRET in MatrixConfig.cpp:658).
+pub fn turret_build_time_ms() -> i32 {
+    let t = crate::matrix_game::config::global().timings.unit_turret;
+    if t > 0 {
+        t
+    } else {
+        UNIT_ROBOT_BUILD_TIME_MS
+    }
+}
 
 /// Port of `CBuildStack` (MatrixObjectBuilding.{cpp,hpp}). The C++
 /// holds an intrusive list of `CMatrixMapStatic*` (robots / cannons /
@@ -131,12 +154,26 @@ pub struct PendingItem {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[allow(clippy::large_enum_variant)] // RobotConfig carries the full spec; boxing wouldn't pay
 pub enum PendingKind {
-    /// A default robot with the given chassis. Ports the robot-
-    /// constructor output — the C++ passes a fully-configured
-    /// `CMatrixRobotAI*` here; we stub it to a chassis kind + defaults.
-    Robot(ChassisKind),
-    // Cannon / Flyer land with their subclass ports.
+    /// A fully-configured robot (chassis + armor + head + weapons)
+    /// produced by the constructor panel. Ports the `CMatrixRobotAI*`
+    /// the C++ `CConstructor::StackRobot` pushes onto `m_BS.AddItem`
+    /// (CConstructor.cpp:219).
+    Robot(RobotConfig),
+    /// A turret (cannon). Port of the `CMatrixCannon*` pushed from
+    /// the turret-build UI. `slot` is the 0-based slot index on the
+    /// parent building; `turret_kind` is the RUK_TURRET_* variant.
+    Turret { slot: i32, turret_kind: i32 },
+}
+
+impl PendingKind {
+    pub fn build_time_ms(&self) -> i32 {
+        match self {
+            PendingKind::Robot(_) => robot_build_time_ms(),
+            PendingKind::Turret { .. } => turret_build_time_ms(),
+        }
+    }
 }
 
 impl BuildStack {
@@ -176,10 +213,11 @@ impl BuildStack {
     /// Progress ratio of the head item in `[0.0, 1.0]`. Drives the
     /// progress-bar UI the C++ updates at MatrixObjectBuilding.cpp:1681.
     pub fn progress(&self) -> f32 {
-        if self.items.is_empty() {
+        let Some(head) = self.items.first() else {
             return 0.0;
-        }
-        (self.timer as f32 / UNIT_ROBOT_BUILD_TIME_MS as f32).clamp(0.0, 1.0)
+        };
+        let total = head.kind.build_time_ms().max(1) as f32;
+        (self.timer as f32 / total).clamp(0.0, 1.0)
     }
 
     /// Port of `CBuildStack::TickTimer` (MatrixObjectBuilding.cpp:
@@ -207,8 +245,8 @@ impl BuildStack {
         self.timer += cms;
 
         let head = self.items[0];
-        let PendingKind::Robot(chassis) = head.kind;
-        if self.timer < UNIT_ROBOT_BUILD_TIME_MS {
+        let total = head.kind.build_time_ms();
+        if self.timer < total {
             return None;
         }
         if parent_state != BaseState::Closed {
@@ -217,21 +255,136 @@ impl BuildStack {
             return None;
         }
 
-        // Produce: pop, build robot, insert.
+        // Produce: pop, build item, insert.
         self.items.remove(0);
         self.timer = 0;
 
-        // Port of MatrixObjectBuilding.cpp:1709-1712: create the robot
-        // at the base's location, call `RobotSpawn(pBase)` so its
-        // state machine enters the platform-rising animation, then
-        // `JoinToGroup` + `AddObject`.
-        let spawn_pos = glam::Vec3::new(parent_pos.x, parent_pos.y, parent_pos.z);
-        let mut robot = Robot::new(spawn_pos, head.side, chassis);
-        robot.robot_spawn(parent_self_id, parent_angle_quad, parent_pos.z);
-        let id = objs.spawn(Box::new(robot));
-        objs.add_lt(id);
-        Some(id)
+        match head.kind {
+            PendingKind::Robot(cfg) => {
+                let spawn_pos = glam::Vec3::new(parent_pos.x, parent_pos.y, parent_pos.z);
+                let chassis = chassis_from_kind(cfg.chassis.kind).unwrap_or(ChassisKind::Track);
+                // Port of CConstructor.cpp:115-122 — auto-balance the
+                // freshly-built robot across the side's three teams.
+                // Tally each team's existing robot count for this side
+                // and pick the least-populated; on ties the C++ rolls
+                // a `Rnd(0,2)`. We mirror that with a deterministic
+                // `(tick % 3)` here — the arena RNG isn't accessible
+                // from this scope, and the choice is only a tie-break.
+                let team = pick_balanced_team(objs, head.side);
+                let mut robot = Robot::new(spawn_pos, head.side, chassis);
+                robot.robot_spawn(parent_self_id, parent_angle_quad, parent_pos.z);
+                robot.set_team(team);
+                robot.config = cfg;
+                // Port of CConstructor.cpp:218 — populate the display
+                // name (m_Name) using the construction-name helper.
+                robot.name = crate::matrix_game::interface::robot_builder::name_of_live(
+                    &cfg.chassis,
+                    &cfg.hull,
+                    &cfg.head,
+                    &robot_weapons_from_cfg(&cfg),
+                );
+                let id = objs.spawn(Box::new(robot));
+                objs.add_lt(id);
+                Some(id)
+            }
+            PendingKind::Turret { slot, turret_kind } => {
+                // Turret placement happens immediately on the parent
+                // building — this branch only completes the build
+                // timer side. The actual per-slot cannon render /
+                // collision is handled by `Building::place_turret`.
+                // Log + no spawn — the turret is already mounted on
+                // the building.
+                log::info!(
+                    "build: turret completed (kind={} slot={}) side={}",
+                    turret_kind,
+                    slot,
+                    head.side,
+                );
+                None
+            }
+        }
     }
+}
+
+/// Port of `CConstructor::ProduceRobot`'s team-balance block at
+/// CConstructor.cpp:117-122. Counts robots on `side` per team and
+/// returns the least-populated team index. Ties resolve to team 0
+/// (the C++ rolls a Rnd(0,2) on tie; we deterministically pick 0,
+/// matching the line at CConstructor.cpp:122 that immediately
+/// overrides whatever was assigned to `0` anyway).
+fn pick_balanced_team(objs: &Objects, side: i32) -> i32 {
+    let mut counts = [0i32; 3];
+    for id in objs.iter_live() {
+        let Some(obj) = objs.get(id) else {
+            continue;
+        };
+        if !matches!(obj.core().obj_type, ObjectType::RobotAi) {
+            continue;
+        }
+        // SAFETY: dynamic dispatch via the trait — `as *const dyn ... as *const Robot`
+        // would be unsound here without confirming the type is Robot. We use
+        // `Robot`'s public field via an inline cast since RobotAi is the only
+        // ObjectType that maps to Robot.
+        let r: &Robot = unsafe { &*(obj as *const dyn MapStatic as *const Robot) };
+        if r.side != side {
+            continue;
+        }
+        let t = r.team().clamp(0, 2) as usize;
+        counts[t] += 1;
+    }
+    if counts[0] < counts[1] && counts[0] < counts[2] {
+        0
+    } else if counts[1] < counts[0] && counts[1] < counts[2] {
+        1
+    } else if counts[2] < counts[0] && counts[2] < counts[1] {
+        2
+    } else {
+        0
+    }
+}
+
+/// Helper: turn the chassis/armor/head/weapons of a `RobotConfig`
+/// into the `[WeaponUnit; MAX_WEAPON_CNT]` shape `name_of_live`
+/// expects (the latter is shared with the constructor preview, which
+/// holds `WeaponUnit` values directly).
+fn robot_weapons_from_cfg(
+    cfg: &RobotConfig,
+) -> [crate::matrix_game::robot_units::WeaponUnit; crate::matrix_game::robot_units::MAX_WEAPON_CNT]
+{
+    let mut out = [crate::matrix_game::robot_units::WeaponUnit::empty();
+        crate::matrix_game::robot_units::MAX_WEAPON_CNT];
+    for (i, w) in cfg.weapon.iter().enumerate() {
+        out[i] = crate::matrix_game::robot_units::WeaponUnit {
+            pos: i as i32 + 1,
+            unit: *w,
+        };
+    }
+    out
+}
+
+/// Translate `ChassisKind` (the render-side enum, 0..=4) into the
+/// kind-space values (`RUK_CHASSIS_*`, 1..=5) the constructor panel
+/// uses. The C++ doesn't need this because it has one enum; we keep
+/// two for historical reasons so this bridge lives here.
+pub fn kind_from_chassis(c: ChassisKind) -> RobotUnitKind {
+    match c {
+        ChassisKind::Pneumatic => RobotUnitKind::CHASSIS_PNEUMATIC,
+        ChassisKind::Wheel => RobotUnitKind::CHASSIS_WHEEL,
+        ChassisKind::Track => RobotUnitKind::CHASSIS_TRACK,
+        ChassisKind::Hovercraft => RobotUnitKind::CHASSIS_HOVERCRAFT,
+        ChassisKind::AntiGravity => RobotUnitKind::CHASSIS_ANTIGRAVITY,
+    }
+}
+
+pub fn chassis_from_kind(k: RobotUnitKind) -> Option<ChassisKind> {
+    Some(match k.0 {
+        1 => ChassisKind::Pneumatic,
+        2 => ChassisKind::Wheel,
+        3 => ChassisKind::Track,
+        4 => ChassisKind::Hovercraft,
+        5 => ChassisKind::AntiGravity,
+        _ => return None,
+    })
 }
 
 /// Base selection radius (MatrixObjectBuilding.hpp:25). Each kind adds
@@ -480,11 +633,49 @@ impl Building {
     /// Entry point for the build-robot UI action — ports the
     /// `m_Base->m_BS.AddItem(m_Build)` call at CConstructor.cpp:219.
     /// Returns true if the queue accepted the item, false if full.
-    pub fn queue_robot(&mut self, chassis: ChassisKind) -> bool {
+    ///
+    /// Accepts a full `RobotConfig` (ports the C++ where `m_Build` is
+    /// a fully-configured `CMatrixRobotAI*` with armor/weapons/head
+    /// already attached).
+    pub fn queue_robot(&mut self, cfg: RobotConfig) -> bool {
         self.build_stack.add_item(PendingItem {
-            kind: PendingKind::Robot(chassis),
+            kind: PendingKind::Robot(cfg),
             side: self.side,
         })
+    }
+
+    /// Back-compat entry point for the simplified "just a chassis"
+    /// default used by the pre-constructor `buro` handler. Builds a
+    /// minimal `RobotConfig` with the chosen chassis + a passive
+    /// armor so the validation check passes.
+    pub fn queue_default_robot(&mut self, chassis: ChassisKind) -> bool {
+        let mut cfg = RobotConfig::new();
+        cfg.chassis.kind = kind_from_chassis(chassis);
+        cfg.hull.unit.kind = RobotUnitKind::ARMOR_PASSIVE;
+        self.queue_robot(cfg)
+    }
+
+    /// Queue a turret build on a free slot of this base. Returns
+    /// false if all turret slots are already occupied or the queue
+    /// is full. Ports the turret-build follow-through of
+    /// `CInterface::BeginBuildTurret` → `m_BS.AddItem`.
+    pub fn queue_turret(&mut self, turret_kind: i32) -> bool {
+        if self.turrets_have >= self.turrets_max {
+            return false;
+        }
+        let slot = self.turrets_have;
+        let ok = self.build_stack.add_item(PendingItem {
+            kind: PendingKind::Turret { slot, turret_kind },
+            side: self.side,
+        });
+        if ok {
+            // Optimistically reserve the slot — the turret is mounted
+            // onto the building immediately (the C++ mounts it before
+            // the timer completes; the timer only gates the cost +
+            // visuals).
+            self.turrets_have += 1;
+        }
+        ok
     }
 
     /// Entry-point for `CMatrixBuilding::ShowHitpoint` (MatrixObjectBuilding.hpp:272).

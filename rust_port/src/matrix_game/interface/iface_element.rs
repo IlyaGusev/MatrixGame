@@ -99,6 +99,22 @@ impl IFaceElement {
         self.flags & IFEF_VISIBLE != 0
     }
 
+    /// Port of `CInterface::CopyElements` (CInterface.cpp:2480-2496).
+    /// Copies all 4 per-state images + `Param1` / `Param2` from `src`
+    /// onto `dest` — the C++ also copies `m_Actions` but we dispatch
+    /// by button name instead of via actions, so that part is inert.
+    ///
+    /// The destination keeps its own `pos`, `size`, `name`, `kind`.
+    /// This is how the constructor panel swaps the currently-selected
+    /// component icon onto the pylon elements.
+    pub fn copy_images_from(&mut self, src: &IFaceElement) {
+        for i in 0..MAX_STATES {
+            self.images[i] = src.images[i].clone();
+        }
+        self.param1 = src.param1;
+        self.param2 = src.param2;
+    }
+
     pub fn set_visible(&mut self, v: bool) {
         if v {
             self.flags |= IFEF_VISIBLE;
