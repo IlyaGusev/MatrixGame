@@ -1022,6 +1022,54 @@ impl RobotNameParts {
     }
 }
 
+/// Port of `g_MatrixData->BlockGet(IF_LABELS_BLOCKPAR)->BlockGet(L"Buildings")`
+/// — the localised per-kind name/description strings the Main panel's
+/// `name` + `bopis` + `bresg` captions read each frame. Keys:
+/// `Base_Name`, `Base_Descr`, `Titan_Name`, `Titan_Descr`,
+/// `Electronics_Name`, `Electronics_Descr`, `Energy_Name`,
+/// `Energy_Descr`, `Plasma_Name`, `Plasma_Descr`, `ResPer` (the
+/// `"<resources> ресурсов в минуту"` income template,
+/// CInterface.cpp:1485).
+#[derive(Debug, Clone, Default)]
+pub struct BuildingLabels {
+    pub base_name: String,
+    pub base_descr: String,
+    pub titan_name: String,
+    pub titan_descr: String,
+    pub electronics_name: String,
+    pub electronics_descr: String,
+    pub energy_name: String,
+    pub energy_descr: String,
+    pub plasma_name: String,
+    pub plasma_descr: String,
+    /// `ResPer` — income-per-minute template, e.g.
+    /// `"<resources> ресурсов в минуту"`. The `<resources>` placeholder
+    /// is replaced with a gold-coloured rich-text run containing the
+    /// income count (CInterface.cpp:1485-1486).
+    pub res_per: String,
+}
+
+impl BuildingLabels {
+    pub fn from_matrix_data(stor: &Storage) -> Option<Self> {
+        let labels_rec = stor.block_record("da", "AllLabels")?;
+        let b_rec = stor.block_record(&labels_rec, "Buildings")?;
+        let get = |key: &str| -> String { stor.block_param(&b_rec, key).unwrap_or_default() };
+        Some(Self {
+            base_name: get("Base_Name"),
+            base_descr: get("Base_Descr"),
+            titan_name: get("Titan_Name"),
+            titan_descr: get("Titan_Descr"),
+            electronics_name: get("Electronics_Name"),
+            electronics_descr: get("Electronics_Descr"),
+            energy_name: get("Energy_Name"),
+            energy_descr: get("Energy_Descr"),
+            plasma_name: get("Plasma_Name"),
+            plasma_descr: get("Plasma_Descr"),
+            res_per: get("ResPer"),
+        })
+    }
+}
+
 /// Bundle of the string-heavy tables. Held behind a separate static so
 /// `GlobalConfig` can stay `Copy`.
 #[derive(Debug, Clone, Default)]
@@ -1029,6 +1077,7 @@ pub struct StringTables {
     pub labels: ItemLabels,
     pub descriptions: ItemDescriptions,
     pub robot_names: RobotNameParts,
+    pub buildings: BuildingLabels,
 }
 
 static GLOBAL_STRINGS: std::sync::OnceLock<std::sync::RwLock<std::sync::Arc<StringTables>>> =

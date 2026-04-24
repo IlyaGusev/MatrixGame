@@ -1878,8 +1878,9 @@ fn refresh_progress_bars(state: &mut AppState) {
 
     state.progress_bars.clear();
 
-    // Only fires for a selected building with queued items — matches
-    // the C++ guard at MatrixObjectBuilding.cpp:1685-1689.
+    // Only fires for a selected building — matches the C++ dispatch
+    // at CInterface.cpp:1576-1578 (HP-bar clone) and
+    // MatrixObjectBuilding.cpp:1685-1689 (build-progress clone).
     if !matches!(
         state.game.player_side.curr_sel,
         CurrSel::BaseSelected | CurrSel::BuildingSelected
@@ -1896,9 +1897,6 @@ fn refresh_progress_bars(state: &mut AppState) {
         return;
     }
     let b: &Building = unsafe { &*(obj as *const dyn MapStatic as *const Building) };
-    if b.build_stack.is_empty() {
-        return;
-    }
 
     let w = state.gfx.config.width as f32;
     let h = state.gfx.config.height as f32;
@@ -1907,20 +1905,6 @@ fn refresh_progress_bars(state: &mut AppState) {
         return;
     };
 
-    // Port of MatrixObjectBuilding.cpp:1676-1689:
-    //   float x = g_IFaceList->GetMainX() + 283;
-    //   float y = g_IFaceList->GetMainY() + 71;
-    //   ...
-    //   m_PB.CreateClone(PBC_CLONE1, x, y, 87);
-    //
-    // `GetMainX()/GetMainY()` return the IF_MAIN panel's resolved
-    // top-left in screen pixels; the +283/+71 offsets and 87-wide
-    // clone are design-space pixels that the C++ uses at its fixed
-    // 1024×768 resolution. We scale them by `screen_h / 768` the
-    // same way CInterface scales its own panels.
-    const PB_OFFSET_X: f32 = 283.0;
-    const PB_OFFSET_Y: f32 = 71.0;
-    const PB_WIDTH: f32 = 87.0;
     use crate::matrix_game::interface::interface::DESIGN_H;
     let scale = (h / DESIGN_H).max(0.1);
     let [panel_x, panel_y] = main.resolved_pos(w, h, scale);
@@ -1932,30 +1916,61 @@ fn refresh_progress_bars(state: &mut AppState) {
             16.0
         }
     };
-    let rect = [
-        panel_x + PB_OFFSET_X * scale,
-        panel_y + PB_OFFSET_Y * scale,
-        PB_WIDTH * scale,
+
+    // Port of CInterface.cpp:1578 — `bld->CreateProgressBarClone(
+    // m_xPos+68, m_yPos+179, 68, PBC_CLONE2)`. HP bar, always visible
+    // when a building is selected, width 68 at (+68, +179).
+    const HP_OFFSET_X: f32 = 68.0;
+    const HP_OFFSET_Y: f32 = 179.0;
+    const HP_WIDTH: f32 = 68.0;
+    let hp_fill = if b.hit_point_max > 0.0 {
+        (b.hit_point / b.hit_point_max).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let hp_rect = [
+        panel_x + HP_OFFSET_X * scale,
+        panel_y + HP_OFFSET_Y * scale,
+        HP_WIDTH * scale,
         bar_h_design * scale,
     ];
-
-    // One-shot log so we can verify the rect + fill on first build.
-    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        log::info!(
-            "progress: pushing bar rect=({:.0},{:.0},{:.0},{:.0}) fill={:.2}",
-            rect[0],
-            rect[1],
-            rect[2],
-            rect[3],
-            b.build_stack.progress(),
-        );
-    }
-
     state.progress_bars.push(ProgressBar {
-        rect,
-        fill: b.build_stack.progress(),
+        rect: hp_rect,
+        fill: hp_fill,
     });
+
+    // Port of MatrixObjectBuilding.cpp:1676-1689 — build-queue
+    // progress bar at (+283, +71), width 87, PBC_CLONE1. Only when an
+    // item is queued for construction.
+    if !b.build_stack.is_empty() {
+        const PB_OFFSET_X: f32 = 283.0;
+        const PB_OFFSET_Y: f32 = 71.0;
+        const PB_WIDTH: f32 = 87.0;
+        let rect = [
+            panel_x + PB_OFFSET_X * scale,
+            panel_y + PB_OFFSET_Y * scale,
+            PB_WIDTH * scale,
+            bar_h_design * scale,
+        ];
+
+        // One-shot log so we can verify the rect + fill on first build.
+        static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            log::info!(
+                "progress: pushing bar rect=({:.0},{:.0},{:.0},{:.0}) fill={:.2}",
+                rect[0],
+                rect[1],
+                rect[2],
+                rect[3],
+                b.build_stack.progress(),
+            );
+        }
+
+        state.progress_bars.push(ProgressBar {
+            rect,
+            fill: b.build_stack.progress(),
+        });
+    }
 }
 
 /// Port of `CInterface::LogicTakt`'s per-frame visibility dispatch
@@ -1972,7 +1987,7 @@ fn refresh_interface_visibility(state: &mut AppState) {
 
     let curr_sel = state.game.player_side.curr_sel;
     // Pull building context when the selection is a Building.
-    let (kind, stack_empty, stack_items, turrets_max) = match curr_sel {
+    let (kind, stack_empty, stack_items, turrets_max, hit_point, hit_point_max) = match curr_sel {
         CurrSel::BaseSelected | CurrSel::BuildingSelected => {
             let active = state.game.active_object();
             active
@@ -1981,11 +1996,32 @@ fn refresh_interface_visibility(state: &mut AppState) {
                 .map(|o| {
                     let b: &Building = unsafe { &*(o as *const dyn MapStatic as *const Building) };
                     let n = b.build_stack.items() as i32;
-                    (Some(b.kind), n == 0, n, b.turrets_max)
+                    (
+                        Some(b.kind),
+                        n == 0,
+                        n,
+                        b.turrets_max,
+                        b.hit_point,
+                        b.hit_point_max,
+                    )
                 })
-                .unwrap_or((None::<BuildingType>, true, 0, 0))
+                .unwrap_or((None::<BuildingType>, true, 0, 0, 0.0, 0.0))
         }
-        _ => (None, true, 0, 0),
+        _ => (None, true, 0, 0, 0.0, 0.0),
+    };
+
+    // Port of `CMatrixSideUnit::GetIncomePerTime(kind, 60000)`
+    // (MatrixSide.cpp:352-377). The original's per-ms scaling is
+    // commented out, so this returns the flat per-tick rate:
+    // `RESOURCES_INCOME_BASE * fu / 100` for a base (3 @ fu=100),
+    // `RESOURCES_INCOME` for a factory (10).
+    const RESOURCES_INCOME: i32 = 10;
+    const RESOURCES_INCOME_BASE: i32 = 3;
+    let force_up = 100; // default m_BaseResForce (MatrixSide.hpp:441).
+    let income_per_minute = match kind {
+        Some(BuildingType::Base) => RESOURCES_INCOME_BASE * force_up / 100,
+        Some(_) => RESOURCES_INCOME,
+        None => 0,
     };
 
     let constructor_active = state
@@ -2007,6 +2043,12 @@ fn refresh_interface_visibility(state: &mut AppState) {
     };
     if let Some(p) = state.iface_list.panel_mut("Main") {
         p.refresh_main_visibility(&ctx);
+        // Push per-kind captions + HP readout into the dynamic labels
+        // — ports CInterface.cpp:1369-1499 (name / bopis / bresg / lives).
+        if let Some(k) = kind {
+            let strings = crate::matrix_game::config::global_strings();
+            p.apply_main_building_text(k, hit_point, hit_point_max, income_per_minute, &strings.buildings);
+        }
     }
     // Snapshot the live preset so we can feed it to `apply_constructor_to_pylons`
     // without holding a borrow across the panel_mut call.

@@ -169,6 +169,23 @@ impl CInterface {
         // all use the same centred-white layout.
         attach_labels(matrix_data, &rec, name, &mut elements);
 
+        // Port of `CInterface::SortElementsByZ()` (CInterface.cpp:2439-2478),
+        // called at the end of Load (CInterface.cpp:809). The C++ bubble-
+        // sort swaps when `elem.zPos < next.zPos`, producing descending
+        // zPos order — elements with higher zPos appear EARLIER in the
+        // list, so they render first (back); lower-zPos elements render
+        // last (front). Crucial for the Main panel: `mp1` (z=0.001) must
+        // render behind `basepl` / `mbres` / `podl*` (z=1e-6) even though
+        // the data authors them later.
+        //
+        // Stable sort preserves data-file order for elements with equal
+        // zPos — the C++ bubble-sort has the same property.
+        elements.sort_by(|a, b| {
+            b.pos_z
+                .partial_cmp(&a.pos_z)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
         log::info!(
             "iface: loaded {} design=({},{}) id={} elements={}",
             name,
@@ -313,9 +330,25 @@ impl CInterface {
                     // Build buttons.
                     "buro" if kind == Some(BuildingType::Base) => e.set_visible(true),
                     "buca" => e.set_visible(true),
-                    "callhell" => e.set_visible(true),
+                    // Reinforcements ("call from hell") is always visible
+                    // for any selected building; state goes DISABLED
+                    // while maintenance is off or the cooldown hasn't
+                    // elapsed (CInterface.cpp:1607-1613). We don't yet
+                    // model maintenance, so it renders DISABLED always.
+                    "callhell" => {
+                        e.set_visible(true);
+                        e.cur_state = ElementState::Disabled;
+                        e.def_state = ElementState::Disabled;
+                    }
                     "baseln" => e.set_visible(true),
                     "zagl1" => e.set_visible(true),
+                    // Resource-income readout — shown while the build
+                    // stack is empty. Separate keys for base vs factory
+                    // (CInterface.cpp:1478, :1489).
+                    "bresg" if empty && kind == Some(BuildingType::Base) => e.set_visible(true),
+                    "fresg" if empty && kind.is_some() && kind != Some(BuildingType::Base) => {
+                        e.set_visible(true)
+                    }
                     // Turret slot markers.
                     "podl1" if ctx.building_turrets_max == 1 => e.set_visible(true),
                     "podl2" if ctx.building_turrets_max == 2 => e.set_visible(true),
@@ -644,6 +677,78 @@ impl CInterface {
                 _ => continue,
             };
             for lbl in &mut e.labels {
+                lbl.text = new_text.to_string();
+            }
+        }
+    }
+
+    /// Refresh the dynamic captions on the `Main` panel when a base or
+    /// factory is selected. Port of the per-element caption assignments
+    /// at CInterface.cpp:1369-1499 — name / bopis / bresg get the
+    /// localised strings from `AllLabels/Buildings`, lives gets the
+    /// `"<hp>/<max>"` integer readout (CInterface.cpp:1503).
+    pub fn apply_main_building_text(
+        &mut self,
+        kind: crate::matrix_game::object_building::BuildingType,
+        hit_point: f32,
+        hit_point_max: f32,
+        income_per_minute: i32,
+        labels: &crate::matrix_game::config::BuildingLabels,
+    ) {
+        use crate::matrix_game::object_building::BuildingType;
+        if self.name != "Main" {
+            return;
+        }
+        let (name, descr) = match kind {
+            BuildingType::Base => (labels.base_name.as_str(), labels.base_descr.as_str()),
+            BuildingType::Titan => (labels.titan_name.as_str(), labels.titan_descr.as_str()),
+            BuildingType::Electronic => (
+                labels.electronics_name.as_str(),
+                labels.electronics_descr.as_str(),
+            ),
+            BuildingType::Energy => (labels.energy_name.as_str(), labels.energy_descr.as_str()),
+            BuildingType::Plasma => (labels.plasma_name.as_str(), labels.plasma_descr.as_str()),
+            BuildingType::Repair => ("", ""),
+        };
+        // Port of CInterface.cpp:1485-1486 — `suck.Replace(<resources>,
+        // "<Color=247,195,0>N</Color>")`. We emit the same rich-text
+        // markup so the renderer's inline `<Color>` tag parser colours
+        // the number gold (247,195,0 = `g_Colors[DEF_NORMAL_LBL_COLOR]`).
+        let bresg_text = if !labels.res_per.is_empty() {
+            let gold = format!("<Color=247,195,0>{}</Color>", income_per_minute);
+            labels.res_per.replace("<resources>", &gold)
+        } else {
+            String::new()
+        };
+        // Port of `CMatrixBuilding::GetHitPoint() { return m_HitPoint / 10; }`
+        // (MatrixObjectBuilding.hpp:274-275). The stored `m_HitPoint` is
+        // 10× the displayed value so the engine can track sub-unit
+        // damage; the HUD always shows the tenths-rounded integer.
+        let shown_hp = (hit_point / 10.0).round() as i32;
+        let shown_max = (hit_point_max / 10.0).round() as i32;
+        let lives_text = format!("{}/{}", shown_hp, shown_max);
+
+        for e in &mut self.elements {
+            let new_text: Option<&str> = match e.name.as_str() {
+                "name" => Some(name),
+                // `bopis` + `bresg` only show for a base; for factories
+                // the matching `IF_FACTORY_RES_INC` branch would use
+                // `fresg` (CInterface.cpp:1489). We leave those alone
+                // since the factory description lives on the same
+                // `bopis` element across all kinds.
+                "bopis" => Some(descr),
+                "bresg" if matches!(kind, BuildingType::Base) => Some(bresg_text.as_str()),
+                "fresg" if !matches!(kind, BuildingType::Base) => Some(bresg_text.as_str()),
+                "lives" => Some(lives_text.as_str()),
+                _ => None,
+            };
+            let Some(new_text) = new_text else {
+                continue;
+            };
+            for lbl in &mut e.labels {
+                // Keep shadow rows in sync (same text, just different
+                // colour / offset) so the drop-shadow under the name
+                // and lives still tracks the caption.
                 lbl.text = new_text.to_string();
             }
         }

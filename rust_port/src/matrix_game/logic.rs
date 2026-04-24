@@ -12,9 +12,9 @@ pub mod ai_group;
 use crate::matrix_game::camera::Camera;
 use crate::matrix_game::common::{PLAYER_SIDE, TRACE_ANYOBJECT};
 use crate::matrix_game::config::{
-    self, BuildingDamages, ChassisChars, GlobalConfig, HeadCharsTable, ItemCharsTable,
-    ItemDescriptions, ItemLabels, ObjectDamages, PriceTable, RobotDamages, RobotNameParts,
-    StringTables, Timings, TurretProps, WeaponCooldown, WeaponStrengthAI,
+    self, BuildingDamages, BuildingLabels, ChassisChars, GlobalConfig, HeadCharsTable,
+    ItemCharsTable, ItemDescriptions, ItemLabels, ObjectDamages, PriceTable, RobotDamages,
+    RobotNameParts, StringTables, Timings, TurretProps, WeaponCooldown, WeaponStrengthAI,
 };
 use crate::matrix_game::map::GameMap;
 use crate::matrix_game::map_static::{MapStatic, ObjectId, ObjectType, Objects};
@@ -150,15 +150,18 @@ impl MapLogic {
         let labels = ItemLabels::from_matrix_data(matrix_data).unwrap_or_default();
         let descriptions = ItemDescriptions::from_matrix_data(matrix_data).unwrap_or_default();
         let robot_names = RobotNameParts::from_matrix_data(matrix_data).unwrap_or_default();
+        let buildings = BuildingLabels::from_matrix_data(matrix_data).unwrap_or_default();
         log::info!(
-            "config: loaded labels (chassis[0]={:?}, robot_names[hull1]={:?})",
+            "config: loaded labels (chassis[0]={:?}, robot_names[hull1]={:?}, base_name={:?})",
             labels.chassis.first().map(|s| s.as_str()).unwrap_or(""),
             robot_names.hull.first().map(|s| s.as_str()).unwrap_or(""),
+            buildings.base_name,
         );
         config::set_global_strings(StringTables {
             labels,
             descriptions,
             robot_names,
+            buildings,
         });
         // AI robot catalogue (CConstructor.cpp:1361 / SSpecialBot::LoadAIRobotType).
         let ai_robots =
