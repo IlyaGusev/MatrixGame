@@ -12,11 +12,12 @@
 //! inside the existing robots renderer and doesn't need a sibling class).
 
 use crate::matrix_game::config;
-use crate::matrix_game::rnd::Rnd;
-use crate::matrix_game::robot_units::{
-    default_weapon_matrix, ArmorUnit, RobotConfig, RobotUnitKind, RobotUnitType, Unit, UnitPrice,
-    WeaponUnit, MAX_RESOURCES, MAX_WEAPON_CNT, MR_MAXUNIT,
-};
+use crate::matrix_game::config::{RobotUnitKind, MAX_RESOURCES};
+use crate::matrix_game::logic::Rnd;
+use crate::matrix_game::map::default_weapon_matrix;
+use crate::matrix_game::object_robot::{RobotUnitType, MAX_WEAPON_CNT, MR_MAXUNIT};
+// ArmorUnit, RobotConfig, Unit, UnitPrice, WeaponUnit all live in the bottom
+// half of this file (see the "Robot-composition types" section).
 
 /// Port of `PRESETS` (CConstructor.h:169). The shipped build hardcodes
 /// 1 active preset slot per side; `g_ConfigHistory` below carries the
@@ -1765,5 +1766,357 @@ mod tests {
         ];
         let cat = AIRobotCatalogue::load_from_pairs(&pairs);
         assert_eq!(cat.bots[0].dif_weapon(&cat.bots[1]), 1.0);
+    }
+}
+
+// ── Constructor preview render state ────────────────────────────────────
+//
+// Port of the constructor panel's 3D preview renderer. The C++
+// `CConstructor::Render` (CConstructor.cpp:264-360) sets up its own
+// D3DVIEWPORT9 sub-rect, a per-preview directional light, and draws
+// the in-progress robot via `m_Robot->Draw()` with `SetInterfaceDraw(true)`.
+//
+// Our port reuses the existing `object_robot::RobotsRenderer` and emits
+// a `PreviewTicket` here that the form-game render loop feeds to
+// `RobotsRenderer::render_preview_full`. The viewport sub-rect is plumbed
+// through as a scissor rect derived from the Base panel resolved origin +
+// the design-space `preview_view` rect, and the per-preview directional
+// light + ambient (CConstructor.cpp:283-306) are uploaded into the
+// renderer's uniform buffer for the preview draw pass.
+
+use crate::matrix_game::robot::ChassisKind;
+
+/// A render ticket populated by the refresh step each frame. The actual
+/// GPU draw is handled by `RobotsRenderer::render_preview`; emitting the
+/// ticket here keeps the game logic independent of the GPU plumbing.
+#[derive(Debug, Clone, Copy)]
+pub struct PreviewTicket {
+    pub chassis: ChassisKind,
+    /// Design-space panel coords (pre-scale) of the viewport rect.
+    pub design_rect: [f32; 4],
+    /// Rotation angle (radians) for the slow turntable effect the original
+    /// achieves via `m_Forward` rotation + D3DXMatrixLookAtLH.
+    pub rotation_rad: f32,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct BuilderPreview {
+    last_chassis: Option<ChassisKind>,
+    angle_ms: f32,
+}
+
+impl BuilderPreview {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Advance the turntable by `step_ms`. Called every frame while the
+    /// constructor is active.
+    pub fn tick(&mut self, step_ms: f32) {
+        self.angle_ms += step_ms;
+        if self.angle_ms > 100_000.0 {
+            self.angle_ms -= 100_000.0;
+        }
+    }
+
+    /// Build a draw ticket for the given preset. Returns `None` when the
+    /// config's chassis isn't set (nothing to render yet).
+    pub fn ticket(&mut self, cfg: &RobotConfig, design_rect: [f32; 4]) -> Option<PreviewTicket> {
+        let chassis = chassis_from_cfg(cfg)?;
+        self.last_chassis = Some(chassis);
+        let rotation_rad = self.angle_ms * 0.0002;
+        Some(PreviewTicket {
+            chassis,
+            design_rect,
+            rotation_rad,
+        })
+    }
+}
+
+fn chassis_from_cfg(cfg: &RobotConfig) -> Option<ChassisKind> {
+    match cfg.chassis.kind {
+        k if k == RobotUnitKind::CHASSIS_PNEUMATIC => Some(ChassisKind::Pneumatic),
+        k if k == RobotUnitKind::CHASSIS_WHEEL => Some(ChassisKind::Wheel),
+        k if k == RobotUnitKind::CHASSIS_TRACK => Some(ChassisKind::Track),
+        k if k == RobotUnitKind::CHASSIS_HOVERCRAFT => Some(ChassisKind::Hovercraft),
+        k if k == RobotUnitKind::CHASSIS_ANTIGRAVITY => Some(ChassisKind::AntiGravity),
+        _ => None,
+    }
+}
+
+// ── Robot-composition types (Interface/CConstructor.h) ──────────────────
+//
+// Port of `SPrice`, `SUnit`, `SArmorUnit`, `SWeaponUnit`, `SRobotConfig`
+// from Interface/CConstructor.h:13-189. Plain data — no rendering, no
+// globals.
+
+use crate::matrix_game::config::Resource;
+
+/// Port of `SPrice` (Interface/CConstructor.h:13-23). Per-component
+/// resource cost vector. Zero for empty / unknown components.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UnitPrice {
+    pub resources: [i32; MAX_RESOURCES],
+}
+
+impl UnitPrice {
+    pub const fn zero() -> Self {
+        Self {
+            resources: [0; MAX_RESOURCES],
+        }
+    }
+
+    pub fn titan(&self) -> i32 {
+        self.resources[Resource::Titan as usize]
+    }
+    pub fn electronics(&self) -> i32 {
+        self.resources[Resource::Electronics as usize]
+    }
+    pub fn energy(&self) -> i32 {
+        self.resources[Resource::Energy as usize]
+    }
+    pub fn plasma(&self) -> i32 {
+        self.resources[Resource::Plasma as usize]
+    }
+
+    pub fn add_from(&mut self, other: UnitPrice) {
+        for i in 0..MAX_RESOURCES {
+            self.resources[i] += other.resources[i];
+        }
+    }
+
+    pub fn is_zero(&self) -> bool {
+        self.resources.iter().all(|&r| r == 0)
+    }
+}
+
+/// Port of `SUnit` (Interface/CConstructor.h:25-31). A single
+/// (type, kind) component with its own cost cached.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Unit {
+    pub ty: RobotUnitType,
+    pub kind: RobotUnitKind,
+    pub price: UnitPrice,
+}
+
+impl Unit {
+    pub const fn empty() -> Self {
+        Self {
+            ty: RobotUnitType::Empty,
+            kind: RobotUnitKind::UNKNOWN,
+            price: UnitPrice::zero(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.kind.is_empty() || self.ty == RobotUnitType::Empty
+    }
+}
+
+/// Port of `SArmorUnit` (Interface/CConstructor.h:33-40). Adds the
+/// per-armor weapon-slot caps to a plain `Unit`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ArmorUnit {
+    /// Common (non-extra) weapon slots exposed by this armor. Filled
+    /// from `SRobotWeaponMatrix::common` at OperateUnit-MRT_ARMOR time
+    /// (CConstructor.cpp:686).
+    pub max_common_weapon_cnt: i32,
+    /// Extra ("super") weapon slots — bomb/mortar go here. From
+    /// `SRobotWeaponMatrix::extra`.
+    pub max_extra_weapon_cnt: i32,
+    pub unit: Unit,
+}
+
+impl ArmorUnit {
+    pub const fn empty() -> Self {
+        Self {
+            max_common_weapon_cnt: 0,
+            max_extra_weapon_cnt: 0,
+            unit: Unit::empty(),
+        }
+    }
+}
+
+/// Port of `SWeaponUnit` (Interface/CConstructor.h:42-47). A weapon
+/// slot with its pylon position within the armor's slot layout.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WeaponUnit {
+    pub pos: i32,
+    pub unit: Unit,
+}
+
+impl WeaponUnit {
+    pub const fn empty() -> Self {
+        Self {
+            pos: 0,
+            unit: Unit::empty(),
+        }
+    }
+}
+
+/// Port of `SRobotConfig` (Interface/CConstructor.h:171-189). The
+/// complete parametric description of one robot design — what the
+/// constructor panel persists in `m_Configs[PRESETS]` and what the
+/// build stack needs to produce a fully-configured robot on dequeue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RobotConfig {
+    pub head: Unit,
+    pub weapon: [Unit; MAX_WEAPON_CNT],
+    pub chassis: Unit,
+    pub hull: ArmorUnit,
+
+    /// Cached running totals — kept for parity with C++'s
+    /// `m_titX/m_elecX/m_enerX/m_plasX` fields updated by
+    /// `SetLabelsAndPrice`.
+    pub tit_x: i32,
+    pub elec_x: i32,
+    pub ener_x: i32,
+    pub plas_x: i32,
+
+    pub structure: i32,
+    pub damage: i32,
+}
+
+impl Default for RobotConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RobotConfig {
+    /// Ports the ctor side-effects of `CConstructorPanel` that seed the
+    /// type tags so `m_Hull.m_Unit.m_nType == MRT_ARMOR` etc. even
+    /// before the player picks a kind (CConstructor.h:228-233).
+    pub const fn new() -> Self {
+        Self {
+            head: Unit {
+                ty: RobotUnitType::Head,
+                kind: RobotUnitKind::UNKNOWN,
+                price: UnitPrice::zero(),
+            },
+            weapon: [Unit {
+                ty: RobotUnitType::Weapon,
+                kind: RobotUnitKind::UNKNOWN,
+                price: UnitPrice::zero(),
+            }; MAX_WEAPON_CNT],
+            chassis: Unit {
+                ty: RobotUnitType::Chassis,
+                kind: RobotUnitKind::UNKNOWN,
+                price: UnitPrice::zero(),
+            },
+            hull: ArmorUnit {
+                max_common_weapon_cnt: 0,
+                max_extra_weapon_cnt: 0,
+                unit: Unit {
+                    ty: RobotUnitType::Armor,
+                    kind: RobotUnitKind::UNKNOWN,
+                    price: UnitPrice::zero(),
+                },
+            },
+            tit_x: 0,
+            elec_x: 0,
+            ener_x: 0,
+            plas_x: 0,
+            structure: 0,
+            damage: 0,
+        }
+    }
+
+    pub fn reset(&mut self) {
+        *self = Self::new();
+    }
+
+    /// True once every required slot is populated (the build button
+    /// gates on this — see the `m_nUnitCnt > 0` check at
+    /// CConstructor.cpp:67 / :149).
+    pub fn is_buildable(&self) -> bool {
+        !self.chassis.is_empty() && !self.hull.unit.is_empty()
+    }
+
+    /// Port of `m_nUnitCnt` tally at CConstructor.cpp:709-725.
+    pub fn unit_count(&self) -> i32 {
+        let mut n = 0;
+        if !self.chassis.is_empty() {
+            n += 1;
+        }
+        if !self.hull.unit.is_empty() {
+            n += 1;
+        }
+        if !self.head.is_empty() {
+            n += 1;
+        }
+        for w in &self.weapon {
+            if !w.is_empty() {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// Port of `CConstructorPanel::ResetWeapon` (CConstructor.h:212).
+    pub fn reset_weapons(&mut self) {
+        for w in &mut self.weapon {
+            *w = Unit {
+                ty: RobotUnitType::Weapon,
+                kind: RobotUnitKind::UNKNOWN,
+                price: UnitPrice::zero(),
+            };
+        }
+        self.damage = 0;
+    }
+}
+
+#[cfg(test)]
+mod robot_config_tests {
+    use super::*;
+    use crate::matrix_game::map::{default_weapon_matrix, WeaponMatrix};
+
+    #[test]
+    fn robot_config_is_buildable_needs_chassis_and_hull() {
+        let mut c = RobotConfig::new();
+        assert!(!c.is_buildable());
+        c.chassis.kind = RobotUnitKind::CHASSIS_TRACK;
+        assert!(!c.is_buildable());
+        c.hull.unit.kind = RobotUnitKind::ARMOR_PASSIVE;
+        assert!(c.is_buildable());
+    }
+
+    #[test]
+    fn unit_count_matches_populated_slots() {
+        let mut c = RobotConfig::new();
+        assert_eq!(c.unit_count(), 0);
+        c.chassis.kind = RobotUnitKind::CHASSIS_WHEEL;
+        c.hull.unit.kind = RobotUnitKind::ARMOR_ACTIVE;
+        c.head.kind = RobotUnitKind::HEAD_BLOCKER;
+        c.weapon[0].kind = RobotUnitKind::WEAPON_MACHINEGUN;
+        assert_eq!(c.unit_count(), 4);
+    }
+
+    #[test]
+    fn find_pylon_for_common_weapon_returns_first_empty() {
+        let m: WeaponMatrix = default_weapon_matrix(RobotUnitKind::ARMOR_ACTIVE);
+        let current = [Unit::empty(); MAX_WEAPON_CNT];
+        assert_eq!(
+            m.find_pylon_for(RobotUnitKind::WEAPON_CANNON, &current),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn find_pylon_for_super_weapon_returns_extra_slot() {
+        let m = default_weapon_matrix(RobotUnitKind::ARMOR_ACTIVE);
+        let current = [Unit::empty(); MAX_WEAPON_CNT];
+        assert_eq!(
+            m.find_pylon_for(RobotUnitKind::WEAPON_BOMB, &current),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn weapon_matrix_is_extra_slot_flags_match() {
+        let m = default_weapon_matrix(RobotUnitKind::ARMOR_NUCLEAR);
+        assert!(!m.is_extra_slot(0));
+        assert!(!m.is_extra_slot(3));
+        assert!(m.is_extra_slot(4));
     }
 }

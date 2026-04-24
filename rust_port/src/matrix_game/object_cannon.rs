@@ -32,7 +32,7 @@ use crate::matrix_game::map::GameMap;
 use crate::matrix_game::map_static::{
     MapStatic, ObjectCore, ObjectId, ObjectType, Objects, MR_ALL, MR_MATRIX,
 };
-use crate::matrix_game::rnd::Rnd;
+use crate::matrix_game::logic::Rnd;
 use crate::matrix_lib::three_g::texture::{
     create_solid_texture, create_texture_from_rgba, decode_texture_bytes,
 };

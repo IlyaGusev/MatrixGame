@@ -62,8 +62,8 @@ pub struct CInterface {
 pub struct BaseVisibilityCtx<'a> {
     pub constructor_active: bool,
     pub build_count: i32,
-    pub focused_price: Option<&'a crate::matrix_game::robot_units::UnitPrice>,
-    pub summ_price: &'a crate::matrix_game::robot_units::UnitPrice,
+    pub focused_price: Option<&'a crate::matrix_game::interface::constructor::UnitPrice>,
+    pub summ_price: &'a crate::matrix_game::interface::constructor::UnitPrice,
     /// `g_MatrixMap->m_RobotWeaponMatrix[hull-1].common` —
     /// 0 hides pi1..pi4. CInterface.cpp:1817.
     pub armor_common_slots: i32,
@@ -436,7 +436,7 @@ impl CInterface {
             constructor_active,
             build_count,
             None,
-            &crate::matrix_game::robot_units::UnitPrice::zero(),
+            &crate::matrix_game::interface::constructor::UnitPrice::zero(),
         );
     }
 
@@ -460,8 +460,8 @@ impl CInterface {
         &mut self,
         constructor_active: bool,
         build_count: i32,
-        focused_price: Option<&crate::matrix_game::robot_units::UnitPrice>,
-        summ_price: &crate::matrix_game::robot_units::UnitPrice,
+        focused_price: Option<&crate::matrix_game::interface::constructor::UnitPrice>,
+        summ_price: &crate::matrix_game::interface::constructor::UnitPrice,
     ) {
         self.refresh_base_visibility_v2(BaseVisibilityCtx {
             constructor_active,
@@ -486,7 +486,7 @@ impl CInterface {
     /// buttons via `SetState(IFACE_DISABLED)`; we mirror that on
     /// HISTORY_LEFT/RIGHT and CONST_BUILD.
     pub fn refresh_base_visibility_v2(&mut self, ctx: BaseVisibilityCtx) {
-        use crate::matrix_game::robot_units::Resource;
+        use crate::matrix_game::config::Resource;
 
         if self.name != "Base" {
             return;
@@ -811,7 +811,7 @@ impl CInterface {
     /// the UI without bespoke call-site glue.
     pub fn apply_constructor_to_pylons(
         &mut self,
-        cfg: &crate::matrix_game::robot_units::RobotConfig,
+        cfg: &crate::matrix_game::interface::constructor::RobotConfig,
     ) {
         if self.name != "Base" {
             return;

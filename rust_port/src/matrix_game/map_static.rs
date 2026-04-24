@@ -25,7 +25,7 @@ use crate::matrix_game::common::{
     TRACE_BUILDING, TRACE_CANNON, TRACE_FLYER, TRACE_OBJECT, TRACE_ROBOT, TRACE_SKIP_INVISIBLE,
 };
 use crate::matrix_game::config::{BuildingDamages, ObjectDamages};
-use crate::matrix_game::rnd::Rnd;
+use crate::matrix_game::logic::Rnd;
 
 // ── Resource-change bits (MR_*) (MatrixMapStatic.hpp:17-25) ──────────────
 //

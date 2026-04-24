@@ -7,7 +7,8 @@
 //! the global by parking the instance on `IFaceList` (the rust analog
 //! of the C++ UI singleton container).
 
-use crate::matrix_game::robot_units::{RobotConfig, MAX_WEAPON_CNT};
+use crate::matrix_game::interface::constructor::RobotConfig;
+use crate::matrix_game::object_robot::MAX_WEAPON_CNT;
 
 /// Port of `CHistory` (CHistory.h:8-28). Keeps the doubly-linked list
 /// of committed configs as a `Vec` (insertion is always at the tail
@@ -89,7 +90,7 @@ impl ConfigHistory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::matrix_game::robot_units::RobotUnitKind;
+    use crate::matrix_game::config::RobotUnitKind;
 
     #[test]
     fn add_is_unbounded() {

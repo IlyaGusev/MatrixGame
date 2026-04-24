@@ -17,7 +17,7 @@
 //! their call sites need them.
 
 use crate::matrix_game::map_static::ObjectId;
-use crate::matrix_game::robot_units::{Resource, MAX_RESOURCES};
+use crate::matrix_game::config::{Resource, MAX_RESOURCES};
 
 /// Port of the hard-coded 9000 cap inside `CMatrixSideUnit::AddResourceAmount`
 /// (MatrixSide.hpp:438-443). Every `AddResourceAmount` call clamps the
@@ -25,45 +25,11 @@ use crate::matrix_game::robot_units::{Resource, MAX_RESOURCES};
 /// pool saturates.
 pub const RESOURCE_CAP: i32 = 9000;
 
-/// Port of `CMatrixMap::GetSideColor` (MatrixMap.cpp:1014, MatrixMap.hpp:738).
-/// Returns the diffuse RGB components (0..1) the C++ loads from
-/// `Side/{id}=<name,r,g,b,Minimap,rMM,gMM,bMM>` entries of `robots.dat`.
-///
-/// The shipped values (confirmed by dumping `Side` from robots.dat):
-///   0 — Neutral = (128,128,128)
-///   1 — Player  = (227,158,31)   Yellow
-///   2 — AI Red  = (142,0,0)
-///   3 — AI Blue = (0,0,150)
-///   4 — AI Green= (0,150,0)
-///
-/// Out-of-range ids fall back to the neutral grey (matches the C++
-/// `if (id == 0) return m_NeutralSideColor` branch when the subscript
-/// lookup below would overrun).
-pub fn side_color_rgb(side: i32) -> [f32; 3] {
-    let c = match side {
-        1 => [227u8, 158, 31],
-        2 => [142, 0, 0],
-        3 => [0, 0, 150],
-        4 => [0, 150, 0],
-        _ => [128, 128, 128],
-    };
-    [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0]
-}
-
-/// Port of `CMatrixMap::GetSideColorMM` (MatrixMap.cpp:1015,
-/// MatrixMap.hpp:745) — saturated minimap variant of the side colour.
-/// Same mapping as `side_color_rgb` except the factions use pure R/G/B
-/// so they read cleanly on the minimap backdrop.
-pub fn side_color_minimap_rgb(side: i32) -> [f32; 3] {
-    let c = match side {
-        1 => [255u8, 255, 0],
-        2 => [255, 0, 0],
-        3 => [0, 0, 255],
-        4 => [0, 255, 0],
-        _ => [128, 128, 128],
-    };
-    [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0]
-}
+// `side_color_rgb` and `side_color_minimap_rgb` — port of
+// `CMatrixMap::GetSideColor` / `GetSideColorMM` (MatrixMap.cpp:1014-1015,
+// MatrixMap.hpp:738/745) — live in `matrix_game::map` alongside their
+// owning class. Re-exported here for the existing call sites.
+pub use crate::matrix_game::map::{side_color_minimap_rgb, side_color_rgb};
 
 /// Port of `ESelectedType` (MatrixSide.hpp). Tracks what the player's
 /// side is currently pointing at — the C++ interface panel dispatches
@@ -190,7 +156,7 @@ impl Side {
 
     /// True if the side can afford the cost (all four resources are
     /// ≥ the requested amount).
-    pub fn can_afford(&self, cost: &crate::matrix_game::robot_units::UnitPrice) -> bool {
+    pub fn can_afford(&self, cost: &crate::matrix_game::interface::constructor::UnitPrice) -> bool {
         for r in Resource::ALL {
             if self.resources[r as usize] < cost.resources[r as usize] {
                 return false;

@@ -119,20 +119,11 @@ pub struct VoSurfaceMesh {
     pub texture_ref: Option<String>,
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct MaterialSpec {
-    pub diffuse: Option<String>,
-    pub gloss: Option<String>,
-    pub back: Option<String>,
-    pub mask: Option<String>,
-    pub scroll: [f32; 2],
-    /// True when the diffuse texture's `ParseFlags` call would set
-    /// `TF_ALPHATEST` (Texture.cpp:96-152). We set it eagerly from the
-    /// `?Trans` suffix (Texture.cpp:108); the sibling `.txt` `AlphaTest`
-    /// override (Texture.cpp:131-136) is applied later via
-    /// `resolve_alpha_test_with_txt`, which needs asset I/O.
-    pub alpha_test: bool,
-}
+pub use crate::matrix_lib::three_g::texture::{
+    has_trans_suffix, merge_materials, parse_material_spec, parse_material_spec_with_prefix,
+    resolve_alpha_test_with_txt, MaterialSpec,
+};
+use crate::matrix_lib::three_g::texture::parse_scroll;
 
 pub fn parse_vo(data: &[u8]) -> Result<VoMesh> {
     let stor = Storage::from_bytes(data).context("parsing VO as CStorage")?;
@@ -372,246 +363,6 @@ fn resolve_cvo_texture(raw: &str, dir: &str) -> Option<String> {
     Some(join_cvo_sibling(dir, base))
 }
 
-/// Resolve an object Id string (from `strings/String`, '*'-delimited) into a
-/// VO file path and texture path. Returns `None` if empty.
-///
-/// Id string layout (MatrixObject.cpp:429-472, Common.hpp:176-191):
-///   [0] OTP_PATH (e.g. `Matrix\Obj\palm\`)
-///   [1] OTP_VO   (e.g. `palm00`)
-///   [2] OTP_TEXTURE (e.g. `palm00?Trans`)
-///   ... more fields
-pub struct ResolvedObjectPaths {
-    pub vo_path: String,
-    pub material: MaterialSpec,
-    pub shadow: ShadowSpec,
-}
-
-#[derive(Clone, Debug)]
-pub struct ShadowSpec {
-    pub kind: ShadowKind,
-    pub texture_size: u32,
-    pub cache_tag: Option<u32>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ShadowKind {
-    None,
-    Stencil,
-    ProjectedStatic,
-    ProjectedDynamic,
-}
-
-pub fn resolve_paths(id_string: &str) -> Option<ResolvedObjectPaths> {
-    let parts: Vec<&str> = id_string.split('*').collect();
-    if parts.len() < 2 {
-        return None;
-    }
-    let path = parts[0].replace('\\', "/");
-    let vo_name = parts[1];
-    if vo_name.is_empty() {
-        return None;
-    }
-    let vo_path = format!("{}{}.vo", path, vo_name);
-
-    let material = MaterialSpec {
-        diffuse: parts
-            .get(2)
-            .and_then(|t| resolve_texture_name(t, Some(&path))),
-        gloss: parts
-            .get(3)
-            .and_then(|t| resolve_texture_name(t, Some(&path))),
-        back: parts
-            .get(4)
-            .and_then(|t| resolve_texture_name(t, Some(&path))),
-        mask: parts
-            .get(5)
-            .and_then(|t| resolve_texture_name(t, Some(&path))),
-        scroll: parts.get(6).map(|t| parse_scroll(t)).unwrap_or([0.0, 0.0]),
-        alpha_test: parts.get(2).is_some_and(|t| has_trans_suffix(t)),
-    };
-    let shadow = parts
-        .get(7)
-        .map(|t| parse_shadow_spec(t))
-        .unwrap_or(ShadowSpec {
-            kind: ShadowKind::None,
-            texture_size: 128,
-            cache_tag: None,
-        });
-
-    Some(ResolvedObjectPaths {
-        vo_path,
-        material,
-        shadow,
-    })
-}
-
-pub fn parse_material_spec(spec: &str) -> MaterialSpec {
-    parse_material_spec_with_prefix(spec, None)
-}
-
-pub fn parse_material_spec_with_prefix(spec: &str, prefix: Option<&str>) -> MaterialSpec {
-    let parts: Vec<&str> = spec.split('*').collect();
-    MaterialSpec {
-        diffuse: parts.first().and_then(|t| resolve_texture_name(t, prefix)),
-        gloss: parts.get(1).and_then(|t| resolve_texture_name(t, prefix)),
-        back: parts.get(2).and_then(|t| resolve_texture_name(t, prefix)),
-        mask: parts.get(3).and_then(|t| resolve_texture_name(t, prefix)),
-        scroll: parts.get(4).map(|t| parse_scroll(t)).unwrap_or([0.0, 0.0]),
-        alpha_test: parts.first().is_some_and(|t| has_trans_suffix(t)),
-    }
-}
-
-pub fn merge_materials(base: &MaterialSpec, overlay: Option<&MaterialSpec>) -> MaterialSpec {
-    let Some(overlay) = overlay else {
-        return base.clone();
-    };
-    // alpha_test tracks the diffuse that actually wins the merge.
-    let (diffuse, alpha_test) = if overlay.diffuse.is_some() {
-        (overlay.diffuse.clone(), overlay.alpha_test)
-    } else {
-        (base.diffuse.clone(), base.alpha_test)
-    };
-    MaterialSpec {
-        diffuse,
-        gloss: overlay.gloss.clone().or_else(|| base.gloss.clone()),
-        back: overlay.back.clone().or_else(|| base.back.clone()),
-        mask: overlay.mask.clone().or_else(|| base.mask.clone()),
-        scroll: if overlay.scroll != [0.0, 0.0] {
-            overlay.scroll
-        } else {
-            base.scroll
-        },
-        alpha_test,
-    }
-}
-
-/// Ports the `?Trans` flag detection inside `CBaseTexture::ParseFlags`
-/// (Texture.cpp:102-111). The raw texture spec is `path?Opt1?Opt2?...`; any
-/// `Trans` option sets `TF_ALPHATEST`. Other options (`Alpha`, `Compressed`)
-/// don't affect alpha-test.
-///
-/// The comparison in the original is `tstr == L"Trans"` via `CWStr::Equal`
-/// (CWStr.cpp:678-684), which is a memcmp — i.e. case-sensitive. We mirror
-/// that: `?trans` (lowercase) would NOT set the flag in the real engine, so
-/// it mustn't here either.
-fn has_trans_suffix(raw: &str) -> bool {
-    let raw = raw.trim().trim_end_matches('\0');
-    let mut parts = raw.split('?');
-    parts.next(); // the actual path — skip
-    parts.any(|opt| opt.trim() == "Trans")
-}
-
-/// Ports the sibling `.txt` override pass of `CBaseTexture::ParseFlags`
-/// (Texture.cpp:113-136). The original reads `<basename>.txt` next to each
-/// texture (via `CacheReplaceFileExt`) and, if present, applies
-/// `AlphaTest = 0` / `AlphaTest = <anything else>` to the flag chosen from
-/// the `?Trans` suffix.
-///
-/// The original explicitly skips `pinguin.txt` and `robotarget.txt`
-/// (Texture.cpp:121-124): those files carry unrelated block content that
-/// would spuriously set the alpha-test flag. We mirror that guard.
-///
-/// `read_file` is the port's asset-lookup callback (the same one that
-/// resolves textures / VO files). It can return `None` when the sibling
-/// `.txt` doesn't exist, which is the common case.
-pub fn resolve_alpha_test_with_txt(
-    diffuse_path: &str,
-    suffix_flag: bool,
-    read_file: &dyn Fn(&str) -> Option<Vec<u8>>,
-) -> bool {
-    let txt_path = replace_extension(diffuse_path, "txt");
-    // Substring match to mirror the original's `tstr.Find(L"pinguin.txt") >= 0`
-    // guard (Texture.cpp:121-124). `CWStr::Find` (CWStr.cpp:489-506) is a
-    // case-sensitive byte scan, so match the casing of the excluded files
-    // verbatim.
-    if txt_path.contains("pinguin.txt") || txt_path.contains("robotarget.txt") {
-        return suffix_flag;
-    }
-    let Some(bytes) = read_file(&txt_path) else {
-        return suffix_flag;
-    };
-    let bp = crate::matrix_lib::base::blockpar::BlockPar::parse_bytes(&bytes);
-    // The C++ branch gates on `!tstr.IsEmpty()` (Texture.cpp:132), so both an
-    // absent key and an empty value leave the suffix flag alone. Only a
-    // non-empty value overrides: "0" clears, anything else sets.
-    match bp.par_get_ne("AlphaTest") {
-        Some(v) => {
-            let trimmed = v.trim();
-            if trimmed.is_empty() {
-                suffix_flag
-            } else {
-                trimmed != "0"
-            }
-        }
-        None => suffix_flag,
-    }
-}
-
-fn replace_extension(path: &str, new_ext: &str) -> String {
-    match path.rsplit_once('.') {
-        Some((stem, _)) => format!("{stem}.{new_ext}"),
-        None => format!("{path}.{new_ext}"),
-    }
-}
-
-fn resolve_texture_name(raw: &str, prefix: Option<&str>) -> Option<String> {
-    let name = raw.trim().trim_end_matches('\0');
-    if name.is_empty() || name == "." {
-        return None;
-    }
-    let name = name.split('?').next().unwrap_or("").trim();
-    if name.is_empty() {
-        return None;
-    }
-    let normalized = name.trim_start_matches(".\\").replace('\\', "/");
-    match prefix {
-        Some(prefix) if !normalized.contains('/') => Some(format!("{prefix}{normalized}")),
-        _ => Some(normalized),
-    }
-}
-
-fn parse_scroll(raw: &str) -> [f32; 2] {
-    let mut it = raw.split(',');
-    let u = it
-        .next()
-        .and_then(|v| v.trim().parse::<f32>().ok())
-        .unwrap_or(0.0);
-    let v = it
-        .next()
-        .and_then(|v| v.trim().parse::<f32>().ok())
-        .unwrap_or(0.0);
-    [u, v]
-}
-
-fn parse_shadow_spec(raw: &str) -> ShadowSpec {
-    let spec = raw.trim();
-    if spec.is_empty() {
-        return ShadowSpec {
-            kind: ShadowKind::None,
-            texture_size: 128,
-            cache_tag: None,
-        };
-    }
-    let mut parts = spec.split(',');
-    let kind = match parts.next().unwrap_or("").trim() {
-        "Stencil" => ShadowKind::Stencil,
-        "Proj" => ShadowKind::ProjectedStatic,
-        "ProjEx" => ShadowKind::ProjectedDynamic,
-        _ => ShadowKind::None,
-    };
-    let texture_size = parts
-        .next()
-        .and_then(|v| v.trim().parse::<u32>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(128);
-    let cache_tag = parts.next().and_then(|v| v.trim().parse::<u32>().ok());
-    ShadowSpec {
-        kind,
-        texture_size,
-        cache_tag,
-    }
-}
-
 /// SVOKadr size on disk — `/Zp1` keeps the struct 64 bytes (6 floats bounds +
 /// 1 float radius + 6 i32 counters; VectorObject.hpp:214).
 const SVO_KADR_SIZE: usize = 64;
@@ -821,4 +572,225 @@ fn read_u32(bytes: &[u8], off: usize) -> u32 {
 
 fn read_f32(bytes: &[u8], off: usize) -> f32 {
     f32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]])
+}
+// ====================================================================
+// Port of `CVectorObjectAnim` (VectorObject.{cpp,hpp}) — the
+// per-instance animation cursor that runs on top of a shared `VoMesh`.
+// In C++ each `SMatrixRobotUnit` owns one; the same cursor is
+// allocated per robot + per unit in this port.
+//
+// Ported methods:
+//   * `takt(cms)` → `CVectorObjectAnim::Takt(cms)` at
+//     VectorObject.cpp:1863-1928 — advances `m_Time`, walks
+//     `m_Frame` forward as many ticks as needed, loops or clamps
+//     at the end, and syncs `m_VOFrame` (the geometry-frame index
+//     the renderer samples from `VoMesh::frames`).
+//   * `set_anim_by_name` → `SetAnimByName(name)` at
+//     VectorObject.hpp:524 — returns true on failure (matches the
+//     original's weird "true means not found" convention).
+//   * `first_frame` / `is_anim_end` — same naming as C++.
+// ====================================================================
+
+use std::sync::{Arc, OnceLock, RwLock};
+
+/// Global per-chassis VoMesh table, populated once at load time by
+/// `RobotsRenderer::new`. Ports the role of `g_CacheHeap`-owned VO
+/// singletons in the C++ engine — the AI layer (`robot.rs::logic_takt`)
+/// needs to walk frame durations to drive animation without holding
+/// a direct reference to the GPU-side renderer.
+///
+/// Indexed by `ChassisKind as usize`. `None` for kinds whose VO
+/// failed to load.
+static CHASSIS_VOS: OnceLock<RwLock<[Option<Arc<VoMesh>>; 5]>> = OnceLock::new();
+
+fn chassis_slot() -> &'static RwLock<[Option<Arc<VoMesh>>; 5]> {
+    CHASSIS_VOS.get_or_init(|| RwLock::new([const { None }; 5]))
+}
+
+pub fn set_chassis_vo(idx: usize, vo: Arc<VoMesh>) {
+    if idx < 5 {
+        chassis_slot().write().unwrap()[idx] = Some(vo);
+    }
+}
+
+pub fn chassis_vo(idx: usize) -> Option<Arc<VoMesh>> {
+    chassis_slot().read().unwrap().get(idx).cloned().flatten()
+}
+
+#[derive(Debug, Clone)]
+pub struct AnimState {
+    /// `m_Anim` — index into `VoMesh::animations`.
+    pub anim: i32,
+    /// `m_Frame` — animation-local frame cursor (0..frames_count).
+    pub frame: i32,
+    /// `m_VOFrame` — resolved VO frame index the renderer samples.
+    pub vo_frame: usize,
+    /// `m_Time` — accumulated animation-local ms.
+    pub time_ms: i64,
+    /// `m_TimeNext` — game-time threshold at which `frame` advances
+    /// (used by `takt`, the normal constant-rate path).
+    pub time_next_ms: i64,
+    /// `m_AnimLooped` — 0 = play once and hold last frame, 1 = loop.
+    pub looped: bool,
+    /// `SMatrixRobotUnit::m_NextAnimTime` (MatrixObjectRobot.hpp) —
+    /// game-time threshold at which `next_frame` advances (used by
+    /// the speed-based per-frame path in `DoAnimation`). Separate
+    /// from `time_next_ms` because the speed-based path uses
+    /// `g_MatrixMap->GetTime()` as its clock, not the accumulated
+    /// anim-local time.
+    pub next_anim_time: f64,
+}
+
+impl Default for AnimState {
+    fn default() -> Self {
+        Self {
+            anim: 0,
+            frame: 0,
+            vo_frame: 0,
+            time_ms: 0,
+            time_next_ms: 0,
+            looped: true,
+            next_anim_time: 0.0,
+        }
+    }
+}
+
+impl AnimState {
+    /// Port of `FirstFrame` (VectorObject.hpp:552): reset frame cursor
+    /// and set the next-advance threshold from anim 0's duration.
+    pub fn first_frame(&mut self, vo: &VoMesh) {
+        self.frame = 0;
+        let (idx, time) = anim_frame(vo, self.anim, 0).unwrap_or((0, 0));
+        self.vo_frame = idx;
+        // Clamp to min 1ms — see takt() for why.
+        self.time_next_ms = self.time_ms + (time as i64).max(1);
+    }
+
+    /// Port of `SetAnimByName(name)` (VectorObject.hpp:524). Returns
+    /// `true` on failure (anim not found) to match the C++ convention.
+    /// When the name resolves, the cursor resets to frame 0 and the
+    /// loop flag is taken from `VoAnim::is_looped` (we don't carry
+    /// that yet, so default to the passed `looped`).
+    pub fn set_anim_by_name(&mut self, vo: &VoMesh, name: &str, looped: bool) -> bool {
+        let Some(idx) = vo.animations.iter().position(|a| a.name == name) else {
+            return true;
+        };
+        self.anim = idx as i32;
+        self.looped = looped;
+        self.first_frame(vo);
+        false
+    }
+
+    /// Port of `IsAnimEnd` (VectorObject.hpp:553).
+    pub fn is_anim_end(&self, vo: &VoMesh) -> bool {
+        if self.looped {
+            return false;
+        }
+        match vo.animations.get(self.anim as usize) {
+            Some(a) => self.frame as usize == a.frames.len().saturating_sub(1),
+            None => true,
+        }
+    }
+
+    /// Port of `Takt(cms)` at VectorObject.cpp:1863-1928. Advances
+    /// `time_ms` and walks `frame` forward as long as `time_ms >
+    /// time_next_ms`. Returns `true` if `frame` changed so the caller
+    /// can refresh a dirty flag. Non-looped anims delay 1000ms before
+    /// stalling on the final frame, matching the C++.
+    ///
+    /// We clamp per-frame duration to min 1ms: the original engine
+    /// assumes authored non-zero durations, but parsed data can carry
+    /// 0 for default / unset frames, which would infinite-loop the
+    /// `while` since `time_next_ms` wouldn't advance. Also caps total
+    /// iterations at `2 * fcnt` as a defense-in-depth safeguard.
+    pub fn takt(&mut self, vo: &VoMesh, cms: i32) -> bool {
+        self.time_ms += cms as i64;
+        let old_frame = self.frame;
+
+        let fcnt = vo
+            .animations
+            .get(self.anim as usize)
+            .map(|a| a.frames.len() as i32)
+            .unwrap_or(0);
+        if fcnt == 0 {
+            return false;
+        }
+
+        let max_iters = (fcnt as i64) * 2 + 2;
+        let mut iters = 0i64;
+        while self.time_ms > self.time_next_ms && iters < max_iters {
+            iters += 1;
+            self.frame += 1;
+            if self.looped {
+                if self.frame >= fcnt {
+                    self.frame = 0;
+                }
+            } else if self.frame >= fcnt {
+                self.time_next_ms += 1000;
+                self.frame = fcnt - 1;
+                break;
+            }
+            let (_, t) = anim_frame(vo, self.anim, self.frame).unwrap_or((0, 0));
+            self.time_next_ms += (t as i64).max(1);
+        }
+        // If we hit the iteration cap (i.e. the data itself is
+        // pathological — all-zero frame times or similar), forcibly
+        // re-sync `time_next_ms` so we don't immediately re-enter
+        // the loop next tick.
+        if iters >= max_iters {
+            self.time_next_ms = self.time_ms + 16;
+        }
+
+        if old_frame != self.frame {
+            if let Some((idx, _)) = anim_frame(vo, self.anim, self.frame) {
+                self.vo_frame = idx;
+            }
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Helper: look up `(VoFrameRef.frame_index, time_ms)` for
+/// `animations[anim].frames[frame]`. Out-of-range returns None.
+fn anim_frame(vo: &VoMesh, anim: i32, frame: i32) -> Option<(usize, i32)> {
+    let a = vo.animations.get(anim as usize)?;
+    let f = a.frames.get(frame as usize)?;
+    Some((f.frame_index, f.time_ms))
+}
+
+impl AnimState {
+    /// Port of `CVectorObjectAnim::NextFrame` (VectorObject.cpp:1930-
+    /// 1945). Advances `frame` by one (wrapping if looped, clamping
+    /// otherwise), updates `vo_frame`, and returns the NEW current
+    /// frame's duration — the caller uses that to compute how much
+    /// to bump `next_anim_time` by.
+    pub fn next_frame(&mut self, vo: &VoMesh) -> i32 {
+        let fcnt = vo
+            .animations
+            .get(self.anim as usize)
+            .map(|a| a.frames.len() as i32)
+            .unwrap_or(0);
+        if fcnt == 0 {
+            return 0;
+        }
+        if self.looped {
+            self.frame += 1;
+            if self.frame >= fcnt {
+                self.frame = 0;
+            }
+        } else if self.frame < fcnt - 1 {
+            self.frame += 1;
+        } else {
+            // Last frame of a non-looped anim — return its
+            // duration and don't advance.
+            return anim_frame(vo, self.anim, self.frame)
+                .map(|(_, t)| t)
+                .unwrap_or(0);
+        }
+        let (idx, t) = anim_frame(vo, self.anim, self.frame).unwrap_or((0, 0));
+        self.vo_frame = idx;
+        t
+    }
 }

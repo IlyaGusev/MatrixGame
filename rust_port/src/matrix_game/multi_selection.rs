@@ -1,6 +1,18 @@
-//! Port of `CMultiSelection::Draw` (MatrixMultiSelection.cpp:104-202) —
-//! the screen-space selection rectangle the user drags to multi-select
-//! their own robots.
+//! Port of `CMultiSelection` (MatrixMultiSelection.{cpp,hpp}) — the
+//! screen-space selection rectangle the user drags to multi-select
+//! their own robots, plus the `End` fold that commits the projected
+//! hits back to the player's `CMatrixSide`.
+//!
+//! Ported here:
+//! * `CMultiSelection::Draw` (MatrixMultiSelection.cpp:104-202) →
+//!   [`MarqueeRenderer`].
+//! * `CMultiSelection::End` marquee-rect fold → [`marquee_select`].
+//! * `CMultiSelection::Add/Remove` (shift-click toggle) and the
+//!   replace-on-drag-end commit are implemented as `Side::select_toggle`
+//!   / `Side::select_replace` in `side.rs` since the CMultiSelection
+//!   container and `CMatrixSide` selection state were collapsed onto
+//!   `Side` in this port; the method docs cross-reference the
+//!   original `MatrixMultiSelection` file.
 //!
 //! The original draws three concentric line-strips (as
 //! `DrawPrimitiveUP(D3DPT_LINESTRIP, ...)` with `D3DFVF_XYZRHW`):
@@ -375,3 +387,70 @@ fn fs_main(v: VOut) -> @location(0) vec4<f32> {
     return v.color;
 }
 "#;
+
+// ── marquee fold ────────────────────────────────────────────────────────
+//
+// Port of the end-of-marquee fold at `CMultiSelection::End`
+// (MatrixMultiSelection.cpp). Projects every live own-side robot to
+// screen coords and keeps the ones whose projection lands inside the
+// axis-aligned rect [rect_min, rect_max]. The result is committed as
+// the new selection with the last hit as `active_object`.
+
+use crate::matrix_game::camera::Camera;
+use crate::matrix_game::logic::MapLogic;
+use crate::matrix_game::map_static::{ObjectId, ObjectType};
+use crate::matrix_game::side::CurrSel;
+
+pub fn marquee_select(
+    logic: &mut MapLogic,
+    camera: &Camera,
+    rect_min: [f32; 2],
+    rect_max: [f32; 2],
+    screen_w: f32,
+    screen_h: f32,
+    shift: bool,
+) -> usize {
+    let vp = camera.view_proj();
+    let map_cx = camera.map_cx();
+    let map_cy = camera.map_cy();
+    let mut hits: Vec<ObjectId> = if shift {
+        logic.player_side.selected.clone()
+    } else {
+        Vec::new()
+    };
+
+    for id in logic.objects.iter_live() {
+        let Some(obj) = logic.objects.get(id) else {
+            continue;
+        };
+        if !matches!(obj.core().obj_type, ObjectType::RobotAi) {
+            continue;
+        }
+        if logic.object_side(id) != logic.player_side.id {
+            continue;
+        }
+        let c = obj.core().geo_center;
+        let clip = vp * glam::Vec4::new(c.x - map_cx, c.y - map_cy, c.z, 1.0);
+        if clip.w <= 0.0 {
+            continue;
+        }
+        let ndc_x = clip.x / clip.w;
+        let ndc_y = clip.y / clip.w;
+        let sx = (ndc_x * 0.5 + 0.5) * screen_w;
+        let sy = (1.0 - (ndc_y * 0.5 + 0.5)) * screen_h;
+        if sx >= rect_min[0]
+            && sx <= rect_max[0]
+            && sy >= rect_min[1]
+            && sy <= rect_max[1]
+            && !hits.contains(&id)
+        {
+            hits.push(id);
+        }
+    }
+    let n = hits.len();
+    let primary = hits.last().copied();
+    logic
+        .player_side
+        .select_replace(hits, primary, CurrSel::RobotsSelected);
+    n
+}

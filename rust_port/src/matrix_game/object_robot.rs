@@ -537,7 +537,7 @@ impl RobotsRenderer {
                     .collect::<Vec<_>>(),
             );
             let vo_mesh = std::sync::Arc::new(vo_mesh);
-            crate::matrix_lib::three_g::animation::set_chassis_vo(
+            crate::matrix_lib::three_g::vector_object::set_chassis_vo(
                 chassis_kind_index(ck),
                 vo_mesh.clone(),
             );
@@ -1597,3 +1597,26 @@ fn create_pipeline(
 }
 
 const SHADER: &str = include_str!("../../shaders/object_building.wgsl");
+
+// ── Robot unit type / slot counts (MatrixObjectRobot.hpp) ───────────────
+
+/// Port of `MAX_WEAPON_CNT` (MatrixRobot.hpp:24). Maximum number of
+/// weapon pylons on any robot — 4 common + 1 extra slot for the
+/// bomb/mortar "super" weapon.
+pub const MAX_WEAPON_CNT: usize = 5;
+
+/// Port of `MR_MAXUNIT` (MatrixObjectRobot.hpp:69). Chassis + Armor +
+/// Head + 5 weapons + 1 slot for anim hooks = 9 at the robot level.
+pub const MR_MAXUNIT: usize = 9;
+
+/// Port of `ERobotUnitType` (MatrixObjectRobot.hpp:47-55).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum RobotUnitType {
+    #[default]
+    Empty = 0,
+    Chassis = 1,
+    Weapon = 2,
+    Armor = 3,
+    Head = 4,
+}

@@ -24,7 +24,9 @@
 //!   inline using the constructor template buttons, drawn on top of
 //!   the Base panel.
 
-use crate::matrix_game::robot_units::{RobotConfig, RobotUnitKind, RobotUnitType, MAX_WEAPON_CNT};
+use crate::matrix_game::config::RobotUnitKind;
+use crate::matrix_game::interface::constructor::RobotConfig;
+use crate::matrix_game::object_robot::{RobotUnitType, MAX_WEAPON_CNT};
 
 /// Identity of the pylon that opened the popup. Mirrors `EMenuParent`
 /// (CIFaceMenu.h:59-69). The pilon index for weapons (0..=4) is

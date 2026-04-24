@@ -263,10 +263,10 @@ impl ChassisChars {
 // 835-898). We keep the flat layout so the indexing arithmetic in
 // `GetConstructionPrice` / `GetConstructionStructure` ports directly.
 
-use crate::matrix_game::robot_units::{
-    Resource, RobotUnitKind, RobotUnitType, UnitPrice, MAX_RESOURCES, ROBOT_ARMOR_CNT,
-    ROBOT_CHASSIS_CNT, ROBOT_HEAD_CNT, ROBOT_WEAPON_CNT,
-};
+use crate::matrix_game::interface::constructor::UnitPrice;
+use crate::matrix_game::object_robot::RobotUnitType;
+// Resource, RobotUnitKind, MAX_RESOURCES, and the ROBOT_*_CNT counts all live
+// in this file (see bottom half). No external import needed here.
 
 /// Resource indices packed per-component. Order matches
 /// MatrixConfig.cpp's `HEAD1_TITAN..PRICE_LAST` enum slab, which groups
@@ -1161,5 +1161,115 @@ mod tests {
         );
         // `WEAPON_NONE` has no table slot.
         assert_eq!(d.get(WEAPON_NONE), None);
+    }
+}
+
+// ── Resource / robot-unit-kind enums (MatrixConfig.hpp) ─────────────────
+
+/// Port of `MAX_RESOURCES` (MatrixConfig.hpp:29). Titan / Electronics /
+/// Energy / Plasma. The enum discriminants match the C++ so
+/// `resources[TITAN as usize]` reads the same index the original uses.
+pub const MAX_RESOURCES: usize = 4;
+
+/// Port of `ERes` (MatrixConfig.hpp:22-32).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Resource {
+    Titan = 0,
+    Electronics = 1,
+    Energy = 2,
+    Plasma = 3,
+}
+
+impl Resource {
+    pub const ALL: [Resource; MAX_RESOURCES] = [
+        Resource::Titan,
+        Resource::Electronics,
+        Resource::Energy,
+        Resource::Plasma,
+    ];
+}
+
+/// Port of `ERobotUnitKind` (MatrixConfig.hpp:34-78). All four categories
+/// (chassis, armor, weapon, head) share one discriminant space; `UNKNOWN=0`
+/// is the sentinel. We keep the plain i32 representation so the C++
+/// arithmetic (`kind + 1`, etc.) in the constructor's wrap-around click
+/// handler ports directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RobotUnitKind(pub i32);
+
+impl RobotUnitKind {
+    pub const UNKNOWN: RobotUnitKind = RobotUnitKind(0);
+
+    // Chassis (MatrixConfig.hpp:36-45).
+    pub const CHASSIS_PNEUMATIC: RobotUnitKind = RobotUnitKind(1);
+    pub const CHASSIS_WHEEL: RobotUnitKind = RobotUnitKind(2);
+    pub const CHASSIS_TRACK: RobotUnitKind = RobotUnitKind(3);
+    pub const CHASSIS_HOVERCRAFT: RobotUnitKind = RobotUnitKind(4);
+    pub const CHASSIS_ANTIGRAVITY: RobotUnitKind = RobotUnitKind(5);
+
+    // Weapons (MatrixConfig.hpp:48-59).
+    pub const WEAPON_MACHINEGUN: RobotUnitKind = RobotUnitKind(1);
+    pub const WEAPON_CANNON: RobotUnitKind = RobotUnitKind(2);
+    pub const WEAPON_MISSILE: RobotUnitKind = RobotUnitKind(3);
+    pub const WEAPON_FLAMETHROWER: RobotUnitKind = RobotUnitKind(4);
+    pub const WEAPON_MORTAR: RobotUnitKind = RobotUnitKind(5);
+    pub const WEAPON_LASER: RobotUnitKind = RobotUnitKind(6);
+    pub const WEAPON_BOMB: RobotUnitKind = RobotUnitKind(7);
+    pub const WEAPON_PLASMA: RobotUnitKind = RobotUnitKind(8);
+    pub const WEAPON_ELECTRIC: RobotUnitKind = RobotUnitKind(9);
+    pub const WEAPON_REPAIR: RobotUnitKind = RobotUnitKind(10);
+
+    // Armor (MatrixConfig.hpp:62-69).
+    pub const ARMOR_PASSIVE: RobotUnitKind = RobotUnitKind(1);
+    pub const ARMOR_ACTIVE: RobotUnitKind = RobotUnitKind(2);
+    pub const ARMOR_FIREPROOF: RobotUnitKind = RobotUnitKind(3);
+    pub const ARMOR_PLASMIC: RobotUnitKind = RobotUnitKind(4);
+    pub const ARMOR_NUCLEAR: RobotUnitKind = RobotUnitKind(5);
+    pub const ARMOR_6: RobotUnitKind = RobotUnitKind(6);
+
+    // Heads (MatrixConfig.hpp:72-77).
+    pub const HEAD_BLOCKER: RobotUnitKind = RobotUnitKind(1);
+    pub const HEAD_DYNAMO: RobotUnitKind = RobotUnitKind(2);
+    pub const HEAD_LOCKATOR: RobotUnitKind = RobotUnitKind(3);
+    pub const HEAD_FIREWALL: RobotUnitKind = RobotUnitKind(4);
+
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+    pub fn as_index(self) -> usize {
+        (self.0 - 1).max(0) as usize
+    }
+}
+
+/// Counts per category — mirror the `ROBOT_*_CNT` discriminants.
+pub const ROBOT_CHASSIS_CNT: usize = 5;
+pub const ROBOT_WEAPON_CNT: usize = 10;
+pub const ROBOT_ARMOR_CNT: usize = 6;
+pub const ROBOT_HEAD_CNT: usize = 4;
+
+// ── Build-time accessors (ports from MatrixConfig.cpp) ──────────────────
+
+const UNIT_ROBOT_BUILD_TIME_MS: i32 = 5000;
+
+/// Per-kind robot build time in ms, resolved from `g_Config.m_Timings`
+/// with a fall-back to `UNIT_ROBOT_BUILD_TIME_MS` when the config
+/// hasn't been loaded yet.
+pub fn robot_build_time_ms() -> i32 {
+    let t = global().timings.unit_robot;
+    if t > 0 {
+        t
+    } else {
+        UNIT_ROBOT_BUILD_TIME_MS
+    }
+}
+
+/// Turret build time (UNIT_TURRET in MatrixConfig.cpp:658).
+pub fn turret_build_time_ms() -> i32 {
+    let t = global().timings.unit_turret;
+    if t > 0 {
+        t
+    } else {
+        UNIT_ROBOT_BUILD_TIME_MS
     }
 }

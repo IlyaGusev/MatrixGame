@@ -31,15 +31,125 @@ use crate::matrix_game::map_static::{
     MR_SHADOW_PROJ_GEOM, MR_SHADOW_PROJ_TEX, OBJECT_STATE_ABLAZE, OBJECT_STATE_BURNED,
     OBJECT_STATE_SHADOW_SPECIAL, OBJECT_STATE_SPECIAL, OBJECT_STATE_TRACE_INVISIBLE,
 };
-use crate::matrix_game::rnd::Rnd;
+use crate::matrix_game::logic::Rnd;
 use crate::matrix_lib::base::storage::Storage;
 use crate::matrix_lib::base::wstr;
 use crate::matrix_lib::three_g::texture::{
     create_solid_texture, create_texture_from_rgba, decode_texture_bytes,
 };
-use crate::matrix_lib::three_g::vector_object::{
-    self, ShadowKind, VoAnimation, VoFrame, VoSurfaceMesh,
+use crate::matrix_lib::three_g::texture::{
+    has_trans_suffix, parse_scroll, resolve_texture_name, MaterialSpec,
 };
+use crate::matrix_lib::three_g::vector_object::{self, VoAnimation, VoFrame, VoSurfaceMesh};
+
+// ── Object id-string parsing ─────────────────────────────────────────────
+//
+// Port of `CMatrixMapObject` id-string decoding (MatrixObject.cpp:429-472)
+// using the OTP_* field layout from Common.hpp:176-191. The VO/material/
+// shadow bundle lives with the map-object because the id-string is a map
+// data field, not a VO library concept.
+
+/// Resolve an object Id string (from `strings/String`, '*'-delimited) into a
+/// VO file path and texture path. Returns `None` if empty.
+///
+/// Id string layout (MatrixObject.cpp:429-472, Common.hpp:176-191):
+///   [0] OTP_PATH (e.g. `Matrix\Obj\palm\`)
+///   [1] OTP_VO   (e.g. `palm00`)
+///   [2] OTP_TEXTURE (e.g. `palm00?Trans`)
+///   ... more fields
+pub struct ResolvedObjectPaths {
+    pub vo_path: String,
+    pub material: MaterialSpec,
+    pub shadow: ShadowSpec,
+}
+
+#[derive(Clone, Debug)]
+pub struct ShadowSpec {
+    pub kind: ShadowKind,
+    pub texture_size: u32,
+    pub cache_tag: Option<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ShadowKind {
+    None,
+    Stencil,
+    ProjectedStatic,
+    ProjectedDynamic,
+}
+
+pub fn resolve_paths(id_string: &str) -> Option<ResolvedObjectPaths> {
+    let parts: Vec<&str> = id_string.split('*').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let path = parts[0].replace('\\', "/");
+    let vo_name = parts[1];
+    if vo_name.is_empty() {
+        return None;
+    }
+    let vo_path = format!("{}{}.vo", path, vo_name);
+
+    let material = MaterialSpec {
+        diffuse: parts
+            .get(2)
+            .and_then(|t| resolve_texture_name(t, Some(&path))),
+        gloss: parts
+            .get(3)
+            .and_then(|t| resolve_texture_name(t, Some(&path))),
+        back: parts
+            .get(4)
+            .and_then(|t| resolve_texture_name(t, Some(&path))),
+        mask: parts
+            .get(5)
+            .and_then(|t| resolve_texture_name(t, Some(&path))),
+        scroll: parts.get(6).map(|t| parse_scroll(t)).unwrap_or([0.0, 0.0]),
+        alpha_test: parts.get(2).is_some_and(|t| has_trans_suffix(t)),
+    };
+    let shadow = parts
+        .get(7)
+        .map(|t| parse_shadow_spec(t))
+        .unwrap_or(ShadowSpec {
+            kind: ShadowKind::None,
+            texture_size: 128,
+            cache_tag: None,
+        });
+
+    Some(ResolvedObjectPaths {
+        vo_path,
+        material,
+        shadow,
+    })
+}
+
+fn parse_shadow_spec(raw: &str) -> ShadowSpec {
+    let spec = raw.trim();
+    if spec.is_empty() {
+        return ShadowSpec {
+            kind: ShadowKind::None,
+            texture_size: 128,
+            cache_tag: None,
+        };
+    }
+    let mut parts = spec.split(',');
+    let kind = match parts.next().unwrap_or("").trim() {
+        "Stencil" => ShadowKind::Stencil,
+        "Proj" => ShadowKind::ProjectedStatic,
+        "ProjEx" => ShadowKind::ProjectedDynamic,
+        _ => ShadowKind::None,
+    };
+    let texture_size = parts
+        .next()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(128);
+    let cache_tag = parts.next().and_then(|v| v.trim().parse::<u32>().ok());
+    ShadowSpec {
+        kind,
+        texture_size,
+        cache_tag,
+    }
+}
 
 // ── Game-object side of CMatrixMapObject ────────────────────────────────
 //
@@ -1089,7 +1199,7 @@ impl ObjectsRenderer {
             } else {
                 continue;
             };
-            let Some(paths) = vector_object::resolve_paths(&id_str) else {
+            let Some(paths) = resolve_paths(&id_str) else {
                 failed_types += 1;
                 continue;
             };
@@ -2612,7 +2722,7 @@ mod tests {
     fn sens_logic_takt_transitions_on_nearby_robot() {
         use crate::matrix_game::logic::MapLogic;
         use crate::matrix_game::map_static::{MapStatic, ObjectType};
-        use crate::matrix_game::rnd::Rnd;
+        use crate::matrix_game::logic::Rnd;
 
         // Build a world with one SENS mapobject at the origin and a
         // "robot" (stub MapStatic with ObjectType::RobotAi) 30 units

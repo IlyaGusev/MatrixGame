@@ -28,9 +28,10 @@ use crate::matrix_game::map::{BuildingInstance, GameMap};
 use crate::matrix_game::map_static::{
     MapStatic, ObjectCore, ObjectId, ObjectType, Objects, MR_ALL,
 };
-use crate::matrix_game::rnd::Rnd;
+use crate::matrix_game::logic::Rnd;
 use crate::matrix_game::robot::{ChassisKind, Robot};
-use crate::matrix_game::robot_units::{RobotConfig, RobotUnitKind};
+use crate::matrix_game::config::RobotUnitKind;
+use crate::matrix_game::interface::constructor::RobotConfig;
 use crate::matrix_lib::three_g::texture::{
     create_solid_texture, create_texture_from_rgba, decode_texture_bytes,
 };
@@ -110,27 +111,10 @@ pub const MAX_STACK_UNITS: usize = 6;
 /// used by the shipping `robots.dat` so behaviour is preserved.
 pub const UNIT_ROBOT_BUILD_TIME_MS: i32 = 5000;
 
-/// Per-kind build time in ms, resolved from `g_Config.m_Timings` with
-/// a fall-back to `UNIT_ROBOT_BUILD_TIME_MS` when the config hasn't
-/// been loaded.
-pub fn robot_build_time_ms() -> i32 {
-    let t = crate::matrix_game::config::global().timings.unit_robot;
-    if t > 0 {
-        t
-    } else {
-        UNIT_ROBOT_BUILD_TIME_MS
-    }
-}
-
-/// Turret build time (UNIT_TURRET in MatrixConfig.cpp:658).
-pub fn turret_build_time_ms() -> i32 {
-    let t = crate::matrix_game::config::global().timings.unit_turret;
-    if t > 0 {
-        t
-    } else {
-        UNIT_ROBOT_BUILD_TIME_MS
-    }
-}
+// `robot_build_time_ms` / `turret_build_time_ms` are `g_Config.m_Timings`
+// accessors — ported to `matrix_game::config` alongside the timing table.
+// Re-exported here for the existing in-file call sites.
+pub use crate::matrix_game::config::{robot_build_time_ms, turret_build_time_ms};
 
 /// Port of `CBuildStack` (MatrixObjectBuilding.{cpp,hpp}). The C++
 /// holds an intrusive list of `CMatrixMapStatic*` (robots / cannons /
@@ -362,12 +346,12 @@ fn pick_balanced_team(objs: &Objects, side: i32) -> i32 {
 /// holds `WeaponUnit` values directly).
 fn robot_weapons_from_cfg(
     cfg: &RobotConfig,
-) -> [crate::matrix_game::robot_units::WeaponUnit; crate::matrix_game::robot_units::MAX_WEAPON_CNT]
+) -> [crate::matrix_game::interface::constructor::WeaponUnit; crate::matrix_game::object_robot::MAX_WEAPON_CNT]
 {
-    let mut out = [crate::matrix_game::robot_units::WeaponUnit::empty();
-        crate::matrix_game::robot_units::MAX_WEAPON_CNT];
+    let mut out = [crate::matrix_game::interface::constructor::WeaponUnit::empty();
+        crate::matrix_game::object_robot::MAX_WEAPON_CNT];
     for (i, w) in cfg.weapon.iter().enumerate() {
-        out[i] = crate::matrix_game::robot_units::WeaponUnit {
+        out[i] = crate::matrix_game::interface::constructor::WeaponUnit {
             pos: i as i32 + 1,
             unit: *w,
         };

@@ -1766,7 +1766,7 @@ pub struct MapRenderer {
     depth_only_batches: Vec<DrawBatch>,
     overlay_batches: Vec<OverlayBatch>,
     gloss_batches: Vec<GlossOverlayBatch>,
-    sky: super::sky::Sky,
+    sky: Sky,
     clear_color: wgpu::Color,
     fog_color: [f32; 4],
     objects: Option<super::object::ObjectsRenderer>,
@@ -2391,7 +2391,7 @@ impl MapRenderer {
 
         let depth_texture = create_depth_texture(device, config);
 
-        let sky = super::sky::Sky::new(
+        let sky = Sky::new(
             device,
             queue,
             config,
@@ -2819,3 +2819,732 @@ const SHADER: &str = include_str!("../../shaders/terrain.wgsl");
 /// the stage 5 `ADD(TEMP, CURRENT)` with SrcAlpha/InvSrcAlpha blending in the
 /// original single-pass pipeline.
 const GLOSS_SHADER: &str = include_str!("../../shaders/terrain_gloss.wgsl");
+
+// ════════════════════════════════════════════════════════════════════════
+// CMatrixMap::DrawSky — ports MatrixMap.cpp:2020-2189.
+//
+// Two parts:
+//   * Skybox pass: four textured walls laid out as vertical strips of a
+//     single panoramic texture (Fore / Rite / Back / Left), drawn with a
+//     rotation-only view + shallow perspective (`CalcSkyMatrix`).
+//   * Gradient pass: screen-space fade along the horizon line computed
+//     from camera direction (MatrixVisiCalc.cpp:609-626). The top color
+//     fades from transparent to the sky color so the gradient blends
+//     into the skybox instead of clipping against it.
+//
+// `m_SkyAngle += m_SkyDeltaAngle * step` advance in CMatrixMap::Takt
+// (MatrixMap.cpp:2495).
+// ════════════════════════════════════════════════════════════════════════
+
+/// MAX_VIEW_DISTANCE from MatrixCamera.cpp:13.
+const MAX_VIEW_DISTANCE: f32 = 4000.0;
+/// SH1 = g_ScreenY * 0.270416... (MatrixMap.cpp:2144).
+const SH1_FRAC: f32 = 0.270_416_68;
+/// SH2 = g_ScreenY * 0.07 (MatrixMap.cpp:2145).
+const SH2_FRAC: f32 = 0.07;
+
+/// Matches CAM_HFOV from MatrixCamera.hpp:51 — used only by the skybox
+/// perspective so skybox walls project onto the frustum exactly once per face.
+const SKY_HFOV: f32 = std::f32::consts::PI / 3.0;
+
+/// Sky face names in the order the Rust port's skybox geometry expects them:
+/// Fore (+Y), Rite (+X), Back (-Y), Left (-X). Matches the C++ SKY_FORE /
+/// SKY_RITE / SKY_BACK / SKY_LEFT enum ordering (MatrixMap.cpp:2071-2098)
+/// and the `Sky` block key names in `cfg/robots/data.txt`.
+const FACE_CONFIG_KEYS: [&str; 4] = ["Fore", "Right", "Back", "Left"];
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct GradientVertex {
+    position: [f32; 2],
+    color: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct BoxVertex {
+    xy: [f32; 2],
+    bottom_w: f32,
+    u: f32,
+    v0: f32,
+    v1: f32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct SkyboxUniforms {
+    sky_view_proj: [[f32; 4]; 4],
+    cut_dn: [f32; 4],
+}
+
+pub struct Sky {
+    gradient_pipeline: wgpu::RenderPipeline,
+    gradient_vertex_buffer: wgpu::Buffer,
+    sky_color: [f32; 3],
+    water_color: [f32; 3],
+    skybox: Option<Skybox>,
+}
+
+struct Skybox {
+    pipeline: wgpu::RenderPipeline,
+    vertex_buffer: wgpu::Buffer,
+    uniform_buffer: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+    base_angle: f32,
+    delta_angle: f32,
+    current_angle: f32,
+}
+
+impl Sky {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        config: &wgpu::SurfaceConfiguration,
+        sky_color_rgba: u32,
+        water_color_rgba: u32,
+        sky_name: &str,
+        sky_angle: f32,
+        matrix_data: &Storage,
+        read_texture: &dyn Fn(&str) -> Option<Vec<u8>>,
+    ) -> Self {
+        let sky_color = unpack_rgb(sky_color_rgba);
+        let water_color = unpack_rgb(water_color_rgba);
+
+        let gradient_pipeline = build_gradient_pipeline(device, config);
+        let gradient_vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Sky Gradient VB"),
+            contents: bytemuck::cast_slice(
+                &[GradientVertex {
+                    position: [0.0, 0.0],
+                    color: [0.0; 4],
+                }; 10],
+            ),
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let sky_cfg = resolve_sky_config(matrix_data, sky_name).or_else(|| {
+            log::warn!(
+                "sky: no config for '{}' in robots.dat; skybox disabled",
+                sky_name
+            );
+            None
+        });
+        let skybox = sky_cfg
+            .and_then(|cfg| load_skybox(device, queue, config, &cfg, sky_angle, read_texture));
+
+        Self {
+            gradient_pipeline,
+            gradient_vertex_buffer,
+            sky_color,
+            water_color,
+            skybox,
+        }
+    }
+
+    /// Advance the skybox rotation. Mirrors `m_SkyAngle += m_SkyDeltaAngle *
+    /// step` in `CMatrixMap::Takt` (MatrixMap.cpp:2495).
+    pub fn takt(&mut self, dt_ms: f32) {
+        if let Some(skybox) = &mut self.skybox {
+            skybox.current_angle += skybox.delta_angle * dt_ms;
+        }
+    }
+
+    pub fn render<'a>(
+        &'a self,
+        queue: &wgpu::Queue,
+        pass: &mut wgpu::RenderPass<'a>,
+        camera: &Camera,
+    ) {
+        let has_skybox = self.skybox.is_some();
+
+        if let Some(skybox) = &self.skybox {
+            skybox.render(queue, pass, camera);
+        }
+
+        self.render_gradient(queue, pass, camera, has_skybox);
+    }
+
+    fn render_gradient<'a>(
+        &'a self,
+        queue: &wgpu::Queue,
+        pass: &mut wgpu::RenderPass<'a>,
+        camera: &Camera,
+        has_skybox: bool,
+    ) {
+        let sh_frac = compute_sky_height_frac(camera);
+        let bot_ndc = 1.0 - 2.0 * sh_frac;
+        let mid_ndc = 1.0 - 2.0 * (sh_frac - SH2_FRAC);
+        let mut top_ndc = 1.0 - 2.0 * (sh_frac - SH1_FRAC);
+        if !has_skybox && top_ndc < 1.0 {
+            top_ndc = 1.0;
+        }
+
+        let [sr, sg, sb] = self.sky_color;
+        let top_color = if has_skybox {
+            [sr, sg, sb, 0.0]
+        } else {
+            [0.0, 0.0, 0.0, 0.0]
+        };
+        let sky_opaque = [sr, sg, sb, 1.0];
+        let [wr, wg, wb] = self.water_color;
+        let water_opaque = [wr, wg, wb, 1.0];
+        let water_top = bot_ndc.clamp(-1.0, 1.0);
+
+        let verts = [
+            GradientVertex { position: [-1.0, top_ndc], color: top_color },
+            GradientVertex { position: [1.0, top_ndc],  color: top_color },
+            GradientVertex { position: [-1.0, mid_ndc], color: sky_opaque },
+            GradientVertex { position: [1.0, mid_ndc],  color: sky_opaque },
+            GradientVertex { position: [-1.0, bot_ndc], color: sky_opaque },
+            GradientVertex { position: [1.0, bot_ndc],  color: sky_opaque },
+            GradientVertex { position: [-1.0, water_top], color: water_opaque },
+            GradientVertex { position: [1.0, water_top],  color: water_opaque },
+            GradientVertex { position: [-1.0, -1.0], color: water_opaque },
+            GradientVertex { position: [1.0, -1.0],  color: water_opaque },
+        ];
+        queue.write_buffer(&self.gradient_vertex_buffer, 0, bytemuck::cast_slice(&verts));
+
+        pass.set_pipeline(&self.gradient_pipeline);
+        pass.set_vertex_buffer(0, self.gradient_vertex_buffer.slice(..));
+        pass.draw(0..6, 0..1);
+        pass.draw(6..10, 0..1);
+    }
+}
+
+impl Skybox {
+    fn render<'a>(&'a self, queue: &wgpu::Queue, pass: &mut wgpu::RenderPass<'a>, camera: &Camera) {
+        let sky_view_proj = build_sky_view_proj(camera, self.base_angle + self.current_angle);
+        let cut_dn = compute_cut_dn(camera.eye_pos().z);
+        queue.write_buffer(
+            &self.uniform_buffer,
+            0,
+            bytemuck::bytes_of(&SkyboxUniforms {
+                sky_view_proj: sky_view_proj.to_cols_array_2d(),
+                cut_dn: [cut_dn, 0.0, 0.0, 0.0],
+            }),
+        );
+
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &self.bind_group, &[]);
+        pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+        pass.draw(0..24, 0..1);
+    }
+}
+
+fn build_gradient_pipeline(
+    device: &wgpu::Device,
+    config: &wgpu::SurfaceConfiguration,
+) -> wgpu::RenderPipeline {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("Sky Gradient Shader"),
+        source: wgpu::ShaderSource::Wgsl(GRADIENT_SHADER.into()),
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("Sky Gradient Layout"),
+        bind_group_layouts: &[],
+        immediate_size: 0,
+    });
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("Sky Gradient Pipeline"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            buffers: &[wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<GradientVertex>() as u64,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &[
+                    wgpu::VertexAttribute { offset: 0, shader_location: 0, format: wgpu::VertexFormat::Float32x2 },
+                    wgpu::VertexAttribute { offset: 8, shader_location: 1, format: wgpu::VertexFormat::Float32x4 },
+                ],
+            }],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: config.format,
+                blend: Some(wgpu::BlendState {
+                    color: wgpu::BlendComponent {
+                        src_factor: wgpu::BlendFactor::SrcAlpha,
+                        dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                        operation: wgpu::BlendOperation::Add,
+                    },
+                    alpha: wgpu::BlendComponent {
+                        src_factor: wgpu::BlendFactor::One,
+                        dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                        operation: wgpu::BlendOperation::Add,
+                    },
+                }),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleStrip,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: false,
+            depth_compare: wgpu::CompareFunction::Always,
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: Default::default(),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn load_skybox(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    config: &wgpu::SurfaceConfiguration,
+    cfg: &SkyConfig,
+    sky_angle: f32,
+    read_texture: &dyn Fn(&str) -> Option<Vec<u8>>,
+) -> Option<Skybox> {
+    let texture_path = &cfg.faces[0].texture;
+    let data = read_texture(texture_path)?;
+    let rgba = decode_texture_bytes(&data)?;
+    let tex_w = rgba.width() as f32;
+    let tex_h = rgba.height() as f32;
+    let texture_view = if rgba.width() >= 4 && rgba.height() >= 4 {
+        create_texture_from_rgba_mipped(device, queue, &rgba, 6)
+    } else {
+        create_texture_from_rgba(device, queue, &rgba)
+    };
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("Skybox Sampler"),
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::MipmapFilterMode::Linear,
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        ..Default::default()
+    });
+
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("Skybox Shader"),
+        source: wgpu::ShaderSource::Wgsl(SKYBOX_SHADER.into()),
+    });
+    let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("Skybox BGL"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("Skybox Layout"),
+        bind_group_layouts: &[&bgl],
+        immediate_size: 0,
+    });
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("Skybox Pipeline"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            buffers: &[wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<BoxVertex>() as u64,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &[
+                    wgpu::VertexAttribute { offset: 0, shader_location: 0, format: wgpu::VertexFormat::Float32x2 },
+                    wgpu::VertexAttribute { offset: 8, shader_location: 1, format: wgpu::VertexFormat::Float32 },
+                    wgpu::VertexAttribute { offset: 12, shader_location: 2, format: wgpu::VertexFormat::Float32 },
+                    wgpu::VertexAttribute { offset: 16, shader_location: 3, format: wgpu::VertexFormat::Float32 },
+                    wgpu::VertexAttribute { offset: 20, shader_location: 4, format: wgpu::VertexFormat::Float32 },
+                ],
+            }],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: config.format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::COLOR,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: false,
+            depth_compare: wgpu::CompareFunction::Always,
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: Default::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+
+    let verts = build_skybox_vertices(cfg, tex_w, tex_h);
+    let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("Skybox VB"),
+        contents: bytemuck::cast_slice(&verts),
+        usage: wgpu::BufferUsages::VERTEX,
+    });
+
+    let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("Skybox UB"),
+        contents: bytemuck::bytes_of(&SkyboxUniforms {
+            sky_view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
+            cut_dn: [0.5, 0.0, 0.0, 0.0],
+        }),
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+    });
+
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("Skybox BG"),
+        layout: &bgl,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: uniform_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&texture_view) },
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&sampler) },
+        ],
+    });
+
+    log::info!(
+        "skybox: loaded '{}' (angle = {:.3} + {:.3} rad, drift = {:.6} rad/ms)",
+        texture_path,
+        cfg.base_angle,
+        sky_angle,
+        cfg.delta_angle
+    );
+    Some(Skybox {
+        pipeline,
+        vertex_buffer,
+        uniform_buffer,
+        bind_group,
+        base_angle: cfg.base_angle + sky_angle,
+        delta_angle: cfg.delta_angle,
+        current_angle: 0.0,
+    })
+}
+
+struct SkyConfig {
+    base_angle: f32,
+    delta_angle: f32,
+    faces: [SkyFaceConfig; 4],
+}
+
+struct SkyFaceConfig {
+    texture: String,
+    uv: [f32; 4],
+}
+
+fn resolve_sky_config(stor: &Storage, sky_name: &str) -> Option<SkyConfig> {
+    let sky_root = stor.block_record("da", "Sky")?;
+    let sky_rec = stor.block_record(&sky_root, sky_name)?;
+
+    let parse_deg = |s: Option<String>| -> f32 {
+        s.and_then(|v| v.parse::<f32>().ok())
+            .map(|d| d.to_radians())
+            .unwrap_or(0.0)
+    };
+    let base_angle = parse_deg(stor.block_param(&sky_rec, "Angle"));
+    let delta_angle = parse_deg(stor.block_param(&sky_rec, "DeltaAngle"));
+
+    let faces = std::array::from_fn(|i| {
+        let raw = stor
+            .block_param(&sky_rec, FACE_CONFIG_KEYS[i])
+            .unwrap_or_default();
+        parse_face(&raw)
+    });
+
+    Some(SkyConfig {
+        base_angle,
+        delta_angle,
+        faces,
+    })
+}
+
+fn parse_face(raw: &str) -> SkyFaceConfig {
+    let mut parts = raw.splitn(5, ',');
+    let path = parts.next().unwrap_or("").trim().replace('\\', "/");
+    let mut uv = [0.0_f32, 0.0, 1.0, 1.0];
+    for slot in &mut uv {
+        if let Some(p) = parts.next() {
+            if let Ok(v) = p.trim().parse::<f32>() {
+                *slot = v;
+            }
+        }
+    }
+    SkyFaceConfig { texture: path, uv }
+}
+
+fn build_skybox_vertices(cfg: &SkyConfig, tex_w: f32, tex_h: f32) -> Vec<BoxVertex> {
+    let positions: [[[f32; 2]; 4]; 4] = [
+        [[-1.0, 1.0], [1.0, 1.0], [-1.0, 1.0], [1.0, 1.0]],
+        [[1.0, 1.0], [1.0, -1.0], [1.0, 1.0], [1.0, -1.0]],
+        [[1.0, -1.0], [-1.0, -1.0], [1.0, -1.0], [-1.0, -1.0]],
+        [[-1.0, -1.0], [-1.0, 1.0], [-1.0, -1.0], [-1.0, 1.0]],
+    ];
+
+    let mut verts = Vec::with_capacity(24);
+    for (i, p) in positions.iter().enumerate() {
+        let [u0, v0, u1, v1] = cfg.faces[i].uv;
+        let nu0 = u0 / tex_w;
+        let nu1 = u1 / tex_w;
+        let nv0 = v0 / tex_h;
+        let nv1 = v1 / tex_h;
+        push_face(&mut verts, p[0], p[1], p[2], p[3], nu0, nu1, nv0, nv1);
+    }
+
+    verts
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_face(
+    out: &mut Vec<BoxVertex>,
+    xy_tl: [f32; 2],
+    xy_tr: [f32; 2],
+    xy_bl: [f32; 2],
+    xy_br: [f32; 2],
+    u_left: f32,
+    u_right: f32,
+    v0: f32,
+    v1: f32,
+) {
+    let tl = BoxVertex { xy: xy_tl, bottom_w: 0.0, u: u_left,  v0, v1 };
+    let tr = BoxVertex { xy: xy_tr, bottom_w: 0.0, u: u_right, v0, v1 };
+    let bl = BoxVertex { xy: xy_bl, bottom_w: 1.0, u: u_left,  v0, v1 };
+    let br = BoxVertex { xy: xy_br, bottom_w: 1.0, u: u_right, v0, v1 };
+    out.push(tl); out.push(bl); out.push(tr);
+    out.push(tr); out.push(bl); out.push(br);
+}
+
+fn compute_cut_dn(eye_z: f32) -> f32 {
+    (200.0 + eye_z) * 0.5 / MAX_VIEW_DISTANCE + 0.5
+}
+
+fn build_sky_view_proj(camera: &Camera, sky_angle: f32) -> glam::Mat4 {
+    let fwd = camera.forward();
+    let y_up_fwd = glam::Vec3::new(fwd.x, fwd.z, -fwd.y);
+    let view_rot = glam::Mat4::look_at_lh(glam::Vec3::ZERO, y_up_fwd, glam::Vec3::Y);
+
+    let yaw = glam::Mat4::from_rotation_z(sky_angle);
+    let z_to_y = glam::Mat4::from_cols_array(&[
+        1.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+    ]);
+
+    let proj = glam::Mat4::perspective_lh(SKY_HFOV, camera.aspect, 0.01, 3.0);
+
+    proj * view_rot * z_to_y * yaw
+}
+
+/// Ports the m_SkyHeight computation from MatrixVisiCalc.cpp:609-626.
+/// Returns the horizon line as a fraction of screen height (0=top, 1=bottom).
+fn compute_sky_height_frac(camera: &Camera) -> f32 {
+    let dir = camera.forward();
+    let mut proj = glam::Vec3::new(dir.x, dir.y, 0.0);
+    let len = proj.length();
+    if len < 0.0001 {
+        return -1.0;
+    }
+    proj /= len;
+    let eye = camera.eye_pos();
+    let mut target = eye + proj * MAX_VIEW_DISTANCE;
+    target.z -= eye.z * 1.5;
+
+    let clip = camera.view_proj() * glam::Vec4::new(target.x, target.y, target.z, 1.0);
+    if clip.w.abs() < 0.0001 {
+        return -1.0;
+    }
+    let ndc_y = clip.y / clip.w;
+    (1.0 - ndc_y) * 0.5
+}
+
+const GRADIENT_SHADER: &str = include_str!("../../shaders/sky_gradient.wgsl");
+const SKYBOX_SHADER: &str = include_str!("../../shaders/sky_skybox.wgsl");
+
+// ── SRobotWeaponMatrix ──────────────────────────────────────────────────
+//
+// Port of `SRobotWeaponMatrix` (MatrixMap.hpp:170-180) — per-armor pylon
+// layout loaded from the chassis VO at map-load time (MatrixMap.cpp:
+// 236-334). Each armor kind (1..=ROBOT_ARMOR_CNT) carries a list of
+// pylon slots; each slot encodes which weapon categories it accepts
+// via `access_invert` (bit N set = weapon index N is blocked, because
+// the C++ stores it inverted).
+//
+// Until the VO loader is wired for reading this off the meshes,
+// `default_weapon_matrix` provides a hand-rolled table matching shipped
+// gameplay: 4 common slots + 1 extra (bomb/mortar) per armor.
+
+use crate::matrix_game::config::RobotUnitKind;
+use crate::matrix_game::interface::constructor::Unit;
+use crate::matrix_game::object_robot::MAX_WEAPON_CNT;
+
+pub const ROBOT_WEAPONS_PER_ROBOT_CNT: usize = 16;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WeaponMatrixSlot {
+    pub id: i32,
+    pub access_invert: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct WeaponMatrix {
+    /// Total slots on this armor. Slot indices `< common` are
+    /// "common" (MG/Cannon/Missile/Laser/Plasma/Electric/Repair);
+    /// the rest are "extra" (Bomb/Mortar/Flamethrower).
+    pub cnt: i32,
+    pub common: i32,
+    pub extra: i32,
+    pub list: [WeaponMatrixSlot; ROBOT_WEAPONS_PER_ROBOT_CNT],
+}
+
+impl Default for WeaponMatrix {
+    fn default() -> Self {
+        Self {
+            cnt: 0,
+            common: 0,
+            extra: 0,
+            list: [WeaponMatrixSlot::default(); ROBOT_WEAPONS_PER_ROBOT_CNT],
+        }
+    }
+}
+
+/// Extra-slot bit — bit 4 (Flamethrower) or bit 6 (Bomb/Mortar) set
+/// in `access_invert` marks a slot as "extra" (CConstructor.cpp:477).
+pub const ACCESS_EXTRA_BIT_A: u32 = 1 << 4;
+pub const ACCESS_EXTRA_BIT_B: u32 = 1 << 6;
+
+impl WeaponMatrix {
+    /// Port of the bit-test at CConstructor.cpp:477-480 / :503-504.
+    pub fn is_extra_slot(&self, i: usize) -> bool {
+        let a = self.list[i].access_invert;
+        (a & ACCESS_EXTRA_BIT_A) != 0 || (a & ACCESS_EXTRA_BIT_B) != 0
+    }
+
+    /// Port of `CConstructor::CheckWeaponLegality` (CConstructor.cpp:
+    /// 731-761) — find the first empty pylon on this armor that
+    /// accepts `weapon_kind`.
+    pub fn find_pylon_for(
+        &self,
+        weapon_kind: RobotUnitKind,
+        current: &[Unit; MAX_WEAPON_CNT],
+    ) -> Option<usize> {
+        let is_super = weapon_kind == RobotUnitKind::WEAPON_MORTAR
+            || weapon_kind == RobotUnitKind::WEAPON_BOMB;
+        let limit = (self.cnt as usize).min(ROBOT_WEAPONS_PER_ROBOT_CNT);
+        if !is_super {
+            for (t, unit) in current.iter().enumerate().take(limit) {
+                if !self.is_extra_slot(t) && unit.is_empty() {
+                    return Some(t);
+                }
+            }
+            None
+        } else {
+            (0..limit).find(|&t| self.is_extra_slot(t))
+        }
+    }
+}
+
+/// Shipped-gameplay weapon matrix layout — hand-rolled to mirror the
+/// data the VO loader produces in the original.
+pub fn default_weapon_matrix(armor_kind: RobotUnitKind) -> WeaponMatrix {
+    let common_slot = WeaponMatrixSlot {
+        id: 0,
+        access_invert: 1 << 0,
+    };
+    let extra_slot_bomb = WeaponMatrixSlot {
+        id: 1,
+        access_invert: ACCESS_EXTRA_BIT_B,
+    };
+
+    let (common, extra) = match armor_kind.0 {
+        1..=4 => (2, 1),
+        5 | 6 => (4, 1),
+        _ => (0, 0),
+    };
+
+    let total = common + extra;
+    let mut list = [WeaponMatrixSlot::default(); ROBOT_WEAPONS_PER_ROBOT_CNT];
+    for slot in list
+        .iter_mut()
+        .take((common as usize).min(ROBOT_WEAPONS_PER_ROBOT_CNT))
+    {
+        *slot = common_slot;
+    }
+    if extra > 0 && (common as usize) < ROBOT_WEAPONS_PER_ROBOT_CNT {
+        list[common as usize] = extra_slot_bomb;
+    }
+
+    WeaponMatrix {
+        cnt: total,
+        common,
+        extra,
+        list,
+    }
+}
+
+// ── GetSideColor / GetSideColorMM (MatrixMap.cpp:1014-1015) ─────────────
+
+/// Port of `CMatrixMap::GetSideColor` (MatrixMap.cpp:1014, MatrixMap.hpp:738).
+/// Returns the diffuse RGB components (0..1) the C++ loads from
+/// `Side/{id}=<name,r,g,b,Minimap,rMM,gMM,bMM>` entries of `robots.dat`.
+///
+/// Shipped values (confirmed by dumping `Side` from robots.dat):
+///   0 — Neutral = (128,128,128)
+///   1 — Player  = (227,158,31)   Yellow
+///   2 — AI Red  = (142,0,0)
+///   3 — AI Blue = (0,0,150)
+///   4 — AI Green= (0,150,0)
+pub fn side_color_rgb(side: i32) -> [f32; 3] {
+    let c = match side {
+        1 => [227u8, 158, 31],
+        2 => [142, 0, 0],
+        3 => [0, 0, 150],
+        4 => [0, 150, 0],
+        _ => [128, 128, 128],
+    };
+    [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0]
+}
+
+/// Port of `CMatrixMap::GetSideColorMM` (MatrixMap.cpp:1015,
+/// MatrixMap.hpp:745) — saturated minimap variant of the side colour.
+pub fn side_color_minimap_rgb(side: i32) -> [f32; 3] {
+    let c = match side {
+        1 => [255u8, 255, 0],
+        2 => [255, 0, 0],
+        3 => [0, 0, 255],
+        4 => [0, 255, 0],
+        _ => [128, 128, 128],
+    };
+    [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0]
+}

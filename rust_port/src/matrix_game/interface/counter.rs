@@ -12,7 +12,8 @@
 //! the per-frame visibility refresh in `CInterface::refresh_base_visibility_v2`
 //! reads them when computing the elements' `cur_state`.
 
-use crate::matrix_game::robot_units::{Resource, UnitPrice};
+use crate::matrix_game::config::Resource;
+use crate::matrix_game::interface::constructor::UnitPrice;
 
 /// Port of `COUNTER_IMAGES` (CCounter.h:6).
 pub const COUNTER_IMAGES: usize = 7;

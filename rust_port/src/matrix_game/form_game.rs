@@ -60,7 +60,7 @@ struct AppState {
     /// Screen-space marquee rectangle drawn while the user holds
     /// left-button and drags on empty terrain. Rebuilt each frame
     /// from `lmb_anchor` + current cursor; hidden otherwise.
-    marquee: crate::matrix_game::effects::marquee::MarqueeRenderer,
+    marquee: crate::matrix_game::multi_selection::MarqueeRenderer,
     /// Move-order ground-ping effect — port of `CMatrixEffectMoveto`
     /// (Effects/MatrixEffectMoveTo.cpp). Spawned at the terrain hit
     /// point when a right-click issues a move order while robots are
@@ -80,7 +80,7 @@ struct AppState {
     /// `CConstructor::Render`'s viewport setup (CConstructor.cpp:
     /// 264-360). Emits a chassis draw-ticket per frame while the
     /// constructor panel is active.
-    builder_preview: crate::matrix_game::interface::builder_preview::BuilderPreview,
+    builder_preview: crate::matrix_game::interface::constructor::BuilderPreview,
 }
 
 pub struct App {
@@ -188,7 +188,7 @@ impl ApplicationHandler for App {
                 &gfx.device,
                 &gfx.config,
             );
-            let marquee = crate::matrix_game::effects::marquee::MarqueeRenderer::new(
+            let marquee = crate::matrix_game::multi_selection::MarqueeRenderer::new(
                 &gfx.device,
                 &gfx.config,
             );
@@ -266,7 +266,7 @@ impl ApplicationHandler for App {
                 iface_renderer,
                 progress_bars,
                 builder_preview:
-                    crate::matrix_game::interface::builder_preview::BuilderPreview::new(),
+                    crate::matrix_game::interface::constructor::BuilderPreview::new(),
             });
         }
 
@@ -361,7 +361,7 @@ impl ApplicationHandler for App {
                         &gfx.device,
                         &gfx.config,
                     );
-                let marquee = crate::matrix_game::effects::marquee::MarqueeRenderer::new(
+                let marquee = crate::matrix_game::multi_selection::MarqueeRenderer::new(
                     &gfx.device,
                     &gfx.config,
                 );
@@ -424,7 +424,7 @@ impl ApplicationHandler for App {
                     iface_renderer,
                     progress_bars,
                     builder_preview:
-                        crate::matrix_game::interface::builder_preview::BuilderPreview::new(),
+                        crate::matrix_game::interface::constructor::BuilderPreview::new(),
                 });
                 win.request_redraw();
                 hide_loading_overlay();
@@ -607,7 +607,8 @@ impl ApplicationHandler for App {
                                     } else {
                                         let rmin = [ax.min(cx), ay.min(cy)];
                                         let rmax = [ax.max(cx), ay.max(cy)];
-                                        let n = state.game.marquee_select(
+                                        let n = crate::matrix_game::multi_selection::marquee_select(
+                                            &mut state.game,
                                             &state.camera,
                                             rmin,
                                             rmax,
@@ -1274,12 +1275,13 @@ fn sync_robot_lights(state: &mut AppState) {
 /// a default chassis.
 fn dispatch_ui_click(state: &mut AppState, click: &crate::matrix_game::interface::Click) {
     use crate::matrix_game::interface::constructor::parse_constructor_button;
-    use crate::matrix_game::interface::turret_build::TurretKind;
+    use crate::matrix_game::interface::iface_list::TurretKind;
     use crate::matrix_game::interface::Click;
     use crate::matrix_game::map_static::{MapStatic, ObjectType};
     use crate::matrix_game::object_building::{Building, BuildingType};
     use crate::matrix_game::robot::ChassisKind;
-    use crate::matrix_game::robot_units::{RobotUnitKind, RobotUnitType};
+    use crate::matrix_game::config::RobotUnitKind;
+    use crate::matrix_game::object_robot::RobotUnitType;
     use crate::matrix_game::side::CurrSel;
 
     let name = match click {
@@ -1534,7 +1536,7 @@ fn dispatch_ui_right_click(state: &mut AppState, click: &crate::matrix_game::int
             // CIFaceButton.cpp:190-310 — colour each row by affordability
             // before showing the menu.
             let mut bank = [0i32; 4];
-            for r in crate::matrix_game::robot_units::Resource::ALL {
+            for r in crate::matrix_game::config::Resource::ALL {
                 bank[r as usize] = state.game.player_side.get_resource_amount(r);
             }
             popup.refresh_affordability(b, &bank);
@@ -1590,7 +1592,7 @@ fn preview_popup_hover(
 /// state (resource income, robot counts) are refreshed every frame so
 /// a long-held hover shows up-to-date numbers.
 fn refresh_hint_replacements(state: &mut AppState) {
-    use crate::matrix_game::robot_units::Resource;
+    use crate::matrix_game::config::Resource;
 
     // `HintSystem::update` early-returns when nothing is hovered, so
     // we can skip the full refresh when the focused element has no
@@ -1788,7 +1790,7 @@ fn builder_preview_query(state: &mut AppState) -> Option<BuilderPreviewQuery> {
 fn try_place_turret(state: &mut AppState, cx: f32, cy: f32, w: f32, h: f32) {
     use crate::matrix_game::map_static::{MapStatic, ObjectType};
     use crate::matrix_game::object_building::Building;
-    use crate::matrix_game::robot_units::Resource;
+    use crate::matrix_game::config::Resource;
 
     let Some(parent_id) = state.iface_list.turret_build.parent else {
         state.iface_list.turret_build.cancel();
@@ -1929,7 +1931,8 @@ fn build_counter_ctx(state: &AppState) -> crate::matrix_game::interface::counter
     use crate::matrix_game::map_static::{MapStatic, ObjectType};
     use crate::matrix_game::object_building::{Building, BuildingType};
     use crate::matrix_game::robot::Robot;
-    use crate::matrix_game::robot_units::{Resource, UnitPrice};
+    use crate::matrix_game::config::Resource;
+    use crate::matrix_game::interface::constructor::UnitPrice;
     let per_unit_price = state
         .game
         .player_side
@@ -1991,7 +1994,7 @@ fn build_counter_ctx(state: &AppState) -> crate::matrix_game::interface::counter
 fn commit_and_queue_robot(state: &mut AppState) {
     use crate::matrix_game::map_static::{MapStatic, ObjectType};
     use crate::matrix_game::object_building::{Building, BuildingType};
-    use crate::matrix_game::robot_units::Resource;
+    use crate::matrix_game::config::Resource;
     use crate::matrix_game::side::CurrSel;
 
     if state.game.player_side.curr_sel != CurrSel::BaseSelected {
@@ -2284,7 +2287,7 @@ fn refresh_interface_visibility(state: &mut AppState) {
     // phz/rvhz` substitution at CInterface.cpp:4444-4462, applied to
     // the Top panel's always-visible value labels.
     {
-        use crate::matrix_game::robot_units::Resource;
+        use crate::matrix_game::config::Resource;
         let side = &state.game.player_side;
         let titan = side.get_resource_amount(Resource::Titan);
         let elect = side.get_resource_amount(Resource::Electronics);
@@ -2326,7 +2329,7 @@ fn refresh_interface_visibility(state: &mut AppState) {
             // Build button enabled: stack not full + side can afford
             // the live preview cost. Ports CInterface.cpp:1850-1867.
             let mut enough = true;
-            for r in crate::matrix_game::robot_units::Resource::ALL {
+            for r in crate::matrix_game::config::Resource::ALL {
                 if state.game.player_side.get_resource_amount(r) < total_cost.resources[r as usize]
                 {
                     enough = false;
@@ -2345,7 +2348,7 @@ fn refresh_interface_visibility(state: &mut AppState) {
         })
         .unwrap_or((
             None,
-            crate::matrix_game::robot_units::UnitPrice::zero(),
+            crate::matrix_game::interface::constructor::UnitPrice::zero(),
             0,
             0,
             true,

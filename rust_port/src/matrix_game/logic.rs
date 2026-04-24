@@ -20,8 +20,7 @@ use crate::matrix_game::map::GameMap;
 use crate::matrix_game::map_static::{MapStatic, ObjectId, ObjectType, Objects};
 use crate::matrix_game::object::MapObject;
 use crate::matrix_game::object_building::{Building, BuildingType};
-use crate::matrix_game::rnd::Rnd;
-use crate::matrix_game::robot_units::Resource;
+use crate::matrix_game::config::Resource;
 use crate::matrix_game::side::{CurrSel, Side};
 use crate::matrix_lib::base::storage::Storage;
 
@@ -358,68 +357,6 @@ impl MapLogic {
         self.click_at_screen(camera, sx, sy, screen_w, screen_h, false)
     }
 
-    /// Port of the end-of-marquee fold at `CMultiSelection::End`
-    /// (MatrixMultiSelection.cpp). Projects every live own-side robot
-    /// to screen coords and keeps the ones whose projection lands
-    /// inside the axis-aligned rect `[rect_min, rect_max]`. The
-    /// result is committed as the new selection with the first hit
-    /// as `active_object`.
-    pub fn marquee_select(
-        &mut self,
-        camera: &Camera,
-        rect_min: [f32; 2],
-        rect_max: [f32; 2],
-        screen_w: f32,
-        screen_h: f32,
-        shift: bool,
-    ) -> usize {
-        let vp = camera.view_proj();
-        let map_cx = camera.map_cx();
-        let map_cy = camera.map_cy();
-        let mut hits: Vec<ObjectId> = if shift {
-            self.player_side.selected.clone()
-        } else {
-            Vec::new()
-        };
-
-        for id in self.objects.iter_live() {
-            let Some(obj) = self.objects.get(id) else {
-                continue;
-            };
-            if !matches!(obj.core().obj_type, ObjectType::RobotAi) {
-                continue;
-            }
-            if self.object_side(id) != self.player_side.id {
-                continue;
-            }
-            let c = obj.core().geo_center;
-            // View-proj expects centered world (see camera::view_proj
-            // + selection shader — map_center subtracted everywhere).
-            let clip = vp * glam::Vec4::new(c.x - map_cx, c.y - map_cy, c.z, 1.0);
-            if clip.w <= 0.0 {
-                continue;
-            } // behind camera
-            let ndc_x = clip.x / clip.w;
-            let ndc_y = clip.y / clip.w;
-            // NDC → screen (Y flip, same as screen_to_world_ray).
-            let sx = (ndc_x * 0.5 + 0.5) * screen_w;
-            let sy = (1.0 - (ndc_y * 0.5 + 0.5)) * screen_h;
-            if sx >= rect_min[0]
-                && sx <= rect_max[0]
-                && sy >= rect_min[1]
-                && sy <= rect_max[1]
-                && !hits.contains(&id)
-            {
-                hits.push(id);
-            }
-        }
-        let n = hits.len();
-        let primary = hits.last().copied();
-        self.player_side
-            .select_replace(hits, primary, CurrSel::RobotsSelected);
-        n
-    }
-
     /// Right-click move order — ports the order-dispatch path at
     /// `CMatrixSideUnit::OnRButtonDown` + `PGOrderMoveTo` +
     /// `PGAssignPlacePlayer` (MatrixSide.cpp:847, 7953-8010, 8694-
@@ -530,7 +467,7 @@ impl MapLogic {
     }
 
     /// Side id of `obj`, or `0` (neutral) if not resolvable.
-    fn object_side(&self, id: ObjectId) -> i32 {
+    pub(crate) fn object_side(&self, id: ObjectId) -> i32 {
         self.objects.get(id).map(|o| o.side()).unwrap_or(0)
     }
 
@@ -1038,6 +975,141 @@ impl SpawnStats {
     }
 }
 
+// ── Rnd: CMatrixMapLogic's Park–Miller MINSTD LCG ───────────────────────
+//
+// Port of the RNG owned by `CMatrixMapLogic` (MatrixLogic.cpp:84-113).
+// Park–Miller MINSTD LCG with a 32-bit state — the generator the
+// original game uses for all deterministic-world decisions (object
+// animation timers, spawn jitter, tactical noise, etc.). The C++ seeds
+// the generator from `rand()` once at construction and burns one output
+// with `Rnd(0,1)` to mix the seed in (MatrixLogic.cpp:49). `Rnd::new`
+// reproduces that contract for bit-for-bit parity.
+
+/// Recurrence constants from `CMatrixMapLogic::Rnd` (MatrixLogic.cpp:88).
+/// `m_Rnd = 16807 * (m_Rnd % 127773) - 2836 * (m_Rnd / 127773)` —
+/// the classic Schrage-factored MINSTD step. Output is `m_Rnd - 1` so
+/// the stream starts at 0 instead of 1.
+const MINSTD_A: i32 = 16_807;
+const MINSTD_Q: i32 = 127_773; // 2^31-1 / A
+const MINSTD_R: i32 = 2_836; // 2^31-1 % A
+const MINSTD_M_MINUS_1: i32 = 2_147_483_647; // 2^31 - 1
+
+pub struct Rnd {
+    /// Matches `m_Rnd` in CMatrixMapLogic (MatrixLogic.hpp:75).
+    /// Must stay strictly positive; the step reseeds to +(2^31-1) when
+    /// it ever lands at or below zero, so the state never gets stuck.
+    state: i32,
+}
+
+impl Rnd {
+    /// Construct with an explicit seed — matches setting `m_Rnd = seed`
+    /// before the constructor's `Rnd(0,1)` mix-in.
+    pub fn new(seed: i32) -> Self {
+        let mut r = Self { state: seed };
+        let _ = r.range(0, 1);
+        r
+    }
+
+    /// Seed from the platform clock — what the original effectively
+    /// does via `m_Rnd=rand()`. Kept separate so tests can construct
+    /// deterministic streams via [`Rnd::new`].
+    pub fn from_clock() -> Self {
+        let now = crate::platform::now_secs();
+        let bits = now.to_bits() as u64;
+        let seed = ((bits ^ (bits >> 32)) as u32 & 0x7FFF_FFFF) as i32;
+        Self::new(if seed == 0 { 1 } else { seed })
+    }
+
+    /// Raw `CMatrixMapLogic::Rnd()` — one step of the generator.
+    /// Result in `[0, 2^31-2]` (matches the C++ `return m_Rnd-1`).
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> i32 {
+        self.state = MINSTD_A.wrapping_mul(self.state % MINSTD_Q)
+            - MINSTD_R.wrapping_mul(self.state / MINSTD_Q);
+        if self.state <= 0 {
+            self.state = self.state.wrapping_add(MINSTD_M_MINUS_1);
+        }
+        self.state - 1
+    }
+
+    /// `Rnd(zmin, zmax)` — inclusive range on both ends. Mirrors the
+    /// C++ semantics where `zmin > zmax` swaps the endpoints
+    /// (MatrixLogic.cpp:100-106).
+    pub fn range(&mut self, zmin: i32, zmax: i32) -> i32 {
+        if zmin <= zmax {
+            zmin + (self.next() % (zmax - zmin + 1))
+        } else {
+            zmax + (self.next() % (zmin - zmax + 1))
+        }
+    }
+
+    /// `RndFloat()` — uniform `[0, 1]`.
+    pub fn float01(&mut self) -> f64 {
+        self.next() as f64 / (MINSTD_M_MINUS_1 as f64 - 2.0)
+    }
+
+    /// `RndFloat(zmin, zmax)` — uniform float in `[zmin, zmax)`.
+    pub fn float_range(&mut self, zmin: f64, zmax: f64) -> f64 {
+        zmin + self.float01() * (zmax - zmin)
+    }
+}
+
+#[cfg(test)]
+mod rnd_tests {
+    use super::*;
+
+    #[test]
+    fn stream_is_deterministic_for_a_fixed_seed() {
+        let mut a = Rnd::new(12345);
+        let mut b = Rnd::new(12345);
+        for _ in 0..32 {
+            assert_eq!(a.next(), b.next());
+        }
+    }
+
+    #[test]
+    fn range_respects_bounds_and_allows_swapped_endpoints() {
+        let mut r = Rnd::new(42);
+        for _ in 0..200 {
+            let v = r.range(-5, 10);
+            assert!((-5..=10).contains(&v));
+        }
+        for _ in 0..200 {
+            let v = r.range(10, -5);
+            assert!((-5..=10).contains(&v));
+        }
+    }
+
+    #[test]
+    fn float01_is_in_unit_interval() {
+        let mut r = Rnd::new(7);
+        for _ in 0..1000 {
+            let f = r.float01();
+            assert!((0.0..=1.0).contains(&f));
+        }
+    }
+
+    #[test]
+    fn first_draws_match_hand_simulation() {
+        let mut r = Rnd::new(1);
+        let v0 = r.next();
+        let v1 = r.next();
+        let step = |s: &mut i32| {
+            *s = MINSTD_A.wrapping_mul(*s % MINSTD_Q) - MINSTD_R.wrapping_mul(*s / MINSTD_Q);
+            if *s <= 0 {
+                *s = s.wrapping_add(MINSTD_M_MINUS_1);
+            }
+        };
+        let mut expect = 1i32;
+        step(&mut expect);
+        let _ = expect;
+        step(&mut expect);
+        assert_eq!(v0, expect - 1);
+        step(&mut expect);
+        assert_eq!(v1, expect - 1);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1283,14 +1355,14 @@ mod tests {
         config::set_global(g);
 
         let mut w = MapLogic::new();
-        w.player_side.resources = [0; crate::matrix_game::robot_units::MAX_RESOURCES];
+        w.player_side.resources = [0; crate::matrix_game::config::MAX_RESOURCES];
         w.player_side.set_resource_force_up(100);
         spawn_building(&mut w, PLAYER_SIDE, BuildingType::Titan, 0.0, 0.0);
         spawn_building(&mut w, PLAYER_SIDE, BuildingType::Base, 50.0, 0.0);
 
         // Under threshold: nothing credited.
         w.accrue_resources(5_000);
-        assert_eq!(w.player_side.resources, [0; crate::matrix_game::robot_units::MAX_RESOURCES]);
+        assert_eq!(w.player_side.resources, [0; crate::matrix_game::config::MAX_RESOURCES]);
 
         // Past titan threshold only (10_000 < 15_000): +10 titan,
         // 0 elsewhere.
@@ -1317,3 +1389,378 @@ mod tests {
     }
 }
 
+
+// ════════════════════════════════════════════════════════════════════════
+// Local A* pathfinding — ports `CMatrixMapLogic::FindLocalPath` and
+// `OptimizeMovePath` from MatrixLogic.cpp:1217-1400+.
+//
+// `CMatrixMap::FindLocalPath` is the top-level symbol in the C++; the
+// implementation lives alongside the logic RNG and `IsAbsenceWall`
+// passability predicate in `MatrixLogic.cpp`, hence owned here.
+//
+// `MatrixMapTrace.cpp` is reserved for the landscape / object ray-cast
+// side of `CMatrixMap::Trace`, which is a separate concern (picking,
+// weapon hit-tests) implemented in a different file in the original.
+//
+// Waypoint semantics: each path cell `(mx, my)` is the upper-left
+// corner of the robot's 4×4 move-cell footprint; the cell center in
+// world coords is `((mx + 2) * GLOBAL_SCALE_MOVE, (my + 2) * GLOBAL_SCALE_MOVE)`.
+// ════════════════════════════════════════════════════════════════════════
+
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
+
+/// Half of the footprint — how far the robot's center is from its
+/// upper-left corner in move cells.
+pub const ROBOT_FOOTPRINT_HALF: i32 = ROBOT_MOVECELLS_PER_SIZE / 2;
+
+/// A single move-grid waypoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MovePt {
+    pub x: i32,
+    pub y: i32,
+}
+
+impl MovePt {
+    pub fn new(x: i32, y: i32) -> Self {
+        Self { x, y }
+    }
+}
+
+/// Port of the `(other_path_list[i], other_des[i])` tuple fed to
+/// `CMatrixMap::FindLocalPath` (MatrixRobot.cpp:1630-1643). Each
+/// blocker is another live robot (or cannon) whose future footprint
+/// should raise the cost of routing through those cells:
+///   - `pos`: where the robot currently stands — `path_list[0]` in
+///     C++. Weight 30 (MatrixLogic.cpp:1289-1300).
+///   - `dest`: where the robot is heading. Weight 200
+///     (MatrixLogic.cpp:1278-1287).
+///
+/// The C++ version originally also walked the *remaining* path and
+/// stamped `SetWeightFromTo` along it, but that loop is commented
+/// out in the shipped binary (MatrixLogic.cpp:1273-1276), so we
+/// faithfully omit it. Blockers influence `find_path` *cost* only —
+/// A* can still route through them when no detour exists.
+#[derive(Debug, Clone, Copy)]
+pub struct Blocker {
+    /// Current standing cell (upper-left corner of footprint). `None`
+    /// for stationary objects where only the final pos is known.
+    pub pos: Option<MovePt>,
+    /// Destination cell (upper-left corner of footprint).
+    pub dest: MovePt,
+}
+
+/// Port of `m_MovePath[]` contents — a contiguous list of move-cell
+/// waypoints. Usage mirrors the C++: walk `cur..cnt-1`, each pair
+/// `(cur, cur+1)` is the current segment being driven.
+#[derive(Debug, Default, Clone)]
+pub struct MovePath {
+    pub pts: Vec<MovePt>,
+    pub cur: usize,
+    /// Total length in world units (MatrixRobot.cpp:1686-1688).
+    pub total_len: f32,
+    /// How far the robot has traveled along the path so far.
+    pub followed_len: f32,
+}
+
+impl MovePath {
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    pub fn is_active(&self) -> bool {
+        !self.pts.is_empty() && self.cur + 1 < self.pts.len()
+    }
+
+    pub fn current_segment(&self) -> Option<(MovePt, MovePt)> {
+        if self.cur + 1 >= self.pts.len() {
+            return None;
+        }
+        Some((self.pts[self.cur], self.pts[self.cur + 1]))
+    }
+}
+
+/// Passability predicate for a robot-sized footprint anchored at
+/// `(mx, my)`. Port of `CMatrixMapLogic::IsAbsenceWall(chassis, 4,
+/// mx, my)` (MatrixLogic.cpp:513-523): reads the single
+/// precomputed size-4 bit at that cell (`(1 << chassis) << 18`),
+/// which the map's CMAP loader already folded in for us. This is
+/// much cheaper than iterating the 4×4 footprint — the compiled
+/// data already encodes the full-footprint test.
+pub fn footprint_passable(map: &GameMap, mx: i32, my: i32, chassis_kind: usize) -> bool {
+    crate::matrix_game::logic::is_absence_wall(map, chassis_kind, ROBOT_MOVECELLS_PER_SIZE, mx, my)
+}
+
+#[derive(Copy, Clone, PartialEq)]
+struct Node {
+    f: f32,
+    g: f32,
+    x: i32,
+    y: i32,
+}
+impl Eq for Node {}
+impl Ord for Node {
+    fn cmp(&self, o: &Self) -> Ordering {
+        // Min-heap by f.
+        o.f.partial_cmp(&self.f).unwrap_or(Ordering::Equal)
+    }
+}
+impl PartialOrd for Node {
+    fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
+        Some(self.cmp(o))
+    }
+}
+
+/// A* on the move grid with 8-way connectivity. Returns a path
+/// inclusive of `start` and `goal` as move-cell upper-left corners.
+/// The robot's 4×4 footprint must be passable at every cell on the
+/// path (see `footprint_passable`).
+///
+/// `blockers` is a list of `(pos, dest)` cells from other live
+/// robots / cannons. Port of the `other_des` / `other_path_list`
+/// arguments to `CMatrixMap::FindLocalPath` (MatrixRobot.cpp:1658-
+/// 1664 + MatrixLogic.cpp:1217-1301). Each blocker raises the
+/// per-cell traversal weight inside a footprint-sized window:
+///   - `dest` → weight 200 (line 1285),
+///   - `pos`  → weight 30  (line 1297).
+///
+/// Everything else has a base weight of 5. Rust rescales to 1.0 /
+/// 6.0 / 40.0 so the octile heuristic stays admissible at step=1.
+///
+/// Port of `CMatrixMap::FindLocalPath` (MatrixLogic.cpp:1217). The
+/// zone-constraint argument (`zonepath`) is omitted — the regions
+/// network isn't ported yet and the C++ uses it purely as an
+/// efficiency hint (restricts the search rectangle); correctness
+/// is preserved by letting A* see the full map.
+pub fn find_path(
+    map: &GameMap,
+    start: MovePt,
+    goal: MovePt,
+    chassis_kind: usize,
+    blockers: &[Blocker],
+) -> Option<Vec<MovePt>> {
+    let sx = map.size_move_x as i32;
+    let sy = map.size_move_y as i32;
+
+    let in_bounds = |p: MovePt| {
+        p.x >= 0
+            && p.y >= 0
+            && p.x + ROBOT_MOVECELLS_PER_SIZE <= sx
+            && p.y + ROBOT_MOVECELLS_PER_SIZE <= sy
+    };
+    if !in_bounds(start) || !in_bounds(goal) {
+        return None;
+    }
+    if !footprint_passable(map, goal.x, goal.y, chassis_kind) {
+        return None;
+    }
+
+    // Per-cell traversal weight grid. Base = 1.0; each blocker stamps
+    // a footprint window around `pos` (weight 6.0) and `dest`
+    // (weight 40.0). `max` between old and new matches C++ `if(w<200)
+    // w=200` / `if(w<30) w=30` semantics (MatrixLogic.cpp:1285, 1297).
+    let w = sx as usize;
+    let h = sy as usize;
+    let mut weight = vec![1.0_f32; w * h];
+    const W_POS: f32 = 6.0; // C++ 30 / 5
+    const W_DEST: f32 = 40.0; // C++ 200 / 5
+    let stamp = |grid: &mut [f32], c: MovePt, new_w: f32| {
+        // Footprint window = `[c.x-(S-1) .. c.x+S) × [c.y-(S-1) ..
+        // c.y+S)` — same `other_size[i]=4` window the C++ uses at
+        // :1278-1287 and :1290-1299.
+        for dy in -(ROBOT_MOVECELLS_PER_SIZE - 1)..ROBOT_MOVECELLS_PER_SIZE {
+            for dx in -(ROBOT_MOVECELLS_PER_SIZE - 1)..ROBOT_MOVECELLS_PER_SIZE {
+                let bx = c.x + dx;
+                let by = c.y + dy;
+                if bx >= 0 && by >= 0 && bx < sx && by < sy {
+                    let i = (by as usize) * w + (bx as usize);
+                    if grid[i] < new_w {
+                        grid[i] = new_w;
+                    }
+                }
+            }
+        }
+    };
+    for b in blockers {
+        // Dest first (higher weight) then pos — stamp order matches
+        // C++ and the `max` semantics make it order-insensitive.
+        stamp(&mut weight, b.dest, W_DEST);
+        if let Some(p) = b.pos {
+            stamp(&mut weight, p, W_POS);
+        }
+    }
+    // Never penalise our own start cell — the C++ never does because
+    // path_list[0] of the *current* robot was never added to its own
+    // blocker list.
+    weight[(start.y as usize) * w + (start.x as usize)] = 1.0;
+
+    let idx = |p: MovePt| -> usize { (p.y as usize) * w + (p.x as usize) };
+
+    let mut g = vec![f32::INFINITY; w * h];
+    let mut parent = vec![(-1i32, -1i32); w * h];
+    let mut closed = vec![false; w * h];
+
+    let h_cost = |p: MovePt| -> f32 {
+        let dx = (goal.x - p.x).abs() as f32;
+        let dy = (goal.y - p.y).abs() as f32;
+        // Octile distance — admissible for 8-way grid with min weight
+        // 1.0. Safe overestimate for weighted cells (conservative).
+        let (a, b) = if dx < dy { (dx, dy) } else { (dy, dx) };
+        (b - a) + std::f32::consts::SQRT_2 * a
+    };
+
+    let mut open = BinaryHeap::new();
+    g[idx(start)] = 0.0;
+    open.push(Node {
+        f: h_cost(start),
+        g: 0.0,
+        x: start.x,
+        y: start.y,
+    });
+
+    const D: f32 = std::f32::consts::SQRT_2;
+    const MOVES: [(i32, i32, f32); 8] = [
+        (1, 0, 1.0),
+        (-1, 0, 1.0),
+        (0, 1, 1.0),
+        (0, -1, 1.0),
+        (1, 1, D),
+        (1, -1, D),
+        (-1, 1, D),
+        (-1, -1, D),
+    ];
+
+    while let Some(Node { g: gu, x, y, .. }) = open.pop() {
+        let u = MovePt::new(x, y);
+        if u == goal {
+            let mut out = vec![goal];
+            let mut cur = goal;
+            while cur != start {
+                let (px, py) = parent[idx(cur)];
+                if px < 0 {
+                    return None;
+                }
+                cur = MovePt::new(px, py);
+                out.push(cur);
+            }
+            out.reverse();
+            return Some(out);
+        }
+        let iu = idx(u);
+        if closed[iu] {
+            continue;
+        }
+        closed[iu] = true;
+
+        for (dx, dy, step) in MOVES {
+            let v = MovePt::new(u.x + dx, u.y + dy);
+            if !in_bounds(v) {
+                continue;
+            }
+            if !footprint_passable(map, v.x, v.y, chassis_kind) {
+                continue;
+            }
+            if dx != 0 && dy != 0 {
+                if !footprint_passable(map, u.x + dx, u.y, chassis_kind) {
+                    continue;
+                }
+                if !footprint_passable(map, u.x, u.y + dy, chassis_kind) {
+                    continue;
+                }
+            }
+
+            let iv = idx(v);
+            if closed[iv] {
+                continue;
+            }
+            // Step cost = base direction cost × enter-cell weight —
+            // matches C++ `smm->m_Find = smm2->m_Find + smm->m_Weight`
+            // where the step itself is free and the entered cell's
+            // weight dominates (MatrixLogic.cpp:1373).
+            let new_g = gu + step * weight[iv];
+            if new_g + 1e-5 < g[iv] {
+                g[iv] = new_g;
+                parent[iv] = (u.x, u.y);
+                open.push(Node {
+                    f: new_g + h_cost(v),
+                    g: new_g,
+                    x: v.x,
+                    y: v.y,
+                });
+            }
+        }
+    }
+    None
+}
+
+/// Port of `CMatrixMap::OptimizeMovePath` (MatrixRobot.cpp:1681
+/// caller, actual impl in MatrixMapTrace.cpp). Walks the raw A*
+/// path and drops intermediate waypoints whose entire line-of-sight
+/// segment to the latest kept waypoint is passable — yielding a
+/// shorter path of diagonal straight runs.
+///
+/// **No blocker awareness** — matches C++ where `OptimizeMovePath`
+/// takes only `(chassis, size, cnt, path)` and never consults the
+/// dynamic-blocker list. Blockers affected A* cost; the optimizer
+/// collapses the resulting path on pure terrain passability.
+pub fn optimize_path(map: &GameMap, path: &[MovePt], chassis_kind: usize) -> Vec<MovePt> {
+    if path.len() <= 2 {
+        return path.to_vec();
+    }
+    let mut out = Vec::with_capacity(path.len());
+    out.push(path[0]);
+    let mut anchor = 0usize;
+    let mut i = 1usize;
+    while i < path.len() {
+        if i + 1 < path.len() && line_of_sight(map, path[anchor], path[i + 1], chassis_kind) {
+            i += 1;
+        } else {
+            out.push(path[i]);
+            anchor = i;
+            i += 1;
+        }
+    }
+    out
+}
+
+fn line_of_sight(map: &GameMap, a: MovePt, b: MovePt, chassis_kind: usize) -> bool {
+    let dx = b.x - a.x;
+    let dy = b.y - a.y;
+    let steps = dx.abs().max(dy.abs());
+    if steps == 0 {
+        return footprint_passable(map, a.x, a.y, chassis_kind);
+    }
+    let fx = dx as f32 / steps as f32;
+    let fy = dy as f32 / steps as f32;
+    for s in 0..=steps {
+        let x = (a.x as f32 + fx * s as f32).round() as i32;
+        let y = (a.y as f32 + fy * s as f32).round() as i32;
+        if !footprint_passable(map, x, y, chassis_kind) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Compute the total world-space length of a sequence of waypoints,
+/// matching MatrixRobot.cpp:1686-1688.
+pub fn path_total_length(pts: &[MovePt]) -> f32 {
+    let gs = GameMap::GLOBAL_SCALE_MOVE;
+    let mut total = 0.0;
+    for w in pts.windows(2) {
+        let dx = (w[1].x - w[0].x) as f32;
+        let dy = (w[1].y - w[0].y) as f32;
+        total += gs * (dx * dx + dy * dy).sqrt();
+    }
+    total
+}
+
+/// Convert a waypoint's upper-left corner to the world-space center
+/// of the 4×4 footprint.
+pub fn waypoint_to_world(p: MovePt) -> (f32, f32) {
+    let gs = GameMap::GLOBAL_SCALE_MOVE;
+    (
+        (p.x as f32 + ROBOT_FOOTPRINT_HALF as f32) * gs,
+        (p.y as f32 + ROBOT_FOOTPRINT_HALF as f32) * gs,
+    )
+}

@@ -1,6 +1,138 @@
-//! GPU texture utilities — DDS decoding, texture creation, mipmaps.
+//! GPU texture utilities — DDS decoding, texture creation, mipmaps,
+//! plus `CBaseTexture::ParseFlags` material/alpha-test parsing
+//! (Texture.cpp:96-152).
 
 use wgpu::util::DeviceExt;
+
+#[derive(Clone, Debug, Default)]
+pub struct MaterialSpec {
+    pub diffuse: Option<String>,
+    pub gloss: Option<String>,
+    pub back: Option<String>,
+    pub mask: Option<String>,
+    pub scroll: [f32; 2],
+    /// True when the diffuse texture's `ParseFlags` call would set
+    /// `TF_ALPHATEST` (Texture.cpp:96-152). Set eagerly from the
+    /// `?Trans` suffix (Texture.cpp:108); the sibling `.txt` `AlphaTest`
+    /// override (Texture.cpp:131-136) is applied later via
+    /// `resolve_alpha_test_with_txt`, which needs asset I/O.
+    pub alpha_test: bool,
+}
+
+pub fn parse_material_spec(spec: &str) -> MaterialSpec {
+    parse_material_spec_with_prefix(spec, None)
+}
+
+pub fn parse_material_spec_with_prefix(spec: &str, prefix: Option<&str>) -> MaterialSpec {
+    let parts: Vec<&str> = spec.split('*').collect();
+    MaterialSpec {
+        diffuse: parts.first().and_then(|t| resolve_texture_name(t, prefix)),
+        gloss: parts.get(1).and_then(|t| resolve_texture_name(t, prefix)),
+        back: parts.get(2).and_then(|t| resolve_texture_name(t, prefix)),
+        mask: parts.get(3).and_then(|t| resolve_texture_name(t, prefix)),
+        scroll: parts.get(4).map(|t| parse_scroll(t)).unwrap_or([0.0, 0.0]),
+        alpha_test: parts.first().is_some_and(|t| has_trans_suffix(t)),
+    }
+}
+
+pub fn merge_materials(base: &MaterialSpec, overlay: Option<&MaterialSpec>) -> MaterialSpec {
+    let Some(overlay) = overlay else {
+        return base.clone();
+    };
+    let (diffuse, alpha_test) = if overlay.diffuse.is_some() {
+        (overlay.diffuse.clone(), overlay.alpha_test)
+    } else {
+        (base.diffuse.clone(), base.alpha_test)
+    };
+    MaterialSpec {
+        diffuse,
+        gloss: overlay.gloss.clone().or_else(|| base.gloss.clone()),
+        back: overlay.back.clone().or_else(|| base.back.clone()),
+        mask: overlay.mask.clone().or_else(|| base.mask.clone()),
+        scroll: if overlay.scroll != [0.0, 0.0] {
+            overlay.scroll
+        } else {
+            base.scroll
+        },
+        alpha_test,
+    }
+}
+
+/// Ports the `?Trans` flag detection inside `CBaseTexture::ParseFlags`
+/// (Texture.cpp:102-111). The raw texture spec is `path?Opt1?Opt2?...`; any
+/// `Trans` option sets `TF_ALPHATEST`. Case-sensitive match mirrors the
+/// original `CWStr::Equal` memcmp.
+pub fn has_trans_suffix(raw: &str) -> bool {
+    let raw = raw.trim().trim_end_matches('\0');
+    let mut parts = raw.split('?');
+    parts.next();
+    parts.any(|opt| opt.trim() == "Trans")
+}
+
+/// Ports the sibling `.txt` override pass of `CBaseTexture::ParseFlags`
+/// (Texture.cpp:113-136). Skips `pinguin.txt` / `robotarget.txt` because
+/// those carry unrelated block content (Texture.cpp:121-124).
+pub fn resolve_alpha_test_with_txt(
+    diffuse_path: &str,
+    suffix_flag: bool,
+    read_file: &dyn Fn(&str) -> Option<Vec<u8>>,
+) -> bool {
+    let txt_path = replace_extension(diffuse_path, "txt");
+    if txt_path.contains("pinguin.txt") || txt_path.contains("robotarget.txt") {
+        return suffix_flag;
+    }
+    let Some(bytes) = read_file(&txt_path) else {
+        return suffix_flag;
+    };
+    let bp = crate::matrix_lib::base::blockpar::BlockPar::parse_bytes(&bytes);
+    match bp.par_get_ne("AlphaTest") {
+        Some(v) => {
+            let trimmed = v.trim();
+            if trimmed.is_empty() {
+                suffix_flag
+            } else {
+                trimmed != "0"
+            }
+        }
+        None => suffix_flag,
+    }
+}
+
+fn replace_extension(path: &str, new_ext: &str) -> String {
+    match path.rsplit_once('.') {
+        Some((stem, _)) => format!("{stem}.{new_ext}"),
+        None => format!("{path}.{new_ext}"),
+    }
+}
+
+pub fn resolve_texture_name(raw: &str, prefix: Option<&str>) -> Option<String> {
+    let name = raw.trim().trim_end_matches('\0');
+    if name.is_empty() || name == "." {
+        return None;
+    }
+    let name = name.split('?').next().unwrap_or("").trim();
+    if name.is_empty() {
+        return None;
+    }
+    let normalized = name.trim_start_matches(".\\").replace('\\', "/");
+    match prefix {
+        Some(prefix) if !normalized.contains('/') => Some(format!("{prefix}{normalized}")),
+        _ => Some(normalized),
+    }
+}
+
+pub fn parse_scroll(raw: &str) -> [f32; 2] {
+    let mut it = raw.split(',');
+    let u = it
+        .next()
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .unwrap_or(0.0);
+    let v = it
+        .next()
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .unwrap_or(0.0);
+    [u, v]
+}
 
 /// Decode DDS (DXT1/DXT3/DXT5) or standard image formats.
 pub fn decode_texture_bytes(data: &[u8]) -> Option<image::RgbaImage> {

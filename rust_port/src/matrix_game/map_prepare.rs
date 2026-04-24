@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 
 use crate::matrix_game::common::TEX_BOTTOM_SIZE;
-use crate::matrix_lib::base::bitmap::{
+use crate::matrix_lib::bitmap::{
     blit_tile, copy_col, copy_row, merge_by_mask, merge_with_alpha,
 };
 use crate::matrix_lib::base::storage::Storage;
