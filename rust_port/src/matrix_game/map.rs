@@ -328,6 +328,15 @@ pub struct BuildingInstance {
     pub kind: u8,
     pub shadow_kind: u8,
     pub shadow_size: i32,
+    /// Port of `m_TurretsPlacesCnt` (MatrixObjectBuilding.hpp:187) — the
+    /// number of factory/turret slots assigned to this building by the
+    /// cannon-placement pass in MatrixMapPrepare.cpp:776-897. Computed by
+    /// scanning `cannons` records in the CMAP: each cannon with `prop=1`
+    /// (factory cannon) or `prop=2` (place-only) attaches to the nearest
+    /// building inside `MAX_DISTANCE_CANNON_BUILDING` and capped at
+    /// `MAX_PLACES`. Drives the turret-UI slot-count visibility
+    /// (`podl1..4` on the Main panel).
+    pub turrets_places_cnt: i32,
 }
 
 impl GameMap {
@@ -1474,8 +1483,61 @@ fn load_buildings(
             kind: *kinds.get(i).unwrap_or(&0),
             shadow_kind: *shadows.get(i).unwrap_or(&0),
             shadow_size: shszs.get(i).copied().unwrap_or(128),
+            turrets_places_cnt: 0,
         });
     }
+
+    // Port of MatrixMapPrepare.cpp:776-897 — scan `cannons` records and
+    // attach each cannon (prop=1 or 2) to the nearest building within
+    // `MAX_DISTANCE_CANNON_BUILDING` (500 world units / `GLOBAL_SCALE`).
+    // Each attachment increments that building's `m_TurretsPlacesCnt`,
+    // which later clamps `m_TurretsMax = min(4, cnt)` so podl1..4 show
+    // the right slot count.
+    if let (Some(cxb), Some(cyb)) = (stor.get_buf("cannons", "X"), stor.get_buf("cannons", "Y")) {
+        let cx_arr = read_f32_array(cxb.get_bytes(0));
+        let cy_arr = read_f32_array(cyb.get_bytes(0));
+        // `prop` column is OPTIONAL in the C++ (CMapPrepare.cpp:794 — `pr
+        // = c7 ? c7->GetFirst<INT32>(0) : NULL`). When absent, the loop
+        // that attaches cannons to buildings is skipped entirely
+        // (MatrixMapPrepare.cpp:816 `if (pr)`). Mirror that: if the CMAP
+        // has no `prop` buffer, leave every building at 0 places.
+        let props: Vec<i32> = stor
+            .get_buf("cannons", "Prop")
+            .map(|b| read_i32_array(b.get_bytes(0)))
+            .unwrap_or_default();
+        if !props.is_empty() {
+            const MAX_PLACES: i32 = 4;
+            const MAX_DIST: f32 = 500.0;
+            const MAX_DIST_SQ: f32 = MAX_DIST * MAX_DIST;
+            let cn = cx_arr.len().min(cy_arr.len()).min(props.len());
+            for ci in 0..cn {
+                let prop = props[ci];
+                if prop != 1 && prop != 2 {
+                    continue;
+                }
+                let cxv = cx_arr[ci];
+                let cyv = cy_arr[ci];
+                let mut best: Option<usize> = None;
+                let mut best_d2 = f32::INFINITY;
+                for (bi, b) in out.iter().enumerate() {
+                    if b.turrets_places_cnt >= MAX_PLACES {
+                        continue;
+                    }
+                    let dx = cxv - b.x;
+                    let dy = cyv - b.y;
+                    let d2 = dx * dx + dy * dy;
+                    if d2 < best_d2 && d2 < MAX_DIST_SQ {
+                        best_d2 = d2;
+                        best = Some(bi);
+                    }
+                }
+                if let Some(bi) = best {
+                    out[bi].turrets_places_cnt += 1;
+                }
+            }
+        }
+    }
+
     out
 }
 

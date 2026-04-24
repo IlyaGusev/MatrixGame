@@ -232,6 +232,13 @@ impl MapLogic {
             if hp > 0 {
                 b.init_max_hitpoint(hp as f32);
             }
+            // Port of MatrixMapPrepare.cpp:891 —
+            //   cb->m_TurretsMax = min(cb->m_TurretsMax, cb->m_TurretsPlacesCnt);
+            // clamps the per-kind `EBuildingTurrets` cap (always 4) to the
+            // number of cannon slots actually defined in the CMAP for
+            // this building. Without this, every base shows `podl4` even
+            // when the map only places 2 or 3 turret slots.
+            b.turrets_max = b.turrets_max.min(inst.turrets_places_cnt);
             let id = self.objects.spawn(Box::new(b));
             if let Some(obj) = self.objects.get_mut(id) {
                 let b_mut: &mut Building =

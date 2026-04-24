@@ -1801,6 +1801,7 @@ mod tests {
             kind,
             shadow_kind: 0,
             shadow_size: 128,
+            turrets_places_cnt: 4,
         }
     }
 
