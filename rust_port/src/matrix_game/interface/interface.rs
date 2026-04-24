@@ -186,13 +186,19 @@ impl CInterface {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
+        let hinted: Vec<&str> = elements
+            .iter()
+            .filter(|e| !e.hint_template.is_empty())
+            .map(|e| e.name.as_str())
+            .collect();
         log::info!(
-            "iface: loaded {} design=({},{}) id={} elements={}",
+            "iface: loaded {} design=({},{}) id={} elements={} hinted={:?}",
             name,
             design_x,
             design_y,
             id,
-            elements.len()
+            elements.len(),
+            hinted
         );
         Some(Self {
             name: name.to_string(),
@@ -964,6 +970,12 @@ fn load_element(stor: &Storage, rec: &str, kind: ElementKind) -> Option<IFaceEle
         return None;
     }
 
+    // Port of the per-element `Hint` param parse at CInterface.cpp:
+    // 229-235 (Button) / :536-542 (Static). Comma-separated
+    // `template,x,y` — missing or empty leaves the hint unset.
+    let (hint_template, hint_offset_x, hint_offset_y) =
+        parse_hint_param(stor, rec).unwrap_or_default();
+
     Some(IFaceElement {
         name,
         kind,
@@ -982,7 +994,37 @@ fn load_element(stor: &Storage, rec: &str, kind: ElementKind) -> Option<IFaceEle
         labels: Default::default(),
         cur_state: def_state,
         def_state,
+        hint_template,
+        hint_offset_x,
+        hint_offset_y,
     })
+}
+
+/// Split a `Hint` param value into `(template, x, y)`. The C++ uses
+/// `CWStr::GetStrPar(0, ",")` + `GetIntPar(1, ",")` + `GetIntPar(2, ",")`.
+/// We replicate that with a simple comma split + trims. Returns `None`
+/// when the param is missing or empty; returns `Some((String::new(),
+/// 0, 0))` for malformed values so callers short-circuit on the empty
+/// template name.
+fn parse_hint_param(stor: &Storage, rec: &str) -> Option<(String, i32, i32)> {
+    let raw = stor.block_param(rec, "Hint")?;
+    if raw.is_empty() {
+        return None;
+    }
+    let mut it = raw.split(',');
+    let template = it.next().unwrap_or("").trim().to_string();
+    let x = it
+        .next()
+        .and_then(|s| s.trim().parse::<i32>().ok())
+        .unwrap_or(0);
+    let y = it
+        .next()
+        .and_then(|s| s.trim().parse::<i32>().ok())
+        .unwrap_or(0);
+    if template.is_empty() {
+        return None;
+    }
+    Some((template, x, y))
 }
 
 /// Faithful port of the labels-walking loop in CInterface::Load

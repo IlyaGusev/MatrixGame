@@ -19,9 +19,11 @@ use wgpu::util::DeviceExt;
 
 use crate::matrix_lib::three_g::texture::{create_texture_from_rgba, decode_texture_bytes};
 
+use super::hint::{Hint, HintChromeLibrary, HintPart};
 use super::iface_element::ElementState;
 use super::interface::{CInterface, DESIGN_H};
 use super::text::{create_atlas_texture, parse_rich_text, GlyphAtlas, RichRun, TEXT_ATLAS_KEY};
+
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
@@ -38,10 +40,14 @@ struct Uniforms {
 }
 
 /// One loaded atlas — keeps the texture view + bind group alive for
-/// the lifetime of the renderer.
+/// the lifetime of the renderer, plus the pixel dimensions needed to
+/// normalise arbitrary (x, y, w, h) subrects into 0..=1 UVs (the 9-
+/// slice hint chrome + inline resource icons need this).
 struct Atlas {
     _tex: wgpu::TextureView,
     bind_group: wgpu::BindGroup,
+    width: u32,
+    height: u32,
 }
 
 /// One draw-bucket per atlas per frame — a contiguous vertex range
@@ -266,6 +272,8 @@ impl InterfaceRenderer {
             Atlas {
                 _tex: view,
                 bind_group,
+                width: self.glyph_atlas.width(),
+                height: self.glyph_atlas.height(),
             },
         );
         self.glyph_atlas_generation = self.glyph_atlas.generation;
@@ -342,8 +350,46 @@ impl InterfaceRenderer {
             Atlas {
                 _tex: view,
                 bind_group,
+                width: rgba.width(),
+                height: rgba.height(),
             },
         );
+    }
+
+    /// Preload the hint chrome atlases. Called at init right after
+    /// `preload_for_panels`. Mirrors `CMatrixHint::PreloadBitmaps`
+    /// (MatrixHint.cpp:441-459) — loads the border0 PNG + every alias
+    /// in `Hints/Bitmaps` (resource icons, face portraits, etc.).
+    pub fn preload_hint_chrome(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        read: &dyn Fn(&str) -> Option<Vec<u8>>,
+        chrome: &HintChromeLibrary,
+    ) {
+        for border in chrome.borders.values() {
+            if !border.source_path.is_empty() {
+                self.ensure_atlas(device, queue, read, &border.source_path);
+            }
+        }
+        for bmp in chrome.bitmaps.values() {
+            if !bmp.path.is_empty() {
+                self.ensure_atlas(device, queue, read, &bmp.path);
+            }
+        }
+    }
+
+    /// `(width, height)` of the PNG bound under `path`, or `None` if
+    /// not loaded. Used by the hint builder to resolve inline
+    /// `_BITMAP:` sizes (the AFT glyph layout needs to know how much
+    /// horizontal space each resource icon consumes).
+    pub fn atlas_size(&self, path: &str) -> Option<(u32, u32)> {
+        let key = normalise_atlas_key(path);
+        self.atlases.get(&key).map(|a| (a.width, a.height))
+    }
+
+    pub fn glyph_atlas_mut(&mut self) -> &mut GlyphAtlas {
+        &mut self.glyph_atlas
     }
 
     /// Preload every atlas referenced by the given panels. Called once
@@ -395,7 +441,25 @@ impl InterfaceRenderer {
         screen_w: f32,
         screen_h: f32,
     ) {
-        self.upload_inner(device, queue, panels, popup, screen_w, screen_h);
+        self.upload_inner(device, queue, panels, popup, None, None, screen_w, screen_h);
+    }
+
+    /// Full-fat upload that also renders a hovering tooltip on top.
+    /// Port of the `CMatrixHint::DrawAll` pass at MatrixHint.cpp:
+    /// 830-862 — stacked last so the hint's chrome + text/icons
+    /// always sit above panels + popup.
+    pub fn upload_with_popup_and_hint(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        panels: &[&CInterface],
+        popup: Option<&super::iface_menu::CIFaceMenu>,
+        hint: Option<&Hint>,
+        chrome: Option<&HintChromeLibrary>,
+        screen_w: f32,
+        screen_h: f32,
+    ) {
+        self.upload_inner(device, queue, panels, popup, hint, chrome, screen_w, screen_h);
     }
 
     /// Compatibility shim — same as upload_with_popup with no popup.
@@ -407,15 +471,18 @@ impl InterfaceRenderer {
         screen_w: f32,
         screen_h: f32,
     ) {
-        self.upload_inner(device, queue, panels, None, screen_w, screen_h);
+        self.upload_inner(device, queue, panels, None, None, None, screen_w, screen_h);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn upload_inner(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         panels: &[&CInterface],
         popup: Option<&super::iface_menu::CIFaceMenu>,
+        hint: Option<&Hint>,
+        chrome: Option<&HintChromeLibrary>,
         screen_w: f32,
         screen_h: f32,
     ) {
@@ -991,6 +1058,24 @@ impl InterfaceRenderer {
             }
         }
 
+        // Tooltip overlay — drawn last so it always sits on top.
+        // Port of `CMatrixHint::DrawAll` (MatrixHint.cpp:830-862).
+        // Layout + 9-slice geometry lives in `hint.rs`; `emit_hint`
+        // here is a dumb vertex emitter.
+        if let (Some(h), Some(c)) = (hint, chrome) {
+            emit_hint(
+                &mut all_verts,
+                &mut current_key,
+                &mut current_start,
+                &mut self.draw_groups,
+                &mut self.glyph_atlas,
+                &self.atlases,
+                c,
+                h,
+                scale,
+            );
+        }
+
         static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         // Log once on change. We check if the count for any panel
         // differs from the last log.
@@ -1078,6 +1163,139 @@ impl InterfaceRenderer {
 /// `MATRIX/IFACE/INTERFACE2`) collapse to the same string.
 fn normalise_atlas_key(path: &str) -> String {
     path.replace('\\', "/").to_lowercase()
+}
+
+/// Emit one hint's draw commands. Visual logic (9-slice layout,
+/// part positioning) already lives in `hint.rs`; this function is a
+/// dumb vertex emitter that:
+///   1. Opens a run keyed by the border atlas path, streams
+///      `hint.slice_draws(chrome, scale)`.
+///   2. For each `HintPart`: text parts go through the glyph atlas
+///      (`emit_rich_line`), bitmap parts open a run keyed by the
+///      bitmap's PNG path and stream one textured quad.
+fn emit_hint(
+    all_verts: &mut Vec<Vertex>,
+    current_key: &mut Option<String>,
+    current_start: &mut u32,
+    draw_groups: &mut Vec<DrawGroup>,
+    glyph_atlas: &mut GlyphAtlas,
+    atlases: &HashMap<String, Atlas>,
+    chrome: &HintChromeLibrary,
+    hint: &Hint,
+    scale: f32,
+) {
+    // ── 9-slice chrome (layout produced by `Hint::slice_draws`) ─────
+    if let Some(path) = hint.border_source_path(chrome) {
+        let atlas_key = normalise_atlas_key(path);
+        if let Some(atlas) = atlases.get(&atlas_key) {
+            let tw = atlas.width as f32;
+            let th = atlas.height as f32;
+            open_run(&atlas_key, current_key, current_start, all_verts, draw_groups);
+            for d in hint.slice_draws(chrome, scale) {
+                let u0 = d.tex_x as f32 / tw;
+                let v0 = d.tex_y as f32 / th;
+                let u1 = (d.tex_x + d.tex_w) as f32 / tw;
+                let v1 = (d.tex_y + d.tex_h) as f32 / th;
+                let (x, y, w, h) = (d.screen_x, d.screen_y, d.screen_w, d.screen_h);
+                all_verts.extend_from_slice(&[
+                    Vertex { pos: [x, y], uv: [u0, v0], tint: [1.0; 4] },
+                    Vertex { pos: [x + w, y], uv: [u1, v0], tint: [1.0; 4] },
+                    Vertex { pos: [x, y + h], uv: [u0, v1], tint: [1.0; 4] },
+                    Vertex { pos: [x + w, y], uv: [u1, v0], tint: [1.0; 4] },
+                    Vertex { pos: [x + w, y + h], uv: [u1, v1], tint: [1.0; 4] },
+                    Vertex { pos: [x, y + h], uv: [u0, v1], tint: [1.0; 4] },
+                ]);
+            }
+        }
+    }
+
+    // ── Parts (text + inline bitmaps) ───────────────────────────────
+    for part in &hint.parts {
+        match part {
+            HintPart::Text { x, y, text, font, color, .. } => {
+                if text.is_empty() {
+                    continue;
+                }
+                // One `_TEXT:` can span multiple rendered lines
+                // (explicit `<br>` or wrap). The hint layout already
+                // picked the per-line widths; here we render each
+                // `\n`-separated sub-line at its own vertical stride.
+                let line_stride_px = glyph_atlas.line_height(font) as f32 * scale;
+                let base_x = hint.screen_x + *x as f32 * scale;
+                let base_y = hint.screen_y + *y as f32 * scale;
+                for (line_idx, line) in text.split('\n').enumerate() {
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let runs = parse_rich_text(line);
+                    emit_rich_line(
+                        all_verts,
+                        current_key,
+                        current_start,
+                        draw_groups,
+                        glyph_atlas,
+                        font,
+                        &runs,
+                        scale,
+                        base_x,
+                        base_y + line_idx as f32 * line_stride_px,
+                        0,
+                        0,
+                        *color,
+                    );
+                }
+            }
+            HintPart::Bitmap { x, y, w, h, name } => {
+                let Some(bmp) = chrome.bitmaps.get(name) else {
+                    continue;
+                };
+                let key = normalise_atlas_key(&bmp.path);
+                if !atlases.contains_key(&key) {
+                    continue;
+                }
+                open_run(&key, current_key, current_start, all_verts, draw_groups);
+                let px = hint.screen_x + *x as f32 * scale;
+                let py = hint.screen_y + *y as f32 * scale;
+                let pw = *w as f32 * scale;
+                let ph = *h as f32 * scale;
+                all_verts.extend_from_slice(&[
+                    Vertex { pos: [px, py], uv: [0.0, 0.0], tint: [1.0; 4] },
+                    Vertex { pos: [px + pw, py], uv: [1.0, 0.0], tint: [1.0; 4] },
+                    Vertex { pos: [px, py + ph], uv: [0.0, 1.0], tint: [1.0; 4] },
+                    Vertex { pos: [px + pw, py], uv: [1.0, 0.0], tint: [1.0; 4] },
+                    Vertex { pos: [px + pw, py + ph], uv: [1.0, 1.0], tint: [1.0; 4] },
+                    Vertex { pos: [px, py + ph], uv: [0.0, 1.0], tint: [1.0; 4] },
+                ]);
+            }
+        }
+    }
+}
+
+/// Open (or extend) a draw run keyed by `key`. Closes the previous
+/// run if the key changes. Called before streaming any vertices that
+/// sample a particular atlas.
+fn open_run(
+    key: &str,
+    current_key: &mut Option<String>,
+    current_start: &mut u32,
+    all_verts: &Vec<Vertex>,
+    draw_groups: &mut Vec<DrawGroup>,
+) {
+    if current_key.as_deref() == Some(key) {
+        return;
+    }
+    if let Some(k) = current_key.take() {
+        let end = all_verts.len() as u32;
+        if end > *current_start {
+            draw_groups.push(DrawGroup {
+                atlas_key: k,
+                start: *current_start,
+                count: end - *current_start,
+            });
+        }
+    }
+    *current_key = Some(key.to_string());
+    *current_start = all_verts.len() as u32;
 }
 
 /// Lay out a sequence of [`RichRun`]s at `(anchor_x, anchor_y)` in

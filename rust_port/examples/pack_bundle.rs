@@ -41,13 +41,18 @@ fn main() {
 
     // Global game data (Sky / Water / Side / ... block par tree).
     // Optional — the renderer falls back to defaults if missing.
-    match std::fs::read("../Data/robots.dat") {
+    let dat_bytes = std::fs::read("../Data/robots.dat");
+    let dat_stor: Option<Storage> = match &dat_bytes {
         Ok(data) => {
             println!("  robots.dat ({} bytes)", data.len());
-            bundle.add("robots.dat", data);
+            bundle.add("robots.dat", data.clone());
+            Storage::from_bytes(data).ok()
         }
-        Err(e) => eprintln!("  skip robots.dat: {}", e),
-    }
+        Err(e) => {
+            eprintln!("  skip robots.dat: {}", e);
+            None
+        }
+    };
 
     let strings = stor.get_buf("strings", "String").unwrap();
     let mut tex_count = 0;
@@ -132,6 +137,30 @@ fn main() {
     // Progress-bar sprite used by `CMatrixProgressBar`
     // (MatrixProgressBar.cpp:22 `TEXTURE_PATH_PB`). Ships only as DDS.
     extra_paths.push("Matrix/Textures/pb".to_string());
+    // Hint chrome + inline resource icons — referenced by
+    // `CMatrixHint::PreloadBitmaps` (MatrixHint.cpp:441-459). Sources
+    // come from `da/Hints/0/Source` (border0) and every alias under
+    // `da/Hints/Bitmaps` (res_* / face_* / exit* / stat_* / bhole*).
+    // Resolve the aliases from the shipped robots.dat so this list
+    // stays in sync with whatever the data team names the hint assets.
+    if let Some(dat_s) = dat_stor.as_ref() {
+        if let Some(hints_rec) = dat_s.block_record("da", "Hints") {
+            if let Some(b0) = dat_s.block_record(&hints_rec, "0") {
+                if let Some(path) = dat_s.block_param(&b0, "Source") {
+                    extra_paths.push(path);
+                }
+            }
+            if let Some(bmps_rec) = dat_s.block_record(&hints_rec, "Bitmaps") {
+                if let (Some(keys), Some(vals)) =
+                    (dat_s.get_buf(&bmps_rec, "0"), dat_s.get_buf(&bmps_rec, "1"))
+                {
+                    for i in 0..keys.arrays_count().min(vals.arrays_count()) {
+                        extra_paths.push(vals.get_as_wstr(i));
+                    }
+                }
+            }
+        }
+    }
     // Sky panorama textures referenced by the hardcoded sky config table in
     // `renderer/sky.rs::resolve_sky_texture`. Pack all of them so every sky
     // name resolves regardless of which map is loaded next.

@@ -275,6 +275,19 @@ impl BuildStack {
                 robot.robot_spawn(parent_self_id, parent_angle_quad, parent_pos.z);
                 robot.set_team(team);
                 robot.config = cfg;
+                // Initialise HP from the summed structure of the
+                // equipped chassis + armor + head. Mirrors
+                // `CMatrixRobotAI::CalcRobotMass` →
+                // `InitMaxHitpoint(hp)` at MatrixRobot.cpp:4150-4293.
+                let hp = crate::matrix_game::interface::constructor::raw_hitpoint_of_live(
+                    &cfg.chassis,
+                    &cfg.hull,
+                    &cfg.head,
+                ) as f32;
+                if hp > 0.0 {
+                    robot.hit_point_max = hp;
+                    robot.hit_point = hp;
+                }
                 // Port of CConstructor.cpp:218 — populate the display
                 // name (m_Name) using the construction-name helper.
                 robot.name = crate::matrix_game::interface::constructor::name_of_live(

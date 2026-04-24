@@ -219,6 +219,15 @@ impl ApplicationHandler for App {
                 &read,
                 iface_list.panels.iter(),
             );
+            // Port of `CMatrixHint::PreloadBitmaps` (MatrixHint.cpp:
+            // 441-459) — load the 9-slice border PNG + every alias in
+            // `Hints/Bitmaps` (res_titan / res_energy / face_N / …).
+            iface_renderer.preload_hint_chrome(
+                &gfx.device,
+                &gfx.queue,
+                &read,
+                &iface_list.hint_chrome,
+            );
             let mut progress_bars = crate::matrix_game::progress_bar::ProgressBarRenderer::new(
                 &gfx.device,
                 &gfx.config,
@@ -372,6 +381,12 @@ impl ApplicationHandler for App {
                     &gfx.queue,
                     &read,
                     iface_list.panels.iter(),
+                );
+                iface_renderer.preload_hint_chrome(
+                    &gfx.device,
+                    &gfx.queue,
+                    &read,
+                    &iface_list.hint_chrome,
                 );
                 let mut progress_bars = crate::matrix_game::progress_bar::ProgressBarRenderer::new(
                     &gfx.device,
@@ -816,6 +831,37 @@ impl ApplicationHandler for App {
                 // :264-360 (Render).
                 tick_builder_preview(state, dt * 1000.0);
 
+                // Tooltip timer + dynamic hint text refresh. Port of
+                // `CIFaceList::OnMouseMove` hint build pass at
+                // CIFaceButton.cpp:134-145 combined with
+                // `AddHintReplacements` (CInterface.cpp:4439-4540).
+                refresh_hint_replacements(state);
+                {
+                    let w = state.gfx.config.width as f32;
+                    let h = state.gfx.config.height as f32;
+                    // Snapshot each loaded hint-bitmap's pixel
+                    // dimensions up front so the hint layout engine
+                    // can size inline resource icons without re-
+                    // borrowing `iface_renderer` (which we need as
+                    // &mut for the glyph atlas). The snapshot is
+                    // cheap — there are ~30 alias entries.
+                    let mut sizes: std::collections::HashMap<String, (i32, i32)> =
+                        std::collections::HashMap::new();
+                    for bmp in state.iface_list.hint_chrome.bitmaps.values() {
+                        if let Some((w, h)) = state.iface_renderer.atlas_size(&bmp.path) {
+                            sizes.insert(bmp.path.clone(), (w as i32, h as i32));
+                        }
+                    }
+                    let sizer = |path: &str| sizes.get(path).copied();
+                    state.iface_list.update(
+                        dt * 1000.0,
+                        w,
+                        h,
+                        state.iface_renderer.glyph_atlas_mut(),
+                        &sizer,
+                    );
+                }
+
                 state.camera.takt(dt * 1000.0); // camera update (ms)
                 state.minimap.takt(dt * 1000.0);
                 state.terrain.takt(
@@ -961,11 +1007,13 @@ impl ApplicationHandler for App {
                         {
                             let panels: Vec<&crate::matrix_game::interface::CInterface> =
                                 state.iface_list.panels.iter().collect();
-                            state.iface_renderer.upload_with_popup(
+                            state.iface_renderer.upload_with_popup_and_hint(
                                 &state.gfx.device,
                                 &state.gfx.queue,
                                 &panels,
                                 state.iface_list.popup.as_ref(),
+                                state.iface_list.hint_system.active(),
+                                Some(&state.iface_list.hint_chrome),
                                 state.gfx.config.width as f32,
                                 state.gfx.config.height as f32,
                             );
@@ -1529,6 +1577,135 @@ fn preview_popup_hover(
     // panel so hovering a popup row gives the same readouts as
     // hovering the equivalent template button would.
     builder.set_labels_and_price(ty, item.kind);
+}
+
+/// Seed dynamic `[key]` replacement values on `IFaceList::hint_replacer`
+/// based on the hovered element name. Port of
+/// `CIFaceList::AddHintReplacements` (CInterface.cpp:4439-4540) — we
+/// only populate values for the element the pointer currently owns so
+/// the map stays lean and the per-frame cost is O(1).
+///
+/// The original mutates the global `PAR_REPLACE` block in place;
+/// `HintReplacer` is the Rust equivalent. Values that depend on live
+/// state (resource income, robot counts) are refreshed every frame so
+/// a long-held hover shows up-to-date numbers.
+fn refresh_hint_replacements(state: &mut AppState) {
+    use crate::matrix_game::robot_units::Resource;
+
+    // `HintSystem::update` early-returns when nothing is hovered, so
+    // we can skip the full refresh when the focused element has no
+    // hint. Cheaper than rebuilding the income query every frame.
+    let Some((pi, ei)) = state.iface_list.focused else {
+        return;
+    };
+    let Some(panel) = state.iface_list.panels.get(pi) else {
+        return;
+    };
+    let Some(elem) = panel.elements.get(ei) else {
+        return;
+    };
+    if elem.hint_template.is_empty() {
+        return;
+    }
+    let elem_name = elem.name.clone();
+    let side_id = state.game.player_side.id;
+    let repl = &mut state.iface_list.hint_replacer;
+    match elem_name.as_str() {
+        "thz" => {
+            let (base_i, fa_i) = state.game.compute_resource_income(side_id, Resource::Titan);
+            repl.set("_titan_income", (base_i + fa_i).to_string());
+        }
+        "enhz1" | "enhz2" => {
+            let (base_i, fa_i) = state.game.compute_resource_income(side_id, Resource::Energy);
+            repl.set("_energy_income", (base_i + fa_i).to_string());
+        }
+        "elhz" => {
+            let (base_i, fa_i) =
+                state.game.compute_resource_income(side_id, Resource::Electronics);
+            repl.set("_electronics_income", (base_i + fa_i).to_string());
+        }
+        "phz" => {
+            let (base_i, fa_i) = state.game.compute_resource_income(side_id, Resource::Plasma);
+            repl.set("_plasma_income", (base_i + fa_i).to_string());
+        }
+        "rvhz" => {
+            let total = state.game.player_side.robots_cnt;
+            let max = state.game.compute_max_side_robots(side_id);
+            repl.set("_total_robots", total.to_string());
+            repl.set("_max_robots", max.to_string());
+        }
+        "tur1" | "tur2" | "tur3" | "tur4" => {
+            // Port of CInterface.cpp:4463-4519 turret hint replacements.
+            // One call per turret slot; the template `BuildTurret`
+            // references `_turret_name`, `_turret_range`,
+            // `_turret_structure`, `_turret_damage`, `_turret_res1..4`.
+            let idx = match elem_name.as_str() {
+                "tur1" => 0,
+                "tur2" => 1,
+                "tur3" => 2,
+                "tur4" => 3,
+                _ => unreachable!(),
+            };
+            let (name_label, range_label) =
+                state.iface_list.hint_replacer.turret_label(idx);
+            let name_label = name_label.to_string();
+            let range_label = range_label.to_string();
+            let cfg = crate::matrix_game::config::global();
+            let cannon = cfg.turrets.cannons[idx];
+            // Structure: hitpoint / 10 (matches CInterface.cpp:4467).
+            let structure = (cannon.hitpoint / 10.0) as i32;
+            // Damage per second — shots/sec × per-shot damage, then
+            // /10 to match the UI's display scale. Mirrors
+            // CInterface.cpp:4464 `damage = (1 / (cooldown/1000)) *
+            // m_RobotDamages[…].damage`.
+            use crate::matrix_game::effects::weapon::{
+                weap_to_index, WEAPON_CANNON0, WEAPON_CANNON1, WEAPON_CANNON2, WEAPON_CANNON3,
+            };
+            let cannon_weap = [
+                WEAPON_CANNON0,
+                WEAPON_CANNON1,
+                WEAPON_CANNON2,
+                WEAPON_CANNON3,
+            ][idx];
+            let cannon_idx = weap_to_index(cannon_weap).unwrap_or(0);
+            let cooldown_ms = cfg.weapon_cooldown.table[cannon_idx];
+            let per_shot_damage = cfg.robot_damages.table[cannon_idx].damage;
+            let dps = if cooldown_ms > 0 {
+                ((1000.0 / cooldown_ms as f32) * per_shot_damage as f32) as i32
+            } else {
+                0
+            };
+            let dmg10 = dps / 10;
+            // Turret 1 + 4 render their damage as "X+X" in the hint
+            // (CInterface.cpp:4468 / :4510) — both burst-weapons in
+            // the shipped game; the other two use the plain value.
+            let damage_str = if matches!(idx, 0 | 3) {
+                format!("{dmg10}+{dmg10}")
+            } else {
+                dmg10.to_string()
+            };
+            let repl = &mut state.iface_list.hint_replacer;
+            repl.set("_turret_name", name_label);
+            repl.set("_turret_range", range_label);
+            repl.set("_turret_structure", structure.to_string());
+            repl.set("_turret_damage", damage_str);
+            for i in 0..Resource::ALL.len() {
+                let v = cannon.resources[i];
+                let key = format!("_turret_res{}", i + 1);
+                if v > 0 {
+                    repl.set(key, v.to_string());
+                } else {
+                    repl.set(key, String::new());
+                }
+            }
+        }
+        _ => {
+            // Other hinted elements (call-from-hell, combat-mode, …)
+            // require plumbing we haven't ported yet. The base
+            // template still renders — unresolved `[keys]` fall
+            // through as empty strings per `HintReplacer::get` → `None`.
+        }
+    }
 }
 
 /// Advance the constructor preview turntable while the panel is open.

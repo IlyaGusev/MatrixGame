@@ -6,6 +6,7 @@
 pub mod builder_preview;
 pub mod constructor;
 pub mod counter;
+pub mod hint;
 pub mod history;
 pub mod iface_element;
 pub mod iface_list;
@@ -19,6 +20,7 @@ pub mod turret_build;
 
 pub use constructor::{FocusTarget, RobotBuilder};
 pub use counter::{CIFaceCounter, CheckUpCtx};
+pub use hint::{Hint, HintReplacer, HintSystem, TemplateLibrary};
 pub use history::ConfigHistory;
 pub use iface_element::{ElementKind, ElementState, IFaceElement, StateImage, MAX_STATES};
 pub use iface_list::{Click, IFaceList};

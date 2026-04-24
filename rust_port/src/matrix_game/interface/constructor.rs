@@ -1131,6 +1131,16 @@ pub fn name_of_live(
 /// preview. Mirrors `GetConstructionStructure` (CConstructor.cpp:
 /// 860-899).
 pub fn structure_of_live(chassis: &Unit, armor: &ArmorUnit, head: &Unit) -> i32 {
+    // Divide-by-10 matches CConstructor.cpp:898 — the C++ displays
+    // `structure / 10` as the UI value.
+    raw_hitpoint_of_live(chassis, armor, head) / 10
+}
+
+/// Raw HP sum used by `CMatrixRobotAI::CalcRobotMass` +
+/// `InitMaxHitpoint` at MatrixRobot.cpp:4150-4293. This is the value
+/// stored on `Robot::hit_point_max` at spawn; the UI only shows it
+/// divided by 10 (see [`structure_of_live`]).
+pub fn raw_hitpoint_of_live(chassis: &Unit, armor: &ArmorUnit, head: &Unit) -> i32 {
     let chars = config::global().item_chars;
     let mut s = 0i32;
     if !chassis.is_empty() {
@@ -1152,9 +1162,7 @@ pub fn structure_of_live(chassis: &Unit, armor: &ArmorUnit, head: &Unit) -> i32 
         let i = head.kind.as_index().min(chars.head_hp_add.len() - 1);
         s += chars.head_hp_add[i];
     }
-    // Divide-by-10 matches CConstructor.cpp:898 — the C++ displays
-    // `structure / 10` as the UI value.
-    s / 10
+    s
 }
 
 /// Translate a Base-panel element name (e.g. `"chas3"`, `"hull5"`,

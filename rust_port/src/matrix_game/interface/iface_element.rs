@@ -139,6 +139,15 @@ pub struct IFaceElement {
     pub labels: Vec<ElementLabel>,
     pub cur_state: ElementState,
     pub def_state: ElementState,
+    /// Port of `SElementHint` (Interface/CIFaceElement.h:21-38). Empty
+    /// string means "no hint on this element". The template resolves
+    /// via `TemplateLibrary::get` at hover-show time.
+    pub hint_template: String,
+    /// `m_Hint.x` / `m_Hint.y` — design-space offset from the element's
+    /// top-left where the hint box anchors. CInterface.cpp:233-234 /
+    /// :540-541.
+    pub hint_offset_x: i32,
+    pub hint_offset_y: i32,
 }
 
 impl IFaceElement {

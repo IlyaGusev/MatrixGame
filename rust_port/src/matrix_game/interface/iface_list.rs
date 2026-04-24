@@ -13,6 +13,7 @@
 use crate::matrix_lib::base::storage::Storage;
 
 use super::counter::CIFaceCounter;
+use super::hint::{HintChromeLibrary, HintReplacer, HintSystem, TemplateLibrary};
 use super::history::ConfigHistory;
 use super::iface_element::ElementState;
 use super::interface::{CInterface, DESIGN_H};
@@ -52,6 +53,23 @@ pub struct IFaceList {
     /// `m_IfListFlags & PREORDER_BUILD_TURRET` flag plus
     /// `m_BuildCa` / `m_CannonForBuild` (CInterface.h:288, 308).
     pub turret_build: TurretBuild,
+    /// Template snapshot from `robots.dat::Templates` (read once at
+    /// `load_default_panels` and never mutated). Drives `CMatrixHint`
+    /// template lookups via `HintSystem::update`.
+    pub hint_templates: TemplateLibrary,
+    /// 9-slice border + bitmap aliases (`Hints/0` + `Hints/Bitmaps`
+    /// in `robots.dat`). Read once at init, consumed by the hint
+    /// builder + the renderer.
+    pub hint_chrome: HintChromeLibrary,
+    /// Baseline + dynamic replacement values. `AddHintReplacements`
+    /// (form_game.rs) mutates this each hover; the update tick reads
+    /// it when building the hint.
+    pub hint_replacer: HintReplacer,
+    /// Hover timer + currently-shown hint. Port of
+    /// `CIFaceList::m_CurrentHint` + `m_CurrentHintControlName`
+    /// (CInterface.h:291-294) plus the per-button hover-show gate at
+    /// CIFaceButton.cpp:128-145.
+    pub hint_system: HintSystem,
 }
 
 /// Outcome of a button click. The C++ dispatches via action arrays
@@ -93,6 +111,10 @@ impl IFaceList {
             history: ConfigHistory::new(),
             r_count_control: CIFaceCounter::new(),
             turret_build: TurretBuild::new(),
+            hint_templates: TemplateLibrary::default(),
+            hint_chrome: HintChromeLibrary::default(),
+            hint_replacer: HintReplacer::default(),
+            hint_system: HintSystem::default(),
         }
     }
 
@@ -107,6 +129,13 @@ impl IFaceList {
     /// Hints). Flip them back on as the game-state plumbing catches up.
     pub fn load_default_panels(matrix_data: &Storage) -> Self {
         let mut list = Self::new();
+        // Tooltip templates + baseline replacements — loaded once and
+        // held on the list. Mirrors the init sequence at
+        // MatrixGame.cpp:262-315 where `PAR_REPLACE` is primed out of
+        // `Labels.Replaces` before the first hint fires.
+        list.hint_templates = TemplateLibrary::load(matrix_data);
+        list.hint_replacer = HintReplacer::from_storage(matrix_data);
+        list.hint_chrome = HintChromeLibrary::load(matrix_data);
         // CIFaceMenu::LoadMenuGraphics (CIFaceMenu.cpp:53-59) loads the
         // chrome (corners / edges / cursor / cursik) from `if/PopupMenu`
         // into a static panel `m_MenuGraphics`. We push it into the same
@@ -185,6 +214,10 @@ impl IFaceList {
                 popup.hovered = hovered;
             }
             if hovered.is_some() {
+                // An open popup suppresses hints — matches the
+                // `POPUP_MENU_ACTIVE` gate in `CheckShowHintLogic`
+                // (CInterface.cpp:4542-4549).
+                self.hint_system.clear();
                 return (None, None);
             }
         }
@@ -240,7 +273,87 @@ impl IFaceList {
             }
             self.focused = new_focus;
         }
+        // Refresh the hover target every move so the hint timer
+        // resets when the cursor leaves the element. Mirrors
+        // CIFaceButton.cpp:128-145 / CIFaceStatic.cpp path.
+        self.refresh_hint_hover(screen_w, screen_h);
         (prev_pair, new_pair)
+    }
+
+    /// Push the currently-focused element's hint metadata into the
+    /// hint timer, including the element's resolved screen rect so
+    /// the hint renders at the right offset. No-op when the focus has
+    /// no hint template.
+    fn refresh_hint_hover(&mut self, screen_w: f32, screen_h: f32) {
+        let clear = |h: &mut HintSystem| {
+            h.set_hovered(None, None, None, 0, 0, 0.0, 0.0, 0.0, 0.0);
+        };
+        let Some((pi, ei)) = self.focused else {
+            clear(&mut self.hint_system);
+            return;
+        };
+        let scale = (screen_h / DESIGN_H).max(0.1);
+        let Some(panel) = self.panels.get(pi) else {
+            clear(&mut self.hint_system);
+            return;
+        };
+        let Some(elem) = panel.elements.get(ei) else {
+            clear(&mut self.hint_system);
+            return;
+        };
+        if elem.hint_template.is_empty() {
+            clear(&mut self.hint_system);
+            return;
+        }
+        let panel_px = panel.resolved_pos(screen_w, screen_h, scale);
+        let [ex, ey, w, h] = elem.rect_in_panel(panel_px, scale);
+        self.hint_system.set_hovered(
+            Some(&panel.name),
+            Some(&elem.name),
+            Some(&elem.hint_template),
+            elem.hint_offset_x,
+            elem.hint_offset_y,
+            ex,
+            ey,
+            w,
+            h,
+        );
+    }
+
+    /// Advance the hint timer + rebuild the active hint when the
+    /// threshold trips. Call once per frame from `form_game`;
+    /// `bitmap_sizer` resolves inline `_BITMAP:` PNG sizes via the
+    /// renderer's loaded atlas cache.
+    pub fn update(
+        &mut self,
+        dt_ms: f32,
+        screen_w: f32,
+        screen_h: f32,
+        atlas: &mut super::text::GlyphAtlas,
+        bitmap_sizer: &dyn Fn(&str) -> Option<(i32, i32)>,
+    ) {
+        let scale = (screen_h / DESIGN_H).max(0.1);
+        let main_origin = self
+            .panel("Main")
+            .map(|p| p.resolved_pos(screen_w, screen_h, scale))
+            .unwrap_or([0.0, 0.0]);
+        let base_origin = self
+            .panel("Base")
+            .map(|p| p.resolved_pos(screen_w, screen_h, scale))
+            .unwrap_or([0.0, 0.0]);
+        self.hint_system.update(
+            dt_ms,
+            &self.hint_templates,
+            &self.hint_chrome,
+            &self.hint_replacer,
+            atlas,
+            bitmap_sizer,
+            screen_w,
+            screen_h,
+            scale,
+            main_origin,
+            base_origin,
+        );
     }
 
     /// Translate a screen-space pixel to design-space coords relative

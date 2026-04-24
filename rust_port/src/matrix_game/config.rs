@@ -558,17 +558,25 @@ pub struct TurretProps {
 }
 
 impl TurretProps {
-    /// Load `Cannons/Cannon{N}` — the block layout matches
-    /// MatrixConfig.cpp:440-490 (reads CANNON1..CANNON4 params).
-    /// Missing entries stay at zero.
+    /// Load `Models/Cannons/{0..3}` — mirrors the C++ loader at
+    /// MatrixConfig.cpp:1052-1079, which walks
+    /// `g_MatrixData->BlockGet("Models")->BlockGet("Cannons")` and
+    /// reads each child's `Titan` / `Energy` / `Plasm` (sic) /
+    /// `Electronics` / `Strength` / `Hitpoint`.
+    ///
+    /// Children are enumerated (not named `Cannon{N}`). Resource keys
+    /// are capitalized, not uppercase. Missing block or params → zero.
     pub fn from_matrix_data(stor: &Storage) -> Option<Self> {
         let mut out = TurretProps::default();
-        let cannons_rec = stor.block_record("da", "Cannons")?;
-        for i in 0..4 {
-            let name = format!("Cannon{}", i + 1);
-            let Some(rec) = stor.block_record(&cannons_rec, &name) else {
-                continue;
-            };
+        let models_rec = stor.block_record("da", "Models")?;
+        let cannons_rec = stor.block_record(&models_rec, "Cannons")?;
+        let (names_buf, recs_buf) = (
+            stor.get_buf(&cannons_rec, "2")?,
+            stor.get_buf(&cannons_rec, "3")?,
+        );
+        let n = names_buf.arrays_count().min(recs_buf.arrays_count()).min(4);
+        for i in 0..n {
+            let rec = recs_buf.get_as_wstr(i);
             let read_i = |k: &str| -> i32 {
                 stor.block_param(&rec, k)
                     .and_then(|s| s.trim().parse::<i32>().ok())
@@ -579,15 +587,19 @@ impl TurretProps {
                     .and_then(|s| s.trim().parse::<f32>().ok())
                     .unwrap_or(0.0)
             };
+            // Resource key ordering is the C++ `Resource` enum:
+            // TITAN=0, ELECTRONICS=1, ENERGY=2, PLASMA=3.
+            // The data file uses `Plasm` (with no trailing `a`) —
+            // preserve the typo to match the shipped assets.
             out.cannons[i] = CannonProps {
                 resources: [
-                    read_i("TITAN"),
-                    read_i("ELECTRONICS"),
-                    read_i("ENERGY"),
-                    read_i("PLASMA"),
+                    read_i("Titan"),
+                    read_i("Electronics"),
+                    read_i("Energy"),
+                    read_i("Plasm"),
                 ],
-                strength: read_f("STRENGTH"),
-                hitpoint: read_f("HITPOINT"),
+                strength: read_f("Strength"),
+                hitpoint: read_f("Hitpoint"),
             };
         }
         Some(out)
