@@ -36,7 +36,6 @@ pub use crate::matrix_game::map::{side_color_minimap_rgb, side_color_rgb};
 /// on this to decide which menu to draw.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CurrSel {
-    /// Nothing selected.
     #[default]
     Nothing,
     /// A base (BUILDING_BASE) is selected — drives the
@@ -49,7 +48,6 @@ pub enum CurrSel {
     RobotsSelected,
     /// A cannon / turret is selected.
     CannonSelected,
-    /// A flyer is selected.
     FlyerSelected,
 }
 
@@ -232,7 +230,6 @@ impl Side {
         self.selected.clear();
     }
 
-    /// Is `id` currently in the multi-selection?
     pub fn is_selected(&self, id: ObjectId) -> bool {
         self.selected.contains(&id)
     }

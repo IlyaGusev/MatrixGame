@@ -1817,7 +1817,6 @@ fn try_place_turret(state: &mut AppState, cx: f32, cy: f32, w: f32, h: f32) {
         return;
     }
 
-    // Cost check.
     let turret_cost = crate::matrix_game::config::global()
         .turrets
         .cost_of(kind as i32);

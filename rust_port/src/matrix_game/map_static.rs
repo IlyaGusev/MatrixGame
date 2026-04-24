@@ -490,7 +490,6 @@ impl Objects {
         slot.obj.as_deref_mut()
     }
 
-    /// Visit each live object in the arena.
     pub fn for_each_live(&self, mut f: impl FnMut(ObjectId, &dyn MapStatic)) {
         for (i, slot) in self.slots.iter().enumerate() {
             let Some(obj) = slot.obj.as_deref() else {

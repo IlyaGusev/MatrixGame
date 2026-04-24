@@ -82,19 +82,16 @@ pub struct Camera {
     angle_param: f32,
     dist_param: f32,
 
-    // Projection.
     pub aspect: f32,
     pub near: f32,
     pub far: f32,
 
-    // Input state.
     actions: u32,
     mouse_cam: bool, // middle-button drag active
     last_mouse: [f32; 2],
     cursor: [f32; 2],
     screen: [f32; 2],
 
-    // Map bounds.
     map_cx: f32,
     map_cy: f32,
     strategy_init_angle: f32,

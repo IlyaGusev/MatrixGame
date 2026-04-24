@@ -1173,21 +1173,18 @@ pub fn raw_hitpoint_of_live(chassis: &Unit, armor: &ArmorUnit, head: &Unit) -> i
 ///
 /// Returns `None` for names that aren't constructor buttons.
 pub fn parse_constructor_button(name: &str) -> Option<(RobotUnitType, RobotUnitKind, i32)> {
-    // chas1..chas5
     if let Some(rest) = name.strip_prefix("chas") {
         let n: i32 = rest.parse().ok()?;
         if (1..=5).contains(&n) {
             return Some((RobotUnitType::Chassis, RobotUnitKind(n), 0));
         }
     }
-    // hull1..hull6
     if let Some(rest) = name.strip_prefix("hull") {
         let n: i32 = rest.parse().ok()?;
         if (1..=6).contains(&n) {
             return Some((RobotUnitType::Armor, RobotUnitKind(n), 0));
         }
     }
-    // head1..head4
     if let Some(rest) = name.strip_prefix("head") {
         // Exclude `headN_st` / `head{empty}` etc. by checking digit-only.
         if let Ok(n) = rest.parse::<i32>() {
@@ -1196,11 +1193,9 @@ pub fn parse_constructor_button(name: &str) -> Option<(RobotUnitType, RobotUnitK
             }
         }
     }
-    // heade (empty head)
     if name == "heade" {
         return Some((RobotUnitType::Head, RobotUnitKind::UNKNOWN, 0));
     }
-    // weap1..weap10
     if let Some(rest) = name.strip_prefix("weap") {
         if let Ok(n) = rest.parse::<i32>() {
             if (1..=10).contains(&n) {
@@ -1208,7 +1203,6 @@ pub fn parse_constructor_button(name: &str) -> Option<(RobotUnitType, RobotUnitK
             }
         }
     }
-    // weape (empty weapon)
     if name == "weape" {
         return Some((RobotUnitType::Weapon, RobotUnitKind::UNKNOWN, 0));
     }

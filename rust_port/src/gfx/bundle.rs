@@ -17,19 +17,16 @@ impl Default for AssetBundle {
 }
 
 impl AssetBundle {
-    /// Create an empty bundle for writing.
     pub fn new() -> Self {
         Self {
             files: HashMap::new(),
         }
     }
 
-    /// Add a file to the bundle.
     pub fn add(&mut self, path: &str, data: Vec<u8>) {
         self.files.insert(path.to_string(), data);
     }
 
-    /// Serialize the bundle to bytes.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         buf.extend_from_slice(&(self.files.len() as u32).to_le_bytes());
@@ -43,7 +40,6 @@ impl AssetBundle {
         buf
     }
 
-    /// Parse a bundle from bytes.
     pub fn from_bytes(raw: &[u8]) -> Result<Self> {
         let mut files = HashMap::new();
         let mut pos = 0;
@@ -88,12 +84,10 @@ impl AssetBundle {
         Ok(Self { files })
     }
 
-    /// Read a file from the bundle.
     pub fn read_file(&self, path: &str) -> Option<&[u8]> {
         self.files.get(path).map(|v| v.as_slice())
     }
 
-    /// List all file paths.
     pub fn list_files(&self) -> Vec<&str> {
         self.files.keys().map(|s| s.as_str()).collect()
     }

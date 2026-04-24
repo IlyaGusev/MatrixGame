@@ -406,7 +406,6 @@ impl ItemCharsTable {
         let mut out = Self::default();
         let chars_rec = stor.block_record("da", "Chars")?;
 
-        // Armor block.
         if let Some(armor_rec) = stor.block_record(&chars_rec, "Armor") {
             if let (Some(keys), Some(values)) =
                 (stor.get_buf(&armor_rec, "0"), stor.get_buf(&armor_rec, "1"))

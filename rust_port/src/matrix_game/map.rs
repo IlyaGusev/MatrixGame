@@ -193,7 +193,6 @@ pub struct MapUnit {
     pub c2: f32,
 }
 
-/// Loaded map data.
 pub struct GameMap {
     pub size_x: usize,
     pub size_y: usize,
@@ -344,7 +343,6 @@ impl GameMap {
     pub fn from_cmap_bytes(cmap_data: &[u8]) -> Result<Self> {
         let stor = Storage::from_bytes(cmap_data).context("parsing CStorage from CMAP")?;
 
-        // Read properties
         let prop_names = stor
             .get_buf("properties", "Name")
             .context("missing properties/Name")?;
@@ -448,7 +446,6 @@ impl GameMap {
             tex_union_dim
         );
 
-        // Read heightmap points
         let points_buf = stor
             .get_buf("points", "Data")
             .context("missing points/Data")?;
@@ -638,7 +635,6 @@ impl GameMap {
         ab + (cd - ab) * ty
     }
 
-    /// Get a heightmap point at grid coordinates.
     pub fn point(&self, x: usize, y: usize) -> &CompilePoint {
         &self.points[y * (self.size_x + 1) + x]
     }
@@ -1828,7 +1824,6 @@ impl MapRenderer {
         let [sr, sg, sb] = unpack_rgb(map.sky_color);
         let fog_color = [sr, sg, sb, 1.0];
 
-        // GPU resources
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Terrain Uniforms"),
             contents: bytemuck::bytes_of(&Uniforms {
@@ -2181,7 +2176,6 @@ impl MapRenderer {
             super::water::Water::new(device, queue, config, map, stor, matrix_data, read_texture);
         let point_lights = PointLightRenderer::new(device, config);
 
-        // Pipelines
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Terrain Shader"),
             source: wgpu::ShaderSource::Wgsl(SHADER.into()),
@@ -2681,7 +2675,6 @@ impl MapRenderer {
         // Visible additive point-light pass on terrain-conforming geometry.
         self.point_lights.render(queue, &mut pass, view_proj);
 
-        // Water
         if let Some(water) = &mut self.water {
             water.render(_device, &mut pass, queue, camera, view_proj, view_mat);
         }
@@ -2789,7 +2782,6 @@ impl MapRenderer {
             }
         }
 
-        // Gloss.
         if !self.gloss_batches.is_empty() {
             pass.set_pipeline(&self.gloss_pipeline);
             for batch in &self.gloss_batches {

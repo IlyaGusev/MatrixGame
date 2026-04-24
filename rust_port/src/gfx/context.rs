@@ -18,7 +18,6 @@ impl GfxContext {
             ..Default::default()
         });
 
-        // Arc<Window> gives us Surface<'static>
         let surface = instance.create_surface(window.clone()).unwrap();
 
         let adapter = instance
