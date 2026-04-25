@@ -105,6 +105,11 @@ pub struct MainVisibilityCtx {
     pub constructor_active: bool,
     /// Turret-build mode active — show turret1..4 kind picker.
     pub turret_build_active: bool,
+    /// `m_BS.GetTopItem()` cannon kind when the head queue item is a
+    /// turret (1..=4), else `None`. Drives the medium-icon preview at
+    /// `sticon`. Port of the cannon branch of
+    /// `CIFaceList::CreateStackIcon` (CInterface.cpp:4018-4053).
+    pub building_stack_head_turret_kind: Option<i32>,
 }
 
 impl CInterface {
@@ -426,6 +431,18 @@ impl CInterface {
                     e.set_visible(true);
                 }
             }
+        }
+
+        // Step 7 — build-stack head icon (cannon branch). Port of
+        // `CIFaceList::CreateStackIcon`'s cannon branch
+        // (CInterface.cpp:4018-4053): when the head queue item is a
+        // turret of kind N, the dynamic medium icon is drawn from
+        // `tmd{N}`'s texture page. We approximate by copying tmd{N}'s
+        // per-state images onto `sticon` so the existing static frame
+        // displays the right turret artwork.
+        if let Some(kind) = ctx.building_stack_head_turret_kind {
+            let src_name = format!("tmd{}", kind);
+            self.copy_pair(Some(src_name.as_str()), "sticon");
         }
     }
 
@@ -974,6 +991,19 @@ fn load_element(stor: &Storage, rec: &str, kind: ElementKind) -> Option<IFaceEle
         }
     }
 
+    // `Image` kind uses a different parameter set (CInterface.cpp:636-646):
+    // `TextureFile`, `TexPosX`, `TexPosY`, `TextureWidth`, `TextureHeight`,
+    // `Width`, `Height` — no s<State>* keys. Translate that into a
+    // single Normal-state `StateImage` so the element can be used as a
+    // copy source for `FindImageByName` / `CreateStaticFromImage` ports
+    // (`tmd1..4`, `tsm1..4`, etc.). The element itself isn't rendered
+    // directly; it's a template the build-stack icon copies from.
+    if matches!(kind, ElementKind::Image) && images.iter().all(|i| i.is_none()) {
+        if let Some(img) = parse_image_element(stor, rec) {
+            images[ElementState::Normal as usize] = Some(img);
+        }
+    }
+
     // Skip elements that carry no image anywhere — likely data-only
     // records (ProgressBar anchors, counters) that the renderer
     // doesn't have a hook for yet.
@@ -1188,6 +1218,32 @@ fn parse_argb(s: &str) -> Option<[u8; 4]> {
         return None;
     }
     Some([parts[1], parts[2], parts[3], parts[0]])
+}
+
+/// Port of the `Image` element parse branch at CInterface.cpp:635-650.
+/// `Image` records carry `TextureFile`/`TexPosX`/`TexPosY`/`TextureWidth`/
+/// `TextureHeight`/`Width`/`Height` instead of the `s<State>*` quartet
+/// `Static`/`Button` use. A missing `TextureFile` skips the element.
+fn parse_image_element(stor: &Storage, rec: &str) -> Option<StateImage> {
+    let tex_path = stor.block_param(rec, "TextureFile")?;
+    if tex_path.is_empty() {
+        return None;
+    }
+    let tex_pos_x = parse_f32(stor, rec, "TexPosX").unwrap_or(0.0);
+    let tex_pos_y = parse_f32(stor, rec, "TexPosY").unwrap_or(0.0);
+    let tex_w = parse_f32(stor, rec, "TextureWidth").unwrap_or(512.0);
+    let tex_h = parse_f32(stor, rec, "TextureHeight").unwrap_or(512.0);
+    let w = parse_f32(stor, rec, "Width").unwrap_or(0.0);
+    let h = parse_f32(stor, rec, "Height").unwrap_or(0.0);
+    Some(StateImage {
+        x: tex_pos_x,
+        y: tex_pos_y,
+        w,
+        h,
+        tex_w,
+        tex_h,
+        tex_path,
+    })
 }
 
 fn parse_state_image(

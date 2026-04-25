@@ -2409,31 +2409,45 @@ fn refresh_interface_visibility(state: &mut AppState) {
     // carry the selected building's `m_Side` so the Base-panel build
     // button can gate on "is this our base?" — port of the
     // `m_Base->m_Side == PLAYER_SIDE` guard at CConstructor.cpp:225-227.
-    let (kind, stack_empty, stack_items, turrets_max, hit_point, hit_point_max, active_side) =
-        match curr_sel {
-            CurrSel::BaseSelected | CurrSel::BuildingSelected => {
-                let active = state.game.active_object();
-                active
-                    .and_then(|id| state.game.objects.get(id))
-                    .filter(|o| matches!(o.core().obj_type, ObjectType::Building))
-                    .map(|o| {
-                        let b: &Building =
-                            unsafe { &*(o as *const dyn MapStatic as *const Building) };
-                        let n = b.build_stack.items() as i32;
-                        (
-                            Some(b.kind),
-                            n == 0,
-                            n,
-                            b.turrets_max,
-                            b.hit_point,
-                            b.hit_point_max,
-                            b.side,
-                        )
-                    })
-                    .unwrap_or((None::<BuildingType>, true, 0, 0, 0.0, 0.0, 0))
-            }
-            _ => (None, true, 0, 0, 0.0, 0.0, 0),
-        };
+    let (
+        kind,
+        stack_empty,
+        stack_items,
+        turrets_max,
+        hit_point,
+        hit_point_max,
+        active_side,
+        stack_head_turret,
+    ) = match curr_sel {
+        CurrSel::BaseSelected | CurrSel::BuildingSelected => {
+            use crate::matrix_game::object_building::PendingKind;
+            let active = state.game.active_object();
+            active
+                .and_then(|id| state.game.objects.get(id))
+                .filter(|o| matches!(o.core().obj_type, ObjectType::Building))
+                .map(|o| {
+                    let b: &Building =
+                        unsafe { &*(o as *const dyn MapStatic as *const Building) };
+                    let n = b.build_stack.items() as i32;
+                    let head_turret = b.build_stack.head().and_then(|h| match h.kind {
+                        PendingKind::Turret { turret_kind, .. } => Some(turret_kind),
+                        _ => None,
+                    });
+                    (
+                        Some(b.kind),
+                        n == 0,
+                        n,
+                        b.turrets_max,
+                        b.hit_point,
+                        b.hit_point_max,
+                        b.side,
+                        head_turret,
+                    )
+                })
+                .unwrap_or((None::<BuildingType>, true, 0, 0, 0.0, 0.0, 0, None))
+        }
+        _ => (None, true, 0, 0, 0.0, 0.0, 0, None),
+    };
     let active_is_player_owned = active_side == player_side_id;
 
     // Port of `CMatrixSideUnit::GetIncomePerTime(kind, 60000)`
@@ -2466,6 +2480,7 @@ fn refresh_interface_visibility(state: &mut AppState) {
         building_turrets_max: turrets_max,
         constructor_active,
         turret_build_active,
+        building_stack_head_turret_kind: stack_head_turret,
     };
     if let Some(p) = state.iface_list.panel_mut("Main") {
         p.refresh_main_visibility(&ctx);
