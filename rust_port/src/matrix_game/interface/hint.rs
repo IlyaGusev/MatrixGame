@@ -779,11 +779,26 @@ pub fn build_hint(
                 lines.push(String::new());
             }
             let line_h = atlas.line_height(&font) as i32;
-            let max_w = lines
+            let measured_w = lines
                 .iter()
                 .map(|s| measure_rich(atlas, &font, s) as i32)
                 .max()
                 .unwrap_or(0);
+            // `_WIDTH:N` (when > 0) forces the text bitmap to N px
+            // wide — port of the `m_RangersText(..., w, h, ...,
+            // wordwrap=(w!=0)?1:0, ...)` contract at MatrixHint.cpp:
+            // 710-716. With wrap enabled the rasterizer returns
+            // `it->m_SizeX = w`, so every wrapped block reserves the
+            // full WIDTH band and the text content is left-aligned
+            // inside it (alignx=0). This is what gives the original
+            // hints their generous right-padding — the text bitmap
+            // is always at least `_WIDTH` px wide regardless of how
+            // short the actual content is.
+            let max_w = if h_width > 0 {
+                measured_w.max(h_width)
+            } else {
+                measured_w
+            };
             // Visible block height = `line_h + (line_h + 1) * (N - 1)`
             // (matches the renderer's `line_h + 1` stride).
             let natural_h = if lines.is_empty() {
@@ -792,13 +807,10 @@ pub fn build_hint(
                 line_h + (line_h + 1) * (lines.len() as i32 - 1)
             };
             // `_HEIGHT:N` (when > 0) forces the text bitmap to N px
-            // tall. Port of the `m_RangersText(..., w, h, ...)`
-            // contract at MatrixHint.cpp:710-720 — the rasterizer
-            // returns `it->m_SizeY = h` when h is non-zero, with the
-            // text content vertically centred inside that band. The
-            // BuildTurret template uses `_HEIGHT:23` for the price
-            // row so the small price text sits aligned with the
-            // 23-px-tall resource icon next to it.
+            // tall — same contract as `_WIDTH` above for the height
+            // dimension. The BuildTurret template uses `_HEIGHT:23`
+            // for the price row so the small price text sits aligned
+            // with the 23-px-tall resource icon next to it.
             let total_h = natural_h.max(h_height);
             let joined = lines.join("\n");
             let (px, py) = pass1_position(
