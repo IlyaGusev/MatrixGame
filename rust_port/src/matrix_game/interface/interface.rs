@@ -316,6 +316,10 @@ impl CInterface {
             let kind = ctx.building_kind;
             let empty = ctx.building_stack_empty;
             let has_items = ctx.building_stack_items > 0;
+            // `bld_tu` in CInterface.cpp:1224 — gates `buro` (1596),
+            // `buca` (1600), and `callhell` (1607) so the turret-kind
+            // picker can take over the same screen real estate.
+            let bld_tu = ctx.turret_build_active;
             for e in &mut self.elements {
                 match e.name.as_str() {
                     "bopis" if empty => e.set_visible(true),
@@ -333,15 +337,19 @@ impl CInterface {
                     "elecpl" if kind == Some(BuildingType::Electronic) => e.set_visible(true),
                     "batpl" if kind == Some(BuildingType::Energy) => e.set_visible(true),
                     "reppl" if kind == Some(BuildingType::Repair) => e.set_visible(true),
-                    // Build buttons.
-                    "buro" if kind == Some(BuildingType::Base) => e.set_visible(true),
-                    "buca" => e.set_visible(true),
-                    // Reinforcements ("call from hell") is always visible
-                    // for any selected building; state goes DISABLED
-                    // while maintenance is off or the cooldown hasn't
-                    // elapsed (CInterface.cpp:1607-1613). We don't yet
-                    // model maintenance, so it renders DISABLED always.
-                    "callhell" => {
+                    // Build buttons — gated by `!bld_tu` (CInterface.cpp:
+                    // 1596, 1600). In turret-build mode the picker
+                    // (`tur1..4` + `ocan`) replaces them.
+                    "buro" if !bld_tu && kind == Some(BuildingType::Base) => e.set_visible(true),
+                    "buca" if !bld_tu => e.set_visible(true),
+                    // Reinforcements ("call from hell") is visible for
+                    // any selected building UNLESS we're in turret-
+                    // build mode (CInterface.cpp:1607 — `&& !bld_tu`).
+                    // State goes DISABLED while maintenance is off or
+                    // the cooldown hasn't elapsed (CInterface.cpp:
+                    // 1609-1613). We don't yet model maintenance, so
+                    // it renders DISABLED always when shown.
+                    "callhell" if !bld_tu => {
                         e.set_visible(true);
                         e.cur_state = ElementState::Disabled;
                         e.def_state = ElementState::Disabled;
@@ -405,13 +413,16 @@ impl CInterface {
             }
         }
 
-        // Step 6 — turret-build mode — show the turret-kind picker.
-        // Ports `CInterface::BeginBuildTurret` + the m_Turrets[4] button
-        // visibility at CInterface.cpp:3518-3542.
+        // Step 6 — turret-build mode — show the turret-kind picker
+        // and the cancel button. Ports `CInterface::BeginBuildTurret`
+        // (CInterface.cpp:3518-3542 for the tur1..4 buttons) and the
+        // `bld_tu` else-branch at CInterface.cpp:1696 that flips
+        // `IF_ORDER_CANCEL` (`ocan`) on while the player picks a
+        // turret kind.
         if ctx.turret_build_active {
             for e in &mut self.elements {
                 let n = e.name.as_str();
-                if matches!(n, "tur1" | "tur2" | "tur3" | "tur4") {
+                if matches!(n, "tur1" | "tur2" | "tur3" | "tur4" | "ocan") {
                     e.set_visible(true);
                 }
             }

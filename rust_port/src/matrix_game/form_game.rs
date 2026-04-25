@@ -1365,15 +1365,28 @@ fn dispatch_ui_click(state: &mut AppState, click: &crate::matrix_game::interface
             return;
         }
         "buca" => {
-            if state.game.player_side.curr_sel != CurrSel::BaseSelected {
-                log::info!("buca: no base selected, ignoring");
+            // Port of CInterface.cpp:3493-3499 — IF_BUILD_CA opens the
+            // turret-kind picker on the Main panel. The C++ flips
+            // ORDERING_MODE + PREORDER_BUILD_TURRET; the actual kind is
+            // not picked yet — that comes when the user clicks one of
+            // the `tur1..tur4` buttons. Visibility for any selected
+            // building (base OR factory) since `buca` is shown for
+            // BUILDING_SELECTED / BASE_SELECTED at CInterface.cpp:1600.
+            if !matches!(
+                state.game.player_side.curr_sel,
+                CurrSel::BaseSelected | CurrSel::BuildingSelected
+            ) {
+                log::info!("buca: no building selected, ignoring");
                 return;
             }
             let Some(id) = state.game.active_object() else {
                 return;
             };
+            // Default to Cannon as a placeholder kind so the existing
+            // placement-cursor code (which assumes `kind.is_some()`)
+            // doesn't break before tur1..4 narrows the choice.
             state.iface_list.turret_build.begin(TurretKind::Cannon, id);
-            log::info!("buca: entered turret-build mode (default Cannon)");
+            log::info!("buca: entered turret-build mode (kind picker)");
             return;
         }
         "cocan" => {
@@ -1448,6 +1461,16 @@ fn dispatch_ui_click(state: &mut AppState, click: &crate::matrix_game::interface
                 state.iface_list.turret_build.begin(kind, parent);
                 log::info!("tur{}: selected kind={:?}", n, kind);
             }
+            return;
+        }
+        "ocan" => {
+            // Port of CInterface.cpp:3465-3470 — IF_ORDER_CANCEL clears
+            // any in-flight turret placement (`m_CannonForBuild.Delete`
+            // + `m_CurrentAction = NOTHING_SPECIAL`) and then resets
+            // ORDERING_MODE / PREORDER_BUILD_TURRET so the Main panel
+            // returns to the building's normal command set.
+            state.iface_list.turret_build.cancel();
+            log::info!("ocan: cancelled turret-build mode");
             return;
         }
         _ => {}

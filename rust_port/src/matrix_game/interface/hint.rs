@@ -781,7 +781,7 @@ pub fn build_hint(
             let line_h = atlas.line_height(&font) as i32;
             let max_w = lines
                 .iter()
-                .map(|s| atlas.measure(&font, s) as i32)
+                .map(|s| measure_rich(atlas, &font, s) as i32)
                 .max()
                 .unwrap_or(0);
             let total_h = line_h * lines.len() as i32;
@@ -978,6 +978,22 @@ fn parse_mod(spec: &str) -> Hem {
     }
 }
 
+/// Visible-text width of `text` in `font`, with `<Color=...>` /
+/// `</color>` tags stripped. The C++ pipes the full marked-up string
+/// to `m_RangersText` which knows to skip tags when measuring; we
+/// re-parse here so width accounting (wrap budgets, bitmap-after-text
+/// placement) doesn't count tag bytes.
+pub(super) fn measure_rich(
+    atlas: &mut super::text::GlyphAtlas,
+    font: &str,
+    text: &str,
+) -> u32 {
+    super::text::parse_rich_text(text)
+        .iter()
+        .map(|run| atlas.measure(font, &run.text))
+        .sum()
+}
+
 fn wrap_plain_text(
     atlas: &mut super::text::GlyphAtlas,
     font: &str,
@@ -987,18 +1003,36 @@ fn wrap_plain_text(
     if wrap_px == 0 {
         return vec![text.to_string()];
     }
+    // Greedy wrap on space boundaries, but track an open `<Color=...>`
+    // tag so each emitted line is self-contained — if we wrap inside
+    // a coloured run, the next line re-opens the same colour and the
+    // previous line gets its own `</color>`. Without this the second
+    // half of a wrapped name would lose its colour (the close tag
+    // landed on the last line, no open on the new one).
     let mut out: Vec<String> = Vec::new();
     let mut current = String::new();
+    let mut active_open: Option<String> = None;
     for word in text.split_inclusive(|c: char| c == ' ') {
         let tentative = format!("{current}{word}");
-        if atlas.measure(font, &tentative) as u32 <= wrap_px {
+        if measure_rich(atlas, font, &tentative) <= wrap_px {
             current = tentative;
         } else {
             if !current.is_empty() {
-                out.push(current.trim_end().to_string());
+                let mut s = current.trim_end().to_string();
+                if active_open.is_some() {
+                    s.push_str("</color>");
+                }
+                out.push(s);
             }
-            current = word.to_string();
+            let mut new_line = String::new();
+            if let Some(t) = active_open.as_ref() {
+                new_line.push_str(t);
+            }
+            new_line.push_str(word);
+            current = new_line;
         }
+        // Update the active-color tracker after committing the word.
+        update_active_color(word, &mut active_open);
     }
     if !current.is_empty() {
         out.push(current.trim_end().to_string());
@@ -1007,6 +1041,39 @@ fn wrap_plain_text(
         out.push(String::new());
     }
     out
+}
+
+/// Walk `frag` and update `active` to reflect the last open
+/// `<Color=...>` tag (or `None` if a `</color>` closed it).
+fn update_active_color(frag: &str, active: &mut Option<String>) {
+    let bytes = frag.as_bytes();
+    let mut i = 0;
+    while i < frag.len() {
+        if !frag.is_char_boundary(i) {
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'<' {
+            let rest = &frag[i..];
+            if rest.len() >= 7 && rest[..7].eq_ignore_ascii_case("<color=") {
+                if let Some(end_off) = rest.find('>') {
+                    *active = Some(rest[..=end_off].to_string());
+                    i += end_off + 1;
+                    continue;
+                }
+            }
+            let close = "</color>";
+            if rest.len() >= close.len() && rest[..close.len()].eq_ignore_ascii_case(close) {
+                *active = None;
+                i += close.len();
+                continue;
+            }
+        }
+        let next = (i + 1..=frag.len())
+            .find(|&j| frag.is_char_boundary(j))
+            .unwrap_or(frag.len());
+        i = next;
+    }
 }
 
 // ── Substitution ────────────────────────────────────────────────────
