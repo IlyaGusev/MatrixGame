@@ -1165,6 +1165,7 @@ impl ApplicationHandler for App {
                                     [sx, sy, sw, sh],
                                     surface_w,
                                     surface_h,
+                                    None,
                                 );
                             }
                         }

@@ -24,7 +24,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 use crate::matrix_game::interface::constructor::RobotConfig;
-use crate::matrix_game::object_robot::RobotsRenderer;
+use crate::matrix_game::object_robot::{IconCamera, RobotsRenderer};
 use crate::matrix_game::robot::ChassisKind;
 
 use super::renderer::InterfaceRenderer;
@@ -191,6 +191,7 @@ fn render_to_texture(
             [0, 0, size, size],
             size,
             size,
+            Some(IconCamera::CPP_DEFAULTS),
         );
     }
     queue.submit(std::iter::once(encoder.finish()));

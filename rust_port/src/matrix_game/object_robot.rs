@@ -108,6 +108,29 @@ struct RobotDraw {
     instance_offset: u32,
 }
 
+/// Camera override for icon-bake calls into `render_preview_full`.
+/// Port of the `anglez` / `anglex` / `fov` parameters of
+/// `CMatrixMapStatic::RenderToTexture` (MatrixMapStatic.hpp:488).
+/// `CPP_DEFAULTS` matches the C++ default arguments used by
+/// `CMatrixRobotAI::CreateTextures` for the build-stack icon bake.
+#[derive(Debug, Clone, Copy)]
+pub struct IconCamera {
+    /// Field-of-view in radians. C++ default `GRAD2RAD(60)` = π/3.
+    pub fov: f32,
+    /// Azimuth around Z. C++ default `GRAD2RAD(30)` = π/6.
+    pub anglez: f32,
+    /// Elevation. C++ default `GRAD2RAD(30)` = π/6.
+    pub anglex: f32,
+}
+
+impl IconCamera {
+    pub const CPP_DEFAULTS: Self = Self {
+        fov: std::f32::consts::FRAC_PI_3,
+        anglez: std::f32::consts::FRAC_PI_6,
+        anglex: std::f32::consts::FRAC_PI_6,
+    };
+}
+
 pub struct RobotsRenderer {
     pipeline: wgpu::RenderPipeline,
     /// Indexed by `ChassisKind as usize`; None for kinds whose VO
@@ -621,7 +644,7 @@ impl RobotsRenderer {
         // weapon kinds. Internally just calls render_preview_full.
         self.render_preview_full(
             queue, pass, chassis, None, None, &[None; 5], angle_rad, scissor_px, surface_w,
-            surface_h,
+            surface_h, None,
         );
     }
 
@@ -653,6 +676,7 @@ impl RobotsRenderer {
         scissor_px: [u32; 4],
         surface_w: u32,
         surface_h: u32,
+        icon_camera: Option<IconCamera>,
     ) {
         let ck_idx = chassis_kind_index(chassis);
         let chassis_gpu = match self.chassis.get(ck_idx).and_then(|o| o.as_ref()) {
@@ -712,18 +736,100 @@ impl RobotsRenderer {
             .matrix_by_id(1, 0)
             .map(|m| m[14]) // D3DXMATRIX _43 = row 3 col 2 = flat[14]
             .unwrap_or_else(|| chassis.spawn_z_offset());
-        let _ = chassis; // keep the kind in scope for logging downstream
         let scissor_aspect = if scissor_px[3] > 0 {
             scissor_px[2] as f32 / scissor_px[3] as f32
         } else {
             1.0
         };
-        let eye = glam::Vec3::new(80.0, -30.0, height + 5.0);
-        let target = glam::Vec3::new(0.0, 0.0, height);
-        let up = glam::Vec3::new(0.0, 0.0, 1.0);
+        let (eye, target, up, fov, far_z) = if let Some(icon) = icon_camera {
+            // Faithful port of `CMatrixMapStatic::RenderToTexture`'s
+            // camera setup (MatrixMapStatic.cpp:382-561). The C++
+            // builds a per-config camera distance from a "robot
+            // adjusted radius" (`ra`) that combines chassis height
+            // with per-chassis and per-armor offsets, then places the
+            // eye on a 30°/30° azimuth/elevation arc and looks at a
+            // point shifted ~3 units sideways from origin.
+            //
+            // Tables come straight from the C++ switch statements at
+            // MatrixMapStatic.cpp:487-547.
+            let mut h = height;
+            let mut ra = height;
+            match chassis {
+                ChassisKind::AntiGravity => {
+                    h -= 5.0;
+                    ra -= 5.5;
+                }
+                ChassisKind::Hovercraft => {
+                    h -= 7.0;
+                }
+                ChassisKind::Pneumatic => {
+                    h -= 9.0;
+                    ra -= 1.0;
+                }
+                ChassisKind::Track => {
+                    h -= 5.0;
+                }
+                ChassisKind::Wheel => {
+                    h -= 8.0;
+                    ra += 3.5;
+                }
+            }
+            // Armor — RUK_ARMOR_* numeric values per
+            // `matrix_game::config` (1=PASSIVE, 2=ACTIVE, 3=FIREPROOF,
+            // 4=PLASMIC, 5=NUCLEAR, 6=ARMOR_6).
+            match armor_kind {
+                Some(2) => {
+                    h += 9.0;
+                    ra += 5.5;
+                }
+                Some(3) => {
+                    h += 5.5;
+                    ra += 3.0;
+                }
+                Some(5) => {
+                    h += 13.5;
+                    ra += 6.0;
+                }
+                Some(1) => {
+                    h += 7.0;
+                    ra += 2.5;
+                }
+                Some(4) => {
+                    h += 10.0;
+                    ra += 5.5;
+                }
+                Some(6) => {
+                    h += 7.5;
+                    ra += 6.5;
+                }
+                _ => {}
+            }
+            // `cdist = ra * 0.8 / tan(fov/2)` (MatrixMapStatic.cpp:549).
+            let cdist = ra * 0.8 / (icon.fov * 0.5).tan();
+            let (sin_z, cos_z) = icon.anglez.sin_cos();
+            let (sin_x, _) = icon.anglex.sin_cos();
+            let eye = glam::Vec3::new(cdist * sin_z, cdist * cos_z, sin_x * cdist + h);
+            // `right = normalize(eye × Z_up)` then target is offset
+            // sideways by 3 units in -right (MatrixMapStatic.cpp:554-561).
+            let right = eye.cross(glam::Vec3::Z).normalize_or_zero();
+            let target = glam::Vec3::new(-right.x * 3.0, -right.y * 3.0, h);
+            (eye, target, glam::Vec3::Z, icon.fov, 500.0)
+        } else {
+            // Constructor preview camera — eye at (80, -30, h+5),
+            // target at (0, 0, h), FOV π/4 (CConstructor.cpp:318-324).
+            let eye = glam::Vec3::new(80.0, -30.0, height + 5.0);
+            let target = glam::Vec3::new(0.0, 0.0, height);
+            (
+                eye,
+                target,
+                glam::Vec3::Z,
+                std::f32::consts::FRAC_PI_4,
+                300.0,
+            )
+        };
+        let _ = chassis; // keep the kind in scope for logging downstream
         let view = glam::Mat4::look_at_lh(eye, target, up);
-        let proj =
-            glam::Mat4::perspective_lh(std::f32::consts::FRAC_PI_4, scissor_aspect, 1.0, 300.0);
+        let proj = glam::Mat4::perspective_lh(fov, scissor_aspect, 1.0, far_z);
         // D3D and wgpu both use Y+ up / Z in [0,1] for clip space,
         // and glam's `look_at_lh` + `perspective_lh` produces that
         // clip orientation natively. No additional flip needed —
