@@ -24,7 +24,10 @@ impl AssetBundle {
     }
 
     pub fn add(&mut self, path: &str, data: Vec<u8>) {
-        self.files.insert(path.to_string(), data);
+        // Normalise to forward slashes on insert so callers can look up
+        // by either convention (the source data uses both — `Hints/0/
+        // Source` is forward-slash, `Hints/Bitmaps/*` is backslash).
+        self.files.insert(path.replace('\\', "/"), data);
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -77,7 +80,10 @@ impl AssetBundle {
             let data = raw[pos..pos + data_len].to_vec();
             pos += data_len;
 
-            files.insert(path, data);
+            // Normalise on load so callers that look up with forward
+            // slashes hit entries packed with backslashes (and vice
+            // versa). `add` does the same; both paths converge.
+            files.insert(path.replace('\\', "/"), data);
         }
 
         log::info!("bundle: loaded {} files", files.len());
@@ -85,7 +91,14 @@ impl AssetBundle {
     }
 
     pub fn read_file(&self, path: &str) -> Option<&[u8]> {
-        self.files.get(path).map(|v| v.as_slice())
+        // Match the slash-normalisation applied on insert so callers
+        // that hand us a backslash path (raw block-param values from
+        // robots.dat) still hit existing entries.
+        let normalised = path.replace('\\', "/");
+        self.files
+            .get(&normalised)
+            .or_else(|| self.files.get(path))
+            .map(|v| v.as_slice())
     }
 
     pub fn list_files(&self) -> Vec<&str> {

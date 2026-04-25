@@ -1221,7 +1221,7 @@ fn emit_hint(
     // ── Parts (text + inline bitmaps) ───────────────────────────────
     for part in &hint.parts {
         match part {
-            HintPart::Text { x, y, text, font, color, .. } => {
+            HintPart::Text { x, y, h, text, font, color, .. } => {
                 if text.is_empty() {
                     continue;
                 }
@@ -1231,8 +1231,22 @@ fn emit_hint(
                 // `\n`-separated sub-line at its own vertical stride.
                 let line_stride_px =
                     (glyph_atlas.line_height(font) as f32 + 1.0) * scale;
+                let line_h = glyph_atlas.line_height(font) as f32;
+                let line_count = text.split('\n').count().max(1) as f32;
+                // Natural visible height of the text block — matches the
+                // renderer's per-line stride, with no trailing leading.
+                let natural_h_design =
+                    line_h + (line_h + 1.0) * (line_count - 1.0);
+                // When the layout reserved more vertical space than the
+                // text actually needs (e.g. `_HEIGHT:23` on the
+                // BuildTurret price row sets h=23 around a 13-px-tall
+                // text), vertically centre the content inside that
+                // band — port of the Rangers rasterizer's behaviour
+                // for `m_RangersText(..., h, ..., aligny=0, ...)`.
+                let extra_h = (*h as f32 - natural_h_design).max(0.0);
+                let v_offset = (extra_h * 0.5) * scale;
                 let base_x = hint.screen_x + *x as f32 * scale;
-                let base_y = hint.screen_y + *y as f32 * scale;
+                let base_y = hint.screen_y + *y as f32 * scale + v_offset;
                 for (line_idx, line) in text.split('\n').enumerate() {
                     if line.is_empty() {
                         continue;

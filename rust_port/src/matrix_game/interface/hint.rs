@@ -612,7 +612,7 @@ pub fn build_hint(
     let mut color: [u8; 4] = [0xFF, 0xFF, 0xFF, 0xFF];
     let mut modif: Hem = Hem::Bitmap;
     let mut h_width: i32 = 0;
-    let mut _h_height: i32 = 0;
+    let mut h_height: i32 = 0;
     let mut skip = false;
 
     // Raw (part, hem) stream — positions resolved in pass 2.
@@ -665,7 +665,7 @@ pub fn build_hint(
             continue;
         }
         if let Some(rest) = directive.strip_prefix("_HEIGHT:") {
-            _h_height = rest.trim().parse().unwrap_or(0);
+            h_height = rest.trim().parse().unwrap_or(0);
             continue;
         }
         if directive.starts_with("_ALIGN:") || directive.starts_with("_SOUNDIN:")
@@ -784,7 +784,22 @@ pub fn build_hint(
                 .map(|s| measure_rich(atlas, &font, s) as i32)
                 .max()
                 .unwrap_or(0);
-            let total_h = line_h * lines.len() as i32;
+            // Visible block height = `line_h + (line_h + 1) * (N - 1)`
+            // (matches the renderer's `line_h + 1` stride).
+            let natural_h = if lines.is_empty() {
+                0
+            } else {
+                line_h + (line_h + 1) * (lines.len() as i32 - 1)
+            };
+            // `_HEIGHT:N` (when > 0) forces the text bitmap to N px
+            // tall. Port of the `m_RangersText(..., w, h, ...)`
+            // contract at MatrixHint.cpp:710-720 — the rasterizer
+            // returns `it->m_SizeY = h` when h is non-zero, with the
+            // text content vertically centred inside that band. The
+            // BuildTurret template uses `_HEIGHT:23` for the price
+            // row so the small price text sits aligned with the
+            // 23-px-tall resource icon next to it.
+            let total_h = natural_h.max(h_height);
             let joined = lines.join("\n");
             let (px, py) = pass1_position(
                 modif,
