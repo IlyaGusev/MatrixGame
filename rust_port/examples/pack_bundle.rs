@@ -137,6 +137,10 @@ fn main() {
     // Progress-bar sprite used by `CMatrixProgressBar`
     // (MatrixProgressBar.cpp:22 `TEXTURE_PATH_PB`). Ships only as DDS.
     extra_paths.push("Matrix/Textures/pb".to_string());
+    // Turret-build slot marker — `TEXTURE_PATH_TURRET_RADIUS` at
+    // StringConstants.hpp:114, used by SPOT_TURRET landscape decals
+    // (MatrixObjectBuilding.cpp:1640). Ships as DDS.
+    extra_paths.push("Matrix/Textures/LandSpots/spot_turr2".to_string());
     // Hint chrome + inline resource icons — referenced by
     // `CMatrixHint::PreloadBitmaps` (MatrixHint.cpp:441-459). Sources
     // come from `da/Hints/0/Source` (border0) and every alias under

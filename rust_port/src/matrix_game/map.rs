@@ -1900,6 +1900,7 @@ pub struct MapRenderer {
     buildings: Option<super::object_building::BuildingsRenderer>,
     robots: Option<super::object_robot::RobotsRenderer>,
     cannons: Option<super::object_cannon::CannonsRenderer>,
+    slot_markers: Option<super::slot_marker::SlotMarkerRenderer>,
     point_lights: PointLightRenderer,
     water: Option<super::water::Water>,
     uniform_buffer: wgpu::Buffer,
@@ -2301,6 +2302,9 @@ impl MapRenderer {
         // Basis.vo + Turret{N}.vo + Shaft{N}.vo on first `RNeed`.
         let cannons =
             super::object_cannon::CannonsRenderer::new(device, queue, config, map, read_texture);
+        // SPOT_TURRET landscape decals (MatrixObjectBuilding.cpp:1640).
+        let slot_markers =
+            super::slot_marker::SlotMarkerRenderer::new(device, queue, config, read_texture);
 
         // Water (MatrixWater.cpp)
         let water =
@@ -2556,6 +2560,7 @@ impl MapRenderer {
             buildings,
             robots,
             cannons,
+            slot_markers,
         }
     }
 
@@ -2641,13 +2646,16 @@ impl MapRenderer {
         point_lights: &PointLightSystem,
         cms: i32,
         ghost_cannon: Option<super::object_cannon::GhostCannon>,
-        slot_markers: &[super::object_cannon::TurretSlotMarker],
+        slot_markers: &[super::slot_marker::SlotMarker],
     ) {
         if let Some(robots) = &mut self.robots {
             robots.sync_robots(queue, objs, map, point_lights, cms);
         }
         if let Some(cannons) = &mut self.cannons {
-            cannons.sync_cannons(queue, objs, map, ghost_cannon, slot_markers);
+            cannons.sync_cannons(queue, objs, map, ghost_cannon, &[]);
+        }
+        if let Some(sm) = &mut self.slot_markers {
+            sm.sync(queue, map, slot_markers);
         }
     }
 
@@ -2803,6 +2811,9 @@ impl MapRenderer {
         }
         if let Some(cannons) = &self.cannons {
             cannons.render(queue, &mut pass, camera, view_proj);
+        }
+        if let Some(sm) = &self.slot_markers {
+            sm.render(queue, &mut pass, view_proj);
         }
 
         // Visible additive point-light pass on terrain-conforming geometry.

@@ -353,7 +353,12 @@ impl MapLogic {
         shift: bool,
     ) -> Option<ObjectId> {
         let (origin, dir) = camera.screen_to_world_ray(sx, sy, screen_w, screen_h);
-        let hit = self.objects.pick_object(origin, dir, TRACE_ANYOBJECT, None);
+        // Cannons are excluded from the click pick — the original
+        // doesn't allow selecting them; clicks pass through to the
+        // parent base / terrain (MatrixSide.cpp's SelectObject only
+        // routes ROBOT / BUILDING / FLYER, not CANNON).
+        let mask = TRACE_ANYOBJECT & !crate::matrix_game::common::TRACE_CANNON;
+        let hit = self.objects.pick_object(origin, dir, mask, None);
         match hit {
             Some((id, _t)) => {
                 let sel = self.curr_sel_for(id);

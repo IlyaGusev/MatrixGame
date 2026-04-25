@@ -630,27 +630,33 @@ impl CannonsRenderer {
                 }
             }
         }
-        // Slot-marker pass — Basis only, kind=1 (the meshes are
-        // identical-enough across kinds for the slot indicator). Picks
-        // the first kind with a loaded Basis so this works on builds
-        // where some kinds failed to load.
+        // Slot-marker pass — render the full cannon mesh (Basis +
+        // Turret + Shaft) at each free slot so the player sees what
+        // would mount there, tinted via `terrain_color`. Picks the
+        // first kind whose meshes loaded so this works on builds where
+        // a kind failed to parse.
         if let Some((m_offset, m_count)) = self.marker_draw {
             for kgpu in &self.kinds {
-                let Some(basis) = kgpu.basis.as_ref() else {
+                if kgpu.basis.is_none() && kgpu.turret.is_none() && kgpu.shaft.is_none() {
                     continue;
-                };
-                pass.set_vertex_buffer(0, basis.vertex_buffer.slice(..));
-                for surface in &basis.surfaces {
-                    pass.set_bind_group(0, &surface.bind_group, &[]);
-                    pass.set_index_buffer(
-                        surface.index_buffer.slice(..),
-                        wgpu::IndexFormat::Uint32,
-                    );
-                    pass.draw_indexed(
-                        0..surface.num_indices,
-                        0,
-                        m_offset..(m_offset + m_count),
-                    );
+                }
+                for mesh in [&kgpu.basis, &kgpu.turret, &kgpu.shaft]
+                    .iter()
+                    .flat_map(|m| m.as_ref())
+                {
+                    pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                    for surface in &mesh.surfaces {
+                        pass.set_bind_group(0, &surface.bind_group, &[]);
+                        pass.set_index_buffer(
+                            surface.index_buffer.slice(..),
+                            wgpu::IndexFormat::Uint32,
+                        );
+                        pass.draw_indexed(
+                            0..surface.num_indices,
+                            0,
+                            m_offset..(m_offset + m_count),
+                        );
+                    }
                 }
                 break;
             }

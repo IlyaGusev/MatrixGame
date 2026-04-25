@@ -27,5 +27,6 @@ pub mod progress_bar;
 pub mod render_pipeline;
 pub mod robot;
 pub mod side;
+pub mod slot_marker;
 pub mod ter_surface;
 pub mod water;

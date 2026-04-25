@@ -1846,12 +1846,13 @@ fn update_turret_build(
     step_ms: i32,
 ) -> (
     Option<crate::matrix_game::object_cannon::GhostCannon>,
-    Vec<crate::matrix_game::object_cannon::TurretSlotMarker>,
+    Vec<crate::matrix_game::slot_marker::SlotMarker>,
 ) {
     use crate::matrix_game::config::Resource;
     use crate::matrix_game::map_static::{MapStatic, ObjectType};
     use crate::matrix_game::object_building::Building;
-    use crate::matrix_game::object_cannon::{GhostCannon, TurretSlotMarker};
+    use crate::matrix_game::object_cannon::GhostCannon;
+    use crate::matrix_game::slot_marker::SlotMarker;
 
     if !state.iface_list.turret_build.is_active() {
         return (None, Vec::new());
@@ -1890,13 +1891,39 @@ fn update_turret_build(
     // (MatrixObjectBuilding.cpp:1617). Visible whenever the picker
     // is open (regardless of whether a kind has been committed) so
     // the player can see where they may build before clicking.
-    let markers: Vec<TurretSlotMarker> = slots
+    // Spot radius — port of MatrixEffectLandscapeSpot.cpp:233-236:
+    //   xc = SPOT_SIZE * scalex * cos(angle)
+    // SPOT_SIZE = 5.0 (MatrixEffectLandscapeSpot.hpp:22), and the
+    // scale passed at MatrixObjectBuilding.cpp:1640 is 6.0. So the
+    // quad's half-extent is 30 world units.
+    const SPOT_SIZE: f32 = 5.0;
+    const SPOT_TURRET_SCALE: f32 = 6.0;
+    let radius = SPOT_SIZE * SPOT_TURRET_SCALE;
+    let markers: Vec<SlotMarker> = slots
         .iter()
         .filter(|p| p.cannon_type < 0)
-        .map(|p| TurretSlotMarker {
-            pos: p.world,
-            pos_z: parent_z + 1.0,
-            angle: p.angle,
+        .map(|p| {
+            // Sample terrain at the four corners + center; lift the
+            // marker above the highest of them so corners don't sink
+            // below uneven terrain (which clips the decal because it's
+            // a single flat quad rather than a true terrain-conforming
+            // decal).
+            let cx = p.world.x;
+            let cy = p.world.y;
+            let r = radius;
+            let z_max = state
+                .map
+                .get_z(cx, cy)
+                .max(state.map.get_z(cx + r, cy + r))
+                .max(state.map.get_z(cx - r, cy + r))
+                .max(state.map.get_z(cx + r, cy - r))
+                .max(state.map.get_z(cx - r, cy - r))
+                .max(parent_z);
+            SlotMarker {
+                pos: p.world,
+                pos_z: z_max + 1.0,
+                radius,
+            }
         })
         .collect();
 
@@ -2756,7 +2783,7 @@ async fn load_map_async() -> (
         // Bump this whenever `pack_bundle.rs` changes the set of
         // packed keys, so the browser refetches instead of serving
         // a stale cached response.
-        format!("{bundle_url}?bv=5")
+        format!("{bundle_url}?bv=6")
     };
     log::info!("loading bundle: {}", bundle_url);
     let bundle_data = crate::gfx::loader::load_bytes(&bundle_url)
