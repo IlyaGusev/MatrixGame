@@ -359,6 +359,44 @@ impl InterfaceRenderer {
         );
     }
 
+    /// Register a runtime-rendered texture as an atlas under `key`.
+    /// Used by `RobotIconCache` to wire offscreen-baked robot portraits
+    /// into the same atlas-keyed draw path as the static UI atlases —
+    /// the corresponding `IFaceElement::StateImage::tex_path` carries
+    /// `key` so the existing emit loop picks it up unchanged.
+    pub fn register_dynamic_atlas(
+        &mut self,
+        device: &wgpu::Device,
+        key: &str,
+        view: wgpu::TextureView,
+        width: u32,
+        height: u32,
+    ) {
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Interface Dynamic Atlas BG"),
+            layout: &self.atlas_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        });
+        self.atlases.insert(
+            key.to_string(),
+            Atlas {
+                _tex: view,
+                bind_group,
+                width,
+                height,
+            },
+        );
+    }
+
     /// Preload the hint chrome atlases. Called at init right after
     /// `preload_for_panels`. Mirrors `CMatrixHint::PreloadBitmaps`
     /// (MatrixHint.cpp:441-459) — loads the border0 PNG + every alias

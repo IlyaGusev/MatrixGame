@@ -85,7 +85,7 @@ pub struct BaseVisibilityCtx<'a> {
 /// depends on. Ports the reads the C++ does at
 /// CInterface.cpp:1215-1426 — `m_CurrSel`, the currently-active
 /// object (for its kind + stack size), and a couple of flag queries.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct MainVisibilityCtx {
     pub curr_sel: crate::matrix_game::side::CurrSel,
     /// `m_ActiveObject->AsBuilding()->m_Kind` — the kind of the
@@ -105,12 +105,34 @@ pub struct MainVisibilityCtx {
     pub constructor_active: bool,
     /// Turret-build mode active — show turret1..4 kind picker.
     pub turret_build_active: bool,
-    /// `m_BS.GetTopItem()` cannon kind when the head queue item is a
-    /// turret (1..=4), else `None`. Drives the medium-icon preview at
-    /// `sticon`. Port of the cannon branch of
-    /// `CIFaceList::CreateStackIcon` (CInterface.cpp:4018-4053).
-    pub building_stack_head_turret_kind: Option<i32>,
+    /// Per-slot cannon kind across the build stack (`m_Top` →
+    /// `m_NextStackItem` walk in C++). Index 0 is the head, 1..5 the
+    /// queued tail items. `Some(N)` flags a turret of kind N (1..=4);
+    /// `None` for an empty slot or a non-cannon item. Drives the
+    /// CIFaceList::CreateStackIcon dispatch (CInterface.cpp:3956-4131):
+    /// the head copies `tmd{N}` onto `sticon`; tails get a dynamic
+    /// 25×25 small icon at `(225+(i-1)*31, 105)` from `tsm{N}`.
+    pub building_stack_turret_kinds: [Option<i32>; MAX_STACK_ICONS],
+    /// Per-slot robot-icon atlas keys. `Some(key)` flags a robot
+    /// build-stack item whose 64×64 portrait has been baked by
+    /// `RobotIconCache` and registered as a virtual atlas under `key`;
+    /// the dynamic stack-icon element samples that atlas. `None` when
+    /// the slot is empty / a turret / the icon hasn't been baked yet.
+    /// Port of the robot branch of `CIFaceList::CreateStackIcon`
+    /// (CInterface.cpp:3975-3982 + 4055-4117): the C++ sources from
+    /// `m_MedTexture`/`m_SmallTexture` baked in
+    /// `CMatrixRobotAI::CreateTextures` (MatrixRobot.cpp:5342-5380).
+    pub building_stack_robot_atlas_keys: [Option<String>; MAX_STACK_ICONS],
 }
+
+/// `MAX_STACK_UNITS` (MatrixObjectBuilding.hpp:43) — 1 head + 5 tail.
+pub const MAX_STACK_ICONS: usize = 6;
+/// `STACK_ICON` (CInterface.h:72) — base id for dynamic stack-icon
+/// elements. `STACK_ICON+(num-1)` identifies the icon for queue
+/// position `num`. Used so per-frame regen can find/drop entries
+/// from prior frames (`IS_STACK_ICON(x)` at CInterface.h:84 spans
+/// `[STACK_ICON, STACK_ICON+9)`).
+pub const STACK_ICON_BASE: i32 = 100;
 
 impl CInterface {
     /// Port of `CInterface::Load(bp, name)` (CInterface.cpp:146 onward).
@@ -433,16 +455,85 @@ impl CInterface {
             }
         }
 
-        // Step 7 — build-stack head icon (cannon branch). Port of
-        // `CIFaceList::CreateStackIcon`'s cannon branch
-        // (CInterface.cpp:4018-4053): when the head queue item is a
-        // turret of kind N, the dynamic medium icon is drawn from
-        // `tmd{N}`'s texture page. We approximate by copying tmd{N}'s
-        // per-state images onto `sticon` so the existing static frame
-        // displays the right turret artwork.
-        if let Some(kind) = ctx.building_stack_head_turret_kind {
-            let src_name = format!("tmd{}", kind);
-            self.copy_pair(Some(src_name.as_str()), "sticon");
+        // Step 7 — build-stack icons. Port of
+        // `CIFaceList::CreateStackIcon` (CInterface.cpp:3956-4131).
+        //
+        // The original `CBuildStack::AddItem` calls `CreateStackIcon`
+        // which spawns a new `CIFaceStatic` per queue position; the
+        // head goes at (232, 55), 42×42 sourced from `tmd{N}`, the
+        // tail items at (225+(num-2)*31, 105), 25×25 sourced from
+        // `tsm{N}` (cannon branch CInterface.cpp:4018-4053).
+        // `DeleteItem` removes them and shifts tail icons left when
+        // the head completes (CInterface.cpp:4135-4170).
+        //
+        // We mirror the visible end state per frame: drop any
+        // dynamically-spawned icons from the prior frame, then push a
+        // fresh static for each turret slot. `sticon`/`stother`
+        // remain unmodified — they're the authored frame plates the
+        // dynamic icons sit inside, exactly like the C++ keeps
+        // them under the dynamic STACK_ICON elements.
+        //
+        // Robot items source from a runtime-baked 64×64 texture
+        // registered as a virtual atlas (`_robot_icon_<hash>`). Port
+        // of the robot branch at CInterface.cpp:3975-3982 + 4067-4078;
+        // the C++ samples the entire `m_MedTexture` (xTexPos=0,
+        // yTexPos=0, full texture rect, fullsize=true) so we do the
+        // same — the StateImage covers the whole 64×64 page, and the
+        // element rect (42×42 / 25×25) handles the on-screen sizing.
+        self.elements.retain(|e| !e.name.starts_with("_dynstack_"));
+        for i in 0..MAX_STACK_ICONS {
+            let (pos_x, pos_y, size_xy) = if i == 0 {
+                (232.0, 55.0, 42.0)
+            } else {
+                (225.0 + (i as f32 - 1.0) * 31.0, 105.0, 25.0)
+            };
+            let images = if let Some(kind) = ctx.building_stack_turret_kinds[i] {
+                let src_name = if i == 0 {
+                    format!("tmd{}", kind)
+                } else {
+                    format!("tsm{}", kind)
+                };
+                let Some(src_idx) = self.elements.iter().position(|e| e.name == src_name) else {
+                    continue;
+                };
+                self.elements[src_idx].images.clone()
+            } else if let Some(key) = &ctx.building_stack_robot_atlas_keys[i] {
+                let mut imgs: [Option<StateImage>; MAX_STATES] = Default::default();
+                imgs[ElementState::Normal as usize] = Some(StateImage {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 64.0,
+                    h: 64.0,
+                    tex_w: 64.0,
+                    tex_h: 64.0,
+                    tex_path: key.clone(),
+                });
+                imgs
+            } else {
+                continue;
+            };
+            self.elements.push(IFaceElement {
+                name: format!("_dynstack_{}", i + 1),
+                kind: ElementKind::Static,
+                id: STACK_ICON_BASE + i as i32,
+                group: 0,
+                flags: IFEF_VISIBLE,
+                param1: 0.0,
+                param2: 0.0,
+                i_param: 0,
+                pos_x,
+                pos_y,
+                pos_z: 0.0,
+                size_x: size_xy,
+                size_y: size_xy,
+                images,
+                labels: Vec::new(),
+                cur_state: ElementState::Normal,
+                def_state: ElementState::Normal,
+                hint_template: String::new(),
+                hint_offset_x: 0,
+                hint_offset_y: 0,
+            });
         }
     }
 

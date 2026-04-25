@@ -194,6 +194,12 @@ impl BuildStack {
         self.items.first()
     }
 
+    /// Read-only view of the full queue, head first. Maps to walking
+    /// the `m_Top` → `m_NextStackItem` chain in the C++.
+    pub fn list(&self) -> &[PendingItem] {
+        &self.items
+    }
+
     /// Progress ratio of the head item in `[0.0, 1.0]`. Drives the
     /// progress-bar UI the C++ updates at MatrixObjectBuilding.cpp:1681.
     pub fn progress(&self) -> f32 {

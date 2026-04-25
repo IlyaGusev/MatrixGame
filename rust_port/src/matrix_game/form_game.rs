@@ -81,6 +81,11 @@ struct AppState {
     /// 264-360). Emits a chassis draw-ticket per frame while the
     /// constructor panel is active.
     builder_preview: crate::matrix_game::interface::constructor::BuilderPreview,
+    /// Cached robot-icon textures for the build-queue UI. One 64×64
+    /// per unique `RobotConfig`, lazily baked the first time the queue
+    /// surfaces a config. Port of `m_MedTexture` (MatrixRobot.cpp:
+    /// 5342-5380); see `interface::robot_icons` for the bake path.
+    robot_icons: crate::matrix_game::interface::RobotIconCache,
 }
 
 pub struct App {
@@ -267,6 +272,7 @@ impl ApplicationHandler for App {
                 progress_bars,
                 builder_preview:
                     crate::matrix_game::interface::constructor::BuilderPreview::new(),
+                robot_icons: crate::matrix_game::interface::RobotIconCache::new(),
             });
         }
 
@@ -425,6 +431,7 @@ impl ApplicationHandler for App {
                     progress_bars,
                     builder_preview:
                         crate::matrix_game::interface::constructor::BuilderPreview::new(),
+                    robot_icons: crate::matrix_game::interface::RobotIconCache::new(),
                 });
                 win.request_redraw();
                 hide_loading_overlay();
@@ -2409,6 +2416,14 @@ fn refresh_interface_visibility(state: &mut AppState) {
     // carry the selected building's `m_Side` so the Base-panel build
     // button can gate on "is this our base?" — port of the
     // `m_Base->m_Side == PLAYER_SIDE` guard at CConstructor.cpp:225-227.
+    use crate::matrix_game::interface::constructor::RobotConfig;
+    use crate::matrix_game::interface::MAX_STACK_ICONS;
+
+    // First pass — read-only snapshot of the build stack: per-slot
+    // turret kinds and per-slot robot configs. We can't borrow
+    // `state.game.objects` and `state.robot_icons`/`state.iface_renderer`
+    // mutably at the same time, so the icon-bake pass runs after the
+    // borrow is released.
     let (
         kind,
         stack_empty,
@@ -2417,7 +2432,18 @@ fn refresh_interface_visibility(state: &mut AppState) {
         hit_point,
         hit_point_max,
         active_side,
-        stack_head_turret,
+        stack_kinds,
+        stack_robot_cfgs,
+    ): (
+        Option<BuildingType>,
+        bool,
+        i32,
+        i32,
+        f32,
+        f32,
+        i32,
+        [Option<i32>; MAX_STACK_ICONS],
+        [Option<RobotConfig>; MAX_STACK_ICONS],
     ) = match curr_sel {
         CurrSel::BaseSelected | CurrSel::BuildingSelected => {
             use crate::matrix_game::object_building::PendingKind;
@@ -2429,10 +2455,20 @@ fn refresh_interface_visibility(state: &mut AppState) {
                     let b: &Building =
                         unsafe { &*(o as *const dyn MapStatic as *const Building) };
                     let n = b.build_stack.items() as i32;
-                    let head_turret = b.build_stack.head().and_then(|h| match h.kind {
-                        PendingKind::Turret { turret_kind, .. } => Some(turret_kind),
-                        _ => None,
-                    });
+                    let mut kinds: [Option<i32>; MAX_STACK_ICONS] =
+                        [None; MAX_STACK_ICONS];
+                    let mut cfgs: [Option<RobotConfig>; MAX_STACK_ICONS] =
+                        [None; MAX_STACK_ICONS];
+                    for (slot, item) in
+                        b.build_stack.list().iter().take(MAX_STACK_ICONS).enumerate()
+                    {
+                        match item.kind {
+                            PendingKind::Turret { turret_kind, .. } => {
+                                kinds[slot] = Some(turret_kind)
+                            }
+                            PendingKind::Robot(cfg) => cfgs[slot] = Some(cfg),
+                        }
+                    }
                     (
                         Some(b.kind),
                         n == 0,
@@ -2441,13 +2477,54 @@ fn refresh_interface_visibility(state: &mut AppState) {
                         b.hit_point,
                         b.hit_point_max,
                         b.side,
-                        head_turret,
+                        kinds,
+                        cfgs,
                     )
                 })
-                .unwrap_or((None::<BuildingType>, true, 0, 0, 0.0, 0.0, 0, None))
+                .unwrap_or((
+                    None,
+                    true,
+                    0,
+                    0,
+                    0.0,
+                    0.0,
+                    0,
+                    [None; MAX_STACK_ICONS],
+                    [None; MAX_STACK_ICONS],
+                ))
         }
-        _ => (None, true, 0, 0, 0.0, 0.0, 0, None),
+        _ => (
+            None,
+            true,
+            0,
+            0,
+            0.0,
+            0.0,
+            0,
+            [None; MAX_STACK_ICONS],
+            [None; MAX_STACK_ICONS],
+        ),
     };
+
+    // Bake (or look up cached) robot icons for any robot configs
+    // queued in the build stack. Each new config triggers a separate
+    // off-screen submit, after which the texture is reused for free.
+    let mut stack_robot_keys: [Option<String>; MAX_STACK_ICONS] = Default::default();
+    if let Some(robots) = state.terrain.robots() {
+        let format = state.gfx.config.format;
+        for (slot, cfg_opt) in stack_robot_cfgs.iter().enumerate() {
+            if let Some(cfg) = cfg_opt {
+                stack_robot_keys[slot] = state.robot_icons.ensure(
+                    &state.gfx.device,
+                    &state.gfx.queue,
+                    format,
+                    robots,
+                    &mut state.iface_renderer,
+                    cfg,
+                );
+            }
+        }
+    }
     let active_is_player_owned = active_side == player_side_id;
 
     // Port of `CMatrixSideUnit::GetIncomePerTime(kind, 60000)`
@@ -2480,7 +2557,8 @@ fn refresh_interface_visibility(state: &mut AppState) {
         building_turrets_max: turrets_max,
         constructor_active,
         turret_build_active,
-        building_stack_head_turret_kind: stack_head_turret,
+        building_stack_turret_kinds: stack_kinds,
+        building_stack_robot_atlas_keys: stack_robot_keys,
     };
     if let Some(p) = state.iface_list.panel_mut("Main") {
         p.refresh_main_visibility(&ctx);
