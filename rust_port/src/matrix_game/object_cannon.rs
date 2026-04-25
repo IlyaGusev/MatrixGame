@@ -667,16 +667,21 @@ impl CannonsRenderer {
 fn cannon_instance(c: &Cannon, cx: f32, cy: f32, _map: &GameMap) -> InstanceData {
     let (s, co) = c.angle.sin_cos();
     let [sr, sg, sb] = crate::matrix_game::side::side_color_rgb(c.side);
-    // Row-major encoding — matches the buildings shader
-    // (object_building.wgsl) which does `world.x = dot(m0, p)`. The
-    // rows are the standard rotation-Z transform with translation in
-    // the last column.
+    // Under-construction tint — port of MatrixObjectCannon.cpp:546
+    // (`SetRenderState(D3DRS_TEXTUREFACTOR, 0xFF00FF00)`). The C++
+    // applies a flat green factor to mark the cannon as still being
+    // built; the live `m_TerainColor` only kicks in once CANNON_IDLE.
+    let terrain_color = if matches!(c.state, CannonState::UnderConstruction) {
+        [0.0, 1.0, 0.0, 1.0]
+    } else {
+        [1.0, 1.0, 1.0, 1.0]
+    };
     InstanceData {
         row0: [co, -s, 0.0, c.pos.x - cx],
         row1: [s, co, 0.0, c.pos.y - cy],
         row2: [0.0, 0.0, 1.0, c.pos_z],
         row3: [0.0, 0.0, 0.0, 1.0],
-        terrain_color: [1.0, 1.0, 1.0, 1.0],
+        terrain_color,
         unit_offset: [0.0, 0.0, 0.0, 0.0],
         side_color: [sr, sg, sb, 1.0],
     }

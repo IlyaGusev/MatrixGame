@@ -368,12 +368,12 @@ impl CInterface {
                     "podl2" if ctx.building_turrets_max == 2 => e.set_visible(true),
                     "podl3" if ctx.building_turrets_max == 3 => e.set_visible(true),
                     "podl4" if ctx.building_turrets_max == 4 => e.set_visible(true),
-                    // Build-queue UI (CInterface.cpp:1592, :1679). The
-                    // stack icons (`sticon`, `stother`) and progress
-                    // track (`prog`) only show while an item is being
-                    // produced.
+                    // Build-queue stack icons (CInterface.cpp:1592).
+                    // `prog` (IF_MAIN_PROG, "Программы") is the
+                    // robot-orders programs panel and only shows when a
+                    // group is selected (CInterface.cpp:1679); it's
+                    // unrelated to the build stack.
                     "sticon" | "stother" if has_items => e.set_visible(true),
-                    "prog" if has_items => e.set_visible(true),
                     _ => {}
                 }
             }
