@@ -386,8 +386,7 @@ pub struct GlyphAtlas {
 
 /// Embedded AFT font assets (extracted from forms.pkg/DATA/FONT/).
 /// Using the plain 1-bit variants (bmp1 only) — every pixel is
-/// fully opaque, no AA halo, so glyphs read as crisp pixel-art at
-/// any scale.
+/// fully opaque, no AA halo, so glyphs read as crisp pixel-art.
 const FONT_RANGER_6: &[u8] = include_bytes!("../../../assets/fonts/RANGER_6.AFT");
 const FONT_RANGER_5: &[u8] = include_bytes!("../../../assets/fonts/RANGER_5.AFT");
 const FONT_VERDANA_10_2: &[u8] = include_bytes!("../../../assets/fonts/VERDANA_10_2.AFT");

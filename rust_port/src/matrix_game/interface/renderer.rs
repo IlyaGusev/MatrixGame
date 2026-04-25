@@ -1022,8 +1022,14 @@ impl InterfaceRenderer {
                         }
                     }
                     if label.wrap {
+                        // Available text width from the label's anchor
+                        // out to the element's right edge. `label.x`
+                        // is the text origin inside the element;
+                        // `label.sme_x` is an extra offset that's
+                        // applied at render time too, so it shrinks
+                        // the wrap budget by the same amount.
                         let wrap_width =
-                            (elem.size_x - label.x).max(0.0) * scale;
+                            (elem.size_x - label.x - label.sme_x).max(0.0) * scale;
                         emit_wrapped_text(
                             &mut all_verts,
                             &mut current_key,
@@ -1223,7 +1229,8 @@ fn emit_hint(
                 // (explicit `<br>` or wrap). The hint layout already
                 // picked the per-line widths; here we render each
                 // `\n`-separated sub-line at its own vertical stride.
-                let line_stride_px = glyph_atlas.line_height(font) as f32 * scale;
+                let line_stride_px =
+                    (glyph_atlas.line_height(font) as f32 + 1.0) * scale;
                 let base_x = hint.screen_x + *x as f32 * scale;
                 let base_y = hint.screen_y + *y as f32 * scale;
                 for (line_idx, line) in text.split('\n').enumerate() {
@@ -1438,7 +1445,9 @@ fn emit_wrapped_text(
     if lines.is_empty() {
         return;
     }
-    let line_h = glyph_atlas.line_height(font) as f32 * scale;
+    // 1 px of leading on top of (ascent + descent) so descenders on
+    // one row don't kiss ascenders on the next.
+    let line_h = (glyph_atlas.line_height(font) as f32 + 1.0) * scale;
     let block_h = line_h * lines.len() as f32;
     let block_top = match align_y {
         1 => anchor_y - block_h * 0.5,
