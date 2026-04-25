@@ -297,7 +297,7 @@ fn main() {
             continue;
         }
         let id_str = strings.get_as_wstr(*type_id as usize);
-        let Some(paths) = vector_object::resolve_paths(&id_str) else {
+        let Some(paths) = matrixgame_rs::matrix_game::object::resolve_paths(&id_str) else {
             continue;
         };
         let vo_key = paths.vo_path.to_uppercase();

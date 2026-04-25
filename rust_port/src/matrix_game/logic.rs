@@ -268,6 +268,42 @@ impl MapLogic {
             self.objects.add_lt(id);
             ids.push(id);
         }
+        // Port of MatrixMapPrepare.cpp:798-885's per-record loop: every
+        // CMAP `cannons/*` record (prop=0 standalone or prop=1 mounted)
+        // gets a live `CMatrixCannon`. The map loader already did the
+        // nearest-base scan and stashed the parent index + slot on
+        // each `CannonInstance`.
+        let mut spawned_cannons = 0;
+        for c in &map.cannons {
+            // Resolve parent building's z / id (if any).
+            let (parent_id, build_z) = if let Some(bi) = c.parent_building {
+                let bid = ids.get(bi).copied();
+                let bz = map.buildings.get(bi).map(|b| b.build_z).unwrap_or(0.0);
+                (bid, bz)
+            } else {
+                // Standalone: anchor to terrain height at (x, y).
+                let z = map.get_z(c.x, c.y).max(0.0);
+                (None, z)
+            };
+            let cannon = crate::matrix_game::object_cannon::Cannon::new(
+                glam::Vec2::new(c.x, c.y),
+                build_z + c.add_h,
+                c.angle,
+                c.side as i32,
+                c.kind as i32,
+                parent_id,
+                c.parent_slot,
+            );
+            let cid = self.objects.spawn(Box::new(cannon));
+            self.objects.add_lt(cid);
+            spawned_cannons += 1;
+        }
+        log::info!(
+            "spawn: {} buildings, {} cannons (from {} records)",
+            ids.len(),
+            spawned_cannons,
+            map.cannons.len()
+        );
         ids
     }
 
@@ -1278,6 +1314,7 @@ mod tests {
             turrets_places_cnt: 4,
             shadow_kind: 0,
             shadow_size: 128,
+            turret_places: Vec::new(),
         };
         let b = Building::from_instance(&inst);
         let id = w.objects.spawn(Box::new(b));

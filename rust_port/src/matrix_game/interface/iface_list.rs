@@ -63,6 +63,13 @@ impl TurretKind {
 /// clicks one of the `turret1..turret4` buttons or `buca` on a building;
 /// the next map click either places the turret (on a valid building slot)
 /// or cancels (anywhere else).
+///
+/// The placement preview is driven each frame by `update_cursor` (called
+/// from the form_game cursor-move + render path): it snaps the cursor
+/// to the nearest free turret slot on the parent building, smooths the
+/// ghost cannon's angle toward the slot's rest angle, and flips the
+/// validity tint. Mirrors `CMatrixSideUnit::LogicTakt` BUILDING_TURRET
+/// branch (MatrixSide.cpp:528-585).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TurretBuild {
     pub active: bool,
@@ -73,8 +80,25 @@ pub struct TurretBuild {
     /// Cursor hover position in world space — drives the placement preview.
     pub cursor_world: (f32, f32),
     /// Which turret slot on the parent building the cursor is over
-    /// (1..=turrets_max) — 0 means none.
-    pub hovered_slot: i32,
+    /// (0..turrets_max-1). `None` = cursor not over any free slot — the
+    /// ghost falls back to the raw cursor position with the red tint.
+    pub hovered_slot: Option<i32>,
+    /// Ghost cannon's current angle in radians — interpolates toward
+    /// the snapped slot's rest angle each tick using the C++ damping
+    /// formula `dang * (1 - 0.99^ms)` (MatrixSide.cpp:578).
+    pub ghost_angle: f32,
+    /// Ghost cannon's current world-space XY (already snapped if a slot
+    /// is hovered, else the raw terrain cursor).
+    pub ghost_pos: glam::Vec2,
+    /// Ghost cannon's pos-Z — taken from the parent base's `build_z`
+    /// + the platform offset on `begin`, then held constant. The C++
+    /// pulls this from the base's matrix every frame; the Rust port
+    /// snaps once at session start since the base doesn't move.
+    pub ghost_z: f32,
+    /// `m_CanBuildFlag` (MatrixSide.cpp:555/558). True when the cursor
+    /// is over a free slot AND the player still has resources for
+    /// another turret on the parent.
+    pub can_build: bool,
 }
 
 impl TurretBuild {
@@ -82,13 +106,36 @@ impl TurretBuild {
         Self::default()
     }
 
+    /// Port of the `bca` LMB-up branch (CInterface.cpp:3493-3499) —
+    /// flips `PREORDER_BUILD_TURRET` so the kind picker is visible, but
+    /// does NOT spawn the placement-preview ghost. The C++ defers the
+    /// ghost cannon to `BeginBuildTurret(no)`, which only runs once the
+    /// player picks a kind.
+    pub fn open_picker(&mut self, parent: crate::matrix_game::map_static::ObjectId) {
+        self.active = true;
+        self.kind = None;
+        self.parent = Some(parent);
+        self.cursor_world = (0.0, 0.0);
+        self.hovered_slot = None;
+        self.ghost_angle = 0.0;
+        self.ghost_pos = glam::Vec2::ZERO;
+        self.ghost_z = 0.0;
+        self.can_build = false;
+    }
+
     /// Port of `CInterface::BeginBuildTurret(no)` (CInterface.cpp:4650+).
+    /// Commits the kind — the per-frame placement preview becomes
+    /// visible on the next tick.
     pub fn begin(&mut self, kind: TurretKind, parent: crate::matrix_game::map_static::ObjectId) {
         self.active = true;
         self.kind = Some(kind);
         self.parent = Some(parent);
         self.cursor_world = (0.0, 0.0);
-        self.hovered_slot = 0;
+        self.hovered_slot = None;
+        self.ghost_angle = 0.0;
+        self.ghost_pos = glam::Vec2::ZERO;
+        self.ghost_z = 0.0;
+        self.can_build = false;
     }
 
     pub fn cancel(&mut self) {
@@ -610,15 +657,28 @@ impl IFaceList {
     /// the press (caller should suppress camera/move-order routing).
     /// Mirrors the early-return of `CIFaceList::OnMouseRBDown` in
     /// the C++ list dispatcher.
+    ///
+    /// Only consumes the event for elements that actually have an RBDown
+    /// handler — i.e. the constructor pylons that open popup menus
+    /// (CIFaceButton.cpp:183-321 returns early when no RB action is
+    /// bound). Other buttons (turret picker, hud, etc.) let the press
+    /// fall through so the camera can rotate-on-drag from over them.
     pub fn on_mouse_right_down(&mut self, sx: f32, sy: f32, screen_w: f32, screen_h: f32) -> bool {
         let hit = self.hit_test(sx, sy, screen_w, screen_h);
-        match hit {
-            Some(handle) => {
-                self.right_pressed = Some(handle);
-                true
-            }
-            None => false,
+        let Some((pi, ei)) = hit else {
+            return false;
+        };
+        let elem_name = self
+            .panels
+            .get(pi)
+            .and_then(|p| p.elements.get(ei))
+            .map(|e| e.name.as_str())
+            .unwrap_or("");
+        if !is_right_clickable(elem_name) {
+            return false;
         }
+        self.right_pressed = Some((pi, ei));
+        true
     }
 
     /// Right-mouse-button up. Fires a `Click::RightButton` when
@@ -659,4 +719,15 @@ impl Default for IFaceList {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Element-name allowlist for RMB consumption — kept in sync with the
+/// names `popup_for_pylon` (interface/iface_menu.rs) recognises. The
+/// constructor pylons are the only buttons that open popup menus on
+/// RBDown; everything else lets RMB fall through to camera rotation.
+fn is_right_clickable(name: &str) -> bool {
+    matches!(
+        name,
+        "pich" | "pihu" | "pihe" | "pi1" | "pi2" | "pi3" | "pi4" | "pi5"
+    )
 }

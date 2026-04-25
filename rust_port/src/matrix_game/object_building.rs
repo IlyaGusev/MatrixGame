@@ -230,6 +230,18 @@ impl BuildStack {
 
         let head = self.items[0];
         let total = head.kind.build_time_ms();
+
+        // Per-tick HP ramp for in-progress turrets — port of
+        // MatrixObjectBuilding.cpp:1764-1769:
+        //   percent_done = m_Timer / g_Config.m_Timings[UNIT_TURRET];
+        //   ca->SetHitPoint(ca->GetMaxHitPoint() * percent_done);
+        // The C++ also invokes the per-build-stack progress-bar UI
+        // here; we keep that on the existing `progress()` accessor.
+        if let PendingKind::Turret { slot, .. } = head.kind {
+            let progress = (self.timer as f32 / total.max(1) as f32).clamp(0.0, 1.0);
+            ramp_turret_hp(objs, parent_self_id, slot, progress);
+        }
+
         if self.timer < total {
             return None;
         }
@@ -286,11 +298,10 @@ impl BuildStack {
             }
             PendingKind::Turret { slot, turret_kind } => {
                 // Turret placement happens immediately on the parent
-                // building — this branch only completes the build
-                // timer side. The actual per-slot cannon render /
-                // collision is handled by `Building::place_turret`.
-                // Log + no spawn — the turret is already mounted on
-                // the building.
+                // building — this branch finalises construction:
+                // ramp HP to 100%, drop invulnerability, flip to IDLE.
+                // Port of MatrixObjectBuilding.cpp:1779-1813.
+                ramp_turret_hp(objs, parent_self_id, slot, 1.0);
                 log::info!(
                     "build: turret completed (kind={} slot={}) side={}",
                     turret_kind,
@@ -300,6 +311,30 @@ impl BuildStack {
                 None
             }
         }
+    }
+}
+
+/// Walk the live arena, find the in-construction cannon mounted on
+/// `parent_id` at `slot`, and forward the build progress so its HP
+/// ramps + state flips at completion. Mirrors the per-tick
+/// `ca->SetHitPoint(...)` call inside `CBuildStack::TickTimer`'s
+/// turret branch (MatrixObjectBuilding.cpp:1769).
+fn ramp_turret_hp(objs: &mut Objects, parent_id: ObjectId, slot: i32, progress: f32) {
+    use crate::matrix_game::map_static::ObjectType;
+    use crate::matrix_game::object_cannon::Cannon;
+
+    let live: Vec<ObjectId> = objs.iter_live().collect();
+    for id in live {
+        let Some(obj) = objs.get_mut(id) else { continue };
+        if !matches!(obj.core().obj_type, ObjectType::Cannon) {
+            continue;
+        }
+        let c: &mut Cannon = unsafe { &mut *(obj as *mut dyn MapStatic as *mut Cannon) };
+        if c.parent != Some(parent_id) || c.slot != slot {
+            continue;
+        }
+        c.tick_construction(progress);
+        return;
     }
 }
 
@@ -454,6 +489,25 @@ pub fn selection_placement(
     (glam::Vec3::new(p.x, p.y, build_z + 5.0), r)
 }
 
+/// One entry in `CMatrixBuilding::m_TurretsPlaces[]`
+/// (MatrixObjectBuilding.hpp:32-37). Holds the slot's world XY
+/// (derived from move-cell coords at map load), default angle, and
+/// the kind of cannon currently mounted there (-1 = empty).
+#[derive(Debug, Clone, Copy)]
+pub struct TurretPlace {
+    /// Move-cell coords (x, y) — same units the C++ uses for slot
+    /// equality + the snap test in `IsInPlaces`.
+    pub coord: (i32, i32),
+    /// Slot center in world space — `coord * GLOBAL_SCALE_MOVE` precomputed.
+    pub world: glam::Vec2,
+    /// Slot rest angle (radians around Z). Newly-built cannons rotate
+    /// to this angle during the placement preview
+    /// (MatrixSide.cpp:576-579).
+    pub angle: f32,
+    /// `m_CannonType` — 1..=4 for occupied, -1 for empty.
+    pub cannon_type: i32,
+}
+
 /// Port of `CMatrixBuilding`. Minimal field set for now — the
 /// capture / selection / progress-bar / turret-placement state lands
 /// with its owning subsystems.
@@ -502,6 +556,15 @@ pub struct Building {
     /// type carries 4 slots; the ctor sets this to the per-kind
     /// `EBuildingTurrets` enum value.
     pub turrets_max: i32,
+
+    /// `m_TurretsPlaces[MAX_PLACES]` (MatrixObjectBuilding.hpp:32-37).
+    /// Per-slot world-space coord + rest-angle + currently-mounted
+    /// cannon kind (-1 for empty). Seeded from the CMAP cannons records
+    /// at map load (MatrixMapPrepare.cpp:852-857). Drives the build-
+    /// preview slot-snap, the validity check, and the `cannon_type`
+    /// occupancy flag the C++ uses to refuse double-builds on the
+    /// same slot (MatrixObjectBuilding.cpp:1569-1576).
+    pub turret_places: Vec<TurretPlace>,
 
     /// `m_UnderAttackTime` (MatrixObjectBuilding.hpp:171). Game-time
     /// ms past which the base is considered "quiet" (no recent
@@ -605,8 +668,30 @@ impl Building {
 
             def_hit_point: 0, // MatrixObjectBuilding.cpp:56
 
-            turrets_have: 0, // MatrixObjectBuilding.cpp:54
-            turrets_max: 4,  // default per-kind turret cap
+            // Pre-mounted factory cannons (prop=1 slots) count toward
+            // `turrets_have` at load (MatrixMapPrepare.cpp:849).
+            turrets_have: inst
+                .turret_places
+                .iter()
+                .filter(|p| p.cannon_type > 0)
+                .count() as i32,
+            turrets_max: 4, // default per-kind turret cap
+            turret_places: inst
+                .turret_places
+                .iter()
+                .map(|p| {
+                    let scale = GameMap::GLOBAL_SCALE_MOVE;
+                    TurretPlace {
+                        coord: p.coord,
+                        world: glam::Vec2::new(
+                            p.coord.0 as f32 * scale,
+                            p.coord.1 as f32 * scale,
+                        ),
+                        angle: p.angle,
+                        cannon_type: p.cannon_type,
+                    }
+                })
+                .collect(),
             under_attack_time: 0,
             capture_me_next_time: 0,
             resource_period: 0, // MatrixObjectBuilding.cpp:53
@@ -652,15 +737,27 @@ impl Building {
         self.queue_robot(cfg)
     }
 
-    /// Queue a turret build on a free slot of this base. Returns
-    /// false if all turret slots are already occupied or the queue
-    /// is full. Ports the turret-build follow-through of
-    /// `CInterface::BeginBuildTurret` → `m_BS.AddItem`.
-    pub fn queue_turret(&mut self, turret_kind: i32) -> bool {
+    /// Queue a turret build on the given free slot of this base.
+    /// Returns false if the slot is out of range, already occupied, or
+    /// the build queue is full. Ports the turret-build follow-through
+    /// of `CInterface::BeginBuildTurret` → `m_BS.AddItem`.
+    ///
+    /// `slot` is the index into `turret_places[]`. The C++ tracks
+    /// occupancy via `m_TurretsPlaces[i].m_CannonType`
+    /// (MatrixObjectBuilding.cpp:1795 + 1551); we mirror that — the
+    /// slot's `cannon_type` flips from -1 to the requested kind on
+    /// reserve, and is cleared back to -1 on cannon destruction.
+    pub fn queue_turret_slot(&mut self, slot: i32, turret_kind: i32) -> bool {
         if self.turrets_have >= self.turrets_max {
             return false;
         }
-        let slot = self.turrets_have;
+        let idx = slot as usize;
+        let Some(place) = self.turret_places.get_mut(idx) else {
+            return false;
+        };
+        if place.cannon_type > 0 {
+            return false; // already occupied
+        }
         let ok = self.build_stack.add_item(PendingItem {
             kind: PendingKind::Turret { slot, turret_kind },
             side: self.side,
@@ -670,9 +767,43 @@ impl Building {
             // onto the building immediately (the C++ mounts it before
             // the timer completes; the timer only gates the cost +
             // visuals).
+            place.cannon_type = turret_kind;
             self.turrets_have += 1;
         }
         ok
+    }
+
+    /// Back-compat shim: pick the first free slot. Used by the older
+    /// non-snapping placement path that has no slot index yet.
+    pub fn queue_turret(&mut self, turret_kind: i32) -> bool {
+        let slot = self
+            .turret_places
+            .iter()
+            .position(|p| p.cannon_type < 0)
+            .map(|i| i as i32);
+        match slot {
+            Some(s) => self.queue_turret_slot(s, turret_kind),
+            // No CMAP slots: fall back to the legacy "just append"
+            // behaviour so test maps without cannon records still
+            // accept turret builds.
+            None => {
+                if self.turrets_have >= self.turrets_max {
+                    return false;
+                }
+                let s = self.turrets_have;
+                let ok = self.build_stack.add_item(PendingItem {
+                    kind: PendingKind::Turret {
+                        slot: s,
+                        turret_kind,
+                    },
+                    side: self.side,
+                });
+                if ok {
+                    self.turrets_have += 1;
+                }
+                ok
+            }
+        }
     }
 
     /// Entry-point for `CMatrixBuilding::ShowHitpoint` (MatrixObjectBuilding.hpp:272).
@@ -1805,6 +1936,16 @@ mod tests {
     use crate::matrix_game::map_static::{MapStatic, Objects, OBJECT_STATE_BUILDING_SPAWNBOT};
 
     fn inst(kind: u8, side: u8) -> BuildingInstance {
+        use crate::matrix_game::map::TurretPlaceCmap;
+        // Synthesise 4 empty turret slots in a cross pattern around the
+        // building so `queue_turret` has somewhere to land in tests.
+        let pad = 30.0_f32;
+        let scale = GameMap::GLOBAL_SCALE_MOVE;
+        let cell = |dx: f32, dy: f32, ang: f32| TurretPlaceCmap {
+            coord: (((100.0 + dx) / scale).floor() as i32, ((100.0 + dy) / scale).floor() as i32),
+            angle: ang,
+            cannon_type: -1,
+        };
         BuildingInstance {
             x: 100.0,
             y: 100.0,
@@ -1815,6 +1956,12 @@ mod tests {
             shadow_kind: 0,
             shadow_size: 128,
             turrets_places_cnt: 4,
+            turret_places: vec![
+                cell(pad, pad, 0.0),
+                cell(-pad, pad, std::f32::consts::FRAC_PI_2),
+                cell(pad, -pad, -std::f32::consts::FRAC_PI_2),
+                cell(-pad, -pad, std::f32::consts::PI),
+            ],
         }
     }
 
@@ -2160,6 +2307,98 @@ mod tests {
         let mb = unsafe { &*(got as *const dyn MapStatic as *const Building) };
         assert_eq!(mb.under_attack_time, 1000, "frozen in DIP");
         assert_eq!(mb.show_hitpoint_time, 500, "frozen in DIP");
+    }
+
+    #[test]
+    fn queue_turret_slot_reserves_marks_cannon_type_and_blocks_double_build() {
+        // The C++ marks `m_TurretsPlaces[i].m_CannonType` so subsequent
+        // hovers over the same slot are rejected
+        // (MatrixObjectBuilding.cpp:1569-1576).
+        let mut b = Building::from_instance(&inst(0, PLAYER_SIDE as u8));
+        b.turrets_max = 4;
+        assert_eq!(b.turret_places.len(), 4);
+        for p in &b.turret_places {
+            assert_eq!(p.cannon_type, -1, "fresh slots empty");
+        }
+
+        assert!(b.queue_turret_slot(2, 3), "slot 2 should accept turret kind 3");
+        assert_eq!(b.turret_places[2].cannon_type, 3);
+        assert_eq!(b.turrets_have, 1);
+
+        // Re-queue on same slot must fail.
+        assert!(!b.queue_turret_slot(2, 1), "slot 2 already occupied");
+        assert_eq!(b.turret_places[2].cannon_type, 3);
+        assert_eq!(b.turrets_have, 1);
+    }
+
+    #[test]
+    fn queue_turret_slot_rejects_when_max_reached() {
+        let mut b = Building::from_instance(&inst(0, PLAYER_SIDE as u8));
+        b.turrets_max = 2; // simulate the EBuildingTurrets cap
+        assert!(b.queue_turret_slot(0, 1));
+        assert!(b.queue_turret_slot(1, 2));
+        // 3rd build hits the turrets_max gate.
+        assert!(!b.queue_turret_slot(2, 3));
+        assert_eq!(b.turrets_have, 2);
+    }
+
+    #[test]
+    fn turret_build_progress_ramps_cannon_hp_and_completes_to_idle() {
+        use crate::matrix_game::logic::MapLogic;
+        use crate::matrix_game::object_cannon::{Cannon, CannonState};
+
+        let mut w = MapLogic::with_seed(1);
+        let mut b = Building::from_instance(&inst(0, PLAYER_SIDE as u8));
+        b.init_max_hitpoint(1000.0);
+        b.state = BaseState::Closed; // CBuildStack only completes when closed
+        let parent_id = w.objects.spawn(Box::new(b));
+        w.objects.add_lt(parent_id);
+        // Re-borrow to wire self_id + queue the turret.
+        {
+            let obj = w.objects.get_mut(parent_id).unwrap();
+            let bb: &mut Building =
+                unsafe { &mut *(obj as *mut dyn MapStatic as *mut Building) };
+            bb.self_id = Some(parent_id);
+            assert!(bb.queue_turret_slot(0, 1));
+        }
+
+        // Spawn the cannon mid-construction (the form_game placement
+        // path mirrors this in `try_place_turret`).
+        let mut cannon = Cannon::new(
+            glam::Vec2::new(100.0, 100.0),
+            0.0,
+            0.0,
+            PLAYER_SIDE,
+            1,
+            Some(parent_id),
+            0,
+        );
+        cannon.hit_point_max = 200.0;
+        cannon.begin_construction();
+        assert!(cannon.invulnerable);
+        assert_eq!(cannon.hit_point, 0.0);
+        assert_eq!(cannon.state, CannonState::UnderConstruction);
+        let cannon_id = w.objects.spawn(Box::new(cannon));
+        w.objects.add_lt(cannon_id);
+
+        // Half-way through the build timer: HP ramped to ~50%, still
+        // UnderConstruction.
+        let total = crate::matrix_game::config::turret_build_time_ms();
+        w.takt(total / 2);
+        let half = w.objects.get(cannon_id).unwrap();
+        let cm = unsafe { &*(half as *const dyn MapStatic as *const Cannon) };
+        assert!(cm.hit_point > 80.0 && cm.hit_point < 130.0,
+            "expected ~100, got {}", cm.hit_point);
+        assert!(cm.invulnerable);
+        assert_eq!(cm.state, CannonState::UnderConstruction);
+
+        // Past the threshold: HP=max, IDLE, vulnerable.
+        w.takt(total);
+        let done = w.objects.get(cannon_id).unwrap();
+        let cm = unsafe { &*(done as *const dyn MapStatic as *const Cannon) };
+        assert_eq!(cm.state, CannonState::Idle);
+        assert_eq!(cm.hit_point, cm.hit_point_max);
+        assert!(!cm.invulnerable);
     }
 
     #[test]

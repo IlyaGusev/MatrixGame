@@ -569,12 +569,15 @@ impl ApplicationHandler for App {
                             if let Some(click) = state.iface_list.on_mouse_up(cx, cy, w, h) {
                                 log::info!("iface: clicked {:?}", click);
                                 dispatch_ui_click(state, &click);
-                            } else if state.iface_list.turret_build.is_active() {
-                                // Turret placement click — land the
-                                // turret on the parent base if the
-                                // click landed on one of its slots.
-                                // Ports MatrixFormGame.cpp:1498-1512's
-                                // PREORDER_BUILD_TURRET branch.
+                            } else if state.iface_list.turret_build.is_active()
+                                && state.iface_list.turret_build.kind.is_some()
+                            {
+                                // Turret placement click — only fires
+                                // once a kind has been committed via
+                                // tur1..4. Picker-only state (kind
+                                // None) leaves world clicks alone so
+                                // the user can still interact with
+                                // the rest of the UI / world.
                                 state.lmb_anchor = None;
                                 try_place_turret(state, cx, cy, w, h);
                             } else if let Some([ax, ay]) = state.lmb_anchor.take() {
@@ -886,6 +889,17 @@ impl ApplicationHandler for App {
                     &state.point_lights,
                 );
 
+                // Per-frame turret-placement preview update — port of
+                // `CMatrixSideUnit::LogicTakt`'s BUILDING_TURRET branch
+                // (MatrixSide.cpp:528-585). Snaps the cursor to the
+                // nearest free turret slot on the parent base, smooth-
+                // rotates the ghost cannon to the slot's rest angle,
+                // and flips the validity tint. Also collects free-slot
+                // markers (port of `CreatePlacesShow`,
+                // MatrixObjectBuilding.cpp:1617) — visible whenever the
+                // picker is open so the player can see where to click.
+                let (ghost, markers) = update_turret_build(state, step_ms);
+
                 // Rebuild chassis instance buffers from the live arena
                 // so newly-spawned robots show up (stand-in for
                 // `CMatrixRobotAI::RNeed`'s per-robot matrix update —
@@ -896,6 +910,8 @@ impl ApplicationHandler for App {
                     &state.map,
                     &state.point_lights,
                     step_ms,
+                    ghost,
+                    &markers,
                 );
 
                 // Bake the minimap background the first time — ports
@@ -1382,10 +1398,12 @@ fn dispatch_ui_click(state: &mut AppState, click: &crate::matrix_game::interface
             let Some(id) = state.game.active_object() else {
                 return;
             };
-            // Default to Cannon as a placeholder kind so the existing
-            // placement-cursor code (which assumes `kind.is_some()`)
-            // doesn't break before tur1..4 narrows the choice.
-            state.iface_list.turret_build.begin(TurretKind::Cannon, id);
+            // Open the kind picker only — the placement-preview ghost
+            // is held off until the player commits a kind via tur1..4.
+            // Mirrors the C++ at CInterface.cpp:3493-3499 where the
+            // PREORDER_BUILD_TURRET flag flips before BeginBuildTurret
+            // (and thus before `m_CannonForBuild.m_Cannon` is created).
+            state.iface_list.turret_build.open_picker(id);
             log::info!("buca: entered turret-build mode (kind picker)");
             return;
         }
@@ -1807,13 +1825,181 @@ fn builder_preview_query(state: &mut AppState) -> Option<BuilderPreviewQuery> {
     })
 }
 
+/// Per-frame placement-preview tick — port of
+/// `CMatrixSideUnit::LogicTakt`'s BUILDING_TURRET branch
+/// (MatrixSide.cpp:528-585). Returns a `GhostCannon` to render when a
+/// turret-build session is active; `None` otherwise.
+///
+/// Steps (all mirrored from the C++):
+///   1. Ray-cast the cursor onto the terrain plane at the parent base's
+///      `build_z`. (The C++ traces against landscape+water; intersecting
+///      a flat plane is good enough since slots are at base elevation.)
+///   2. Walk the parent's `turret_places[]` and find the nearest free
+///      slot inside `SNAP_DIST` (4 move-cells in C++ → 40 world units).
+///   3. Set `can_build` = `turrets_have < turrets_max` AND a slot was
+///      hovered AND the player has the required resources.
+///   4. Snap ghost pos to the slot if hovered, otherwise to the raw
+///      cursor; smooth-rotate ghost angle toward the slot's rest angle
+///      using the C++ damping `dang * (1 - 0.99^ms)`.
+fn update_turret_build(
+    state: &mut AppState,
+    step_ms: i32,
+) -> (
+    Option<crate::matrix_game::object_cannon::GhostCannon>,
+    Vec<crate::matrix_game::object_cannon::TurretSlotMarker>,
+) {
+    use crate::matrix_game::config::Resource;
+    use crate::matrix_game::map_static::{MapStatic, ObjectType};
+    use crate::matrix_game::object_building::Building;
+    use crate::matrix_game::object_cannon::{GhostCannon, TurretSlotMarker};
+
+    if !state.iface_list.turret_build.is_active() {
+        return (None, Vec::new());
+    }
+    let Some(parent_id) = state.iface_list.turret_build.parent else {
+        return (None, Vec::new());
+    };
+
+    // Snapshot the parent's slot table so the cursor scan doesn't fight
+    // the borrow on `state.iface_list.turret_build`.
+    let (parent_pos, parent_z, slots, turrets_have, turrets_max, parent_side) = {
+        let Some(obj) = state.game.objects.get(parent_id) else {
+            return (None, Vec::new());
+        };
+        if !matches!(obj.core().obj_type, ObjectType::Building) {
+            return (None, Vec::new());
+        }
+        let b: &Building = unsafe { &*(obj as *const dyn MapStatic as *const Building) };
+        (
+            b.pos,
+            b.build_z,
+            b.turret_places.clone(),
+            b.turrets_have,
+            b.turrets_max,
+            b.side,
+        )
+    };
+
+    // Refuse builds on enemy bases up front — same gate as the click
+    // path (CConstructor.cpp:225-227).
+    if parent_side != state.game.player_side.id {
+        return (None, Vec::new());
+    }
+
+    // Slot markers — port of `CreatePlacesShow`
+    // (MatrixObjectBuilding.cpp:1617). Visible whenever the picker
+    // is open (regardless of whether a kind has been committed) so
+    // the player can see where they may build before clicking.
+    let markers: Vec<TurretSlotMarker> = slots
+        .iter()
+        .filter(|p| p.cannon_type < 0)
+        .map(|p| TurretSlotMarker {
+            pos: p.world,
+            pos_z: parent_z + 1.0,
+            angle: p.angle,
+        })
+        .collect();
+
+    // No kind chosen yet → markers only, no ghost.
+    let Some(kind) = state.iface_list.turret_build.kind.map(|k| k as i32) else {
+        return (None, markers);
+    };
+
+    // Ray-cast cursor onto z=parent_z plane.
+    let [cx, cy] = state.cursor;
+    let w = state.gfx.config.width as f32;
+    let h = state.gfx.config.height as f32;
+    let (origin, dir) = state.camera.screen_to_world_ray(cx, cy, w, h);
+    let cursor_world = if dir.z.abs() > 1e-6 {
+        let t = (parent_z - origin.z) / dir.z;
+        if t > 0.0 {
+            glam::Vec2::new(origin.x + dir.x * t, origin.y + dir.y * t)
+        } else {
+            parent_pos
+        }
+    } else {
+        parent_pos
+    };
+
+    // Snap to nearest free slot — C++ uses `rr < 4` in move-cell space
+    // (MatrixSide.cpp:1645). 4 move-cells × GLOBAL_SCALE_MOVE = 40
+    // world units.
+    const SNAP_DIST: f32 = 4.0 * crate::matrix_game::map::GameMap::GLOBAL_SCALE_MOVE;
+    const SNAP_DIST_SQ: f32 = SNAP_DIST * SNAP_DIST;
+    let mut hovered: Option<(usize, f32)> = None;
+    for (i, p) in slots.iter().enumerate() {
+        if p.cannon_type > 0 {
+            continue; // occupied
+        }
+        let d2 = (p.world - cursor_world).length_squared();
+        if d2 < SNAP_DIST_SQ && hovered.map_or(true, |(_, best)| d2 < best) {
+            hovered = Some((i, d2));
+        }
+    }
+
+    // Resource check — port of `IsEnoughResources` (CSide.cpp:?).
+    let cost = crate::matrix_game::config::global().turrets.cost_of(kind);
+    let resources_ok = Resource::ALL.iter().all(|r| {
+        state.game.player_side.get_resource_amount(*r) >= cost.resources[*r as usize]
+    });
+
+    let can_build = hovered.is_some() && turrets_have < turrets_max && resources_ok;
+
+    let tb = &mut state.iface_list.turret_build;
+    tb.cursor_world = (cursor_world.x, cursor_world.y);
+    tb.hovered_slot = hovered.map(|(i, _)| i as i32);
+    tb.can_build = can_build;
+    // Ghost Z: keep at base_z + small platform offset so the cannon sits
+    // on top of the base mesh. The C++ pulls this off `m_BuildZ` directly.
+    tb.ghost_z = parent_z + 8.0;
+
+    let (target_pos, target_angle) = if let Some((i, _)) = hovered {
+        let p = &slots[i];
+        (p.world, p.angle)
+    } else {
+        (cursor_world, tb.ghost_angle)
+    };
+    tb.ghost_pos = target_pos;
+
+    // Smooth-rotate to the slot's rest angle. Port of MatrixSide.cpp:578:
+    //   m_Angle += dang * (1 - 0.99^ms)
+    // where `dang` is the shortest-arc angle from current to target.
+    let dang = shortest_arc(tb.ghost_angle, target_angle);
+    let damping = 1.0 - (0.99_f64).powf(step_ms.max(0) as f64) as f32;
+    tb.ghost_angle += dang * damping;
+
+    let ghost = GhostCannon {
+        kind,
+        pos: tb.ghost_pos,
+        pos_z: tb.ghost_z,
+        angle: tb.ghost_angle,
+        can_build: tb.can_build,
+        side: state.game.player_side.id,
+    };
+    (Some(ghost), markers)
+}
+
+/// Shortest signed angle from `a` to `b` in radians, in the range
+/// `(-π, π]`. Port of the C++ `AngleDist` helper used at
+/// MatrixSide.cpp:576.
+fn shortest_arc(a: f32, b: f32) -> f32 {
+    let two_pi = std::f32::consts::TAU;
+    let mut d = (b - a) % two_pi;
+    if d > std::f32::consts::PI {
+        d -= two_pi;
+    } else if d < -std::f32::consts::PI {
+        d += two_pi;
+    }
+    d
+}
+
 /// Port of the "click during PREORDER_BUILD_TURRET" path
 /// (MatrixFormGame.cpp:1498-1512). If the click lands on the parent
 /// base's ring, queue the turret + deduct cost; otherwise cancel.
-fn try_place_turret(state: &mut AppState, cx: f32, cy: f32, w: f32, h: f32) {
+fn try_place_turret(state: &mut AppState, _cx: f32, _cy: f32, _w: f32, _h: f32) {
+    use crate::matrix_game::config::Resource;
     use crate::matrix_game::map_static::{MapStatic, ObjectType};
     use crate::matrix_game::object_building::Building;
-    use crate::matrix_game::config::Resource;
 
     let Some(parent_id) = state.iface_list.turret_build.parent else {
         state.iface_list.turret_build.cancel();
@@ -1823,42 +2009,29 @@ fn try_place_turret(state: &mut AppState, cx: f32, cy: f32, w: f32, h: f32) {
         state.iface_list.turret_build.cancel();
         return;
     };
-    // Validate the click hit the parent base.
-    let hit = {
-        let (origin, dir) = state.camera.screen_to_world_ray(cx, cy, w, h);
-        state.game.objects.pick_object(
-            origin,
-            dir,
-            crate::matrix_game::common::TRACE_ANYOBJECT,
-            None,
-        )
-    };
-    let landed_on_parent = matches!(hit, Some((id, _)) if id == parent_id);
-    if !landed_on_parent {
-        log::info!("turret: click missed parent base — cancelling placement");
+
+    // The per-frame `update_turret_build` already snapped the cursor to
+    // a slot (or determined no slot is hovered). Honour its decision —
+    // the C++ click path also reads `m_CannonForBuild.m_CanBuildFlag`
+    // set by the LogicTakt branch (MatrixSide.cpp:626).
+    if !state.iface_list.turret_build.can_build {
+        log::info!("turret: click without valid slot — cancelling placement");
         state.iface_list.turret_build.cancel();
         return;
     }
+    let Some(slot_idx) = state.iface_list.turret_build.hovered_slot else {
+        state.iface_list.turret_build.cancel();
+        return;
+    };
+    let ghost_pos = state.iface_list.turret_build.ghost_pos;
+    let ghost_z = state.iface_list.turret_build.ghost_z;
+    let ghost_angle = state.iface_list.turret_build.ghost_angle;
 
     let turret_cost = crate::matrix_game::config::global()
         .turrets
         .cost_of(kind as i32);
-    for r in Resource::ALL {
-        if state.game.player_side.get_resource_amount(r) < turret_cost.resources[r as usize] {
-            log::info!(
-                "turret: insufficient {:?}: need {}, have {}",
-                r,
-                turret_cost.resources[r as usize],
-                state.game.player_side.get_resource_amount(r),
-            );
-            state.iface_list.turret_build.cancel();
-            return;
-        }
-    }
 
-    // Queue on the parent building + snapshot placement for the
-    // cannon spawn below.
-    let placement = {
+    let placement_ok = {
         let Some(obj) = state.game.objects.get_mut(parent_id) else {
             state.iface_list.turret_build.cancel();
             return;
@@ -1868,62 +2041,35 @@ fn try_place_turret(state: &mut AppState, cx: f32, cy: f32, w: f32, h: f32) {
             return;
         }
         let b: &mut Building = unsafe { &mut *(obj as *mut dyn MapStatic as *mut Building) };
-        // Same player-side guard as robot builds (CConstructor.cpp:225-227) —
-        // enemy bases can be clicked but not built on.
         if b.side != state.game.player_side.id {
-            log::info!(
-                "turret: refused — base is side {}, not player side {}",
-                b.side,
-                state.game.player_side.id
-            );
             state.iface_list.turret_build.cancel();
             return;
         }
-        if !b.queue_turret(kind as i32) {
-            log::info!("turret: all turret slots full on base");
-            state.iface_list.turret_build.cancel();
-            return;
-        }
-        let slot = (b.turrets_have - 1).max(0);
-        let ang = (b.angle & 3) as f32 * std::f32::consts::FRAC_PI_2;
-        // Turret slot offset (4 slots around the base, roughly 40
-        // units from centre). Port of the per-slot position the C++
-        // reads off the base's `Turret{N}` named matrices on the
-        // building mesh (MatrixObjectBuilding.cpp::m_Turrets init).
-        // We use a fixed cross pattern until the VO matrix-name
-        // lookup lands — positionally close enough for the display.
-        let (dx, dy) = match slot {
-            0 => (30.0, 30.0),
-            1 => (-30.0, 30.0),
-            2 => (30.0, -30.0),
-            _ => (-30.0, -30.0),
-        };
-        let (s, c) = ang.sin_cos();
-        let off_x = c * dx - s * dy;
-        let off_y = s * dx + c * dy;
-        (
-            glam::Vec2::new(b.pos.x + off_x, b.pos.y + off_y),
-            b.build_z + 8.0,
-            ang,
-            slot,
-            b.turrets_max,
-            b.turrets_have,
-        )
+        // Reserve the slot — flips m_CannonType to the kind so subsequent
+        // hovers in the same session won't snap to it.
+        b.queue_turret_slot(slot_idx, kind as i32)
     };
+    if !placement_ok {
+        log::info!("turret: slot {} no longer free — cancelling", slot_idx);
+        state.iface_list.turret_build.cancel();
+        return;
+    }
 
     // Spawn the Cannon object immediately — the build-stack timer
     // still runs for the cost/progress UI, but the C++ mounts the
-    // cannon on the building as soon as BeginBuildTurret commits
-    // so we match that.
-    let cannon = crate::matrix_game::object_cannon::Cannon::new(
-        placement.0,
-        placement.1,
-        placement.2,
+    // cannon on the building as soon as BeginBuildTurret commits.
+    // HP starts at 0 + state UNDER_CONSTRUCTION + invulnerable; the
+    // build-stack tick ramps HP up over `turret_build_time_ms`.
+    let mut cannon = crate::matrix_game::object_cannon::Cannon::new(
+        ghost_pos,
+        ghost_z,
+        ghost_angle,
         state.game.player_side.id,
         kind as i32,
-        parent_id,
-        placement.3,
+        Some(parent_id),
+        slot_idx,
     );
+    cannon.begin_construction();
     let id = state.game.objects.spawn(Box::new(cannon));
     state.game.objects.add_lt(id);
 
@@ -1934,10 +2080,9 @@ fn try_place_turret(state: &mut AppState, cx: f32, cy: f32, w: f32, h: f32) {
             .add_resource_amount(r, -turret_cost.resources[r as usize]);
     }
     log::info!(
-        "turret: placed {:?} on base (slot {}/{}) as object {:?}",
+        "turret: placed {:?} on slot {} as object {:?}",
         kind,
-        placement.5,
-        placement.4,
+        slot_idx,
         id,
     );
     state.iface_list.turret_build.cancel();
@@ -2611,7 +2756,7 @@ async fn load_map_async() -> (
         // Bump this whenever `pack_bundle.rs` changes the set of
         // packed keys, so the browser refetches instead of serving
         // a stale cached response.
-        format!("{bundle_url}?bv=4")
+        format!("{bundle_url}?bv=5")
     };
     log::info!("loading bundle: {}", bundle_url);
     let bundle_data = crate::gfx::loader::load_bytes(&bundle_url)

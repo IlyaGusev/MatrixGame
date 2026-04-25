@@ -38,6 +38,21 @@ use crate::matrix_lib::three_g::texture::{
 };
 use crate::matrix_lib::three_g::vector_object::{self, MaterialSpec, VoMesh};
 
+/// Port of `ECannonState` (MatrixObjectCannon.hpp). Drives whether
+/// the cannon is mid-construction (HP ramping, invulnerable) or live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CannonState {
+    /// `CANNON_IDLE` — fully built and operational.
+    Idle,
+    /// `CANNON_UNDER_CONSTRUCTION` — HP ramps from 0 to `hit_point_max`
+    /// over `turret_build_time_ms`. Invulnerable while in this state.
+    UnderConstruction,
+    /// `CANNON_DIP` — destroyed, mid-explosion. Not driven yet (the
+    /// damage path lands with the AI/firing port).
+    #[allow(dead_code)]
+    Dip,
+}
+
 /// Port of the Cannon game object. Instance-level state.
 pub struct Cannon {
     core: ObjectCore,
@@ -65,9 +80,18 @@ pub struct Cannon {
     pub slot: i32,
 
     /// Hit points — seeded from `g_Config.m_CannonsProps[kind-1].m_Hitpoint`
-    /// at spawn time (MatrixObjectCannon.cpp:201-202).
+    /// at spawn time (MatrixObjectCannon.cpp:201-202). When the cannon
+    /// is `UnderConstruction`, this ramps from 0 toward `hit_point_max`
+    /// in `tick_construction`.
     pub hit_point: f32,
     pub hit_point_max: f32,
+
+    /// `m_CurrState` (MatrixObjectCannon.hpp).
+    pub state: CannonState,
+    /// `m_Invulnerability` flag — port of `SetInvulnerability`
+    /// (MatrixObjectCannon.cpp:1486+ / MatrixSide.cpp:631). Damage paths
+    /// must early-return while this is true.
+    pub invulnerable: bool,
 }
 
 impl Cannon {
@@ -77,7 +101,7 @@ impl Cannon {
         angle: f32,
         side: i32,
         kind: i32,
-        parent: ObjectId,
+        parent: Option<ObjectId>,
         slot: i32,
     ) -> Self {
         let hp = crate::matrix_game::config::global()
@@ -104,10 +128,37 @@ impl Cannon {
             angle,
             side,
             kind,
-            parent: Some(parent),
+            parent,
             slot,
             hit_point: hp,
             hit_point_max: hp,
+            state: CannonState::Idle,
+            invulnerable: false,
+        }
+    }
+
+    /// Flip into `UnderConstruction`: HP=0, invulnerable. Called once
+    /// at placement-confirmation time. Mirrors MatrixSide.cpp:629-631
+    /// + 649.
+    pub fn begin_construction(&mut self) {
+        self.state = CannonState::UnderConstruction;
+        self.invulnerable = true;
+        self.hit_point = 0.0;
+    }
+
+    /// Build-stack timer notifies the cannon every tick — `progress` is
+    /// in `[0, 1]`. Ramps HP and, on completion, flips to Idle and drops
+    /// invulnerability. Port of MatrixObjectBuilding.cpp:1764-1813.
+    pub fn tick_construction(&mut self, progress: f32) {
+        if !matches!(self.state, CannonState::UnderConstruction) {
+            return;
+        }
+        let p = progress.clamp(0.0, 1.0);
+        self.hit_point = self.hit_point_max * p;
+        if p >= 1.0 {
+            self.state = CannonState::Idle;
+            self.invulnerable = false;
+            self.hit_point = self.hit_point_max;
         }
     }
 }
@@ -261,6 +312,10 @@ pub struct CannonsRenderer {
     /// kind `k+1` in the shared instance buffer, and `k+4` is the
     /// count.
     draws: Vec<(i32, u32, u32)>, // (kind, offset, count)
+    /// Slot-marker draws — Basis-only stamps placed at `(offset, count)`
+    /// in the instance buffer. Rendered separately from `draws` because
+    /// they only emit the `Basis` sub-mesh (no Turret / Shaft).
+    marker_draw: Option<(u32, u32)>,
 }
 
 const MAX_LIVE_CANNONS: u32 = 64;
@@ -336,10 +391,22 @@ impl CannonsRenderer {
         let mut kinds: Vec<KindGpu> = Vec::with_capacity(4);
         let mut loaded = 0;
         for kind in 1..=4 {
+            // Sub-mesh mount chain — port of `CMatrixCannon::RNeed`'s
+            // `tm = m_Unit[i].m_Graph->GetMatrixById(20)` walk
+            // (MatrixObjectCannon.cpp:282-329):
+            //   Basis lives at the cannon origin.
+            //   Turret mounts at Basis.matrix(20).translation.
+            //   Shaft mounts at Basis.matrix(20) + Turret.matrix(20)
+            //                                       (translations added).
+            // We bake the cumulative offset into vertex positions at
+            // load time — the per-instance transform is unchanged, so
+            // the renderer doesn't need a second uniform.
+            let basis_offset = glam::Vec3::ZERO;
             let basis = basis_bytes.as_deref().and_then(|b| {
                 load_mesh(
                     b,
                     "Matrix/Cannon/Basis.vo",
+                    basis_offset,
                     device,
                     queue,
                     &bgl,
@@ -352,31 +419,41 @@ impl CannonsRenderer {
                     &transparent_tex,
                 )
             });
-            let turret = {
-                let path = format!("Matrix/Cannon/Turret{}.vo", kind);
-                read_texture(&path).and_then(|b| {
-                    load_mesh(
-                        &b,
-                        &path,
-                        device,
-                        queue,
-                        &bgl,
-                        &sampler,
-                        &uniform_buffer,
-                        &mut tex_cache,
-                        read_texture,
-                        &fallback_tex,
-                        &black_tex,
-                        &transparent_tex,
-                    )
-                })
-            };
+            let basis_mount = basis_bytes
+                .as_deref()
+                .and_then(|b| read_mount_offset(b, 20, "Basis"))
+                .unwrap_or(glam::Vec3::ZERO);
+            let turret_offset = basis_mount;
+            let turret_bytes = read_texture(&format!("Matrix/Cannon/Turret{}.vo", kind));
+            let turret = turret_bytes.as_deref().and_then(|b| {
+                load_mesh(
+                    b,
+                    &format!("Matrix/Cannon/Turret{}.vo", kind),
+                    turret_offset,
+                    device,
+                    queue,
+                    &bgl,
+                    &sampler,
+                    &uniform_buffer,
+                    &mut tex_cache,
+                    read_texture,
+                    &fallback_tex,
+                    &black_tex,
+                    &transparent_tex,
+                )
+            });
+            let turret_mount = turret_bytes
+                .as_deref()
+                .and_then(|b| read_mount_offset(b, 20, &format!("Turret{kind}")))
+                .unwrap_or(glam::Vec3::ZERO);
+            let shaft_offset = basis_mount + turret_mount;
             let shaft = {
                 let path = format!("Matrix/Cannon/Shaft{}.vo", kind);
                 read_texture(&path).and_then(|b| {
                     load_mesh(
                         &b,
                         &path,
+                        shaft_offset,
                         device,
                         queue,
                         &bgl,
@@ -419,6 +496,7 @@ impl CannonsRenderer {
             time_ms: 0.0,
             center: [cx, cy],
             draws: Vec::new(),
+            marker_draw: None,
         })
     }
 
@@ -429,10 +507,23 @@ impl CannonsRenderer {
         self.time_ms += dt_ms;
     }
 
-    /// Walk live cannons and populate the instance buffer.
-    pub fn sync_cannons(&mut self, queue: &wgpu::Queue, objs: &mut Objects, map: &GameMap) {
+    /// Walk live cannons and populate the instance buffer. The
+    /// optional `ghost` parameter renders a single extra cannon at the
+    /// turret-build placement preview position, tinted by validity
+    /// (green = can build, red = can't). Mirrors the
+    /// `m_CannonForBuild.m_Cannon->SetTerainColor(0xFF{00FF00,FF0000})`
+    /// path at MatrixSide.cpp:554-558.
+    pub fn sync_cannons(
+        &mut self,
+        queue: &wgpu::Queue,
+        objs: &mut Objects,
+        map: &GameMap,
+        ghost: Option<GhostCannon>,
+        markers: &[TurretSlotMarker],
+    ) {
         let [cx, cy] = self.center;
         self.draws.clear();
+        self.marker_draw = None;
         let mut instance_data: Vec<InstanceData> = Vec::with_capacity(16);
 
         // Group cannons by kind so draws are contiguous.
@@ -445,6 +536,10 @@ impl CannonsRenderer {
             let c: &Cannon = unsafe { &*(obj as *const dyn MapStatic as *const Cannon) };
             let k = ((c.kind - 1).max(0) as usize).min(3);
             by_kind[k].push(cannon_instance(c, cx, cy, map));
+        }
+        if let Some(g) = ghost {
+            let k = ((g.kind - 1).max(0) as usize).min(3);
+            by_kind[k].push(ghost_instance(&g, cx, cy));
         }
 
         let mut offset: u32 = 0;
@@ -461,6 +556,25 @@ impl CannonsRenderer {
             }
             self.draws.push((k as i32 + 1, offset, count));
             offset += count;
+        }
+
+        // Slot markers — Basis-only mini-cannons at each free slot.
+        // Append after the main cannons in the instance buffer; the
+        // render loop emits a separate Basis-only pass for them.
+        if !markers.is_empty() {
+            let marker_start = offset;
+            let mut marker_count: u32 = 0;
+            for m in markers {
+                if offset + 1 > self.instance_capacity {
+                    break;
+                }
+                instance_data.push(marker_instance(m, cx, cy));
+                offset += 1;
+                marker_count += 1;
+            }
+            if marker_count > 0 {
+                self.marker_draw = Some((marker_start, marker_count));
+            }
         }
 
         if !instance_data.is_empty() {
@@ -516,27 +630,148 @@ impl CannonsRenderer {
                 }
             }
         }
+        // Slot-marker pass — Basis only, kind=1 (the meshes are
+        // identical-enough across kinds for the slot indicator). Picks
+        // the first kind with a loaded Basis so this works on builds
+        // where some kinds failed to load.
+        if let Some((m_offset, m_count)) = self.marker_draw {
+            for kgpu in &self.kinds {
+                let Some(basis) = kgpu.basis.as_ref() else {
+                    continue;
+                };
+                pass.set_vertex_buffer(0, basis.vertex_buffer.slice(..));
+                for surface in &basis.surfaces {
+                    pass.set_bind_group(0, &surface.bind_group, &[]);
+                    pass.set_index_buffer(
+                        surface.index_buffer.slice(..),
+                        wgpu::IndexFormat::Uint32,
+                    );
+                    pass.draw_indexed(
+                        0..surface.num_indices,
+                        0,
+                        m_offset..(m_offset + m_count),
+                    );
+                }
+                break;
+            }
+        }
     }
 }
 
 fn cannon_instance(c: &Cannon, cx: f32, cy: f32, _map: &GameMap) -> InstanceData {
     let (s, co) = c.angle.sin_cos();
     let [sr, sg, sb] = crate::matrix_game::side::side_color_rgb(c.side);
+    // Row-major encoding — matches the buildings shader
+    // (object_building.wgsl) which does `world.x = dot(m0, p)`. The
+    // rows are the standard rotation-Z transform with translation in
+    // the last column.
     InstanceData {
-        row0: [co, s, 0.0, 0.0],
-        row1: [-s, co, 0.0, 0.0],
-        row2: [0.0, 0.0, 1.0, 0.0],
-        row3: [c.pos.x - cx, c.pos.y - cy, c.pos_z, 1.0],
+        row0: [co, -s, 0.0, c.pos.x - cx],
+        row1: [s, co, 0.0, c.pos.y - cy],
+        row2: [0.0, 0.0, 1.0, c.pos_z],
+        row3: [0.0, 0.0, 0.0, 1.0],
         terrain_color: [1.0, 1.0, 1.0, 1.0],
         unit_offset: [0.0, 0.0, 0.0, 0.0],
         side_color: [sr, sg, sb, 1.0],
     }
 }
 
+/// Placement-preview snapshot consumed by `sync_cannons`. Carries the
+/// world-space pose + tint of the ghost cannon the player sees while
+/// `BUILDING_TURRET` is active. The C++ keeps this on
+/// `m_CannonForBuild.m_Cannon` (a real `CMatrixCannon` instance held
+/// out of the live arena); the Rust port keeps it as plain data on
+/// `TurretBuild` and rebuilds the instance each frame.
+#[derive(Debug, Clone, Copy)]
+pub struct GhostCannon {
+    pub kind: i32,
+    pub pos: glam::Vec2,
+    pub pos_z: f32,
+    pub angle: f32,
+    /// True = green tint (can build), false = red tint (can't build).
+    pub can_build: bool,
+    pub side: i32,
+}
+
+/// One free turret slot to mark on the terrain while the build picker
+/// is open. Rendered as a low-alpha green Basis-only mini-cannon —
+/// stand-in for the C++ `CreatePlacesShow` SPOT_TURRET landscape decals
+/// (MatrixObjectBuilding.cpp:1617).
+#[derive(Debug, Clone, Copy)]
+pub struct TurretSlotMarker {
+    pub pos: glam::Vec2,
+    pub pos_z: f32,
+    pub angle: f32,
+}
+
+fn marker_instance(m: &TurretSlotMarker, cx: f32, cy: f32) -> InstanceData {
+    let (s, co) = m.angle.sin_cos();
+    InstanceData {
+        row0: [co, -s, 0.0, m.pos.x - cx],
+        row1: [s, co, 0.0, m.pos.y - cy],
+        row2: [0.0, 0.0, 1.0, m.pos_z],
+        row3: [0.0, 0.0, 0.0, 1.0],
+        // Cyan tint so the slot marker reads as "buildable here" even
+        // against grass / sand. Dim enough not to be confused with a
+        // live cannon.
+        terrain_color: [0.4, 0.9, 1.0, 1.0],
+        unit_offset: [0.0, 0.0, 0.0, 0.0],
+        side_color: [0.4, 0.9, 1.0, 1.0],
+    }
+}
+
+fn ghost_instance(g: &GhostCannon, cx: f32, cy: f32) -> InstanceData {
+    let (s, co) = g.angle.sin_cos();
+    let [sr, sg, sb] = crate::matrix_game::side::side_color_rgb(g.side);
+    let tint = if g.can_build {
+        [0.4, 1.0, 0.4, 1.0] // green — port of 0xFF00FF00
+    } else {
+        [1.0, 0.4, 0.4, 1.0] // red — port of 0xFFFF0000
+    };
+    InstanceData {
+        row0: [co, -s, 0.0, g.pos.x - cx],
+        row1: [s, co, 0.0, g.pos.y - cy],
+        row2: [0.0, 0.0, 1.0, g.pos_z],
+        row3: [0.0, 0.0, 0.0, 1.0],
+        terrain_color: tint,
+        unit_offset: [0.0, 0.0, 0.0, 0.0],
+        side_color: [sr, sg, sb, 1.0],
+    }
+}
+
+/// Read the matrix-id 20 from a VO and return its translation column.
+/// In `CMatrixCannon::RNeed` (MatrixObjectCannon.cpp:321-327) this is
+/// the mount-point for the next sub-mesh in the chain. The C++ reads
+/// `tm->_41 / _42 / _43` (row-major D3DXMATRIX translation column),
+/// which our `[f32; 16]` row-major slice exposes at indices 12-14.
+fn read_mount_offset(bytes: &[u8], id: u32, label: &str) -> Option<glam::Vec3> {
+    let mesh = vector_object::parse_vo(bytes).ok()?;
+    let ids: Vec<(u32, String)> = mesh
+        .matrices
+        .iter()
+        .map(|m| (m.id, m.name.clone()))
+        .collect();
+    log::info!("cannons: {label} matrix ids: {:?}", ids);
+    let Some(m) = mesh.matrix_by_id(id, 0) else {
+        log::warn!("cannons: {label} has no matrix id {id}");
+        return None;
+    };
+    log::info!(
+        "cannons: {label} matrix {id} = [{}, {}, {}]",
+        m[12], m[13], m[14]
+    );
+    Some(glam::Vec3::new(m[12], m[13], m[14]))
+}
+
 #[allow(clippy::too_many_arguments)]
+// `mount_offset`: world-space translation baked into every vertex of
+// this mesh. Composes the cannon's hierarchical sub-mesh chain
+// (Basis → Turret → Shaft) without needing per-sub-mesh uniforms. Zero
+// for the first mesh in a chain.
 fn load_mesh(
     bytes: &[u8],
     path: &str,
+    mount_offset: glam::Vec3,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     bgl: &wgpu::BindGroupLayout,
@@ -557,7 +792,11 @@ fn load_mesh(
         .vertices
         .iter()
         .map(|v| Vertex {
-            position: v.position,
+            position: [
+                v.position[0] + mount_offset.x,
+                v.position[1] + mount_offset.y,
+                v.position[2] + mount_offset.z,
+            ],
             normal: v.normal,
             uv: v.uv,
         })

@@ -577,6 +577,7 @@ mod tests {
             }],
             objects: Vec::<ObjectInstance>::new(),
             buildings: Vec::new(),
+            cannons: Vec::new(),
             group_max_z_land: vec![0.0],
             group_w: 1,
             group_h: 1,

@@ -232,6 +232,13 @@ pub struct GameMap {
     /// time via the building's `EBuildingType` → `Matrix\Building\bN.cvo`
     /// mapping (MatrixObjectBuilding.cpp:158-163).
     pub buildings: Vec<BuildingInstance>,
+    /// All cannon records from the `cannons/*` CMAP table
+    /// (MatrixMapPrepare.cpp:776-885). One entry per record regardless
+    /// of `prop`: prop=0 standalone cannons, prop=1 factory cannons
+    /// mounted on a base, prop=2 empty placement slots (skipped at
+    /// spawn). The C++ creates a `CMatrixCannon` for every non-empty
+    /// record; we mirror that in `MapLogic::spawn_buildings`.
+    pub cannons: Vec<CannonInstance>,
     /// Per-group max LAND z, size = group_w * group_h.
     /// Ports GetGroupMaxZLand (MatrixMap.hpp:759): returns 0 for empty groups /
     /// groups whose max is negative. Used by the camera to keep the link-point
@@ -336,6 +343,50 @@ pub struct BuildingInstance {
     /// `MAX_PLACES`. Drives the turret-UI slot-count visibility
     /// (`podl1..4` on the Main panel).
     pub turrets_places_cnt: i32,
+    /// Per-slot data — port of `m_TurretsPlaces[MAX_PLACES]`
+    /// (MatrixObjectBuilding.hpp:32-37). Each entry corresponds to one
+    /// `cannons` record (prop=1 or 2) attached to this building by the
+    /// nearest-building scan. `cannon_type` is `c->m_Num` for prop=1
+    /// (a pre-mounted factory cannon) and -1 for prop=2 (an empty
+    /// build slot).
+    pub turret_places: Vec<TurretPlaceCmap>,
+}
+
+/// One CMAP `cannons/*` record. Mirrors the loop body at
+/// MatrixMapPrepare.cpp:798-885 — every record allocates a
+/// `CMatrixCannon` with these fields. `parent_building` resolves at
+/// spawn time (the loader already does the nearest-base scan and
+/// stores the building's index here for prop=1/2 attachments).
+#[derive(Debug, Clone, Copy)]
+pub struct CannonInstance {
+    pub x: f32,
+    pub y: f32,
+    pub angle: f32,
+    pub kind: u8,  // `m_Num` — cannon variant (1..=4)
+    pub side: u8,
+    pub add_h: f32,
+    /// 0 = standalone, 1 = factory cannon (mounted), 2 = empty slot
+    /// (no cannon spawned, just records placement).
+    pub prop: i32,
+    /// Index into `GameMap::buildings` if attached, else None.
+    pub parent_building: Option<usize>,
+    /// Slot index on the parent (only meaningful for prop=1).
+    pub parent_slot: i32,
+}
+
+/// One entry in `m_TurretsPlaces[]`. Coordinates are in MOVE-cell units
+/// (`x / GLOBAL_SCALE_MOVE`, floored), matching the C++ at
+/// MatrixMapPrepare.cpp:852-853 — slot equality + the snap test in
+/// `IsInPlaces` work against these int coords.
+#[derive(Debug, Clone, Copy)]
+pub struct TurretPlaceCmap {
+    /// Move-cell coords (x, y).
+    pub coord: (i32, i32),
+    /// Slot-default angle (cannon faces this direction unless rotated).
+    pub angle: f32,
+    /// -1 = empty (player can build here), 1..=4 = pre-mounted factory
+    /// cannon of that kind.
+    pub cannon_type: i32,
 }
 
 impl GameMap {
@@ -531,8 +582,13 @@ impl GameMap {
         // Ports MatrixMapPrepare.cpp:621-694 (RS_BUILDINGS step). We need the
         // per-cell units computed above so the floor-z fallback matches
         // `CMatrixBuilding::OnLoad`'s `GetZ` lookup.
-        let buildings = load_buildings(&stor, &units, size_x, size_y);
-        log::info!("map: loaded {} starting buildings", buildings.len());
+        let mut buildings = load_buildings(&stor, &units, size_x, size_y);
+        let cannons = load_cannons(&stor, &mut buildings);
+        log::info!(
+            "map: loaded {} starting buildings, {} cannon records",
+            buildings.len(),
+            cannons.len()
+        );
 
         // No dilation: the stored per-group max is the max of THIS group's
         // land-cell corner z only. Dilation used to smear mountain height
@@ -580,6 +636,7 @@ impl GameMap {
             units,
             objects,
             buildings,
+            cannons,
             group_max_z_land,
             group_w,
             group_h,
@@ -1480,6 +1537,7 @@ fn load_buildings(
             shadow_kind: *shadows.get(i).unwrap_or(&0),
             shadow_size: shszs.get(i).copied().unwrap_or(128),
             turrets_places_cnt: 0,
+            turret_places: Vec::new(),
         });
     }
 
@@ -1489,51 +1547,124 @@ fn load_buildings(
     // Each attachment increments that building's `m_TurretsPlacesCnt`,
     // which later clamps `m_TurretsMax = min(4, cnt)` so podl1..4 show
     // the right slot count.
-    if let (Some(cxb), Some(cyb)) = (stor.get_buf("cannons", "X"), stor.get_buf("cannons", "Y")) {
-        let cx_arr = read_f32_array(cxb.get_bytes(0));
-        let cy_arr = read_f32_array(cyb.get_bytes(0));
-        // `prop` column is OPTIONAL in the C++ (CMapPrepare.cpp:794 — `pr
-        // = c7 ? c7->GetFirst<INT32>(0) : NULL`). When absent, the loop
-        // that attaches cannons to buildings is skipped entirely
-        // (MatrixMapPrepare.cpp:816 `if (pr)`). Mirror that: if the CMAP
-        // has no `prop` buffer, leave every building at 0 places.
-        let props: Vec<i32> = stor
-            .get_buf("cannons", "Prop")
-            .map(|b| read_i32_array(b.get_bytes(0)))
-            .unwrap_or_default();
-        if !props.is_empty() {
-            const MAX_PLACES: i32 = 4;
-            const MAX_DIST: f32 = 500.0;
-            const MAX_DIST_SQ: f32 = MAX_DIST * MAX_DIST;
-            let cn = cx_arr.len().min(cy_arr.len()).min(props.len());
-            for ci in 0..cn {
-                let prop = props[ci];
-                if prop != 1 && prop != 2 {
+    out
+}
+
+/// Port of MatrixMapPrepare.cpp:776-885 — read every CMAP `cannons/*`
+/// record, attach factory + place-only entries to the nearest base, and
+/// return the full record list. Mutates `buildings` to record per-base
+/// turret-slot tables and per-base `turrets_have` for pre-mounted
+/// factory cannons.
+fn load_cannons(
+    stor: &Storage,
+    buildings: &mut [BuildingInstance],
+) -> Vec<CannonInstance> {
+    let Some(cxb) = stor.get_buf("cannons", "X") else {
+        return Vec::new();
+    };
+    let Some(cyb) = stor.get_buf("cannons", "Y") else {
+        return Vec::new();
+    };
+    let cx_arr = read_f32_array(cxb.get_bytes(0));
+    let cy_arr = read_f32_array(cyb.get_bytes(0));
+    let n = cx_arr.len().min(cy_arr.len());
+    if n == 0 {
+        return Vec::new();
+    }
+    let sides: Vec<u8> = stor
+        .get_buf("cannons", "Side")
+        .map(|b| b.get_bytes(0).to_vec())
+        .unwrap_or_else(|| vec![0; n]);
+    let kinds: Vec<u8> = stor
+        .get_buf("cannons", "Kind")
+        .map(|b| b.get_bytes(0).to_vec())
+        .unwrap_or_else(|| vec![1; n]);
+    let angles: Vec<f32> = stor
+        .get_buf("cannons", "Angle")
+        .map(|b| read_f32_array(b.get_bytes(0)))
+        .unwrap_or_else(|| vec![0.0; n]);
+    let addh: Vec<f32> = stor
+        .get_buf("cannons", "AddH")
+        .map(|b| read_f32_array(b.get_bytes(0)))
+        .unwrap_or_else(|| vec![0.0; n]);
+    // `Prop` is optional (MatrixMapPrepare.cpp:794) — when absent every
+    // record is treated as standalone (prop=0).
+    let props: Vec<i32> = stor
+        .get_buf("cannons", "Prop")
+        .map(|b| read_i32_array(b.get_bytes(0)))
+        .unwrap_or_else(|| vec![0; n]);
+
+    const MAX_PLACES: i32 = 4;
+    const MAX_DIST: f32 = 500.0;
+    const MAX_DIST_SQ: f32 = MAX_DIST * MAX_DIST;
+
+    let mut out: Vec<CannonInstance> = Vec::with_capacity(n);
+    for i in 0..n {
+        let cxv = cx_arr[i];
+        let cyv = cy_arr[i];
+        let prop = props.get(i).copied().unwrap_or(0);
+        let kind = kinds.get(i).copied().unwrap_or(1);
+        let side = sides.get(i).copied().unwrap_or(0);
+        let angle = angles.get(i).copied().unwrap_or(0.0);
+        let add_h = addh.get(i).copied().unwrap_or(0.0);
+
+        let mut parent_building: Option<usize> = None;
+        let mut parent_slot: i32 = -1;
+        let mut owning_side = side;
+
+        if prop == 1 || prop == 2 {
+            // Nearest-base scan — port of MatrixMapPrepare.cpp:826-845.
+            let mut best: Option<usize> = None;
+            let mut best_d2 = f32::INFINITY;
+            for (bi, b) in buildings.iter().enumerate() {
+                if b.turrets_places_cnt >= MAX_PLACES {
                     continue;
                 }
-                let cxv = cx_arr[ci];
-                let cyv = cy_arr[ci];
-                let mut best: Option<usize> = None;
-                let mut best_d2 = f32::INFINITY;
-                for (bi, b) in out.iter().enumerate() {
-                    if b.turrets_places_cnt >= MAX_PLACES {
-                        continue;
-                    }
-                    let dx = cxv - b.x;
-                    let dy = cyv - b.y;
-                    let d2 = dx * dx + dy * dy;
-                    if d2 < best_d2 && d2 < MAX_DIST_SQ {
-                        best_d2 = d2;
-                        best = Some(bi);
-                    }
-                }
-                if let Some(bi) = best {
-                    out[bi].turrets_places_cnt += 1;
+                let dx = cxv - b.x;
+                let dy = cyv - b.y;
+                let d2 = dx * dx + dy * dy;
+                if d2 < best_d2 && d2 < MAX_DIST_SQ {
+                    best_d2 = d2;
+                    best = Some(bi);
                 }
             }
+            if let Some(bi) = best {
+                let bld = &mut buildings[bi];
+                let coord_x = (cxv / GameMap::GLOBAL_SCALE_MOVE).floor() as i32;
+                let coord_y = (cyv / GameMap::GLOBAL_SCALE_MOVE).floor() as i32;
+                let cannon_type = if prop == 1 { kind as i32 } else { -1 };
+                bld.turret_places.push(TurretPlaceCmap {
+                    coord: (coord_x, coord_y),
+                    angle,
+                    cannon_type,
+                });
+                parent_slot = bld.turrets_places_cnt;
+                bld.turrets_places_cnt += 1;
+                parent_building = Some(bi);
+                // Inherit the parent base's side (MatrixMapPrepare.cpp:850).
+                owning_side = bld.side;
+            }
         }
-    }
 
+        // Skip prop=2 records entirely — they're empty placement slots
+        // (no Cannon entity). prop=0 + prop=1 + orphaned prop=2 with no
+        // parent become live cannons.
+        if prop == 2 {
+            continue;
+        }
+
+        out.push(CannonInstance {
+            x: cxv,
+            y: cyv,
+            angle,
+            kind,
+            side: owning_side,
+            add_h,
+            prop,
+            parent_building,
+            parent_slot,
+        });
+    }
     out
 }
 
@@ -2509,12 +2640,14 @@ impl MapRenderer {
         map: &GameMap,
         point_lights: &PointLightSystem,
         cms: i32,
+        ghost_cannon: Option<super::object_cannon::GhostCannon>,
+        slot_markers: &[super::object_cannon::TurretSlotMarker],
     ) {
         if let Some(robots) = &mut self.robots {
             robots.sync_robots(queue, objs, map, point_lights, cms);
         }
         if let Some(cannons) = &mut self.cannons {
-            cannons.sync_cannons(queue, objs, map);
+            cannons.sync_cannons(queue, objs, map, ghost_cannon, slot_markers);
         }
     }
 
