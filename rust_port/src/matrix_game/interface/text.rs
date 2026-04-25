@@ -385,20 +385,15 @@ pub struct GlyphAtlas {
 }
 
 /// Embedded AFT font assets (extracted from forms.pkg/DATA/FONT/).
-/// The shipped game uses the SMOOTH (antialiased) variants; they
-/// carry a coverage-AA bitmap (bmp2) plus a stored bearing_x for
-/// proper subpixel positioning. The plain 1-bit variants only have
-/// bmp1 and look chunky / asymmetric at small sizes.
+/// Using the plain 1-bit variants (bmp1 only) — every pixel is
+/// fully opaque, no AA halo, so glyphs read as crisp pixel-art at
+/// any scale.
 const FONT_RANGER_6: &[u8] = include_bytes!("../../../assets/fonts/RANGER_6.AFT");
 const FONT_RANGER_5: &[u8] = include_bytes!("../../../assets/fonts/RANGER_5.AFT");
-const FONT_VERDANA_10_2_SMOOTH: &[u8] =
-    include_bytes!("../../../assets/fonts/VERDANA_10_2_SMOOTH.AFT");
-const FONT_VERDANA_09_2_BOLD_SMOOTH: &[u8] =
-    include_bytes!("../../../assets/fonts/VERDANA_09_2_BOLD_SMOOTH.AFT");
-const FONT_VERDANA_08_1_SMOOTH: &[u8] =
-    include_bytes!("../../../assets/fonts/VERDANA_08_1_SMOOTH.AFT");
-const FONT_VERDANA_07_1_SMOOTH: &[u8] =
-    include_bytes!("../../../assets/fonts/VERDANA_07_1_SMOOTH.AFT");
+const FONT_VERDANA_10_2: &[u8] = include_bytes!("../../../assets/fonts/VERDANA_10_2.AFT");
+const FONT_VERDANA_09_2: &[u8] = include_bytes!("../../../assets/fonts/VERDANA_09_2.AFT");
+const FONT_VERDANA_08_1: &[u8] = include_bytes!("../../../assets/fonts/VERDANA_08_1.AFT");
+const FONT_VERDANA_07_1: &[u8] = include_bytes!("../../../assets/fonts/VERDANA_07_1.AFT");
 
 impl Default for GlyphAtlas {
     fn default() -> Self {
@@ -420,13 +415,13 @@ impl GlyphAtlas {
         //   Font.2Mini — tooltip / smallest text
         for (name, bytes) in [
             ("Font.2Ranger", FONT_RANGER_6),
-            ("Font.2Small", FONT_VERDANA_08_1_SMOOTH),
-            ("Font.2Normal", FONT_VERDANA_10_2_SMOOTH),
-            ("Font.2Mini", FONT_VERDANA_07_1_SMOOTH),
+            ("Font.2Mini", FONT_VERDANA_07_1),
+            ("Font.2Small", FONT_VERDANA_08_1),
+            ("Font.2Bold", FONT_VERDANA_09_2),
+            ("Font.2Normal", FONT_VERDANA_10_2),
+            ("Font.2Big", FONT_VERDANA_10_2),
             ("RANGER_5", FONT_RANGER_5),
             ("RANGER_6", FONT_RANGER_6),
-            ("Font.2Big", FONT_VERDANA_10_2_SMOOTH),
-            ("Font.2Bold", FONT_VERDANA_09_2_BOLD_SMOOTH),
         ] {
             match AftFont::parse(bytes) {
                 Ok(f) => {

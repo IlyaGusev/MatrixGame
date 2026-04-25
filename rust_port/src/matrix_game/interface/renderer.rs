@@ -204,13 +204,16 @@ impl InterfaceRenderer {
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             ..Default::default()
         });
-        // Separate point/nearest sampler for the text atlas. AFT
-        // bitmap fonts are 1-bpp at native pixel size; bilinear
-        // sampling at non-integer scales blurs them away. Point
-        // sampling preserves the pixel grid the original used.
+        // Linear sampler for the text atlas. The panel scale is
+        // typically non-integer (~1.4 at 1080p from the 1024×768
+        // design space), and nearest-neighbour sampling at that scale
+        // gives 1-px native stems an inconsistent 1-or-2 output-pixel
+        // width depending on where each glyph's left edge lands.
+        // Linear blends the texels evenly so every stem renders at a
+        // uniform width — slightly softened, but visually consistent.
         let text_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
             mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
