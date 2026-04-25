@@ -25,24 +25,34 @@
 //!
 //! Glyph entry (64 bytes per glyph, glyph_count entries follow header):
 //!   0x00  u32     codepoint (UTF-32)
-//!   0x04  u32     unknown
-//!   0x08  u32     advance (px) — matches the SMOOTH glyph width +
-//!                  side-bearing in SMOOTH fonts; matches the 1-bit
-//!                  bitmap width in plain fonts
-//!   0x0C  u32     reserved (zero)
-//!   0x10  u32     unknown (0 or 1)
-//!   0x14  i32     bearing_y1 — TOP offset for the 1-bit bitmap
-//!   0x18  u32     bitmap1 width
-//!   0x1C  u32     bitmap1 height
-//!   0x20  u32     bitmap1 offset (file-absolute)
-//!   0x24  u32     bitmap1 size (bytes incl. 16-byte bitmap header)
-//!   0x28  u32     reserved (zero)
-//!   0x2C  i32     bearing_y2 — TOP offset for the SMOOTH bitmap
-//!                  (only set when the font ships a SMOOTH variant)
-//!   0x30  u32     bitmap2 width (SMOOTH, antialiased)
-//!   0x34  u32     bitmap2 height
-//!   0x38  u32     bitmap2 offset (0 when absent)
-//!   0x3C  u32     bitmap2 size
+//!   0x04  i32     unused / legacy bearing (matches 0x10 in plain
+//!                  fonts; the SMOOTH layout uses 0x10 instead)
+//!   0x08  u32     base advance (px)
+//!   0x0C  i32     advance delta (signed) — the effective per-glyph
+//!                  advance is `advance + delta`. Carries the actual
+//!                  space width for ' ' (raw advance is just 1) and
+//!                  small ±1..±2 nudges for narrow / wide letters.
+//!   0x10  i32     bearing_x1 — LEFT offset for bmp1 (bmp1 is the
+//!                  1-bit horizontal-stroke layer). Signed.
+//!   0x14  i32     bearing_y1 — TOP offset for bmp1 (signed,
+//!                  measured from the baseline upward).
+//!   0x18  u32     bmp1 width
+//!   0x1C  u32     bmp1 height
+//!   0x20  u32     bmp1 file offset
+//!   0x24  u32     bmp1 size (bytes incl. 16-byte bitmap header)
+//!   0x28  i32     bearing_x2 — LEFT offset for bmp2 (bmp2 is the
+//!                  SMOOTH antialiased verticals + halo layer).
+//!   0x2C  i32     bearing_y2 — TOP offset for bmp2.
+//!   0x30  u32     bmp2 width (0 when absent — plain fonts)
+//!   0x34  u32     bmp2 height
+//!   0x38  u32     bmp2 file offset (0 when absent)
+//!   0x3C  u32     bmp2 size
+//!
+//! SMOOTH glyphs render as bmp2 painted first, bmp1 OVER (max
+//! alpha) — bmp1 carries strokes that would alias badly at small
+//! sizes (top/middle/bottom bars, curve fills), bmp2 carries the
+//! verticals plus a 1-px AA halo that intentionally spills into
+//! neighbour cells so adjacent letters blend together.
 //!
 //! Bitmap (size bytes at offset):
 //!   0x00  u32     data_size (bytes, excluding this 16-byte header)
@@ -84,14 +94,6 @@ pub struct AftFont {
     pub line_height: u32,
     /// Distance from the cell's top edge to the baseline.
     pub ascent: u32,
-    /// Extra inter-letter spacing added to every glyph's advance.
-    /// The plain (non-`_SMOOTH`) VERDANA variants have `advance ==
-    /// bitmap width` for most glyphs, so consecutive letters touch.
-    /// The shipped game uses the SMOOTH variants which carry +1..+4
-    /// px of side-bearing baked into their wider advance. As a
-    /// stop-gap until the SMOOTH compositor lands we add that letter
-    /// spacing here so plain VERDANA still reads clearly.
-    pub extra_advance: u32,
     /// Codepoint → metrics + decoded 8bpp alpha bitmap.
     glyphs: HashMap<u32, AftGlyph>,
 }
@@ -100,13 +102,12 @@ pub struct AftFont {
 struct AftGlyph {
     width: u32,
     height: u32,
-    /// Left-side bearing: pen-relative x offset where the glyph
-    /// bitmap's left column should be drawn. For plain bitmaps the
-    /// width matches the advance, so this is 0. SMOOTH bitmaps are
-    /// wider than the advance (halo pixels spill outside), so the
-    /// glyph is centered on the advance slot by shifting left.
+    /// Left-side bearing: pen-relative x offset of the composited
+    /// bitmap's leftmost column.
     bearing_x: i32,
+    /// Signed offset from the baseline to the bitmap's TOP row.
     bearing_y: i32,
+    /// Effective advance: stored advance + signed per-glyph delta.
     advance: u32,
     /// 8bpp coverage alpha, width*height bytes.
     pixels: Vec<u8>,
@@ -127,64 +128,44 @@ impl AftFont {
                 break;
             }
             let code = u32_at(bytes, o)?;
-            let advance = u32_at(bytes, o + 0x08)?;
-            // SMOOTH fonts put an antialiased bitmap at offset 0x38;
-            // non-SMOOTH fonts leave that slot zero and only ship the
-            // 1-bit bitmap at 0x20.
-            let smooth_off = u32_at(bytes, o + 0x38)? as usize;
-            let smooth_sz = u32_at(bytes, o + 0x3C)? as usize;
-            let (bmp_off, bmp_sz, bearing_y, smooth) = if smooth_off != 0
-                && smooth_sz >= 16
-                && smooth_off + smooth_sz <= bytes.len()
-            {
-                (
-                    smooth_off,
-                    smooth_sz,
-                    i32_at(bytes, o + 0x2C)?,
-                    true,
-                )
-            } else {
-                (
-                    u32_at(bytes, o + 0x20)? as usize,
-                    u32_at(bytes, o + 0x24)? as usize,
-                    i32_at(bytes, o + 0x14)?,
-                    false,
-                )
-            };
-            // Whitespace glyphs (e.g. space) have bmp_off == 0 and
-            // carry only an advance value. Cache as zero-pixel glyphs.
-            if bmp_off == 0 || bmp_sz < 16 || bmp_off + bmp_sz > bytes.len() {
-                glyphs.insert(
-                    code,
-                    AftGlyph {
-                        width: 0,
-                        height: 0,
-                        bearing_x: 0,
-                        bearing_y,
-                        advance,
-                        pixels: Vec::new(),
-                    },
-                );
-                continue;
-            }
-            let bw = u32_at(bytes, bmp_off + 4)?;
-            let bh = u32_at(bytes, bmp_off + 8)?;
-            let rle = &bytes[bmp_off + 16..bmp_off + bmp_sz];
-            let pixels = decode_rle(rle, bw, bh, smooth);
-            // SMOOTH bitmaps can be wider than the advance: the extra
-            // columns are antialiasing halo. Center the glyph on its
-            // advance slot so the solid core lines up where the plain
-            // bitmap would have sat.
-            let bearing_x = if smooth && bw > advance {
-                -(((bw - advance) as i32) / 2)
-            } else {
-                0
-            };
+            // Effective advance = stored advance (0x08) plus a
+            // signed per-glyph delta at 0x0C. The delta carries:
+            //   - the actual space width for ' ' (raw adv=1, but
+            //     x0C=2/3/4 depending on font size)
+            //   - +1 px for narrow letters like 'i'/'l' that store
+            //     a 1-px raw advance (overlap-by-design halo)
+            //   - -1 px for glyphs whose AA halo already filled the
+            //     trailing pixel (e.g. Cyrillic 'т' in 08_1_SMOOTH
+            //     has x28=-1, x0C=-1 — bmp2 ends at pen+6 so the
+            //     advance shrinks from 7 to 6 to avoid a visible
+            //     trailing gap to the next letter).
+            let advance =
+                (u32_at(bytes, o + 0x08)? as i32 + i32_at(bytes, o + 0x0C)?).max(0) as u32;
+            // Each glyph carries up to two bitmaps with their own
+            // bearings:
+            //   bmp1 (offset 0x20, plain 1-bit, RLE flag = solid)
+            //   bmp2 (offset 0x38, antialiased, RLE has alpha bytes)
+            // Plain fonts ship only bmp1; SMOOTH fonts ship BOTH and
+            // the rendered glyph is bmp1 OVER bmp2 — bmp1 carries the
+            // horizontal strokes and curve fills (which would alias
+            // badly at small sizes), bmp2 carries the vertical
+            // strokes plus the AA halo. Drawing bmp2 alone leaves
+            // letters with hollow middles (no top/middle/bottom bars).
+            // bmp1 bearing_x lives at 0x10 (NOT 0x04 — that field
+            // appears unused in the SMOOTH placement). bmp2 bearing_x
+            // lives at 0x28. The two values together centre bmp1's
+            // narrower core inside bmp2's wider halo box, e.g. for an
+            // 'O' with bw1=8/bw2=10 we get x10=1, x28=0 (a 1-px
+            // offset to centre).
+            let layer1 = decode_layer(bytes, o, 0x10, 0x14, 0x18, 0x20, 0x24, false)?;
+            let layer2 = decode_layer(bytes, o, 0x28, 0x2C, 0x30, 0x38, 0x3C, true)?;
+            let (width, height, bearing_x, bearing_y, pixels) =
+                composite_layers(layer1, layer2);
             glyphs.insert(
                 code,
                 AftGlyph {
-                    width: bw,
-                    height: bh,
+                    width,
+                    height,
                     bearing_x,
                     bearing_y,
                     advance,
@@ -192,12 +173,7 @@ impl AftFont {
                 },
             );
         }
-        Ok(Self {
-            line_height,
-            ascent,
-            extra_advance: 0,
-            glyphs,
-        })
+        Ok(Self { line_height, ascent, glyphs })
     }
 
     fn glyph(&self, codepoint: u32) -> Option<&AftGlyph> {
@@ -206,16 +182,118 @@ impl AftFont {
             .or_else(|| self.glyphs.get(&('?' as u32)))
     }
 
-    /// Pixel advance of `text` at this font's native size, including
-    /// the `extra_advance` letter-spacing nudge.
+    /// Pixel advance of `text` at this font's native size.
     pub fn measure(&self, text: &str) -> u32 {
         text.chars()
-            .map(|c| {
-                self.glyph(c as u32)
-                    .map(|g| g.advance + self.extra_advance)
-                    .unwrap_or(0)
-            })
+            .map(|c| self.glyph(c as u32).map(|g| g.advance).unwrap_or(0))
             .sum()
+    }
+}
+
+/// One decoded bitmap layer (either the 1-bit bmp1 or the SMOOTH
+/// bmp2). `pixels` is `width*height` bytes of 8bpp coverage alpha.
+struct Layer {
+    width: u32,
+    height: u32,
+    bearing_x: i32,
+    bearing_y: i32,
+    pixels: Vec<u8>,
+}
+
+/// Decode one of the two glyph layers. Field offsets are passed in so
+/// the same routine handles bmp1 and bmp2 (the 64-byte glyph entry is
+/// laid out the same way for each: bearing_x, bearing_y, width,
+/// height, file offset, byte size). Returns `None` when the layer is
+/// absent (size/offset zero — common for the SMOOTH layer of plain
+/// fonts and for the bmp1 layer of dot-only glyphs like `i`).
+fn decode_layer(
+    bytes: &[u8],
+    glyph_off: usize,
+    bx_off: usize,
+    by_off: usize,
+    bw_off: usize,
+    bmp_off_off: usize,
+    bmp_sz_off: usize,
+    smooth: bool,
+) -> Result<Option<Layer>, &'static str> {
+    let bmp_off = u32_at(bytes, glyph_off + bmp_off_off)? as usize;
+    let bmp_sz = u32_at(bytes, glyph_off + bmp_sz_off)? as usize;
+    if bmp_off == 0 || bmp_sz < 16 || bmp_off + bmp_sz > bytes.len() {
+        return Ok(None);
+    }
+    let width = u32_at(bytes, glyph_off + bw_off)?;
+    let height = u32_at(bytes, glyph_off + bw_off + 4)?;
+    if width == 0 || height == 0 {
+        return Ok(None);
+    }
+    let bw = u32_at(bytes, bmp_off + 4)?;
+    let bh = u32_at(bytes, bmp_off + 8)?;
+    let rle = &bytes[bmp_off + 16..bmp_off + bmp_sz];
+    let pixels = decode_rle(rle, bw, bh, smooth);
+    Ok(Some(Layer {
+        width: bw,
+        height: bh,
+        bearing_x: i32_at(bytes, glyph_off + bx_off)?,
+        bearing_y: i32_at(bytes, glyph_off + by_off)?,
+        pixels,
+    }))
+}
+
+/// Composite two glyph layers into one 8bpp alpha bitmap. Each layer
+/// is placed at its own (bearing_x, bearing_y) — bearing_y is the
+/// signed offset from the glyph's baseline to the bitmap's TOP row,
+/// bearing_x the offset from the pen to the bitmap's LEFT column. The
+/// resulting bitmap covers the union of both layers' rectangles, with
+/// `bearing_x`/`bearing_y` pointing at the union's top-left.
+///
+/// Painting order is bmp2 first, then bmp1 OVER (saturating max), so
+/// bmp1's solid pixels override bmp2's halo at the strokes that bmp2
+/// only hints at. Returns a degenerate (0×0) glyph when both layers
+/// are absent (used for whitespace).
+fn composite_layers(
+    layer1: Option<Layer>,
+    layer2: Option<Layer>,
+) -> (u32, u32, i32, i32, Vec<u8>) {
+    match (layer1, layer2) {
+        (None, None) => (0, 0, 0, 0, Vec::new()),
+        (Some(l), None) | (None, Some(l)) => {
+            (l.width, l.height, l.bearing_x, l.bearing_y, l.pixels)
+        }
+        (Some(l1), Some(l2)) => {
+            let left = l1.bearing_x.min(l2.bearing_x);
+            let top = l1.bearing_y.min(l2.bearing_y);
+            let right = (l1.bearing_x + l1.width as i32).max(l2.bearing_x + l2.width as i32);
+            let bottom =
+                (l1.bearing_y + l1.height as i32).max(l2.bearing_y + l2.height as i32);
+            let w = (right - left) as u32;
+            let h = (bottom - top) as u32;
+            let mut out = vec![0u8; (w * h) as usize];
+            // bmp2 first (halo + verticals).
+            let dx2 = (l2.bearing_x - left) as u32;
+            let dy2 = (l2.bearing_y - top) as u32;
+            for y in 0..l2.height {
+                for x in 0..l2.width {
+                    let v = l2.pixels[(y * l2.width + x) as usize];
+                    if v != 0 {
+                        let p = ((dy2 + y) * w + dx2 + x) as usize;
+                        out[p] = v;
+                    }
+                }
+            }
+            // bmp1 over (solid horizontal strokes / curve fills).
+            let dx1 = (l1.bearing_x - left) as u32;
+            let dy1 = (l1.bearing_y - top) as u32;
+            for y in 0..l1.height {
+                for x in 0..l1.width {
+                    let v = l1.pixels[(y * l1.width + x) as usize];
+                    if v != 0 {
+                        let p = ((dy1 + y) * w + dx1 + x) as usize;
+                        out[p] = out[p].max(v);
+                    }
+                }
+            }
+            (w, h, left, top, out)
+        }
     }
 }
 
@@ -307,17 +385,20 @@ pub struct GlyphAtlas {
 }
 
 /// Embedded AFT font assets (extracted from forms.pkg/DATA/FONT/).
-/// The SMOOTH (antialiased) variants are checked in but not yet
-/// wired up — they use a two-layer format (bmp1 = solid core,
-/// bmp2 = halo) that needs a compositing step before we can use
-/// them. The decoder handles both formats, the font map just
-/// points at the plain 1-bit files for now.
+/// The shipped game uses the SMOOTH (antialiased) variants; they
+/// carry a coverage-AA bitmap (bmp2) plus a stored bearing_x for
+/// proper subpixel positioning. The plain 1-bit variants only have
+/// bmp1 and look chunky / asymmetric at small sizes.
 const FONT_RANGER_6: &[u8] = include_bytes!("../../../assets/fonts/RANGER_6.AFT");
 const FONT_RANGER_5: &[u8] = include_bytes!("../../../assets/fonts/RANGER_5.AFT");
-const FONT_VERDANA_10_2: &[u8] = include_bytes!("../../../assets/fonts/VERDANA_10_2.AFT");
-const FONT_VERDANA_09_2: &[u8] = include_bytes!("../../../assets/fonts/VERDANA_09_2.AFT");
-const FONT_VERDANA_08_1: &[u8] = include_bytes!("../../../assets/fonts/VERDANA_08_1.AFT");
-const FONT_VERDANA_07_1: &[u8] = include_bytes!("../../../assets/fonts/VERDANA_07_1.AFT");
+const FONT_VERDANA_10_2_SMOOTH: &[u8] =
+    include_bytes!("../../../assets/fonts/VERDANA_10_2_SMOOTH.AFT");
+const FONT_VERDANA_09_2_BOLD_SMOOTH: &[u8] =
+    include_bytes!("../../../assets/fonts/VERDANA_09_2_BOLD_SMOOTH.AFT");
+const FONT_VERDANA_08_1_SMOOTH: &[u8] =
+    include_bytes!("../../../assets/fonts/VERDANA_08_1_SMOOTH.AFT");
+const FONT_VERDANA_07_1_SMOOTH: &[u8] =
+    include_bytes!("../../../assets/fonts/VERDANA_07_1_SMOOTH.AFT");
 
 impl Default for GlyphAtlas {
     fn default() -> Self {
@@ -337,23 +418,18 @@ impl GlyphAtlas {
         //   Font.2Small — focused-component label (it_label1)
         //   Font.2Normal — focused-component description (it_label2)
         //   Font.2Mini — tooltip / smallest text
-        // Each entry: (alias, AFT bytes, extra letter-spacing px).
-        // RANGER fonts have a 1-px gap baked into their advance, so 0.
-        // Plain VERDANA glyphs have advance == bitmap width (no gap),
-        // so we add +1 px between each pair.
-        for (name, bytes, extra) in [
-            ("Font.2Ranger", FONT_RANGER_6, 0),
-            ("Font.2Small", FONT_VERDANA_08_1, 1),
-            ("Font.2Normal", FONT_VERDANA_10_2, 1),
-            ("Font.2Mini", FONT_VERDANA_07_1, 1),
-            ("RANGER_5", FONT_RANGER_5, 0),
-            ("RANGER_6", FONT_RANGER_6, 0),
-            ("Font.2Big", FONT_VERDANA_10_2, 1),
-            ("Font.2Bold", FONT_VERDANA_09_2, 1),
+        for (name, bytes) in [
+            ("Font.2Ranger", FONT_RANGER_6),
+            ("Font.2Small", FONT_VERDANA_08_1_SMOOTH),
+            ("Font.2Normal", FONT_VERDANA_10_2_SMOOTH),
+            ("Font.2Mini", FONT_VERDANA_07_1_SMOOTH),
+            ("RANGER_5", FONT_RANGER_5),
+            ("RANGER_6", FONT_RANGER_6),
+            ("Font.2Big", FONT_VERDANA_10_2_SMOOTH),
+            ("Font.2Bold", FONT_VERDANA_09_2_BOLD_SMOOTH),
         ] {
             match AftFont::parse(bytes) {
-                Ok(mut f) => {
-                    f.extra_advance = extra;
+                Ok(f) => {
                     fonts.insert(name.to_string(), f);
                 }
                 Err(e) => log::warn!("AFT font {name} failed to parse: {e}"),
@@ -413,7 +489,6 @@ impl GlyphAtlas {
             return *cached;
         }
         let font_ref = self.fonts.get(font)?;
-        let extra = font_ref.extra_advance;
         let g = font_ref.glyph(codepoint)?.clone();
         // Whitespace / zero-pixel glyph — cache metrics only, no atlas slot.
         if g.width == 0 || g.height == 0 {
@@ -424,7 +499,7 @@ impl GlyphAtlas {
                 h: 0,
                 bearing_x: g.bearing_x,
                 bearing_y: g.bearing_y,
-                advance: g.advance + extra,
+                advance: g.advance,
             };
             self.cache.insert(key, Some(r));
             return Some(r);
@@ -469,7 +544,7 @@ impl GlyphAtlas {
             h: g.height,
             bearing_x: g.bearing_x,
             bearing_y: g.bearing_y,
-            advance: g.advance + extra,
+            advance: g.advance,
         };
         self.cache.insert(key, Some(r));
         Some(r)
@@ -621,7 +696,8 @@ mod tests {
     fn colon_decodes_with_gap() {
         // The colon glyph has a vertical gap encoded as the 0x80
         // opcode. Before the fix it decoded as a solid bar.
-        let f = AftFont::parse(FONT_VERDANA_07_1).unwrap();
+        let bytes = include_bytes!("../../../assets/fonts/VERDANA_07_1.AFT");
+        let f = AftFont::parse(bytes).unwrap();
         let g = f.glyph(b':' as u32).unwrap();
         assert_eq!(g.width, 1);
         let any_gap = g
@@ -630,6 +706,20 @@ mod tests {
             .enumerate()
             .any(|(i, &v)| v == 0 && i > 0 && i < g.pixels.len() - 1);
         assert!(any_gap, "colon must have a transparent gap row: {:?}", g.pixels);
+    }
+
+    #[test]
+    fn smooth_prefers_bmp2_over_bmp1() {
+        // When a SMOOTH font ships both bitmaps, the parser must pick
+        // bmp2 (the full antialiased glyph) — bmp1 is a smaller
+        // sparse mask that doesn't render anything legible on its own.
+        let bytes =
+            include_bytes!("../../../assets/fonts/VERDANA_10_2_SMOOTH.AFT");
+        let f = AftFont::parse(bytes).unwrap();
+        // For 'O', bmp1 width is 8 vs bmp2 width 10 in this font;
+        // assert we picked the wider (bmp2) bitmap.
+        let g = f.glyph(b'O' as u32).unwrap();
+        assert!(g.width >= 9, "expected SMOOTH bmp2 width, got {}", g.width);
     }
 
     #[test]
