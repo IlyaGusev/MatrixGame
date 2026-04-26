@@ -670,11 +670,15 @@ impl InterfaceRenderer {
             let base_panel = panels.iter().find(|p| p.name == "Base");
             if let Some(base_panel) = base_panel {
                 let [bx, by] = base_panel.resolved_pos(screen_w, screen_h, scale);
-                // Origin of the popup rect, screen pixels.
+                // Origin of the popup rect, screen pixels — top-left of
+                // the chrome (NOT the items area). Items sit inset by
+                // `popup.items_top()` from the top edge.
                 let ox = bx + popup.design_x * scale;
                 let oy = by + popup.design_y * scale;
-                let total_w = popup.item_w * scale;
-                let total_h = popup.item_h * popup.items.len() as f32 * scale;
+                let total_w = popup.total_w() * scale;
+                let total_h = popup.total_h() * scale;
+                let items_y0 = oy + popup.items_top() * scale;
+                let items_h = popup.item_h * popup.items.len() as f32 * scale;
 
                 // Helper to emit one textured quad — borrows an atlas
                 // sub-rect from an arbitrary panel element. Used by the
@@ -762,6 +766,54 @@ impl InterfaceRenderer {
                         .find(|e| e.name == name)
                         .and_then(|e| e.images.first()?.as_ref())
                 };
+
+                // (0) Opaque background fill behind the items area. The
+                // C++ tiles `IF_POPUP_SEL` across every row to bake the
+                // row backgrounds into the popup texture
+                // (CIFaceMenu.cpp:184-202). The original `sel` sprite
+                // is itself partly transparent — replicating it 1:1 in
+                // a quad leaves the popup half-transparent. Faithful
+                // workaround: sample a single known-opaque pixel of the
+                // chrome border (the painted line color in `topline`)
+                // and stretch it across the items area as a solid back.
+                if let Some(line) = pop_img("topline").or_else(|| pop_img("bottomline")) {
+                    let mut solid = line.clone();
+                    // 1×1 sample of the middle of the line — guaranteed
+                    // opaque since the chrome border is a painted
+                    // pixel-line in the atlas.
+                    solid.x = line.x;
+                    solid.y = line.y + (line.h * 0.5).max(1.0);
+                    solid.w = 1.0;
+                    solid.h = 1.0;
+                    emit_textured(
+                        &mut all_verts,
+                        &mut current_key,
+                        &mut current_start,
+                        &mut self.draw_groups,
+                        ox,
+                        items_y0,
+                        total_w,
+                        items_h,
+                        &solid,
+                        [0.10, 0.09, 0.07, 1.0],
+                    );
+                }
+                // Optional `sel` overlay (matches C++'s tiled SEL pass) —
+                // adds the subtle gradient of the original interior.
+                if let Some(sel) = pop_img("sel") {
+                    emit_textured(
+                        &mut all_verts,
+                        &mut current_key,
+                        &mut current_start,
+                        &mut self.draw_groups,
+                        ox,
+                        items_y0,
+                        total_w,
+                        items_h,
+                        sel,
+                        [1.0, 1.0, 1.0, 1.0],
+                    );
+                }
                 let opaque = [1.0, 1.0, 1.0, 1.0];
                 if let Some(tl) = pop_img("topleft") {
                     let cw = tl.w * scale;
@@ -901,11 +953,10 @@ impl InterfaceRenderer {
                 }
 
                 // (2) Selector bar — port of the `m_Selector` element
-                // (CIFaceMenu.cpp:268-297). Drawn over the hovered row
-                // when any. Sourced from the `sel` element on PopupMenu;
-                // falls back to a simple tint if the asset is missing.
+                // (CIFaceMenu.cpp:268-297). Drawn brightened over the
+                // hovered row to highlight the active selection.
                 if let Some(hi) = popup.hovered {
-                    let row_y = oy + hi as f32 * popup.item_h * scale;
+                    let row_y = items_y0 + hi as f32 * popup.item_h * scale;
                     let row_h = popup.item_h * scale;
                     if let Some(sel) = pop_img("sel") {
                         emit_textured(
@@ -913,12 +964,12 @@ impl InterfaceRenderer {
                             &mut current_key,
                             &mut current_start,
                             &mut self.draw_groups,
-                            ox + corner_w,
+                            ox + 2.0 * scale,
                             row_y,
-                            (total_w - corner_w - corner_w_r).max(0.0),
+                            (total_w - 4.0 * scale).max(0.0),
                             row_h,
                             sel,
-                            [1.0, 1.0, 1.0, 0.7],
+                            [1.4, 1.2, 0.6, 1.0],
                         );
                     }
                 }
@@ -938,7 +989,7 @@ impl InterfaceRenderer {
                 let popup_ty = popup.parent.unit_type() as i32;
                 for (i, item) in popup.items.iter().enumerate() {
                     let row_x = ox;
-                    let row_y = oy + i as f32 * popup.item_h * scale;
+                    let row_y = items_y0 + i as f32 * popup.item_h * scale;
                     let row_h = popup.item_h * scale;
                     // C++ NERES_LABELS_COLOR (red-grey) when unaffordable;
                     // DEFAULT_LABELS_COLOR (off-white) otherwise.
@@ -990,10 +1041,10 @@ impl InterfaceRenderer {
                     if let Some(cursik) = pop_img("cursik") {
                         let cw = cursik.w * scale;
                         let ch = cursik.h * scale;
-                        let row_y = oy + pos as f32 * popup.item_h * scale;
+                        let row_y = items_y0 + pos as f32 * popup.item_h * scale;
                         // C++ places it at LEFT_SPACE + 1 (8px). Centred
                         // vertically in the row.
-                        let cx = ox + 8.0 * scale;
+                        let cx = ox + 4.0 * scale;
                         let cy = row_y + (popup.item_h * scale - ch) * 0.5;
                         emit_textured(
                             &mut all_verts,

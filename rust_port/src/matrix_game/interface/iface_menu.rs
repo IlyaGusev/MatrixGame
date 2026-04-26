@@ -276,16 +276,46 @@ impl CIFaceMenu {
         }
     }
 
+    /// Per-CIFaceMenu.h chrome dimensions. The popup top-left
+    /// (`design_x`, `design_y`) is the CHROME origin; items are inset
+    /// by [`Self::CHROME_TOP`] / [`Self::CHROME_LEFT`] and the bottom
+    /// chrome adds [`Self::CHROME_BOTTOM`] beneath the last row.
+    /// Mirrors the C++ catcher placement at `y + 11 + UNIT_HEIGHT*i`
+    /// (CIFaceMenu.cpp:316) and the `h += TOPLINE_HEIGHT +
+    /// BOTTOMLINE_HEIGHT` total-height computation
+    /// (CIFaceMenu.cpp:88-90).
+    pub const CHROME_TOP: f32 = 11.0;
+    pub const CHROME_BOTTOM: f32 = 11.0;
+    pub const CHROME_LEFT: f32 = 4.0;
+    pub const CHROME_RIGHT: f32 = 4.0;
+
+    /// Total popup width including chrome.
+    pub fn total_w(&self) -> f32 {
+        self.item_w
+    }
+
+    /// Total popup height including chrome (top + items + bottom).
+    pub fn total_h(&self) -> f32 {
+        Self::CHROME_TOP + self.item_h * self.items.len() as f32 + Self::CHROME_BOTTOM
+    }
+
+    /// Y offset (in design space) where the items area begins, relative
+    /// to the popup top-left. Matches the C++ catcher base offset.
+    pub fn items_top(&self) -> f32 {
+        Self::CHROME_TOP
+    }
+
     /// Hit-test the popup at design-space cursor coords (relative to
     /// the Base panel origin). Returns the item index under the cursor.
     pub fn hit_test_design(&self, dx: f32, dy: f32) -> Option<usize> {
-        if dx < self.design_x || dx >= self.design_x + self.item_w {
+        if dx < self.design_x || dx >= self.design_x + self.total_w() {
             return None;
         }
-        if dy < self.design_y {
+        let items_y0 = self.design_y + self.items_top();
+        if dy < items_y0 {
             return None;
         }
-        let row = ((dy - self.design_y) / self.item_h).floor() as i32;
+        let row = ((dy - items_y0) / self.item_h).floor() as i32;
         if row < 0 || (row as usize) >= self.items.len() {
             return None;
         }
@@ -293,14 +323,9 @@ impl CIFaceMenu {
     }
 
     /// Total popup rect in design-space (relative to Base panel
-    /// origin). Drives the renderer.
+    /// origin), including chrome. Drives the renderer + click-outside.
     pub fn rect_design(&self) -> [f32; 4] {
-        [
-            self.design_x,
-            self.design_y,
-            self.item_w,
-            self.item_h * self.items.len() as f32,
-        ]
+        [self.design_x, self.design_y, self.total_w(), self.total_h()]
     }
 
     /// True when the design-space cursor is inside the popup's rect

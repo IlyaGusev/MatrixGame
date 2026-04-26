@@ -677,27 +677,27 @@ impl CInterface {
         let energy_v = res_visible(Resource::Energy);
         let plasma_v = res_visible(Resource::Plasma);
 
-        // Decode (prefix, kind) for `chasN`/`hullN`/`headN`/`weapN` (or
-        // `headNst`, `weaponNst`, `iheNtext`, `iwNtext` …). Returns
-        // `(category_letter, kind_index)` so we can match against the
-        // currently-focused (type, kind) pair.
+        // Decode (category_letter, kind_index) for the *_st preview and
+        // i*N text statics. The C++ shows these on the right-hand side
+        // of the constructor when the focused pylon's (type, kind)
+        // matches.
         //
-        //   c: chassis → focuses MRT_CHASSIS
-        //   h: armor   → focuses MRT_ARMOR (template prefix `hull`)
-        //   d: head    → focuses MRT_HEAD  (template prefix `head` / `ihe`)
-        //   w: weapon  → focuses MRT_WEAPON (template prefix `weap` / `iw` / `weapon`)
+        //   c: chassis → MRT_CHASSIS  (chasNst, ichNtext, ichtext)
+        //   h: armor   → MRT_ARMOR    (hullNst, ihuNtext, ihutext)
+        //   d: head    → MRT_HEAD     (headNst, iheNtext, ihetext)
+        //   w: weapon  → MRT_WEAPON   (weaponNst, iwNtext, iwtext)
+        //
+        // CInterface.cpp:2358-2406 enumerates each name + the matching
+        // (Param1, Param2) gate. Numbered template buttons themselves
+        // (`chasN`, `hullN`, `headN`, `weapN`, `heade`, `weape`) are
+        // popup-only image sources — they never appear in the panel
+        // outside the popup overlay, so we keep them hidden.
         fn template_target(n: &str) -> Option<(char, i32)> {
-            // Numbered chas1..5, hull1..6, head1..4, weap1..10
-            for (prefix, ch) in [("chas", 'c'), ("hull", 'h'), ("head", 'd'), ("weap", 'w')] {
+            // *Nst (chas1st, hull1st, head1st) — preview state image
+            // tied to (type, kind).
+            for (prefix, ch) in [("chas", 'c'), ("hull", 'h'), ("head", 'd')] {
                 if let Some(suffix) = n.strip_prefix(prefix) {
-                    if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) {
-                        if let Ok(k) = suffix.parse::<i32>() {
-                            return Some((ch, k));
-                        }
-                    }
-                    // *Nst (hull1st, head1st, etc.)
-                    if suffix.ends_with("st") {
-                        let body = suffix.trim_end_matches("st");
+                    if let Some(body) = suffix.strip_suffix("st") {
                         if !body.is_empty() && body.chars().all(|c| c.is_ascii_digit()) {
                             if let Ok(k) = body.parse::<i32>() {
                                 return Some((ch, k));
@@ -706,7 +706,8 @@ impl CInterface {
                     }
                 }
             }
-            // weaponNst (note `weapon` not `weap`)
+            // weaponNst — note `weapon` (not `weap`), CInterface.cpp:
+            // 2388-2406.
             if let Some(rest) = n.strip_prefix("weapon") {
                 if let Some(num) = rest.strip_suffix("st") {
                     if let Ok(k) = num.parse::<i32>() {
@@ -744,11 +745,22 @@ impl CInterface {
             }
         }
 
-        // Empty-slot template variants — hidden by default; the popup
-        // mechanic shows them while the kind picker is open.
-        let is_empty_template = |n: &str| -> bool {
-            matches!(n, "heade" | "weape")
-        };
+        // Numbered popup-template buttons + the empty-slot variants —
+        // never visible in the constructor outside the popup overlay,
+        // which renders them via its own pass.
+        fn is_popup_template(n: &str) -> bool {
+            for prefix in ["chas", "hull", "head", "weap"] {
+                if let Some(suffix) = n.strip_prefix(prefix) {
+                    if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) {
+                        return true;
+                    }
+                    if suffix == "e" {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
 
         // Map a focused (type, kind) into our (category_letter, kind)
         // tuple. `None` when no pylon is focused or the focused kind is
@@ -811,7 +823,8 @@ impl CInterface {
                 Some(focus_tk == Some(tt))
             } else if let Some(cat) = info_header {
                 Some(focus_tk.map(|(c, _)| c == cat).unwrap_or(false))
-            } else if is_empty_template(n) {
+            } else if is_popup_template(n) {
+                // Popup-only image sources — never visible directly.
                 Some(false)
             } else {
                 None
@@ -935,18 +948,6 @@ impl CInterface {
                 "struct" => Some(structure_text.as_str()),
                 "damage" => Some(damage_text.as_str()),
                 "rcname" => Some(robot_name),
-                // Summary (×counter) prices — port of CInterface.cpp:
-                // 2168-2199 dynamic CWStr(titan_summ) caption assigns.
-                "titans" => Some(summ_titan.as_str()),
-                "electrs" => Some(summ_elec.as_str()),
-                "energys" => Some(summ_ener.as_str()),
-                "plasmas" => Some(summ_plas.as_str()),
-                // Per-unit prices for the focused component — port of
-                // CInterface.cpp:2238-2287.
-                "titan" => Some(unit_titan.as_str()),
-                "electr" => Some(unit_elec.as_str()),
-                "energy" => Some(unit_ener.as_str()),
-                "plasma" => Some(unit_plas.as_str()),
                 _ => None,
             };
             let Some(new_text) = new_text else { continue };
@@ -962,6 +963,196 @@ impl CInterface {
                 if force_wrap {
                     lbl.wrap = true;
                 }
+            }
+        }
+        // Helper price strings live with `apply_constructor_prices` now;
+        // these are kept here just to silence the parameter-unused
+        // warning when the price helpers were inlined.
+        let _ = (
+            summ_titan, summ_elec, summ_ener, summ_plas, unit_titan, unit_elec, unit_ener,
+            unit_plas, summ_price, focused_price,
+        );
+    }
+
+    /// Port of `CIFaceList::CreateSummPrice` (CInterface.cpp:3220-3297) +
+    /// `CreateItemPrice` (CInterface.cpp:3146-3193). The C++ creates
+    /// IFACE_DYNAMIC_STATIC elements at runtime for each non-zero
+    /// resource, sourcing the icon from the named `titan` / `electr` /
+    /// `energy` / `plasma` `CIFaceImage` template; the price text then
+    /// gets layered onto the `res_summ` / `res_unit` panel via
+    /// `SetStateText` with offset `m_titX+25` etc.
+    ///
+    /// We rebuild the dynamic icons + text labels each frame: dropping
+    /// any `_dynprice_*` / `_dynsumm_*` from the previous frame, then
+    /// pushing a fresh static for every non-zero entry. The icon image
+    /// is borrowed from the `titan` / `electr` / `energy` / `plasma`
+    /// IFaceImage element (the `FindImageByName` source); the text
+    /// label is appended directly to the dynamic element.
+    pub fn apply_constructor_prices(
+        &mut self,
+        constructor_active: bool,
+        focused_price: Option<&crate::matrix_game::interface::constructor::UnitPrice>,
+        summ_price: &crate::matrix_game::interface::constructor::UnitPrice,
+    ) {
+        if self.name != "Base" {
+            return;
+        }
+        // Always wipe last frame's dynamic price entries — they're
+        // re-emitted from scratch below if the constructor is active.
+        self.elements
+            .retain(|e| !e.name.starts_with("_dynsumm_") && !e.name.starts_with("_dynprice_"));
+        if !constructor_active {
+            return;
+        }
+        use crate::matrix_game::config::Resource;
+        // Resolve the four icon templates up-front. Each is a CIFaceImage
+        // element loaded by panel data; its `images[Normal]` carries the
+        // atlas sub-rect we want to copy onto each dynamic static.
+        // Precomputing avoids borrowing `self.elements` immutably during
+        // the mutate-and-push pass below.
+        let icons: [Option<(StateImage, f32, f32)>; 4] = {
+            let resolve = |name: &str| -> Option<(StateImage, f32, f32)> {
+                let e = self.elements.iter().find(|e| e.name == name)?;
+                let img = e.images.first()?.as_ref()?.clone();
+                // Image elements ship size via `Width` / `Height` (loaded
+                // into StateImage.w/h); the element itself has size_x/y
+                // == 0 since it's just a template handle.
+                let mut w = if e.size_x > 0.0 { e.size_x } else { img.w };
+                let mut h = if e.size_y > 0.0 { e.size_y } else { img.h };
+                if w <= 0.0 {
+                    w = 22.0;
+                }
+                if h <= 0.0 {
+                    h = 22.0;
+                }
+                Some((img, w, h))
+            };
+            [
+                resolve("titan"),
+                resolve("electr"),
+                resolve("energy"),
+                resolve("plasma"),
+            ]
+        };
+
+        // Helper: push one icon + price text pair as a dynamic static.
+        // Mirrors `CreateStaticFromImage` (CInterface.cpp:3170 etc.).
+        let push = |elements: &mut Vec<IFaceElement>,
+                    name_prefix: &str,
+                    res_idx: usize,
+                    icon: StateImage,
+                    icon_w: f32,
+                    icon_h: f32,
+                    pos_x: f32,
+                    pos_y: f32,
+                    price: i32| {
+            let mut images: [Option<StateImage>; MAX_STATES] = Default::default();
+            images[ElementState::Normal as usize] = Some(icon);
+            // Price text label sits to the RIGHT of the icon (the C++
+            // uses `m_titX + 25 - elem.x` as `m_SmeX` to push the text
+            // ~25 px past the icon). Anchor with align_y=1 (vertical
+            // center): the renderer's cell_top = anchor_y - line_h/2,
+            // so anchor_y must equal the icon's vertical mid-line for
+            // the digits to land on the icon. Since size_y / 2 already
+            // produces that anchor (align_y=1), label.y stays 0.
+            let label_text = price.to_string();
+            let label = ElementLabel {
+                state: ElementState::Normal,
+                text: label_text,
+                x: icon_w + 4.0,
+                y: 0.0,
+                sme_x: 0.0,
+                sme_y: 0.0,
+                align_x: 0,
+                align_y: 1,
+                wrap: false,
+                font: "Font.2Small".to_string(),
+                color: [246, 192, 0, 255],
+            };
+            elements.push(IFaceElement {
+                name: format!("{name_prefix}{res_idx}"),
+                kind: ElementKind::Static,
+                id: 0,
+                group: 0,
+                flags: IFEF_VISIBLE,
+                param1: 0.0,
+                param2: 0.0,
+                i_param: 0,
+                pos_x,
+                pos_y,
+                pos_z: 0.0,
+                size_x: icon_w,
+                size_y: icon_h,
+                images,
+                labels: vec![label],
+                cur_state: ElementState::Normal,
+                def_state: ElementState::Normal,
+                hint_template: String::new(),
+                hint_offset_x: 0,
+                hint_offset_y: 0,
+            });
+        };
+
+        // ── Summary price row (CInterface.cpp:3220-3297). Anchor
+        // shifts left when fewer resources are present so the row
+        // stays roughly centred under the build-button.
+        let summ_count = (0..4)
+            .filter(|i| summ_price.resources[*i] != 0)
+            .count();
+        let mut x = match summ_count {
+            3 => 235.0,
+            2 => 250.0,
+            _ => 200.0,
+        };
+        let y = 352.0;
+        for r in Resource::ALL {
+            let v = summ_price.resources[r as usize];
+            if v == 0 {
+                continue;
+            }
+            let Some((img, w, h)) = icons[r as usize].clone() else {
+                continue;
+            };
+            push(
+                &mut self.elements,
+                "_dynsumm_",
+                r as usize,
+                img,
+                w,
+                h,
+                x,
+                y,
+                v,
+            );
+            // CInterface.cpp:3285 — advance by `s->m_xSize + 31`.
+            x += w + 31.0;
+        }
+
+        // ── Per-item price row (CInterface.cpp:3146-3193). Always
+        // anchored at (22, 243); icons advance by `s->m_xSize + 25`.
+        if let Some(unit) = focused_price {
+            let mut x = 22.0;
+            let y = 243.0;
+            for r in Resource::ALL {
+                let v = unit.resources[r as usize];
+                if v == 0 {
+                    continue;
+                }
+                let Some((img, w, h)) = icons[r as usize].clone() else {
+                    continue;
+                };
+                push(
+                    &mut self.elements,
+                    "_dynprice_",
+                    r as usize,
+                    img,
+                    w,
+                    h,
+                    x,
+                    y,
+                    v,
+                );
+                x += w + 25.0;
             }
         }
     }

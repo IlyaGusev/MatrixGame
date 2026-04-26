@@ -1815,10 +1815,18 @@ impl BuilderPreview {
     pub fn ticket(&mut self, cfg: &RobotConfig, design_rect: [f32; 4]) -> Option<PreviewTicket> {
         let chassis = chassis_from_cfg(cfg)?;
         self.last_chassis = Some(chassis);
+        // Faithful port of CConstructor.cpp:44 — `m_Robot->m_Forward =
+        // D3DXVECTOR3(1, 0, 0)`. The robot model's local +Y is its
+        // "forward"; the C++ matrix-builder maps local +Y to the world
+        // m_Forward direction, so to face +X (matching the camera at
+        // (80,-30) looking at origin) the chassis world matrix is a
+        // -π/2 rotation around Z. The renderer's `chassis_world` is a
+        // simple Z-rotation by `rotation_rad`, so passing -π/2 here
+        // reproduces the C++ orientation exactly.
         Some(PreviewTicket {
             chassis,
             design_rect,
-            rotation_rad: 0.0,
+            rotation_rad: -std::f32::consts::FRAC_PI_2,
         })
     }
 }

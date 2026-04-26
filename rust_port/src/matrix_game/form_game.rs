@@ -694,15 +694,24 @@ impl ApplicationHandler for App {
                     // Route Base-panel focus changes into the
                     // constructor — port of CConstructor.cpp:903-958
                     // (`RemoteFocusElement` / `RemoteUnFocusElement`).
-                    if let Some(b) = state.game.player_side.builder.as_mut() {
-                        if let Some((panel, elem)) = unfocused {
-                            if panel == "Base" {
-                                b.unfocus_element(&elem);
+                    //
+                    // While the popup is open the C++ skips OnMouseMove
+                    // for buttons (CInterface.cpp:979) and additionally
+                    // RemoteUnFocusElement guards on `POPUP_MENU_ACTIVE`
+                    // (CConstructor.cpp:907-910). Net effect: pylon
+                    // hover changes are frozen until the popup closes.
+                    let popup_active = state.iface_list.popup.is_some();
+                    if !popup_active {
+                        if let Some(b) = state.game.player_side.builder.as_mut() {
+                            if let Some((panel, elem)) = unfocused {
+                                if panel == "Base" {
+                                    b.unfocus_element(&elem);
+                                }
                             }
-                        }
-                        if let Some((panel, elem)) = focused {
-                            if panel == "Base" {
-                                b.focus_element(&elem);
+                            if let Some((panel, elem)) = focused {
+                                if panel == "Base" {
+                                    b.focus_element(&elem);
+                                }
                             }
                         }
                     }
@@ -1416,13 +1425,13 @@ fn dispatch_ui_click(state: &mut AppState, click: &crate::matrix_game::interface
             return;
         }
         "cocan" => {
-            // Port of CConstructor.cpp:986-994 — close panel, reset the
-            // counter, kill any open popup. The C++ also unpauses the
-            // world; the Rust port doesn't pause yet so that step is a
-            // no-op until the pause/resume plumbing lands.
+            // Port of CConstructorPanel::ResetGroupNClose
+            // (CConstructor.cpp:986-994). Despite the name, this only
+            // clears `m_Active` + closes the popup — it does NOT reset
+            // the live construction state. The next `buro` reopens with
+            // the same chassis/armor/head/weapons the user had.
             if let Some(b) = state.game.player_side.builder.as_mut() {
                 b.deactivate();
-                b.reset_construction();
             }
             state.iface_list.r_count_control.reset();
             state.iface_list.popup = None;
@@ -2264,10 +2273,13 @@ fn commit_and_queue_robot(state: &mut AppState) {
     }
     // CConstructor.cpp:231 — push to global config history.
     state.iface_list.history.add(cfg);
-    // CConstructor.cpp:244-246 — close the panel.
+    // CConstructor.cpp:244-246 — close the panel via ResetGroupNClose.
+    // That call only clears `m_Active`; it does NOT reset the live
+    // construction state. `RemoteBuild` itself stacks robots with
+    // `StackRobot` (CConstructor.cpp:233-235) which never resets either,
+    // so the user's design persists across builds.
     if let Some(b) = state.game.player_side.builder.as_mut() {
         b.deactivate();
-        b.reset_construction();
     }
     // CConstructor.cpp:247-248 — reset + revalidate the counter.
     state.iface_list.r_count_control.reset();
@@ -2715,6 +2727,17 @@ fn refresh_interface_visibility(state: &mut AppState) {
                 );
             }
         }
+        // Per-frame port of CIFaceList::CreateSummPrice / CreateItemPrice
+        // (CInterface.cpp:3146-3297). Wipes the prior frame's dynamic
+        // price icons + price-text labels, then re-emits them for every
+        // non-zero resource on the current focused / summary price.
+        let focused_price_owned = state
+            .game
+            .player_side
+            .builder
+            .as_ref()
+            .and_then(|b| b.focused_price);
+        p.apply_constructor_prices(constructor_active, focused_price_owned.as_ref(), &summ_price);
         if was_visible != p.visible {
             let n_vis = p.elements.iter().filter(|e| e.visible()).count();
             let n_total = p.elements.len();
