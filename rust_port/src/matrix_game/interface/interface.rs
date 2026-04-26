@@ -79,6 +79,14 @@ pub struct BaseVisibilityCtx<'a> {
     /// Side has enough resources for current preset and stack isn't
     /// full and robot count under cap. CInterface.cpp:1859.
     pub build_enabled: bool,
+    /// True when the player has hit the side robot cap — drives `warn1`/
+    /// `warnl` visibility. Port of CInterface.cpp:1829-1831.
+    pub robot_limit_reached: bool,
+    /// Currently-focused (type, kind) on a pylon — drives the right-side
+    /// per-kind preview / info overlay (head{N}_st, ihu{N}text, etc.).
+    /// `None` when no pylon is focused. Port of the
+    /// `m_FocusedElement->m_Param1/Param2` reads at CInterface.cpp:2358-2406.
+    pub focused_target: Option<crate::matrix_game::interface::constructor::FocusTarget>,
 }
 
 /// Subset of `CMatrixSide` state the Main panel's visibility dispatch
@@ -277,6 +285,34 @@ impl CInterface {
                 // lookup finds `heade` / `weape` correctly.
                 && is_template_element_name(&e.name)
         })
+    }
+
+    /// Look up the localised popup label for a `(type, kind)` part
+    /// (e.g. "Pulemyot" for weapon kind 1). The C++ stores these as
+    /// `iw{N}text_sNormal` / `ihu{N}text_sNormal` /
+    /// `ihe{N}text_sNormal` / `ich{N}text_sNormal` strings inside the
+    /// `LabelsText/Base` block, then assigns them into per-popup
+    /// `g_PopupChassis[]` / `g_PopupHull[]` / etc. arrays in
+    /// `CInterface.cpp:715-772`. We reuse the already-attached
+    /// `iw{N}text` / `ihu{N}text` / `ihe{N}text` / `ich{N}text` element
+    /// labels — same data, no extra parse pass.
+    pub fn popup_kind_label(&self, ty: i32, kind: i32) -> Option<&str> {
+        if kind <= 0 {
+            return None;
+        }
+        let prefix = match ty {
+            1 => "ich",
+            2 => "iw",
+            3 => "ihu",
+            4 => "ihe",
+            _ => return None,
+        };
+        let elem_name = format!("{prefix}{kind}text");
+        let e = self.elements.iter().find(|e| e.name == elem_name)?;
+        e.labels
+            .iter()
+            .find(|l| matches!(l.state, ElementState::Normal))
+            .map(|l| l.text.as_str())
     }
 
     /// Screen-space pixel rect of a named element. Computed from the
@@ -594,6 +630,8 @@ impl CInterface {
             counter_up_enabled: true,
             counter_down_enabled: true,
             build_enabled: true,
+            robot_limit_reached: false,
+            focused_target: None,
         });
     }
 
@@ -639,68 +677,100 @@ impl CInterface {
         let energy_v = res_visible(Resource::Energy);
         let plasma_v = res_visible(Resource::Plasma);
 
-        // Helper: detect template / popup-overlay element names that
-        // should stay hidden until the popup-menu is invoked. The C++
-        // stacks these at the same panel position and only one shows
-        // at a time during a popup interaction. Until the popup is
-        // ported we just hide them all.
+        // Decode (prefix, kind) for `chasN`/`hullN`/`headN`/`weapN` (or
+        // `headNst`, `weaponNst`, `iheNtext`, `iwNtext` …). Returns
+        // `(category_letter, kind_index)` so we can match against the
+        // currently-focused (type, kind) pair.
         //
-        // Pattern: a category prefix (chas/hull/head/weap) followed by
-        // a digit suffix (chas1..5, hull1..6, head1..7, weap1..10) OR
-        // the empty-slot variants `heade`/`weape`. Plain category
-        // labels like `chasl`, `weapl`, `hulll`, `headl` are STATIC
-        // text elements that remain visible.
-        fn is_kind_template(n: &str) -> bool {
-            for prefix in ["chas", "hull", "head", "weap"] {
+        //   c: chassis → focuses MRT_CHASSIS
+        //   h: armor   → focuses MRT_ARMOR (template prefix `hull`)
+        //   d: head    → focuses MRT_HEAD  (template prefix `head` / `ihe`)
+        //   w: weapon  → focuses MRT_WEAPON (template prefix `weap` / `iw` / `weapon`)
+        fn template_target(n: &str) -> Option<(char, i32)> {
+            // Numbered chas1..5, hull1..6, head1..4, weap1..10
+            for (prefix, ch) in [("chas", 'c'), ("hull", 'h'), ("head", 'd'), ("weap", 'w')] {
                 if let Some(suffix) = n.strip_prefix(prefix) {
-                    // Digit suffix → numbered template button
                     if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) {
-                        return true;
+                        if let Ok(k) = suffix.parse::<i32>() {
+                            return Some((ch, k));
+                        }
                     }
-                    // Empty-slot variants `heade` / `weape`
-                    if suffix == "e" {
-                        return true;
-                    }
-                    // Decorative `*Nst` (hull1st, weapon3st, etc.) —
-                    // also `weaponNst` (note `weapon` not `weap`).
-                    if suffix.ends_with("st")
-                        && suffix
-                            .trim_end_matches("st")
-                            .chars()
-                            .any(|c| c.is_ascii_digit())
-                    {
-                        return true;
+                    // *Nst (hull1st, head1st, etc.)
+                    if suffix.ends_with("st") {
+                        let body = suffix.trim_end_matches("st");
+                        if !body.is_empty() && body.chars().all(|c| c.is_ascii_digit()) {
+                            if let Ok(k) = body.parse::<i32>() {
+                                return Some((ch, k));
+                            }
+                        }
                     }
                 }
             }
-            // `weaponNst` siblings (see panel dump — uses `weapon` not
-            // `weap` prefix for the *st statics).
+            // weaponNst (note `weapon` not `weap`)
             if let Some(rest) = n.strip_prefix("weapon") {
-                if rest.ends_with("st") {
-                    return true;
-                }
-            }
-            // Per-template info text statics: `iw1text`, `ihe2text`,
-            // `ihu3text`, `ich4text`. The bare `iwtext`/`ihetext`/etc.
-            // are headers — keep them visible.
-            for prefix in ["iw", "ihe", "ihu", "ich"] {
-                if let Some(suffix) = n.strip_prefix(prefix) {
-                    if suffix.ends_with("text")
-                        && suffix
-                            .trim_end_matches("text")
-                            .chars()
-                            .any(|c| c.is_ascii_digit())
-                    {
-                        return true;
+                if let Some(num) = rest.strip_suffix("st") {
+                    if let Ok(k) = num.parse::<i32>() {
+                        return Some(('w', k));
                     }
                 }
             }
-            false
+            // ihe{N}text / iw{N}text / ihu{N}text / ich{N}text — info
+            // text statics tied to (head/weapon/armor/chassis, kind N).
+            for (prefix, ch) in [("ihe", 'd'), ("iw", 'w'), ("ihu", 'h'), ("ich", 'c')] {
+                if let Some(suffix) = n.strip_prefix(prefix) {
+                    if let Some(num) = suffix.strip_suffix("text") {
+                        if !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()) {
+                            if let Ok(k) = num.parse::<i32>() {
+                                return Some((ch, k));
+                            }
+                        }
+                    }
+                }
+            }
+            None
         }
+
+        // Bare info-text headers (`ihetext`/`iwtext`/`ihutext`/`ichtext`)
+        // are visible while the matching category is focused. C++
+        // condition at CInterface.cpp:2358-2406 (`pElement->m_strName ==
+        // IF_BASE_IHE_TEXT && Param1 == MRT_HEAD`).
+        fn info_header_for(n: &str) -> Option<char> {
+            match n {
+                "ihetext" => Some('d'),
+                "iwtext" => Some('w'),
+                "ihutext" => Some('h'),
+                "ichtext" => Some('c'),
+                _ => None,
+            }
+        }
+
+        // Empty-slot template variants — hidden by default; the popup
+        // mechanic shows them while the kind picker is open.
+        let is_empty_template = |n: &str| -> bool {
+            matches!(n, "heade" | "weape")
+        };
+
+        // Map a focused (type, kind) into our (category_letter, kind)
+        // tuple. `None` when no pylon is focused or the focused kind is
+        // empty — `head{N}_st` etc. should NOT appear for the empty
+        // slot in the original UI.
+        use crate::matrix_game::object_robot::RobotUnitType;
+        let focus_tk: Option<(char, i32)> = ctx.focused_target.and_then(|t| {
+            if t.kind.is_empty() {
+                return None;
+            }
+            let ch = match t.ty {
+                RobotUnitType::Chassis => 'c',
+                RobotUnitType::Armor => 'h',
+                RobotUnitType::Head => 'd',
+                RobotUnitType::Weapon => 'w',
+                RobotUnitType::Empty => return None,
+            };
+            Some((ch, t.kind.0))
+        });
 
         for e in &mut self.elements {
             let n = e.name.as_str();
-            let is_template = is_kind_template(n);
             let is_digit = DIGIT_NAMES.contains(&n);
             // CInterface.cpp:889-892 — resource icon template names.
             let res_v = match n {
@@ -712,12 +782,39 @@ impl CInterface {
             };
 
             // Weapon-pylon visibility per CInterface.cpp:1972-2090.
-            // pi1..pi4 only visible when armor has common slots;
-            // pi5 only when armor has extra slots.
+            // pi1..pi4 each have their own threshold against
+            // `m_RobotWeaponMatrix[hull-1].common`. pi5 needs `extra`.
             let pylon_v: Option<bool> = match n {
-                "pi1" | "pi2" | "pi3" | "pi4" => Some(ctx.armor_common_slots > 0),
+                "pi1" => Some(ctx.armor_common_slots > 0),
+                "pi2" => Some(ctx.armor_common_slots > 1),
+                "pi3" => Some(ctx.armor_common_slots > 2),
+                "pi4" => Some(ctx.armor_common_slots > 3),
                 "pi5" => Some(ctx.armor_extra_slots > 0),
                 _ => None,
+            };
+
+            // CInterface.cpp:1829-1831 — `warn1` / `warnl` only when
+            // the player has hit the side robot cap.
+            let warn_v = match n {
+                "warn1" | "warnl" | "warn" | "warning1" | "warning" => {
+                    Some(ctx.robot_limit_reached)
+                }
+                _ => None,
+            };
+
+            // Right-side per-kind preview / info-text overlay. The C++
+            // shows `headN_st` + `iheN_text` etc. for the focused
+            // (type, kind) only — see CInterface.cpp:2358-2406.
+            let template = template_target(n);
+            let info_header = info_header_for(n);
+            let template_v: Option<bool> = if let Some(tt) = template {
+                Some(focus_tk == Some(tt))
+            } else if let Some(cat) = info_header {
+                Some(focus_tk.map(|(c, _)| c == cat).unwrap_or(false))
+            } else if is_empty_template(n) {
+                Some(false)
+            } else {
+                None
             };
 
             // History button enabled state per CInterface.cpp:1954-1967.
@@ -775,34 +872,96 @@ impl CInterface {
                 e.set_visible(v);
             } else if let Some(v) = res_v {
                 e.set_visible(v);
+            } else if let Some(v) = warn_v {
+                e.set_visible(v);
+            } else if let Some(v) = template_v {
+                e.set_visible(v);
             } else {
-                e.set_visible(!is_template);
+                e.set_visible(true);
             }
         }
     }
 
     /// Push the constructor's currently-focused-component label and
     /// description into the `it_label1` / `it_label2` dynamic-label
-    /// elements so the renderer's text pass picks them up.
+    /// elements + the live preview robot's stats (`struct` / `damage` /
+    /// `rcname`) into their respective static labels, so the renderer's
+    /// text pass picks them up.
     ///
-    /// Port of CInterface.cpp:1869-1884 — the C++ assigns
-    /// `m_FocusedLabel` / `m_FocusedDescription` to those elements'
-    /// `m_Caption` strings every panel-refresh tick. The Params /
-    /// Font / Color / alignment for those statics are seeded by
-    /// `attach_labels` from the data; we just overwrite the `text`
-    /// field on the matching label rows here.
-    pub fn apply_focused_text(&mut self, label: &str, description: &str) {
+    /// Port of CInterface.cpp:1869-1884 (it_label1/2),
+    /// CInterface.cpp:2330-2354 (struct / damage), and
+    /// CInterface.cpp:1822-1827 (rcname). Same per-frame-overwrite
+    /// pattern as `apply_top_hud_text`.
+    pub fn apply_focused_text(
+        &mut self,
+        label: &str,
+        description: &str,
+        structure: i32,
+        damage: i32,
+        robot_name: &str,
+        summ_price: &crate::matrix_game::interface::constructor::UnitPrice,
+        focused_price: Option<&crate::matrix_game::interface::constructor::UnitPrice>,
+    ) {
         if self.name != "Base" {
             return;
         }
+        use crate::matrix_game::config::Resource;
+        let structure_text = structure.to_string();
+        let damage_text = damage.to_string();
+        let summ_titan = summ_price.resources[Resource::Titan as usize].to_string();
+        let summ_elec = summ_price.resources[Resource::Electronics as usize].to_string();
+        let summ_ener = summ_price.resources[Resource::Energy as usize].to_string();
+        let summ_plas = summ_price.resources[Resource::Plasma as usize].to_string();
+        // Per-item price (the focused-component cost, no count multiplier).
+        // Port of `g_IFaceList->CreateItemPrice(price)` (CInterface.cpp:3146):
+        // when nothing is focused or the focus has no cost, the
+        // unit-panel statics stay empty.
+        let unit_titan = focused_price
+            .map(|p| p.resources[Resource::Titan as usize].to_string())
+            .unwrap_or_default();
+        let unit_elec = focused_price
+            .map(|p| p.resources[Resource::Electronics as usize].to_string())
+            .unwrap_or_default();
+        let unit_ener = focused_price
+            .map(|p| p.resources[Resource::Energy as usize].to_string())
+            .unwrap_or_default();
+        let unit_plas = focused_price
+            .map(|p| p.resources[Resource::Plasma as usize].to_string())
+            .unwrap_or_default();
         for e in &mut self.elements {
-            let new_text = match e.name.as_str() {
-                "it_label1" => label,
-                "it_label2" => description,
-                _ => continue,
+            let new_text: Option<&str> = match e.name.as_str() {
+                "it_label1" => Some(label),
+                "it_label2" => Some(description),
+                "struct" => Some(structure_text.as_str()),
+                "damage" => Some(damage_text.as_str()),
+                "rcname" => Some(robot_name),
+                // Summary (×counter) prices — port of CInterface.cpp:
+                // 2168-2199 dynamic CWStr(titan_summ) caption assigns.
+                "titans" => Some(summ_titan.as_str()),
+                "electrs" => Some(summ_elec.as_str()),
+                "energys" => Some(summ_ener.as_str()),
+                "plasmas" => Some(summ_plas.as_str()),
+                // Per-unit prices for the focused component — port of
+                // CInterface.cpp:2238-2287.
+                "titan" => Some(unit_titan.as_str()),
+                "electr" => Some(unit_elec.as_str()),
+                "energy" => Some(unit_ener.as_str()),
+                "plasma" => Some(unit_plas.as_str()),
+                _ => None,
             };
+            let Some(new_text) = new_text else { continue };
+            // The focused-part label / description are multi-line —
+            // `<br>` substitution in `make_item_replacements` lands
+            // `\r\n` inside the string, and the C++ uses `Word_wrap=1`
+            // on these statics. Force wrap on so the renderer's
+            // multi-line layout kicks in, regardless of what the panel
+            // data shipped.
+            let force_wrap = matches!(e.name.as_str(), "it_label1" | "it_label2");
             for lbl in &mut e.labels {
                 lbl.text = new_text.to_string();
+                if force_wrap {
+                    lbl.wrap = true;
+                }
             }
         }
     }

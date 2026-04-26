@@ -1796,7 +1796,6 @@ pub struct PreviewTicket {
 #[derive(Debug, Clone, Default)]
 pub struct BuilderPreview {
     last_chassis: Option<ChassisKind>,
-    angle_ms: f32,
 }
 
 impl BuilderPreview {
@@ -1804,25 +1803,22 @@ impl BuilderPreview {
         Self::default()
     }
 
-    /// Advance the turntable by `step_ms`. Called every frame while the
-    /// constructor is active.
-    pub fn tick(&mut self, step_ms: f32) {
-        self.angle_ms += step_ms;
-        if self.angle_ms > 100_000.0 {
-            self.angle_ms -= 100_000.0;
-        }
-    }
+    /// Per-frame tick. The C++ `CConstructor::BeforeRender`
+    /// (CConstructor.cpp:251-262) has the rotation block commented out —
+    /// the preview robot stays at a fixed `m_Forward = (1,0,0)` set by
+    /// the constructor (CConstructor.cpp:44). Kept as a no-op so callers
+    /// don't have to special-case the panel-active branch.
+    pub fn tick(&mut self, _step_ms: f32) {}
 
     /// Build a draw ticket for the given preset. Returns `None` when the
     /// config's chassis isn't set (nothing to render yet).
     pub fn ticket(&mut self, cfg: &RobotConfig, design_rect: [f32; 4]) -> Option<PreviewTicket> {
         let chassis = chassis_from_cfg(cfg)?;
         self.last_chassis = Some(chassis);
-        let rotation_rad = self.angle_ms * 0.0002;
         Some(PreviewTicket {
             chassis,
             design_rect,
-            rotation_rad,
+            rotation_rad: 0.0,
         })
     }
 }

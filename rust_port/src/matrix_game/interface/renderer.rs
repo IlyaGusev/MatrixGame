@@ -923,52 +923,63 @@ impl InterfaceRenderer {
                     }
                 }
 
-                // (3) Row icons — resolved via the Base panel's
-                // `template_by_kind` so the element whose `Param2`
-                // matches the item's `kind` is used. The template-
-                // button names (chas1, weap1, …) DON'T line up with
-                // kinds 1:1 (e.g. `weap7` is the MACHINEGUN template,
-                // not `weap1`) — see CInterface.cpp:338-387 for how the
-                // C++ builds the same lookup.
+                // (3) Row labels — port of CIFaceMenu::CreateMenu's
+                // text-catcher pass at CIFaceMenu.cpp:312-342. The C++
+                // pulls per-kind names from the panel's `LabelsText`
+                // block (e.g. "Pulemyot" / "Cannon" / "Pneumatic" /
+                // "Light hull") via `g_Popup{Chassis,Hull,Head,Weapon*}[]`
+                // (CInterface.cpp:715-772) and renders one
+                // `Font.2Ranger` text row per item.
+                //
+                // We pull the same strings via `popup_kind_label`, which
+                // reads them from the `iw{N}text` / `ihu{N}text` /
+                // `ihe{N}text` / `ich{N}text` element labels already
+                // attached during panel load.
                 let popup_ty = popup.parent.unit_type() as i32;
                 for (i, item) in popup.items.iter().enumerate() {
-                    let Some(src) = base_panel.template_by_kind(popup_ty, item.kind.0) else {
-                        continue;
-                    };
-                    let Some(img) = src.images.first().and_then(|x| x.as_ref()) else {
-                        continue;
-                    };
-                    let x = ox;
-                    let y = oy + i as f32 * popup.item_h * scale;
-                    let w = popup.item_w * scale;
-                    let h = popup.item_h * scale;
-                    // Hovered row gets the brightened tint; others
-                    // dimmed slightly so the active selection pops.
-                    // Unaffordable items render in the C++
-                    // `NERES_LABELS_COLOR` reddish-grey (CIFaceButton.cpp
-                    // :198 etc.) — we approximate via a red-shifted dim.
-                    let tint = if !item.affordable {
-                        if popup.hovered == Some(i) {
-                            [0.85, 0.35, 0.35, 1.0]
-                        } else {
-                            [0.55, 0.20, 0.20, 1.0]
-                        }
-                    } else if popup.hovered == Some(i) {
-                        [1.0, 1.0, 1.0, 1.0]
+                    let row_x = ox;
+                    let row_y = oy + i as f32 * popup.item_h * scale;
+                    let row_h = popup.item_h * scale;
+                    // C++ NERES_LABELS_COLOR (red-grey) when unaffordable;
+                    // DEFAULT_LABELS_COLOR (off-white) otherwise.
+                    let color = if !item.affordable {
+                        [180, 70, 70, 255]
                     } else {
-                        [0.7, 0.7, 0.7, 1.0]
+                        [230, 220, 200, 255]
                     };
-                    emit_textured(
+                    // Empty-slot row → "—"; equipped kinds → the
+                    // localised label. Falls back to a numeric kind when
+                    // the panel data didn't ship a label.
+                    let text = if item.kind.is_empty() {
+                        Cow::Borrowed("—")
+                    } else if let Some(label) = base_panel.popup_kind_label(popup_ty, item.kind.0)
+                    {
+                        Cow::Borrowed(label)
+                    } else {
+                        Cow::Owned(format!("kind {}", item.kind.0))
+                    };
+                    let runs = vec![RichRun {
+                        text: text.into_owned(),
+                        color: None,
+                    }];
+                    // Anchor: left-padded by the cursik width (8 px) to
+                    // leave room for the equipped-row arrow indicator;
+                    // vertically centred in the row.
+                    let pad_left = 12.0 * scale;
+                    emit_rich_line(
                         &mut all_verts,
                         &mut current_key,
                         &mut current_start,
                         &mut self.draw_groups,
-                        x,
-                        y,
-                        w,
-                        h,
-                        img,
-                        tint,
+                        &mut self.glyph_atlas,
+                        "Font.2Ranger",
+                        &runs,
+                        scale,
+                        row_x + pad_left,
+                        row_y + row_h * 0.5,
+                        0,
+                        1,
+                        color,
                     );
                 }
 

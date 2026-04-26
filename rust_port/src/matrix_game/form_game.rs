@@ -2595,7 +2595,14 @@ fn refresh_interface_visibility(state: &mut AppState) {
     let build_count = state.iface_list.r_count_control.counter();
     let counter_state = state.iface_list.r_count_control.clone();
     let counter_ctx = build_counter_ctx(state);
-    let (focused_price, summ_price, armor_common, armor_extra, build_enabled) = state
+    let (
+        focused_price,
+        summ_price,
+        armor_common,
+        armor_extra,
+        build_enabled,
+        focused_target,
+    ) = state
         .game
         .player_side
         .builder
@@ -2632,7 +2639,14 @@ fn refresh_interface_visibility(state: &mut AppState) {
             // be selected for inspection but the build button must not
             // fire on them.
             enough = enough && buildable_base && under_cap && active_is_player_owned;
-            (b.focused_price, total_cost, common, extra, enough)
+            // Decode the focused pylon → (type, kind) so the visibility
+            // refresh knows which `head{N}_st` / `iw{N}text` etc. to
+            // expose.
+            let focused = b
+                .focused_element
+                .as_deref()
+                .and_then(|n| b.focus_target_for(n));
+            (b.focused_price, total_cost, common, extra, enough, focused)
         })
         .unwrap_or((
             None,
@@ -2640,7 +2654,12 @@ fn refresh_interface_visibility(state: &mut AppState) {
             0,
             0,
             true,
+            None,
         ));
+    // Robot-limit warning gate — port of CInterface.cpp:1830-1831
+    // (`ps->GetRobotsCnt()+ps->GetRobotsInStack() >= ps->GetMaxSideRobots()`).
+    let robot_limit_reached =
+        counter_ctx.side_robots + counter_ctx.robots_in_stack >= counter_ctx.max_side_robots;
     // Port of the C++ `m_VisibleAlpha = IS_VISIBLEA` gate at
     // CInterface.cpp:1797 — the Base panel is *visible* whenever a
     // base/building is the active selection; whether individual
@@ -2664,6 +2683,8 @@ fn refresh_interface_visibility(state: &mut AppState) {
                 counter_up_enabled: counter_state.button_up_enabled,
                 counter_down_enabled: counter_state.button_down_enabled,
                 build_enabled,
+                robot_limit_reached,
+                focused_target,
             },
         );
         if constructor_active {
@@ -2671,10 +2692,27 @@ fn refresh_interface_visibility(state: &mut AppState) {
                 p.apply_constructor_to_pylons(cfg);
             }
             // Push the focused-component label / description into the
-            // `it_label1` / `it_label2` statics so the text pass picks
-            // them up. Matches CInterface.cpp:1869-1884.
+            // `it_label1` / `it_label2` statics + the live preview's
+            // structure / damage / robot-name into their respective
+            // statics. Matches CInterface.cpp:1822-1827 (rcname),
+            // 1869-1884 (it_label1/2), and 2330-2354 (struct/damage).
             if let Some(b) = state.game.player_side.builder.as_ref() {
-                p.apply_focused_text(&b.focused_text.label, &b.focused_text.description);
+                let structure = b.construction_structure();
+                // C++ damage path zeroes the value when there are no
+                // weapons (CInterface.cpp:2347-2350); construction_damage
+                // already sums only populated weapon slots, so the same
+                // outcome falls out.
+                let damage = b.construction_damage();
+                let robot_name = b.construction_name();
+                p.apply_focused_text(
+                    &b.focused_text.label,
+                    &b.focused_text.description,
+                    structure,
+                    damage,
+                    &robot_name,
+                    &summ_price,
+                    b.focused_price.as_ref(),
+                );
             }
         }
         if was_visible != p.visible {
