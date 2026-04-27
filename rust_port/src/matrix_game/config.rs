@@ -314,49 +314,70 @@ impl PriceTable {
         }
     }
 
-    /// Load `robots.dat`'s `Source/Price/*` block — the flat
-    /// `HEAD{N}_{RES}` / `ARMOR{N}_{RES}` / `WEAPON{N}_{RES}` /
-    /// `CHASSIS{N}_{RES}` keys at MatrixConfig.cpp:713-802.
+    /// Load `robots.dat`'s `Price/{Head,Armor,Weapon,Chassis}` blocks
+    /// — the flat `HEAD{N}_{RES}` / `ARMOR{N}_{RES}` / etc. keys read
+    /// at MatrixConfig.cpp:711-833. The C++ structure is:
     ///
-    /// The C++ loader hardcodes every key; we iterate the block keys
-    /// and match by prefix so the table keeps filling in if new
-    /// components are added to the data without changing code.
+    ///   Price/
+    ///     Head/    HEAD1_TITAN, HEAD1_ELECTRONICS, …
+    ///     Armor/   ARMOR1_TITAN, …
+    ///     Weapon/  WEAPON1_TITAN, …
+    ///     Chassis/ CHASSIS1_TITAN, …
+    ///
+    /// Each sub-block is its own BlockPar. We walk all four and parse
+    /// every `{PREFIX}{N}_{RES}` key the same way the C++ does (case-
+    /// insensitive `ParGet`).
     pub fn from_matrix_data(stor: &Storage) -> Option<Self> {
-        let source_rec = stor.block_record("da", "Source")?;
-        let price_rec = stor.block_record(&source_rec, "Price")?;
-        let keys = stor.get_buf(&price_rec, "0")?;
-        let values = stor.get_buf(&price_rec, "1")?;
-        let n = keys.arrays_count().min(values.arrays_count());
-
+        let price_rec = stor.block_record("da", "Price")?;
         let mut out = Self::default();
-        for i in 0..n {
-            let name = keys.get_as_wstr(i);
-            let val = values.get_as_wstr(i);
-            let Ok(v) = val.trim().parse::<i32>() else {
+        for sub in ["Head", "Armor", "Weapon", "Chassis"] {
+            let Some(sub_rec) = stor.block_record(&price_rec, sub) else {
                 continue;
             };
-            let Some((prefix, num, res)) = parse_component_key(&name) else {
+            let Some(keys) = stor.get_buf(&sub_rec, "0") else {
                 continue;
             };
-            // CBlockPar lookups in C++ are case-insensitive; the data
-            // file may author keys as `head1_titan` / `Head1_Titan` /
-            // `HEAD1_TITAN`. Compare without case so all variants match.
-            let res_upper = res.to_ascii_uppercase();
-            let res_idx = match res_upper.as_str() {
-                "TITAN" => Resource::Titan as usize,
-                "ELECTRONICS" => Resource::Electronics as usize,
-                "ENERGY" => Resource::Energy as usize,
-                "PLASM" | "PLASMA" => Resource::Plasma as usize,
-                _ => continue,
+            let Some(values) = stor.get_buf(&sub_rec, "1") else {
+                continue;
             };
-            let slot = (num - 1) as usize;
-            let prefix_upper = prefix.to_ascii_uppercase();
-            match prefix_upper.as_str() {
-                "HEAD" if slot < ROBOT_HEAD_CNT => out.heads[slot].resources[res_idx] = v,
-                "ARMOR" if slot < ROBOT_ARMOR_CNT => out.armors[slot].resources[res_idx] = v,
-                "WEAPON" if slot < ROBOT_WEAPON_CNT => out.weapons[slot].resources[res_idx] = v,
-                "CHASSIS" if slot < ROBOT_CHASSIS_CNT => out.chassis[slot].resources[res_idx] = v,
-                _ => {}
+            let n = keys.arrays_count().min(values.arrays_count());
+            for i in 0..n {
+                let name = keys.get_as_wstr(i);
+                let val = values.get_as_wstr(i);
+                let Ok(v) = val.trim().parse::<i32>() else {
+                    continue;
+                };
+                let Some((prefix, num, res)) = parse_component_key(&name) else {
+                    continue;
+                };
+                // CBlockPar lookups in C++ are case-insensitive; data
+                // may author keys as `head1_titan` / `Head1_Titan` /
+                // `HEAD1_TITAN`. Compare uppercased.
+                let res_upper = res.to_ascii_uppercase();
+                let res_idx = match res_upper.as_str() {
+                    "TITAN" => Resource::Titan as usize,
+                    "ELECTRONICS" => Resource::Electronics as usize,
+                    "ENERGY" => Resource::Energy as usize,
+                    "PLASM" | "PLASMA" => Resource::Plasma as usize,
+                    _ => continue,
+                };
+                let slot = (num - 1) as usize;
+                let prefix_upper = prefix.to_ascii_uppercase();
+                match prefix_upper.as_str() {
+                    "HEAD" if slot < ROBOT_HEAD_CNT => {
+                        out.heads[slot].resources[res_idx] = v
+                    }
+                    "ARMOR" if slot < ROBOT_ARMOR_CNT => {
+                        out.armors[slot].resources[res_idx] = v
+                    }
+                    "WEAPON" if slot < ROBOT_WEAPON_CNT => {
+                        out.weapons[slot].resources[res_idx] = v
+                    }
+                    "CHASSIS" if slot < ROBOT_CHASSIS_CNT => {
+                        out.chassis[slot].resources[res_idx] = v
+                    }
+                    _ => {}
+                }
             }
         }
         Some(out)
@@ -1024,22 +1045,30 @@ impl RobotNameParts {
         let labels_rec = stor.block_record("da", "AllLabels")?;
         let names_rec = stor.block_record(&labels_rec, "RobotNames")?;
         let mut out = Self::default();
+        // The data authors many of these with a trailing tab as a
+        // visual delimiter (e.g. `Hull1Key = "б\t"`). The C++
+        // concatenates them verbatim and the Rangers font treats the
+        // tab as zero-width, but our AFT renderer skips unknown
+        // glyphs without any fallback, so a trailing tab leaves a
+        // visible gap. Strip the trailing whitespace so the rendered
+        // robot name stays compact.
+        let trim = |s: String| -> String { s.trim_end().to_string() };
         for i in 0..ROBOT_ARMOR_CNT {
             let key = format!("Hull{}Key", i + 1);
             if let Some(s) = stor.block_param(&names_rec, &key) {
-                out.hull[i] = s;
+                out.hull[i] = trim(s);
             }
         }
         for i in 0..ROBOT_CHASSIS_CNT {
             let key = format!("Chas{}Key", i + 1);
             if let Some(s) = stor.block_param(&names_rec, &key) {
-                out.chassis[i] = s;
+                out.chassis[i] = trim(s);
             }
         }
         for i in 0..ROBOT_HEAD_CNT {
             let key = format!("Head{}Key", i + 1);
             if let Some(s) = stor.block_param(&names_rec, &key) {
-                out.head[i] = s;
+                out.head[i] = trim(s);
             }
         }
         Some(out)

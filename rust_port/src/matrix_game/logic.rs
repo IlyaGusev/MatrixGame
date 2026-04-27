@@ -142,6 +142,13 @@ impl MapLogic {
             BuildingDamages::from_matrix_data(matrix_data).unwrap_or_default();
         let chassis = ChassisChars::from_matrix_data(matrix_data).unwrap_or_default();
         let prices = PriceTable::from_matrix_data(matrix_data).unwrap_or_default();
+        log::info!(
+            "config: prices chassis[0]={:?}, armor[5]={:?}, weapon[0]={:?}, head[0]={:?}",
+            prices.chassis[0].resources,
+            prices.armors[5].resources,
+            prices.weapons[0].resources,
+            prices.heads[0].resources,
+        );
         let item_chars = ItemCharsTable::from_matrix_data(matrix_data).unwrap_or_default();
         let timings = Timings::from_matrix_data(matrix_data).unwrap_or_default();
         let turrets = TurretProps::from_matrix_data(matrix_data).unwrap_or_default();
