@@ -1387,6 +1387,41 @@ fn dispatch_ui_click(state: &mut AppState, click: &crate::matrix_game::interface
             state.iface_list.r_count_control.check_up(ctx);
             if let Some(b) = state.game.player_side.builder.as_mut() {
                 b.activate();
+                let cfg = b.cfg();
+                let price = b.construction_price();
+                let name = b.construction_name();
+                log::info!(
+                    "buro: live={{chas:{}, hull:{}, head:{}, w0:{}}}, price={:?}, name={:?}",
+                    cfg.chassis.kind.0,
+                    cfg.hull.unit.kind.0,
+                    cfg.head.kind.0,
+                    cfg.weapon[0].kind.0,
+                    price.resources,
+                    name,
+                );
+                let strings = crate::matrix_game::config::global_strings();
+                log::info!(
+                    "buro: robot_names hull={:?} chas={:?} head={:?}",
+                    &strings.robot_names.hull,
+                    &strings.robot_names.chassis,
+                    &strings.robot_names.head,
+                );
+            }
+            // Diagnostic — confirm the price-icon templates exist.
+            if let Some(p) = state.iface_list.panel("Base") {
+                let titan = p.element_by_name("titan").map(|e| {
+                    let img = e.images.first().and_then(|x| x.as_ref());
+                    (e.size_x, e.size_y, img.is_some(), img.map(|i| (i.w, i.h)))
+                });
+                let rcname = p.element_by_name("rcname").is_some();
+                let res_summ = p.element_by_name("res_summ").is_some();
+                let res_unit = p.element_by_name("res_unit").is_some();
+                let damage = p.element_by_name("damage").is_some();
+                let struct_ = p.element_by_name("struct").is_some();
+                log::info!(
+                    "buro: panel hits → titan={:?}, rcname={}, res_summ={}, res_unit={}, damage={}, struct={}",
+                    titan, rcname, res_summ, res_unit, damage, struct_,
+                );
             }
             log::info!("buro: opened robot constructor");
             // Silence "unused import" on paths we only need in other

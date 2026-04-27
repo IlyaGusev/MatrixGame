@@ -1034,6 +1034,25 @@ impl CInterface {
                 resolve("plasma"),
             ]
         };
+        static LOGGED_ICONS: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if !LOGGED_ICONS.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            for (i, ico) in icons.iter().enumerate() {
+                let label = ["titan", "electr", "energy", "plasma"][i];
+                match ico {
+                    Some((img, w, h)) => log::info!(
+                        "price icon[{}] {} = atlas={:?} (x={},y={},w={},h={}) box={}x{}",
+                        i, label, img.tex_path, img.x, img.y, img.w, img.h, w, h
+                    ),
+                    None => log::warn!("price icon[{}] {} = MISSING", i, label),
+                }
+            }
+            log::info!(
+                "summ_price = {:?}, focused_price = {:?}",
+                summ_price.resources,
+                focused_price.map(|p| p.resources),
+            );
+        }
 
         // Helper: push one icon + price text pair as a dynamic static.
         // Mirrors `CreateStaticFromImage` (CInterface.cpp:3170 etc.).
