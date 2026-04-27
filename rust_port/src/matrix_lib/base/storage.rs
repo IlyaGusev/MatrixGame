@@ -108,9 +108,13 @@ impl DataBuf {
         String::from_utf16_lossy(&chars)
     }
 
-    /// Find index of array matching a UTF-16LE string (for ST_WCHAR buffers).
+    /// Find index of array matching a UTF-16LE string (for ST_WCHAR
+    /// buffers). Comparison is **case-insensitive** to mirror
+    /// `CBlockPar`'s lookup behaviour (CBlockPar.cpp `Compare` reduces
+    /// to a `_wcsicmp`), so ports that hardcode keys in one case still
+    /// match data files that authored them in another.
     pub fn find_as_wstr(&self, val: &str) -> Option<usize> {
-        (0..self.arrays.len()).find(|&i| self.get_as_wstr(i) == val)
+        (0..self.arrays.len()).find(|&i| self.get_as_wstr(i).eq_ignore_ascii_case(val))
     }
 }
 

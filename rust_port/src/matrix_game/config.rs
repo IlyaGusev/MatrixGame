@@ -338,7 +338,11 @@ impl PriceTable {
             let Some((prefix, num, res)) = parse_component_key(&name) else {
                 continue;
             };
-            let res_idx = match res {
+            // CBlockPar lookups in C++ are case-insensitive; the data
+            // file may author keys as `head1_titan` / `Head1_Titan` /
+            // `HEAD1_TITAN`. Compare without case so all variants match.
+            let res_upper = res.to_ascii_uppercase();
+            let res_idx = match res_upper.as_str() {
                 "TITAN" => Resource::Titan as usize,
                 "ELECTRONICS" => Resource::Electronics as usize,
                 "ENERGY" => Resource::Energy as usize,
@@ -346,7 +350,8 @@ impl PriceTable {
                 _ => continue,
             };
             let slot = (num - 1) as usize;
-            match prefix {
+            let prefix_upper = prefix.to_ascii_uppercase();
+            match prefix_upper.as_str() {
                 "HEAD" if slot < ROBOT_HEAD_CNT => out.heads[slot].resources[res_idx] = v,
                 "ARMOR" if slot < ROBOT_ARMOR_CNT => out.armors[slot].resources[res_idx] = v,
                 "WEAPON" if slot < ROBOT_WEAPON_CNT => out.weapons[slot].resources[res_idx] = v,
