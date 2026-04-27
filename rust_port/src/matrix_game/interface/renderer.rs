@@ -24,6 +24,19 @@ use super::iface_element::ElementState;
 use super::interface::{CInterface, DESIGN_H};
 use super::text::{create_atlas_texture, parse_rich_text, GlyphAtlas, RichRun, TEXT_ATLAS_KEY};
 
+/// Atlas key for the 1×1 solid-white pixel texture, used to draw
+/// flat-colour quads via the standard textured pipeline (the tint
+/// channel multiplies with the texel; an all-white texel passes the
+/// tint colour through unchanged). Created in `InterfaceRenderer::new`.
+pub const SOLID_ATLAS_KEY: &str = "__solid__";
+
+/// Atlas key for the dynamically-baked popup texture. Re-baked each
+/// frame the popup is open so size changes (different popups have
+/// different items counts and widths) are picked up automatically.
+/// Mirrors the C++ `m_RamTex` (CIFaceMenu.h:90, baked in
+/// CIFaceMenu::CreateMenu).
+pub const POPUP_BAKED_KEY: &str = "__popup_baked__";
+
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
@@ -43,11 +56,17 @@ struct Uniforms {
 /// the lifetime of the renderer, plus the pixel dimensions needed to
 /// normalise arbitrary (x, y, w, h) subrects into 0..=1 UVs (the 9-
 /// slice hint chrome + inline resource icons need this).
+///
+/// `cpu_pixels` holds the decoded RGBA bytes alongside the GPU view —
+/// needed for popup texture baking (`bake_popup`), which has to read
+/// individual chrome-sprite pixels and composite them on the CPU
+/// exactly as `CIFaceMenu::CreateMenu` does (CIFaceMenu.cpp:117-226).
 struct Atlas {
     _tex: wgpu::TextureView,
     bind_group: wgpu::BindGroup,
     width: u32,
     height: u32,
+    cpu_pixels: Option<image::RgbaImage>,
 }
 
 /// One draw-bucket per atlas per frame — a contiguous vertex range
@@ -83,7 +102,11 @@ pub struct InterfaceRenderer {
 }
 
 impl InterfaceRenderer {
-    pub fn new(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) -> Self {
+    pub fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        config: &wgpu::SurfaceConfiguration,
+    ) -> Self {
         let uniform_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Interface Uniform BGL"),
             entries: &[wgpu::BindGroupLayoutEntry {
@@ -228,6 +251,44 @@ impl InterfaceRenderer {
             mapped_at_creation: false,
         });
 
+        // Solid-white 1×1 atlas for flat-colour quads (popup background
+        // fill etc.). Texel = (1,1,1,1); the tint then sets the colour
+        // outright since the shader multiplies tint × texel.
+        let solid_atlases = {
+            let pixels = [255u8, 255, 255, 255];
+            let view = create_texture_from_rgba(
+                device,
+                queue,
+                &image::RgbaImage::from_raw(1, 1, pixels.to_vec()).expect("1x1 rgba"),
+            );
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Solid Atlas BG"),
+                layout: &atlas_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&sampler),
+                    },
+                ],
+            });
+            let mut m: HashMap<String, Atlas> = HashMap::new();
+            m.insert(
+                SOLID_ATLAS_KEY.to_string(),
+                Atlas {
+                    _tex: view,
+                    bind_group,
+                    width: 1,
+                    height: 1,
+                    cpu_pixels: None,
+                },
+            );
+            m
+        };
+
         Self {
             pipeline,
             uniform_bgl,
@@ -238,7 +299,7 @@ impl InterfaceRenderer {
             text_sampler,
             vertex_buffer,
             vertex_capacity,
-            atlases: HashMap::new(),
+            atlases: solid_atlases,
             draw_groups: Vec::new(),
             num_verts: 0,
             glyph_atlas: GlyphAtlas::new(),
@@ -277,6 +338,7 @@ impl InterfaceRenderer {
                 bind_group,
                 width: self.glyph_atlas.width(),
                 height: self.glyph_atlas.height(),
+                cpu_pixels: None,
             },
         );
         self.glyph_atlas_generation = self.glyph_atlas.generation;
@@ -348,13 +410,15 @@ impl InterfaceRenderer {
             bytes.len(),
             key
         );
+        let (w, h) = (rgba.width(), rgba.height());
         self.atlases.insert(
             key,
             Atlas {
                 _tex: view,
                 bind_group,
-                width: rgba.width(),
-                height: rgba.height(),
+                width: w,
+                height: h,
+                cpu_pixels: Some(rgba),
             },
         );
     }
@@ -393,6 +457,7 @@ impl InterfaceRenderer {
                 bind_group,
                 width,
                 height,
+                cpu_pixels: None,
             },
         );
     }
@@ -431,6 +496,259 @@ impl InterfaceRenderer {
 
     pub fn glyph_atlas_mut(&mut self) -> &mut GlyphAtlas {
         &mut self.glyph_atlas
+    }
+
+    /// Faithful port of `CIFaceMenu::CreateMenu` (CIFaceMenu.cpp:62-226)
+    /// — composes the popup chrome (corners + edges + tiled SEL +
+    /// SELMOUSE + SELRIGHTMOUSE) into a single 512×512 RGBA buffer and
+    /// uploads it under `__popup_baked__`. The renderer then draws ONE
+    /// quad sourcing from this baked texture, matching the C++
+    /// `m_Ramka` composition pixel-for-pixel.
+    ///
+    /// Returns the popup width and height in design pixels (the C++
+    /// `w` and `h` locals at CIFaceMenu.cpp:86-92), or `None` when the
+    /// chrome atlas isn't loaded yet.
+    ///
+    /// `width` is the per-popup width param the C++ receives in
+    /// `CreateMenu(parent, elements, width, x, y, ...)` — it does NOT
+    /// include the chrome side margins. Total popup width is
+    /// `width + CURSIK_WIDTH + LEFTLINE_WIDTH + RIGHTLINE_WIDTH`.
+    pub fn bake_popup(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        popup_panel: &CInterface,
+        width: i32,
+        elements: i32,
+    ) -> Option<(u32, u32)> {
+        // CIFaceMenu.h constants.
+        const TOPLEFT_WIDTH: i32 = 13;
+        const TOPLEFT_HEIGHT: i32 = 18;
+        const TOPRIGHT_WIDTH: i32 = 18;
+        const BOTTOMLEFT_HEIGHT: i32 = 22;
+        const BOTTOMRIGHT_WIDTH: i32 = 13;
+        const BOTTOMRIGHT_HEIGHT: i32 = 21;
+        const TOPLINE_HEIGHT: i32 = 18;
+        const BOTTOMLINE_HEIGHT: i32 = 22;
+        const RIGHTLINE_WIDTH: i32 = 18;
+        const LEFTLINE_WIDTH: i32 = 13;
+        const CURSIK_WIDTH: i32 = 7;
+        const UNIT_HEIGHT: i32 = 19;
+        const MOD: i32 = 8;
+
+        // CIFaceMenu.cpp:88-92.
+        let mut h = TOPLINE_HEIGHT + BOTTOMLINE_HEIGHT;
+        let h_clean = elements * UNIT_HEIGHT;
+        h += h_clean;
+        let width = width + CURSIK_WIDTH;
+        let w = width + RIGHTLINE_WIDTH + LEFTLINE_WIDTH;
+
+        let tex_w = 512u32;
+        let tex_h = 512u32;
+        let mut buf =
+            image::RgbaImage::from_pixel(tex_w, tex_h, image::Rgba([0, 0, 0, 0]));
+
+        // Resolve a chrome sprite by element name → (atlas pixels, src_x,
+        // src_y, sprite_w, sprite_h). The C++ reads `els->m_Image`,
+        // `m_xTexPos`, `m_yTexPos`, `m_Width`, `m_Height` for each
+        // entry of `m_FirstImage` (CIFaceMenu.cpp:122-225).
+        let get_sprite = |name: &str| -> Option<(&image::RgbaImage, i32, i32, i32, i32)> {
+            let elem = popup_panel.elements.iter().find(|e| e.name == name)?;
+            let img = elem.images.first()?.as_ref()?;
+            let key = normalise_atlas_key(&img.tex_path);
+            let atlas = self.atlases.get(&key)?;
+            let cpu = atlas.cpu_pixels.as_ref()?;
+            // For Image-kind entries, sprite size lives in img.w / img.h
+            // (parsed from `Width`/`Height` in parse_image_element).
+            // The element's `size_x/size_y` is 0 so we ignore it.
+            Some((
+                cpu,
+                img.x as i32,
+                img.y as i32,
+                img.w as i32,
+                img.h as i32,
+            ))
+        };
+
+        // Faithful port of `CBitmap::MergeWithAlpha` — alpha-blend a
+        // (src_w × src_h) region from src at (sx, sy) onto buf at (dx,
+        // dy). Mirrors MatrixLib/Bitmap/CBitmap.cpp's blend formula.
+        fn merge(
+            buf: &mut image::RgbaImage,
+            src: &image::RgbaImage,
+            sx: i32,
+            sy: i32,
+            sw: i32,
+            sh: i32,
+            dx: i32,
+            dy: i32,
+        ) {
+            let bw = buf.width() as i32;
+            let bh = buf.height() as i32;
+            let sxw = src.width() as i32;
+            let syh = src.height() as i32;
+            for py in 0..sh {
+                for px in 0..sw {
+                    let dx_p = dx + px;
+                    let dy_p = dy + py;
+                    let sx_p = sx + px;
+                    let sy_p = sy + py;
+                    if dx_p < 0 || dy_p < 0 || dx_p >= bw || dy_p >= bh {
+                        continue;
+                    }
+                    if sx_p < 0 || sy_p < 0 || sx_p >= sxw || sy_p >= syh {
+                        continue;
+                    }
+                    let s = src.get_pixel(sx_p as u32, sy_p as u32).0;
+                    let d = buf.get_pixel(dx_p as u32, dy_p as u32).0;
+                    let alpha = s[3] as u16;
+                    let inv = 255 - alpha;
+                    let blended = [
+                        ((d[0] as u16 * inv + s[0] as u16 * alpha) / 255) as u8,
+                        ((d[1] as u16 * inv + s[1] as u16 * alpha) / 255) as u8,
+                        ((d[2] as u16 * inv + s[2] as u16 * alpha) / 255) as u8,
+                        // Alpha: dest_alpha + src_alpha*(1-dest_alpha).
+                        // Equivalent for the porter-duff over operator
+                        // when premultiplied alpha is straight.
+                        (((d[3] as u16) * inv / 255) + alpha as u16).min(255) as u8,
+                    ];
+                    buf.put_pixel(dx_p as u32, dy_p as u32, image::Rgba(blended));
+                }
+            }
+        }
+
+        // Faithful port of CIFaceMenu.cpp:122-225. The IF_POPUP_*
+        // sprite names match the original macro string-constants in
+        // StringConstants.hpp.
+        if let Some((src, sx, sy, sw, sh)) = get_sprite("topleft") {
+            // CIFaceMenu.cpp:129 — drawn at (1, 0).
+            merge(&mut buf, src, sx, sy, sw, sh, 1, 0);
+        }
+        if let Some((src, sx, sy, sw, sh)) = get_sprite("topright") {
+            // CIFaceMenu.cpp:136 — drawn at (w - TOPRIGHT_WIDTH + 1, 0).
+            merge(&mut buf, src, sx, sy, sw, sh, w - TOPRIGHT_WIDTH + 1, 0);
+        }
+        if let Some((src, sx, sy, sw, sh)) = get_sprite("bottomleft") {
+            // CIFaceMenu.cpp:143 — drawn at (0, h - BOTTOMLEFT_HEIGHT - mod).
+            merge(&mut buf, src, sx, sy, sw, sh, 0, h - BOTTOMLEFT_HEIGHT - MOD);
+        }
+        if let Some((src, sx, sy, sw, sh)) = get_sprite("bottomright") {
+            // CIFaceMenu.cpp:150 — drawn at (w - BOTTOMRIGHT_WIDTH - 4,
+            // h - BOTTOMRIGHT_HEIGHT - 1 - mod).
+            merge(
+                &mut buf,
+                src,
+                sx,
+                sy,
+                sw,
+                sh,
+                w - BOTTOMRIGHT_WIDTH - 4,
+                h - BOTTOMRIGHT_HEIGHT - 1 - MOD,
+            );
+        }
+        if let Some((src, sx, sy, sw, sh)) = get_sprite("leftline") {
+            // CIFaceMenu.cpp:156-158 — tiled at (1, TOPLEFT_HEIGHT + i)
+            // for i in 0..h_clean - mod.
+            for i in 0..(h_clean - MOD) {
+                merge(&mut buf, src, sx, sy, sw, sh, 1, TOPLEFT_HEIGHT + i);
+            }
+        }
+        if let Some((src, sx, sy, sw, sh)) = get_sprite("rightline") {
+            // CIFaceMenu.cpp:164-166 — tiled at (w - RIGHTLINE_WIDTH + 1,
+            // TOPRIGHT_HEIGHT + i).
+            for i in 0..(h_clean - MOD) {
+                merge(
+                    &mut buf,
+                    src,
+                    sx,
+                    sy,
+                    sw,
+                    sh,
+                    w - RIGHTLINE_WIDTH + 1,
+                    TOPLINE_HEIGHT + i,
+                );
+            }
+        }
+        if let Some((src, sx, sy, sw, sh)) = get_sprite("topline") {
+            // CIFaceMenu.cpp:172-174 — tiled at (TOPLEFT_WIDTH + i + 1, 0)
+            // for i in 0..width.
+            for i in 0..width {
+                merge(&mut buf, src, sx, sy, sw, sh, TOPLEFT_WIDTH + i + 1, 0);
+            }
+        }
+        if let Some((src, sx, sy, sw, sh)) = get_sprite("bottomline") {
+            // CIFaceMenu.cpp:180-182 — tiled at (BOTTOMLEFT_WIDTH + i,
+            // h - BOTTOMLEFT_HEIGHT - mod).
+            for i in 0..width {
+                merge(
+                    &mut buf,
+                    src,
+                    sx,
+                    sy,
+                    sw,
+                    sh,
+                    14 + i, // BOTTOMLEFT_WIDTH = 14 in CIFaceMenu.h
+                    h - BOTTOMLEFT_HEIGHT - MOD,
+                );
+            }
+        }
+        if let Some((src, sx, sy, sw, sh)) = get_sprite("sel") {
+            // CIFaceMenu.cpp:188-192 — tiled SEL pixel-by-pixel for
+            // every row at (j, 11 + UNIT_HEIGHT*i) for j in 5..w-9.
+            for i in 0..elements {
+                for j in 5..(w - 9) {
+                    merge(&mut buf, src, sx, sy, sw, sh, j, 11 + UNIT_HEIGHT * i);
+                }
+            }
+        }
+        if let Some((src, sx, sy, sw, sh)) = get_sprite("selright") {
+            // CIFaceMenu.cpp:198-200 — drawn at (w - 12, 11 +
+            // UNIT_HEIGHT*i) per row.
+            for i in 0..elements {
+                merge(&mut buf, src, sx, sy, sw, sh, w - 12, 11 + UNIT_HEIGHT * i);
+            }
+        }
+        if let Some((src, sx, sy, sw, sh)) = get_sprite("selmouse") {
+            // CIFaceMenu.cpp:207-209 — tiled at (w + j, 0) for j 5..w-9.
+            // This populates the SECOND copy of the popup (right of the
+            // first one in the texture) used by the SELECTOR overlay.
+            for j in 5..(w - 9) {
+                merge(&mut buf, src, sx, sy, sw, sh, w + j, 0);
+            }
+        }
+        if let Some((src, sx, sy, sw, sh)) = get_sprite("selrightmouse") {
+            // CIFaceMenu.cpp:215 — drawn at (w*2 - 12, 0).
+            merge(&mut buf, src, sx, sy, sw, sh, w * 2 - 12, 0);
+        }
+
+        // Upload the baked buffer as the popup texture.
+        let view = create_texture_from_rgba(device, queue, &buf);
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Popup Baked Atlas BG"),
+            layout: &self.atlas_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        });
+        self.atlases.insert(
+            POPUP_BAKED_KEY.to_string(),
+            Atlas {
+                _tex: view,
+                bind_group,
+                width: tex_w,
+                height: tex_h,
+                cpu_pixels: None,
+            },
+        );
+
+        Some((w as u32, h as u32))
     }
 
     /// Preload every atlas referenced by the given panels. Called once
@@ -660,12 +978,42 @@ impl InterfaceRenderer {
         }
 
         // ── Popup overlay ─────────────────────────────────────────
-        // Port of CIFaceMenu::Render. Draws (in back-to-front order):
-        //   1. ramka (9-slice border from the PopupMenu panel),
-        //   2. selector bar over the hovered row,
-        //   3. row icons (per-row sprites borrowed from Base panel),
-        //   4. cursik arrow at `current_pos`.
+        // Faithful port of CIFaceMenu::Render (CIFaceMenu.cpp:62-369):
+        //   - `m_Ramka` is a single static drawing the BAKED popup
+        //     texture composed in CreateMenu (chrome + tiled SEL).
+        //   - `m_Selector` is a row-tall static drawing from offset
+        //     (w, 0) of the SAME baked texture (the SELMOUSE-tiled
+        //     copy populated at CIFaceMenu.cpp:203-216).
+        //   - Per-row text catchers render the row labels.
+        //   - `m_Cursor` is a Cursik static drawn at the equipped row.
+        //
+        // We rebake every frame the popup is open so size changes pick
+        // up automatically. Cost is ~ items*width pixels of CPU bitmap
+        // composition + a 512×512 GPU upload — cheap for a popup that
+        // only renders during the constructor's right-click interaction.
         if let Some(popup) = popup {
+            // Bake the popup texture into POPUP_BAKED_KEY. The bake call
+            // needs the PopupMenu chrome panel for sprite lookups; bail
+            // out cleanly if it isn't present (e.g. if the panel data
+            // didn't load).
+            let popup_baked_size = if let Some(popup_panel) = panels
+                .iter()
+                .find(|p| p.name == "PopupMenu")
+                .copied()
+            {
+                self.bake_popup(
+                    device,
+                    queue,
+                    popup_panel,
+                    // C++ `width` is the per-popup item-width param
+                    // (CIFaceMenu.h: WEAPON_MENU_WIDTH etc.). We carry
+                    // it on `popup.item_w`.
+                    popup.item_w as i32,
+                    popup.items.len() as i32,
+                )
+            } else {
+                None
+            };
             let popup_panel = panels.iter().find(|p| p.name == "PopupMenu");
             let base_panel = panels.iter().find(|p| p.name == "Base");
             if let Some(base_panel) = base_panel {
@@ -678,7 +1026,7 @@ impl InterfaceRenderer {
                 let total_w = popup.total_w() * scale;
                 let total_h = popup.total_h() * scale;
                 let items_y0 = oy + popup.items_top() * scale;
-                let items_h = popup.item_h * popup.items.len() as f32 * scale;
+                let _items_h = popup.item_h * popup.items.len() as f32 * scale;
 
                 // Helper to emit one textured quad — borrows an atlas
                 // sub-rect from an arbitrary panel element. Used by the
@@ -700,10 +1048,16 @@ impl InterfaceRenderer {
                     if !atlases.contains_key(&key) {
                         return;
                     }
-                    let u0 = img.x / img.tex_w;
-                    let v0 = img.y / img.tex_h;
-                    let u1 = (img.x + img.w) / img.tex_w;
-                    let v1 = (img.y + img.h) / img.tex_h;
+                    // Half-pixel inset on the UVs so linear filtering
+                    // doesn't blend in the colour of neighbour atlas
+                    // pixels — important for tiny 1×1 source rects (the
+                    // popup interior fill samples a single pixel of the
+                    // chrome line and must read it as a solid colour
+                    // without bleed from the next pixel).
+                    let u0 = (img.x + 0.5) / img.tex_w;
+                    let v0 = (img.y + 0.5) / img.tex_h;
+                    let u1 = (img.x + img.w - 0.5).max(img.x + 0.5) / img.tex_w;
+                    let v1 = (img.y + img.h - 0.5).max(img.y + 0.5) / img.tex_h;
                     if current_key.as_deref() != Some(&key) {
                         if let Some(k) = current_key.take() {
                             let end = all_verts.len() as u32;
@@ -767,57 +1121,20 @@ impl InterfaceRenderer {
                         .and_then(|e| e.images.first()?.as_ref())
                 };
 
-                // (0) Opaque background fill behind the items area. The
-                // C++ tiles `IF_POPUP_SEL` across every row to bake the
-                // row backgrounds into the popup texture
-                // (CIFaceMenu.cpp:184-202). The original `sel` sprite
-                // is itself partly transparent — replicating it 1:1 in
-                // a quad leaves the popup half-transparent. Faithful
-                // workaround: sample a single known-opaque pixel of the
-                // chrome border (the painted line color in `topline`)
-                // and stretch it across the items area as a solid back.
-                if let Some(line) = pop_img("topline").or_else(|| pop_img("bottomline")) {
-                    let mut solid = line.clone();
-                    // 1×1 sample of the middle of the line — guaranteed
-                    // opaque since the chrome border is a painted
-                    // pixel-line in the atlas.
-                    solid.x = line.x;
-                    solid.y = line.y + (line.h * 0.5).max(1.0);
-                    solid.w = 1.0;
-                    solid.h = 1.0;
-                    emit_textured(
-                        &mut all_verts,
-                        &mut current_key,
-                        &mut current_start,
-                        &mut self.draw_groups,
-                        ox,
-                        items_y0,
-                        total_w,
-                        items_h,
-                        &solid,
-                        [0.10, 0.09, 0.07, 1.0],
-                    );
-                }
-                // Optional `sel` overlay (matches C++'s tiled SEL pass) —
-                // adds the subtle gradient of the original interior.
-                if let Some(sel) = pop_img("sel") {
-                    emit_textured(
-                        &mut all_verts,
-                        &mut current_key,
-                        &mut current_start,
-                        &mut self.draw_groups,
-                        ox,
-                        items_y0,
-                        total_w,
-                        items_h,
-                        sel,
-                        [1.0, 1.0, 1.0, 1.0],
-                    );
-                }
+                // (1) m_Ramka — render the baked popup texture as ONE
+                // quad sourcing from (0, 0) to (popup_w, popup_h)
+                // inside POPUP_BAKED_KEY. CIFaceMenu.cpp:248-262.
                 let opaque = [1.0, 1.0, 1.0, 1.0];
-                if let Some(tl) = pop_img("topleft") {
-                    let cw = tl.w * scale;
-                    let ch = tl.h * scale;
+                if let Some((bake_w, bake_h)) = popup_baked_size {
+                    let img = super::iface_element::StateImage {
+                        x: 0.0,
+                        y: 0.0,
+                        w: bake_w as f32,
+                        h: bake_h as f32,
+                        tex_w: 512.0,
+                        tex_h: 512.0,
+                        tex_path: POPUP_BAKED_KEY.to_string(),
+                    };
                     emit_textured(
                         &mut all_verts,
                         &mut current_key,
@@ -825,198 +1142,70 @@ impl InterfaceRenderer {
                         &mut self.draw_groups,
                         ox,
                         oy,
-                        cw,
-                        ch,
-                        tl,
-                        opaque,
-                    );
-                }
-                if let Some(tr) = pop_img("topright") {
-                    let cw = tr.w * scale;
-                    let ch = tr.h * scale;
-                    emit_textured(
-                        &mut all_verts,
-                        &mut current_key,
-                        &mut current_start,
-                        &mut self.draw_groups,
-                        ox + total_w - cw,
-                        oy,
-                        cw,
-                        ch,
-                        tr,
-                        opaque,
-                    );
-                }
-                if let Some(bl) = pop_img("bottomleft") {
-                    let cw = bl.w * scale;
-                    let ch = bl.h * scale;
-                    emit_textured(
-                        &mut all_verts,
-                        &mut current_key,
-                        &mut current_start,
-                        &mut self.draw_groups,
-                        ox,
-                        oy + total_h - ch,
-                        cw,
-                        ch,
-                        bl,
-                        opaque,
-                    );
-                }
-                if let Some(br) = pop_img("bottomright") {
-                    let cw = br.w * scale;
-                    let ch = br.h * scale;
-                    emit_textured(
-                        &mut all_verts,
-                        &mut current_key,
-                        &mut current_start,
-                        &mut self.draw_groups,
-                        ox + total_w - cw,
-                        oy + total_h - ch,
-                        cw,
-                        ch,
-                        br,
-                        opaque,
-                    );
-                }
-                // Edges — `topline` / `bottomline` are 1px wide source
-                // sprites stretched horizontally between the corners;
-                // `leftline` / `rightline` are 1px tall stretched
-                // vertically.
-                let corner_h = pop_img("topleft").map(|i| i.h * scale).unwrap_or(0.0);
-                let corner_h_b = pop_img("bottomleft").map(|i| i.h * scale).unwrap_or(0.0);
-                let corner_w = pop_img("topleft").map(|i| i.w * scale).unwrap_or(0.0);
-                let corner_w_r = pop_img("topright").map(|i| i.w * scale).unwrap_or(0.0);
-                if let Some(tline) = pop_img("topline") {
-                    let h = tline.h * scale;
-                    let span = (total_w - corner_w - corner_w_r).max(0.0);
-                    emit_textured(
-                        &mut all_verts,
-                        &mut current_key,
-                        &mut current_start,
-                        &mut self.draw_groups,
-                        ox + corner_w,
-                        oy,
-                        span,
-                        h,
-                        tline,
-                        opaque,
-                    );
-                }
-                if let Some(bline) = pop_img("bottomline") {
-                    let h = bline.h * scale;
-                    let span = (total_w - corner_w - corner_w_r).max(0.0);
-                    emit_textured(
-                        &mut all_verts,
-                        &mut current_key,
-                        &mut current_start,
-                        &mut self.draw_groups,
-                        ox + corner_w,
-                        oy + total_h - h,
-                        span,
-                        h,
-                        bline,
-                        opaque,
-                    );
-                }
-                if let Some(lline) = pop_img("leftline") {
-                    let w = lline.w * scale;
-                    let span = (total_h - corner_h - corner_h_b).max(0.0);
-                    emit_textured(
-                        &mut all_verts,
-                        &mut current_key,
-                        &mut current_start,
-                        &mut self.draw_groups,
-                        ox,
-                        oy + corner_h,
-                        w,
-                        span,
-                        lline,
-                        opaque,
-                    );
-                }
-                if let Some(rline) = pop_img("rightline") {
-                    let w = rline.w * scale;
-                    let span = (total_h - corner_h - corner_h_b).max(0.0);
-                    emit_textured(
-                        &mut all_verts,
-                        &mut current_key,
-                        &mut current_start,
-                        &mut self.draw_groups,
-                        ox + total_w - w,
-                        oy + corner_h,
-                        w,
-                        span,
-                        rline,
+                        total_w,
+                        total_h,
+                        &img,
                         opaque,
                     );
                 }
 
-                // (2) Selector bar — port of the `m_Selector` element
-                // (CIFaceMenu.cpp:268-297). Drawn brightened over the
-                // hovered row to highlight the active selection.
-                if let Some(hi) = popup.hovered {
-                    let row_y = items_y0 + hi as f32 * popup.item_h * scale;
-                    let row_h = popup.item_h * scale;
-                    if let Some(sel) = pop_img("sel") {
-                        emit_textured(
-                            &mut all_verts,
-                            &mut current_key,
-                            &mut current_start,
-                            &mut self.draw_groups,
-                            ox + 2.0 * scale,
-                            row_y,
-                            (total_w - 4.0 * scale).max(0.0),
-                            row_h,
-                            sel,
-                            [1.4, 1.2, 0.6, 1.0],
-                        );
-                    }
+                use crate::matrix_game::interface::iface_menu::CIFaceMenu;
+
+                // (2) m_Selector overlay — port of CIFaceMenu.cpp:
+                // 268-297. The C++ selector samples the baked texture
+                // starting at (w, 0) (i.e. the SECOND copy of the
+                // popup populated by SELMOUSE+SELRIGHTMOUSE) sized
+                // w × 18, repositioned to the hovered row's y. Drawn
+                // BEFORE the row text so labels render on top.
+                if let (Some(hi), Some((bake_w, _bake_h))) = (popup.hovered, popup_baked_size) {
+                    let row_y = oy
+                        + (CIFaceMenu::ITEMS_TOP + popup.item_h * hi as f32) * scale;
+                    let img = super::iface_element::StateImage {
+                        x: bake_w as f32,
+                        y: 0.0,
+                        w: bake_w as f32,
+                        h: 18.0,
+                        tex_w: 512.0,
+                        tex_h: 512.0,
+                        tex_path: POPUP_BAKED_KEY.to_string(),
+                    };
+                    emit_textured(
+                        &mut all_verts,
+                        &mut current_key,
+                        &mut current_start,
+                        &mut self.draw_groups,
+                        ox,
+                        row_y,
+                        total_w,
+                        18.0 * scale,
+                        &img,
+                        opaque,
+                    );
                 }
 
-                // (3) Row labels — port of CIFaceMenu::CreateMenu's
-                // text-catcher pass at CIFaceMenu.cpp:312-342. The C++
-                // pulls per-kind names from the panel's `LabelsText`
-                // block (e.g. "Pulemyot" / "Cannon" / "Pneumatic" /
-                // "Light hull") via `g_Popup{Chassis,Hull,Head,Weapon*}[]`
-                // (CInterface.cpp:715-772) and renders one
-                // `Font.2Ranger` text row per item.
-                //
-                // We pull the same strings via `popup_kind_label`, which
-                // reads them from the `iw{N}text` / `ihu{N}text` /
-                // `ihe{N}text` / `ich{N}text` element labels already
-                // attached during panel load.
-                let popup_ty = popup.parent.unit_type() as i32;
+                // (3) Row labels — faithful port of CIFaceMenu::CreateMenu
+                // catcher pass at CIFaceMenu.cpp:312-341. Drawn AFTER the
+                // selector so labels stay readable on the highlighted
+                // row.
                 for (i, item) in popup.items.iter().enumerate() {
-                    let row_x = ox;
                     let row_y = items_y0 + i as f32 * popup.item_h * scale;
                     let row_h = popup.item_h * scale;
                     // C++ NERES_LABELS_COLOR (red-grey) when unaffordable;
-                    // DEFAULT_LABELS_COLOR (off-white) otherwise.
+                    // DEFAULT_LABELS_COLOR (gold) otherwise.
                     let color = if !item.affordable {
-                        [180, 70, 70, 255]
+                        [255, 67, 25, 255]
                     } else {
-                        [230, 220, 200, 255]
-                    };
-                    // Empty-slot row → "—"; equipped kinds → the
-                    // localised label. Falls back to a numeric kind when
-                    // the panel data didn't ship a label.
-                    let text = if item.kind.is_empty() {
-                        Cow::Borrowed("—")
-                    } else if let Some(label) = base_panel.popup_kind_label(popup_ty, item.kind.0)
-                    {
-                        Cow::Borrowed(label)
-                    } else {
-                        Cow::Owned(format!("kind {}", item.kind.0))
+                        [246, 192, 0, 255]
                     };
                     let runs = vec![RichRun {
-                        text: text.into_owned(),
+                        text: item.text.clone(),
                         color: None,
                     }];
-                    // Anchor: left-padded by the cursik width (8 px) to
-                    // leave room for the equipped-row arrow indicator;
-                    // vertically centred in the row.
-                    let pad_left = 12.0 * scale;
+                    // C++ catcher text origin: `LEFT_SPACE+6 = 13` from
+                    // catcher left, `-3` from catcher top with align_y=1
+                    // (CIFaceMenu.cpp:338).
+                    let text_x = ox + 13.0 * scale;
+                    let text_y = row_y + (row_h * 0.5) - 3.0 * scale;
                     emit_rich_line(
                         &mut all_verts,
                         &mut current_key,
@@ -1026,26 +1215,27 @@ impl InterfaceRenderer {
                         "Font.2Ranger",
                         &runs,
                         scale,
-                        row_x + pad_left,
-                        row_y + row_h * 0.5,
+                        text_x,
+                        text_y,
                         0,
                         1,
                         color,
                     );
                 }
 
-                // (4) Cursik — the arrow indicator at the row matching
+                // (5) Cursik — the arrow indicator at the row matching
                 // the currently-equipped item. Port of `m_CursikImage` /
-                // `cursik_hpos` placement at CIFaceMenu.cpp:94-96, 217.
+                // `cursik_hpos` placement at CIFaceMenu.cpp:94-96, 217:
+                // x = LEFT_SPACE (7), y = idx*UNIT_HEIGHT + TOPLINE_HEIGHT
+                // (relative to popup top).
                 if let Some(pos) = popup.current_pos {
                     if let Some(cursik) = pop_img("cursik") {
                         let cw = cursik.w * scale;
                         let ch = cursik.h * scale;
-                        let row_y = items_y0 + pos as f32 * popup.item_h * scale;
-                        // C++ places it at LEFT_SPACE + 1 (8px). Centred
-                        // vertically in the row.
-                        let cx = ox + 4.0 * scale;
-                        let cy = row_y + (popup.item_h * scale - ch) * 0.5;
+                        // CIFaceMenu.cpp:96: cursik_hpos = idx*19 + 18.
+                        let cursik_hpos = pos as f32 * popup.item_h + 18.0;
+                        let cx = ox + 7.0 * scale;
+                        let cy = oy + cursik_hpos * scale - ch * 0.5;
                         emit_textured(
                             &mut all_verts,
                             &mut current_key,
@@ -1074,11 +1264,37 @@ impl InterfaceRenderer {
         // 1024×768 design-space resolution and don't carry vector data.
         // We scale them as a single unit by `scale`, with point
         // sampling on the text atlas to keep the pixels crisp.
+        //
+        // When the popup is open, the C++ renders the popup on its own
+        // m_MenuGraphics interface that's drawn LAST and covers
+        // anything underneath (CIFaceMenu.cpp:225-369). Our text pass
+        // runs after the popup quads but iterates ALL panel labels —
+        // including chasl/hulll/headl/weapl etc. that visually fall
+        // INSIDE the popup rect and would leak on top of the baked
+        // chrome. Compute the popup rect here in screen pixels and
+        // skip any label whose anchor lands inside it.
+        let popup_rect: Option<[f32; 4]> = popup.and_then(|popup| {
+            let base_panel = panels.iter().find(|p| p.name == "Base")?;
+            let [bx, by] = base_panel.resolved_pos(screen_w, screen_h, scale);
+            let ox = bx + popup.design_x * scale;
+            let oy = by + popup.design_y * scale;
+            let w = popup.total_w() * scale;
+            let h = popup.total_h() * scale;
+            Some([ox, oy, w, h])
+        });
         for panel in panels {
             if !panel.visible {
                 continue;
             }
             let [px, py] = panel.resolved_pos(screen_w, screen_h, scale);
+            // Don't text-draw the PopupMenu chrome elements — the
+            // popup-overlay block above already laid out the row
+            // labels via `emit_rich_line`. Letting the chrome's own
+            // panel labels (e.g. Russian-localised headers from the
+            // PopupMenu data) draw through here would double-render.
+            if panel.name == "PopupMenu" {
+                continue;
+            }
             for elem in &panel.elements {
                 if !elem.visible() {
                     continue;
@@ -1107,6 +1323,19 @@ impl InterfaceRenderer {
                         elem.pos_y + base_y + label.y + label.sme_y;
                     let anchor_x = px + design_anchor_x * scale;
                     let anchor_y = py + design_anchor_y * scale;
+                    // Skip labels whose anchor falls inside the popup
+                    // rect — the C++ achieves the same effect by
+                    // drawing the popup on its own panel that sits on
+                    // top of the constructor-base panel.
+                    if let Some([rx, ry, rw, rh]) = popup_rect {
+                        if anchor_x >= rx
+                            && anchor_x < rx + rw
+                            && anchor_y >= ry
+                            && anchor_y < ry + rh
+                        {
+                            continue;
+                        }
+                    }
                     // Parse inline `<Color=R,G,B>...</color>` tags so
                     // numeric values inserted by `make_item_replacements`
                     // (CConstructor.cpp:1100-1191) render in their

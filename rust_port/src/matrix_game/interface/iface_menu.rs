@@ -57,15 +57,19 @@ impl EMenuParent {
     }
 }
 
-/// One selectable item in the popup. The icon is the *element name*
-/// in the loaded Base panel (e.g. `"chas2"`). The renderer copies
-/// that element's images onto the popup-row hit slot for display.
-#[derive(Debug, Clone, Copy)]
+/// One selectable item in the popup. Port of `SMenuItemText`
+/// (CIFaceMenu.h:70-77) — the C++ holds `text` (the localised row
+/// caption) + a `color` (DEFAULT_LABELS_COLOR or NERES_LABELS_COLOR
+/// flipped by the resource-affordability pass at
+/// CIFaceButton.cpp:197-309).
+#[derive(Debug, Clone)]
 pub struct SMenuItemText {
     pub kind: RobotUnitKind,
-    /// Element name on the Base panel whose images we render for
-    /// this row (e.g. `"chas1"`, `"hull3"`, `"weap6"`).
-    pub icon_element: &'static str,
+    /// Localised row caption — one entry per popup row, pre-populated
+    /// from `iw{N}text` / `ihu{N}text` / `ihe{N}text` / `ich{N}text`
+    /// element captions (CInterface.cpp:715-772) or `AllLabels/Base/none`
+    /// for the empty row (MatrixGame.cpp:521-523).
+    pub text: String,
     /// Port of the per-item color flip at CIFaceButton.cpp:197-309.
     /// `true` = `DEFAULT_LABELS_COLOR`, `false` = `NERES_LABELS_COLOR`
     /// (set by `IsEnoughResourcesForThisPieceOfShit`). Defaults to
@@ -107,117 +111,119 @@ pub struct CIFaceMenu {
 }
 
 impl CIFaceMenu {
-    /// Build the chassis popup (5 kinds: Pneumatic..Antigravity).
-    /// Mirrors the chassis branch of `CIFaceButton::OnMouseRBDown` at
-    /// CIFaceButton.cpp:301-312 (anchor `+321, +231`).
-    pub fn for_chassis() -> Self {
+    /// Build the chassis popup (5 kinds, no empty row). Mirrors the
+    /// chassis branch of `CIFaceButton::OnMouseRBDown` at
+    /// CIFaceButton.cpp:301-312 with text loaded from the per-kind
+    /// `ich{N}text_sNormal` element captions
+    /// (CInterface.cpp:763-772).
+    pub fn for_chassis(base: Option<&super::CInterface>, none_label: &str) -> Self {
         let items = (1..=5)
             .map(|n| SMenuItemText {
                 kind: RobotUnitKind(n),
-                icon_element: chas_name(n),
+                text: lookup_text(base, &format!("ich{n}text"))
+                    .unwrap_or_else(|| format!("Chas{n}")),
                 affordable: true,
             })
             .collect();
-        Self {
-            parent: EMenuParent::PylonChassis,
+        Self::new_at(
+            EMenuParent::PylonChassis,
             items,
-            design_x: 321.0,
-            design_y: 231.0,
-            // CIFaceMenu.h:50 — Russian build CHASSIS_MENU_WIDTH=90 +
-            // chrome (CURSIK_WIDTH+LEFT_SPACE+LEFT/RIGHT line ≈ 18) =
-            // ~108. UNIT_HEIGHT=19.
-            item_w: 108.0,
-            item_h: 19.0,
-            hovered: None,
-            current_pos: None,
-            caller_name: String::new(),
-            saved_config: None,
-            previewed: None,
-        }
+            321.0,
+            231.0,
+            CHASSIS_MENU_WIDTH,
+            none_label,
+        )
     }
 
-    /// Hull/armor popup (6 kinds, ordered by original C++ at
-    /// CIFaceButton.cpp:283-300: index 1 → kind 6, index 2 → kind 1, … 6 → 5).
-    /// We follow that exact ordering.
-    pub fn for_hull() -> Self {
+    /// Hull/armor popup (6 kinds, no empty). Order from
+    /// CIFaceButton.cpp:283-300 (`[6, 1, 2, 3, 4, 5]`); text from
+    /// the `ihu{N}text_sNormal` element captions
+    /// (CInterface.cpp:737-748).
+    pub fn for_hull(base: Option<&super::CInterface>, none_label: &str) -> Self {
         let order: [i32; 6] = [6, 1, 2, 3, 4, 5];
         let items = order
             .iter()
             .map(|&n| SMenuItemText {
                 kind: RobotUnitKind(n),
-                icon_element: hull_name(n),
+                text: lookup_text(base, &format!("ihu{n}text"))
+                    .unwrap_or_else(|| format!("Hull{n}")),
                 affordable: true,
             })
             .collect();
-        Self {
-            parent: EMenuParent::PylonHull,
+        Self::new_at(
+            EMenuParent::PylonHull,
             items,
-            design_x: 321.0,
-            design_y: 148.0,
-            // HULL_MENU_WIDTH=90 + chrome ≈ 108.
-            item_w: 108.0,
-            item_h: 19.0,
-            hovered: None,
-            current_pos: None,
-            caller_name: String::new(),
-            saved_config: None,
-            previewed: None,
-        }
+            321.0,
+            148.0,
+            HULL_MENU_WIDTH,
+            none_label,
+        )
     }
 
-    /// Head popup (4 kinds + empty). The C++ menu_head_items includes
-    /// the empty/none slot at index 0 (CIFaceButton.cpp:272-282).
-    pub fn for_head() -> Self {
+    /// Head popup (4 kinds + empty `none` row at index 0). Per
+    /// CIFaceButton.cpp:272-282 + the empty-row pre-assignment at
+    /// MatrixGame.cpp:523.
+    pub fn for_head(base: Option<&super::CInterface>, none_label: &str) -> Self {
         let mut items = vec![SMenuItemText {
             kind: RobotUnitKind::UNKNOWN,
-            icon_element: "heade",
+            text: none_label.to_string(),
             affordable: true,
         }];
         for n in 1..=4 {
             items.push(SMenuItemText {
                 kind: RobotUnitKind(n),
-                icon_element: head_name(n),
+                text: lookup_text(base, &format!("ihe{n}text"))
+                    .unwrap_or_else(|| format!("Head{n}")),
                 affordable: true,
             });
         }
-        Self {
-            parent: EMenuParent::PylonHead,
+        Self::new_at(
+            EMenuParent::PylonHead,
             items,
-            design_x: 315.0,
-            design_y: 76.0,
-            // HEAD_MENU_WIDTH=100 + chrome ≈ 118.
-            item_w: 118.0,
-            item_h: 19.0,
-            hovered: None,
-            current_pos: None,
-            caller_name: String::new(),
-            saved_config: None,
-            previewed: None,
-        }
+            315.0,
+            76.0,
+            HEAD_MENU_WIDTH,
+            none_label,
+        )
     }
 
-    /// Common-weapon pylon popup (pylons 1..4). The C++ skips kind 5
-    /// (Mortar) and 7 (Bomb) — those are extra-pylon-only. The
-    /// remapping at CIFaceButton.cpp:191-196 yields the kind sequence
-    /// `[1, 2, 3, 4, 6, 8, 9, 10]` for 8 menu rows.
-    pub fn for_weapon_normal(pilon_idx: i32) -> Self {
-        let kinds: [i32; 8] = [1, 2, 3, 4, 6, 8, 9, 10];
+    /// Common-weapon pylon popup (pylons 1..4). The C++ kind remapping
+    /// at CIFaceButton.cpp:191-196 yields the kind sequence
+    /// `[1, 2, 3, 4, 6, 8, 9, 10]` for 8 rows; index 0 is the `none`
+    /// empty row (MatrixGame.cpp:522). Text comes from
+    /// `iw{N}text_sNormal` (CInterface.cpp:715-736).
+    pub fn for_weapon_normal(
+        base: Option<&super::CInterface>,
+        none_label: &str,
+        pilon_idx: i32,
+    ) -> Self {
+        // (kind, label_idx) — label_idx is the source `iw{label_idx}text`.
+        // The C++ remaps weapon-popup-row → weapon-kind so kind 5
+        // (mortar) and 7 (bomb) skip to the extern popup.
+        let rows: [(i32, i32); 8] = [
+            (1, 1),
+            (2, 2),
+            (3, 3),
+            (4, 4),
+            (6, 6),
+            (8, 8),
+            (9, 9),
+            (10, 10),
+        ];
         let mut items = vec![SMenuItemText {
             kind: RobotUnitKind::UNKNOWN,
-            icon_element: "weape",
+            text: none_label.to_string(),
             affordable: true,
         }];
-        for &k in &kinds {
+        for &(kind, lbl) in &rows {
             items.push(SMenuItemText {
-                kind: RobotUnitKind(k),
-                icon_element: weap_name(k),
+                kind: RobotUnitKind(kind),
+                text: lookup_text(base, &format!("iw{lbl}text"))
+                    .unwrap_or_else(|| format!("Weap{kind}")),
                 affordable: true,
             });
         }
-        // Anchor coords mirror CIFaceButton.cpp:203/220/237/255 —
-        // pylons 1+3 land at +242, pylons 2+4 at +389, vertical
-        // varies. For simplicity we anchor uniformly above the pylon
-        // here; precise positioning lands when the popup chrome ports.
+        // Anchor coords mirror CIFaceButton.cpp:203/220/237/255.
         let (dx, dy) = match pilon_idx {
             0 => (242.0, 155.0),
             1 => (389.0, 155.0),
@@ -225,49 +231,71 @@ impl CIFaceMenu {
             3 => (389.0, 135.0),
             _ => (242.0, 155.0),
         };
-        Self {
-            parent: EMenuParent::PylonWeapon(pilon_idx),
+        Self::new_at(
+            EMenuParent::PylonWeapon(pilon_idx),
             items,
-            design_x: dx,
-            design_y: dy,
-            // WEAPON_MENU_WIDTH=70 + chrome ≈ 88.
-            item_w: 88.0,
-            item_h: 19.0,
-            hovered: None,
-            current_pos: None,
-            caller_name: String::new(),
-            saved_config: None,
-            previewed: None,
-        }
+            dx,
+            dy,
+            WEAPON_MENU_WIDTH,
+            none_label,
+        )
     }
 
-    /// Extra-pylon popup (pylon 5). Only Mortar / Bomb (+ empty). Anchor
-    /// from CIFaceButton.cpp:270.
-    pub fn for_weapon_extern() -> Self {
+    /// Extra-pylon popup (pylon 5). Mortar (kind 5) + Bomb (kind 7) +
+    /// empty `none` row. Anchor from CIFaceButton.cpp:270; row text
+    /// from `iw5text_sNormal` (mortar) and `iw7text_sNormal` (bomb)
+    /// per CInterface.cpp:723-730.
+    pub fn for_weapon_extern(base: Option<&super::CInterface>, none_label: &str) -> Self {
         let items = vec![
             SMenuItemText {
                 kind: RobotUnitKind::UNKNOWN,
-                icon_element: "weape",
+                text: none_label.to_string(),
                 affordable: true,
             },
             SMenuItemText {
                 kind: RobotUnitKind::WEAPON_MORTAR,
-                icon_element: weap_name(5),
+                text: lookup_text(base, "iw5text").unwrap_or_else(|| "Mortar".into()),
                 affordable: true,
             },
             SMenuItemText {
                 kind: RobotUnitKind::WEAPON_BOMB,
-                icon_element: weap_name(7),
+                text: lookup_text(base, "iw7text").unwrap_or_else(|| "Bomb".into()),
                 affordable: true,
             },
         ];
-        Self {
-            parent: EMenuParent::PylonWeapon(4),
+        Self::new_at(
+            EMenuParent::PylonWeapon(4),
             items,
-            design_x: 389.0,
-            design_y: 76.0,
-            item_w: 88.0,
-            item_h: 19.0,
+            389.0,
+            76.0,
+            WEAPON_MENU_WIDTH,
+            none_label,
+        )
+    }
+
+    /// Common helper — assembles a popup at a fixed (design_x, design_y)
+    /// with the menu width pre-shifted by `+CURSIK_WIDTH` per the C++
+    /// `width += CURSIK_WIDTH` step (CIFaceMenu.cpp:91).
+    fn new_at(
+        parent: EMenuParent,
+        items: Vec<SMenuItemText>,
+        design_x: f32,
+        design_y: f32,
+        menu_width: f32,
+        _none_label: &str,
+    ) -> Self {
+        Self {
+            parent,
+            items,
+            design_x,
+            design_y,
+            // C++ stores `WIDTH` (the param to CreateMenu) in
+            // CIFaceMenu.h. Total popup width is then
+            // `WIDTH + CURSIK_WIDTH + LEFTLINE_WIDTH + RIGHTLINE_WIDTH`.
+            // We carry the `menu_width` here and compute the total via
+            // [`Self::total_w`].
+            item_w: menu_width,
+            item_h: UNIT_HEIGHT,
             hovered: None,
             current_pos: None,
             caller_name: String::new(),
@@ -276,33 +304,47 @@ impl CIFaceMenu {
         }
     }
 
-    /// Per-CIFaceMenu.h chrome dimensions. The popup top-left
-    /// (`design_x`, `design_y`) is the CHROME origin; items are inset
-    /// by [`Self::CHROME_TOP`] / [`Self::CHROME_LEFT`] and the bottom
-    /// chrome adds [`Self::CHROME_BOTTOM`] beneath the last row.
-    /// Mirrors the C++ catcher placement at `y + 11 + UNIT_HEIGHT*i`
-    /// (CIFaceMenu.cpp:316) and the `h += TOPLINE_HEIGHT +
-    /// BOTTOMLINE_HEIGHT` total-height computation
-    /// (CIFaceMenu.cpp:88-90).
-    pub const CHROME_TOP: f32 = 11.0;
-    pub const CHROME_BOTTOM: f32 = 11.0;
-    pub const CHROME_LEFT: f32 = 4.0;
-    pub const CHROME_RIGHT: f32 = 4.0;
+    /// Per-`CIFaceMenu.h` constants. `UNIT_HEIGHT` is the row height;
+    /// the chrome wraps the items area with `TOPLINE_HEIGHT` above and
+    /// `BOTTOMLINE_HEIGHT` below — the total popup height is
+    /// `TOPLINE_HEIGHT + items*UNIT_HEIGHT + BOTTOMLINE_HEIGHT`
+    /// (CIFaceMenu.cpp:88-92).
+    /// Items area starts `ITEMS_TOP` (=11) below the popup top;
+    /// catcher rect spans `(w-8) × UNIT_HEIGHT` per row
+    /// (CIFaceMenu.cpp:316-319).
+    pub const TOPLINE_HEIGHT: f32 = 18.0;
+    pub const BOTTOMLINE_HEIGHT: f32 = 22.0;
+    pub const ITEMS_TOP: f32 = 11.0;
+    pub const LEFT_SPACE: f32 = 7.0;
+    pub const CURSIK_WIDTH: f32 = 7.0;
+    pub const LEFTLINE_WIDTH: f32 = 13.0;
+    pub const RIGHTLINE_WIDTH: f32 = 18.0;
+    pub const TOPLEFT_WIDTH: f32 = 13.0;
+    pub const TOPRIGHT_WIDTH: f32 = 18.0;
+    pub const BOTTOMLEFT_WIDTH: f32 = 14.0;
+    pub const BOTTOMRIGHT_WIDTH: f32 = 13.0;
+    pub const TOPLEFT_HEIGHT: f32 = 18.0;
+    pub const BOTTOMLEFT_HEIGHT: f32 = 22.0;
+    pub const BOTTOMRIGHT_HEIGHT: f32 = 21.0;
+    pub const CATCHER_RIGHT_INSET: f32 = 8.0;
 
-    /// Total popup width including chrome.
+    /// Total popup width: `WIDTH + CURSIK_WIDTH + LEFTLINE_WIDTH +
+    /// RIGHTLINE_WIDTH`. Port of CIFaceMenu.cpp:91-92.
     pub fn total_w(&self) -> f32 {
-        self.item_w
+        self.item_w + Self::CURSIK_WIDTH + Self::LEFTLINE_WIDTH + Self::RIGHTLINE_WIDTH
     }
 
-    /// Total popup height including chrome (top + items + bottom).
+    /// Total popup height: `TOPLINE_HEIGHT + items*UNIT_HEIGHT +
+    /// BOTTOMLINE_HEIGHT`. Port of CIFaceMenu.cpp:88-90.
     pub fn total_h(&self) -> f32 {
-        Self::CHROME_TOP + self.item_h * self.items.len() as f32 + Self::CHROME_BOTTOM
+        Self::TOPLINE_HEIGHT + self.item_h * self.items.len() as f32 + Self::BOTTOMLINE_HEIGHT
     }
 
     /// Y offset (in design space) where the items area begins, relative
-    /// to the popup top-left. Matches the C++ catcher base offset.
+    /// to the popup top-left. Matches the C++ catcher base offset
+    /// `y + 11 + UNIT_HEIGHT*i` (CIFaceMenu.cpp:316).
     pub fn items_top(&self) -> f32 {
-        Self::CHROME_TOP
+        Self::ITEMS_TOP
     }
 
     /// Hit-test the popup at design-space cursor coords (relative to
@@ -387,6 +429,7 @@ impl CIFaceMenu {
     }
 }
 
+#[allow(dead_code)]
 fn chas_name(n: i32) -> &'static str {
     match n {
         1 => "chas1",
@@ -398,6 +441,7 @@ fn chas_name(n: i32) -> &'static str {
     }
 }
 
+#[allow(dead_code)]
 fn hull_name(n: i32) -> &'static str {
     match n {
         1 => "hull1",
@@ -410,6 +454,7 @@ fn hull_name(n: i32) -> &'static str {
     }
 }
 
+#[allow(dead_code)]
 fn head_name(n: i32) -> &'static str {
     match n {
         1 => "head1",
@@ -420,6 +465,7 @@ fn head_name(n: i32) -> &'static str {
     }
 }
 
+#[allow(dead_code)]
 fn weap_name(n: i32) -> &'static str {
     match n {
         1 => "weap1",
@@ -437,19 +483,53 @@ fn weap_name(n: i32) -> &'static str {
 }
 
 /// Map a clicked pylon name to the popup that should open. Returns
-/// `None` for non-pylon names.
-pub fn popup_for_pylon(name: &str) -> Option<CIFaceMenu> {
+/// `None` for non-pylon names. The Base panel + the localised "none"
+/// label come from the caller (form_game) so we can stay free of
+/// global state in the popup module.
+pub fn popup_for_pylon(
+    name: &str,
+    base: Option<&super::CInterface>,
+    none_label: &str,
+) -> Option<CIFaceMenu> {
     match name {
-        "pich" => Some(CIFaceMenu::for_chassis()),
-        "pihu" => Some(CIFaceMenu::for_hull()),
-        "pihe" => Some(CIFaceMenu::for_head()),
-        "pi1" => Some(CIFaceMenu::for_weapon_normal(0)),
-        "pi2" => Some(CIFaceMenu::for_weapon_normal(1)),
-        "pi3" => Some(CIFaceMenu::for_weapon_normal(2)),
-        "pi4" => Some(CIFaceMenu::for_weapon_normal(3)),
-        "pi5" => Some(CIFaceMenu::for_weapon_extern()),
+        "pich" => Some(CIFaceMenu::for_chassis(base, none_label)),
+        "pihu" => Some(CIFaceMenu::for_hull(base, none_label)),
+        "pihe" => Some(CIFaceMenu::for_head(base, none_label)),
+        "pi1" => Some(CIFaceMenu::for_weapon_normal(base, none_label, 0)),
+        "pi2" => Some(CIFaceMenu::for_weapon_normal(base, none_label, 1)),
+        "pi3" => Some(CIFaceMenu::for_weapon_normal(base, none_label, 2)),
+        "pi4" => Some(CIFaceMenu::for_weapon_normal(base, none_label, 3)),
+        "pi5" => Some(CIFaceMenu::for_weapon_extern(base, none_label)),
         _ => None,
     }
+}
+
+/// Per-CIFaceMenu.h constants accessible to the renderer + the popup
+/// factory functions above.
+pub const UNIT_HEIGHT: f32 = 19.0;
+
+/// Russian-build menu widths (CIFaceMenu.h:47-50). The English-build
+/// variant uses different numbers; we follow the Russian build since
+/// our forms.pkg ships the Russian resource pack.
+const WEAPON_MENU_WIDTH: f32 = 70.0;
+const HULL_MENU_WIDTH: f32 = 90.0;
+const HEAD_MENU_WIDTH: f32 = 100.0;
+const CHASSIS_MENU_WIDTH: f32 = 90.0;
+
+/// Look up a localised popup-row caption from a Base-panel element's
+/// attached label. Mirrors the C++ catch-all that copies
+/// `iw{N}text_sNormal` / `ihu{N}text_sNormal` / `ihe{N}text_sNormal` /
+/// `ich{N}text_sNormal` text into the per-popup arrays
+/// (CInterface.cpp:715-772). Returns `None` when the element is
+/// missing or has no attached label — caller falls back to a stub.
+fn lookup_text(base: Option<&super::CInterface>, elem_name: &str) -> Option<String> {
+    use super::iface_element::ElementState;
+    let base = base?;
+    let elem = base.elements.iter().find(|e| e.name == elem_name)?;
+    elem.labels
+        .iter()
+        .find(|l| matches!(l.state, ElementState::Normal))
+        .map(|l| l.text.clone())
 }
 
 /// Decode the chosen menu kind for a `EMenuParent::PylonWeapon` —

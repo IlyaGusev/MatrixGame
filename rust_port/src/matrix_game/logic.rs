@@ -142,13 +142,6 @@ impl MapLogic {
             BuildingDamages::from_matrix_data(matrix_data).unwrap_or_default();
         let chassis = ChassisChars::from_matrix_data(matrix_data).unwrap_or_default();
         let prices = PriceTable::from_matrix_data(matrix_data).unwrap_or_default();
-        log::info!(
-            "config: prices chassis[0]={:?}, armor[5]={:?}, weapon[0]={:?}, head[0]={:?}",
-            prices.chassis[0].resources,
-            prices.armors[5].resources,
-            prices.weapons[0].resources,
-            prices.heads[0].resources,
-        );
         let item_chars = ItemCharsTable::from_matrix_data(matrix_data).unwrap_or_default();
         let timings = Timings::from_matrix_data(matrix_data).unwrap_or_default();
         let turrets = TurretProps::from_matrix_data(matrix_data).unwrap_or_default();
@@ -178,17 +171,27 @@ impl MapLogic {
         let descriptions = ItemDescriptions::from_matrix_data(matrix_data).unwrap_or_default();
         let robot_names = RobotNameParts::from_matrix_data(matrix_data).unwrap_or_default();
         let buildings = BuildingLabels::from_matrix_data(matrix_data).unwrap_or_default();
+        // `AllLabels/Base/none` — the empty-slot row text the C++ pre-
+        // assigns to g_PopupHead[0] / g_PopupWeaponNormal[0] /
+        // g_PopupWeaponExtern[0] (MatrixGame.cpp:521-523).
+        let popup_none = matrix_data
+            .block_record("da", "AllLabels")
+            .and_then(|labels_rec| matrix_data.block_record(&labels_rec, "Base"))
+            .and_then(|base_rec| matrix_data.block_param(&base_rec, "none"))
+            .unwrap_or_default();
         log::info!(
-            "config: loaded labels (chassis[0]={:?}, robot_names[hull1]={:?}, base_name={:?})",
+            "config: loaded labels (chassis[0]={:?}, robot_names[hull1]={:?}, base_name={:?}, popup_none={:?})",
             labels.chassis.first().map(|s| s.as_str()).unwrap_or(""),
             robot_names.hull.first().map(|s| s.as_str()).unwrap_or(""),
             buildings.base_name,
+            popup_none,
         );
         config::set_global_strings(StringTables {
             labels,
             descriptions,
             robot_names,
             buildings,
+            popup_none,
         });
         // AI robot catalogue (CConstructor.cpp:1361 / SSpecialBot::LoadAIRobotType).
         let ai_robots =

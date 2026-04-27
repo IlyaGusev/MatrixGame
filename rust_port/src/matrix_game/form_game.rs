@@ -204,7 +204,7 @@ impl ApplicationHandler for App {
                 crate::matrix_game::interface::IFaceList::load_default_panels(&matrix_data);
             log::info!("iface: loaded {} panels", iface_list.panels.len());
             let mut iface_renderer =
-                crate::matrix_game::interface::InterfaceRenderer::new(&gfx.device, &gfx.config);
+                crate::matrix_game::interface::InterfaceRenderer::new(&gfx.device, &gfx.queue, &gfx.config);
             // Preload every atlas referenced by any element of any
             // loaded panel. `if/Main` alone pulls from interface1/2/3,
             // base_1, base_4, text_1; other panels add base_2/3/5/6.
@@ -380,7 +380,7 @@ impl ApplicationHandler for App {
                     crate::matrix_game::interface::IFaceList::load_default_panels(&matrix_data);
                 log::info!("iface: loaded {} panels", iface_list.panels.len());
                 let mut iface_renderer =
-                    crate::matrix_game::interface::InterfaceRenderer::new(&gfx.device, &gfx.config);
+                    crate::matrix_game::interface::InterfaceRenderer::new(&gfx.device, &gfx.queue, &gfx.config);
                 let read = |p: &str| -> Option<Vec<u8>> { bundle.read_file(p).map(|b| b.to_vec()) };
                 iface_renderer.preload_for_panels(
                     &gfx.device,
@@ -1387,41 +1387,6 @@ fn dispatch_ui_click(state: &mut AppState, click: &crate::matrix_game::interface
             state.iface_list.r_count_control.check_up(ctx);
             if let Some(b) = state.game.player_side.builder.as_mut() {
                 b.activate();
-                let cfg = b.cfg();
-                let price = b.construction_price();
-                let name = b.construction_name();
-                log::info!(
-                    "buro: live={{chas:{}, hull:{}, head:{}, w0:{}}}, price={:?}, name={:?}",
-                    cfg.chassis.kind.0,
-                    cfg.hull.unit.kind.0,
-                    cfg.head.kind.0,
-                    cfg.weapon[0].kind.0,
-                    price.resources,
-                    name,
-                );
-                let strings = crate::matrix_game::config::global_strings();
-                log::info!(
-                    "buro: robot_names hull={:?} chas={:?} head={:?}",
-                    &strings.robot_names.hull,
-                    &strings.robot_names.chassis,
-                    &strings.robot_names.head,
-                );
-            }
-            // Diagnostic — confirm the price-icon templates exist.
-            if let Some(p) = state.iface_list.panel("Base") {
-                let titan = p.element_by_name("titan").map(|e| {
-                    let img = e.images.first().and_then(|x| x.as_ref());
-                    (e.size_x, e.size_y, img.is_some(), img.map(|i| (i.w, i.h)))
-                });
-                let rcname = p.element_by_name("rcname").is_some();
-                let res_summ = p.element_by_name("res_summ").is_some();
-                let res_unit = p.element_by_name("res_unit").is_some();
-                let damage = p.element_by_name("damage").is_some();
-                let struct_ = p.element_by_name("struct").is_some();
-                log::info!(
-                    "buro: panel hits → titan={:?}, rcname={}, res_summ={}, res_unit={}, damage={}, struct={}",
-                    titan, rcname, res_summ, res_unit, damage, struct_,
-                );
             }
             log::info!("buro: opened robot constructor");
             // Silence "unused import" on paths we only need in other
@@ -1619,7 +1584,9 @@ fn dispatch_ui_right_click(state: &mut AppState, click: &crate::matrix_game::int
         return;
     }
 
-    if let Some(mut popup) = popup_for_pylon(name) {
+    let strings = crate::matrix_game::config::global_strings();
+    let base_panel = state.iface_list.panel("Base");
+    if let Some(mut popup) = popup_for_pylon(name, base_panel, &strings.popup_none) {
         // CIFaceMenu::CreateMenu (CIFaceMenu.cpp:62-100) — record the
         // caller pylon, locate the cursik index for the equipped item.
         popup.set_caller(name);
@@ -1661,7 +1628,7 @@ fn preview_popup_hover(
         builder.clear_focused_card();
         return;
     };
-    let Some(item) = popup.items.get(idx).copied() else {
+    let Some(item) = popup.items.get(idx).cloned() else {
         return;
     };
     let ty = popup.parent.unit_type();

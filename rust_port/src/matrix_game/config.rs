@@ -1131,6 +1131,11 @@ pub struct StringTables {
     pub descriptions: ItemDescriptions,
     pub robot_names: RobotNameParts,
     pub buildings: BuildingLabels,
+    /// Localised "none" word — port of `AllLabels/Base/none` loaded at
+    /// startup (MatrixGame.cpp:521-523) and assigned to
+    /// `g_PopupHead[0].text` / `g_PopupWeaponNormal[0].text` /
+    /// `g_PopupWeaponExtern[0].text` as the empty-slot popup row.
+    pub popup_none: String,
 }
 
 static GLOBAL_STRINGS: std::sync::OnceLock<std::sync::RwLock<std::sync::Arc<StringTables>>> =

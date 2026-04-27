@@ -597,7 +597,7 @@ impl IFaceList {
                 .and_then(|(dx, dy)| popup.hit_test_design(dx, dy));
             self.pressed = None;
             if let Some(idx) = hit {
-                if let Some(item) = popup.items.get(idx).copied() {
+                if let Some(item) = popup.items.get(idx).cloned() {
                     log::info!(
                         "popup: selected item idx={} kind={} parent={:?}",
                         idx,
