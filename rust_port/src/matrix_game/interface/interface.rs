@@ -1376,6 +1376,47 @@ impl CInterface {
         for (src, dst) in &weapon_srcs {
             self.copy_pair(src.as_deref(), dst.as_str());
         }
+
+        // Empty-pylon "?" badge. The C++ shows this character via the
+        // heade/weape atlas region (a "?" graphic baked into the
+        // sprite) — the atlas content lives in encrypted Lang.dat and
+        // doesn't ship in our extracted data, so the copied image
+        // arrives blank. Faithful workaround: when the pylon's kind is
+        // empty, drop a single-glyph "?" label centred on the pylon
+        // so users still get the empty-slot visual cue.
+        let pylon_qmark: [(&str, bool); 8] = [
+            ("pich", cfg.chassis.kind.is_empty()),
+            ("pihu", cfg.hull.unit.kind.is_empty()),
+            ("pihe", cfg.head.kind.is_empty()),
+            ("pi1", cfg.weapon[0].kind.is_empty()),
+            ("pi2", cfg.weapon[1].kind.is_empty()),
+            ("pi3", cfg.weapon[2].kind.is_empty()),
+            ("pi4", cfg.weapon[3].kind.is_empty()),
+            ("pi5", cfg.weapon[4].kind.is_empty()),
+        ];
+        for (name, is_empty) in pylon_qmark {
+            let Some(e) = self.elements.iter_mut().find(|e| e.name == name) else {
+                continue;
+            };
+            // Remove any prior "?" we seeded last frame.
+            e.labels.retain(|l| l.text != "?");
+            if !is_empty {
+                continue;
+            }
+            e.labels.push(ElementLabel {
+                state: ElementState::Normal,
+                text: "?".to_string(),
+                x: 0.0,
+                y: 0.0,
+                sme_x: 0.0,
+                sme_y: 0.0,
+                align_x: 1, // centred
+                align_y: 1,
+                wrap: false,
+                font: "Font.2Big".to_string(),
+                color: [246, 192, 0, 255],
+            });
+        }
     }
 
     /// Port of `CInterface::CopyElements(src_name, dst_name)` by-name
