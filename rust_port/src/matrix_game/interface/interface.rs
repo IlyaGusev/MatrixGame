@@ -958,10 +958,40 @@ impl CInterface {
             // multi-line layout kicks in, regardless of what the panel
             // data shipped.
             let force_wrap = matches!(e.name.as_str(), "it_label1" | "it_label2");
-            for lbl in &mut e.labels {
-                lbl.text = new_text.to_string();
-                if force_wrap {
-                    lbl.wrap = true;
+            // C++ writes the dynamic caption directly onto
+            // `m_StateImages[IFACE_NORMAL].m_Caption` (CInterface.cpp:
+            // 1825/1872/2334/2353). If our panel data didn't ship a
+            // `LabelsText/<panel>/<elem>_sNormal` entry, our
+            // `attach_labels` skips the row and `e.labels` ends up
+            // empty — meaning the per-frame caption update has nothing
+            // to update. Seed a default Normal-state label here so the
+            // text actually renders. Mirrors the C++ behaviour where
+            // every state-image carries a (possibly empty) m_Caption
+            // from construction.
+            if e.labels.is_empty() {
+                e.labels.push(ElementLabel {
+                    state: ElementState::Normal,
+                    text: new_text.to_string(),
+                    x: 0.0,
+                    y: 0.0,
+                    sme_x: 0.0,
+                    sme_y: 0.0,
+                    align_x: if matches!(e.name.as_str(), "struct" | "damage") {
+                        2 // right-aligned numeric readouts (CConstructor.cpp:2334-2353)
+                    } else {
+                        1 // centered text (rcname)
+                    },
+                    align_y: 1,
+                    wrap: force_wrap,
+                    font: "Font.2Small".to_string(),
+                    color: [246, 192, 0, 255],
+                });
+            } else {
+                for lbl in &mut e.labels {
+                    lbl.text = new_text.to_string();
+                    if force_wrap {
+                        lbl.wrap = true;
+                    }
                 }
             }
         }
