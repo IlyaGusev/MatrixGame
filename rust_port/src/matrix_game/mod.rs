@@ -23,6 +23,7 @@ pub mod object_building;
 pub mod object_cannon;
 pub mod object_robot;
 pub mod particles;
+pub mod pause_overlay;
 pub mod progress_bar;
 pub mod render_pipeline;
 pub mod robot;

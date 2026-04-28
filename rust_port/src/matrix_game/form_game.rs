@@ -86,6 +86,12 @@ struct AppState {
     /// surfaces a config. Port of `m_MedTexture` (MatrixRobot.cpp:
     /// 5342-5380); see `interface::robot_icons` for the bake path.
     robot_icons: crate::matrix_game::interface::RobotIconCache,
+    /// Fullscreen translucent-black overlay drawn when `is_paused` —
+    /// port of MatrixMap.cpp:2430-2454.
+    pause_overlay: crate::matrix_game::pause_overlay::PauseOverlay,
+    /// Mirrors `g_MatrixMap->IsPaused()` (MatrixMap.hpp:640). Constructor
+    /// open / close toggles this; logic takt is gated on it.
+    is_paused: bool,
 }
 
 pub struct App {
@@ -247,6 +253,10 @@ impl ApplicationHandler for App {
                 b.constructor_buttons_init();
             }
 
+            let pause_overlay = crate::matrix_game::pause_overlay::PauseOverlay::new(
+                &gfx.device,
+                &gfx.config,
+            );
             *self.state.borrow_mut() = Some(AppState {
                 window,
                 gfx,
@@ -273,6 +283,8 @@ impl ApplicationHandler for App {
                 builder_preview:
                     crate::matrix_game::interface::constructor::BuilderPreview::new(),
                 robot_icons: crate::matrix_game::interface::RobotIconCache::new(),
+                pause_overlay,
+                is_paused: false,
             });
         }
 
@@ -406,6 +418,10 @@ impl ApplicationHandler for App {
                     b.constructor_buttons_init();
                 }
 
+                let pause_overlay = crate::matrix_game::pause_overlay::PauseOverlay::new(
+                    &gfx.device,
+                    &gfx.config,
+                );
                 *state_slot.borrow_mut() = Some(AppState {
                     window: win.clone(),
                     gfx,
@@ -432,6 +448,8 @@ impl ApplicationHandler for App {
                     builder_preview:
                         crate::matrix_game::interface::constructor::BuilderPreview::new(),
                     robot_icons: crate::matrix_game::interface::RobotIconCache::new(),
+                    pause_overlay,
+                    is_paused: false,
                 });
                 win.request_redraw();
                 hide_loading_overlay();
@@ -794,7 +812,14 @@ impl ApplicationHandler for App {
                     // `current_map()` (ports `g_MatrixMap`).
                     let _scope =
                         crate::matrix_game::map::MapScope::enter(&state.map, state.game.elapsed_ms);
-                    state.game.takt(step_ms);
+                    // Port of `if (IsPaused()) return;` guarding
+                    // `CMatrixMapLogic::Takt` (MatrixLogic.cpp:2607).
+                    // Graphic takt still runs so animation cursors keep
+                    // ticking — matches the C++ where rendering and
+                    // effect timers continue while logic is frozen.
+                    if !state.is_paused {
+                        state.game.takt(step_ms);
+                    }
                     state.game.graphic_takt(step_ms);
                 }
 
@@ -850,6 +875,22 @@ impl ApplicationHandler for App {
                 // open. Stand-in for CConstructor.cpp:251-262 +
                 // :264-360 (Render).
                 tick_builder_preview(state, dt * 1000.0);
+
+                // Drain a pending popup-close focus clear — when the
+                // popup was dismissed by clicking outside it, the
+                // focused pylon's right-side preview + price label
+                // need to drop along with the popup. The C++ achieves
+                // this naturally via the next OnMouseMove pass under
+                // !POPUP_MENU_ACTIVE; we clear explicitly here so
+                // there's no one-frame stale state.
+                if state.iface_list.popup_focus_clear_pending {
+                    state.iface_list.popup_focus_clear_pending = false;
+                    if let Some(b) = state.game.player_side.builder.as_mut() {
+                        if let Some(name) = b.focused_element.clone() {
+                            b.unfocus_element(&name);
+                        }
+                    }
+                }
 
                 // Tooltip timer + dynamic hint text refresh. Port of
                 // `CIFaceList::OnMouseMove` hint build pass at
@@ -1032,20 +1073,74 @@ impl ApplicationHandler for App {
                                 state.gfx.config.height as f32,
                                 &state.map,
                                 &state.camera,
+                                &state.game.objects,
                             );
+                        }
+                        // Pause overlay — fullscreen translucent black
+                        // tint when the game is paused. Sits between
+                        // world+minimap and the UI so the HUD stays
+                        // bright while the playfield dims. Port of
+                        // MatrixMap.cpp:2430-2454.
+                        let pause_visible = state.is_paused
+                            || state
+                                .game
+                                .player_side
+                                .builder
+                                .as_ref()
+                                .map(|b| b.active)
+                                .unwrap_or(false);
+                        if pause_visible {
+                            let mut pass =
+                                encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                    label: Some("Pause Overlay Pass"),
+                                    color_attachments: &[Some(
+                                        wgpu::RenderPassColorAttachment {
+                                            view: &view,
+                                            resolve_target: None,
+                                            depth_slice: None,
+                                            ops: wgpu::Operations {
+                                                load: wgpu::LoadOp::Load,
+                                                store: wgpu::StoreOp::Store,
+                                            },
+                                        },
+                                    )],
+                                    depth_stencil_attachment: None,
+                                    timestamp_writes: None,
+                                    occlusion_query_set: None,
+                                    multiview_mask: None,
+                                });
+                            state.pause_overlay.draw(&mut pass);
                         }
                         // Interface (HUD) pass — draws on top of
                         // world + minimap. Ports
                         // `CIFaceList::Render` iteration.
                         {
+                            // Pause hint — port of MatrixLogic.cpp:2607-2614:
+                            //   m_PauseHint = CMatrixHint::Build(TEMPLATE_PAUSE);
+                            //   m_PauseHint->Show(14, 62);
+                            // Built each frame while paused (cheap layout).
+                            // Falls through to the regular hover hint when
+                            // unpaused or when the "Pause" template is
+                            // missing from `da/Templates`. Build BEFORE
+                            // borrowing `iface_list.panels` because the
+                            // builder needs `&mut iface_renderer`.
+                            let pause_hint_local: Option<crate::matrix_game::interface::Hint> =
+                                if pause_visible {
+                                    build_pause_hint(state)
+                                } else {
+                                    None
+                                };
                             let panels: Vec<&crate::matrix_game::interface::CInterface> =
                                 state.iface_list.panels.iter().collect();
+                            let hint_to_show = pause_hint_local
+                                .as_ref()
+                                .or_else(|| state.iface_list.hint_system.active());
                             state.iface_renderer.upload_with_popup_and_hint(
                                 &state.gfx.device,
                                 &state.gfx.queue,
                                 &panels,
                                 state.iface_list.popup.as_ref(),
-                                state.iface_list.hint_system.active(),
+                                hint_to_show,
                                 Some(&state.iface_list.hint_chrome),
                                 state.gfx.config.width as f32,
                                 state.gfx.config.height as f32,
@@ -1346,6 +1441,7 @@ fn dispatch_ui_click(state: &mut AppState, click: &crate::matrix_game::interface
             }
             state.iface_list.popup = None;
             state.iface_list.popup_restore_pending = None;
+            state.iface_list.popup_focus_clear_pending = true;
             let _ = EMenuParent::PylonChassis; // keep import live
             return;
         }
@@ -1388,6 +1484,9 @@ fn dispatch_ui_click(state: &mut AppState, click: &crate::matrix_game::interface
             if let Some(b) = state.game.player_side.builder.as_mut() {
                 b.activate();
             }
+            // Pause the game while the constructor is open — port of
+            // `g_MatrixMap->Pause(true)` at CConstructor.cpp:975.
+            state.is_paused = true;
             log::info!("buro: opened robot constructor");
             // Silence "unused import" on paths we only need in other
             // arms of this match.
@@ -1433,6 +1532,9 @@ fn dispatch_ui_click(state: &mut AppState, click: &crate::matrix_game::interface
             if let Some(b) = state.game.player_side.builder.as_mut() {
                 b.deactivate();
             }
+            // Resume the game — port of `g_MatrixMap->Pause(false)` at
+            // CConstructor.cpp:992.
+            state.is_paused = false;
             state.iface_list.r_count_control.reset();
             state.iface_list.popup = None;
             state.iface_list.popup_restore_pending = None;
@@ -2287,6 +2389,7 @@ fn commit_and_queue_robot(state: &mut AppState) {
     if let Some(b) = state.game.player_side.builder.as_mut() {
         b.deactivate();
     }
+    state.is_paused = false;
     // CConstructor.cpp:247-248 — reset + revalidate the counter.
     state.iface_list.r_count_control.reset();
     let ctx = build_counter_ctx(state);
@@ -2990,6 +3093,94 @@ fn bundle_url_from_query() -> Option<String> {
     }
     let params = web_sys::UrlSearchParams::new_with_str(&search).ok()?;
     params.get("bundle").filter(|s| !s.is_empty())
+}
+
+/// Construct the "Pause" hint widget — port of MatrixLogic.cpp:2611:
+///
+///     m_PauseHint = CMatrixHint::Build(TEMPLATE_PAUSE);
+///     m_PauseHint->Show(14, 62);
+///
+/// The hint goes through the standard hint render path so it picks up
+/// the engine's chrome (border, background) and font choices baked
+/// into the `Pause` template in `da/Templates`. Returns `None` when
+/// the template is missing — older / stripped data files that don't
+/// ship `Pause` just won't show a label, only the dim tint.
+fn build_pause_hint(state: &mut AppState) -> Option<crate::matrix_game::interface::Hint> {
+    use crate::matrix_game::interface::hint::{build_hint, ChromeBorder};
+
+    let raw = state.iface_list.hint_templates.get("Pause")?;
+    let raw = raw.to_string();
+    let chrome = &state.iface_list.hint_chrome;
+    let border_default = ChromeBorder::default();
+    let border = chrome.borders.get(&0).unwrap_or(&border_default);
+
+    let screen_w = state.gfx.config.width as f32;
+    let screen_h = state.gfx.config.height as f32;
+    let scale = (screen_h / crate::matrix_game::interface::interface::DESIGN_H).max(0.1);
+
+    // Snapshot bitmap sizes for the hint layout — same pattern as the
+    // hover-hint update path (see the `iface_list.update` call
+    // elsewhere in this file).
+    let mut sizes: std::collections::HashMap<String, (i32, i32)> =
+        std::collections::HashMap::new();
+    for bmp in chrome.bitmaps.values() {
+        if let Some((w, h)) = state.iface_renderer.atlas_size(&bmp.path) {
+            sizes.insert(bmp.path.clone(), (w as i32, h as i32));
+        }
+    }
+    let sizer = |path: &str| sizes.get(path).copied();
+
+    let replacer = state.iface_list.hint_replacer.clone();
+    let atlas = state.iface_renderer.glyph_atlas_mut();
+    let (mut parts, otstup, total_w, total_h, border_id, _wrap) =
+        build_hint(&raw, border, &chrome.bitmaps, &replacer, atlas, sizer)?;
+    if parts.is_empty() {
+        return None;
+    }
+
+    // Center text horizontally within the hint's content area. The
+    // original C++ Rangers rasterizer centers text inside its bounding
+    // box by default (`alignx = 1` at MatrixHint.cpp:590); our
+    // hint renderer renders `HintPart::Text` left-aligned at `x`, and
+    // when the template uses `_WIDTH:N` the part's `w` may be wider
+    // than the actual glyph run. Re-measure and shift each text part
+    // so its glyph run sits centered within the hint's content area.
+    let content_w = total_w - otstup[0] - otstup[2];
+    let atlas = state.iface_renderer.glyph_atlas_mut();
+    for part in parts.iter_mut() {
+        if let crate::matrix_game::interface::hint::HintPart::Text {
+            x, text, font, ..
+        } = part
+        {
+            // Use the longest line for measurement when text is
+            // multi-line (e.g. `<br>` separator). That preserves the
+            // visual block centering the C++ produces.
+            let measured: i32 = text
+                .split('\n')
+                .map(|line| atlas.measure(font, line) as i32)
+                .max()
+                .unwrap_or(0);
+            *x = otstup[0] + (content_w - measured) / 2;
+        }
+    }
+
+    // C++ position from MatrixLogic.cpp:2612 — `Show(14, 62)` is in
+    // design-space pixels (1024×768). Scale to current screen.
+    let screen_x = 14.0 * scale;
+    let screen_y = 62.0 * scale;
+    // Clamp so it doesn't fall off-screen on tiny windows.
+    let screen_x = screen_x.min(screen_w - total_w as f32 * scale - 2.0).max(0.0);
+    let screen_y = screen_y.min(screen_h - total_h as f32 * scale - 2.0).max(0.0);
+
+    Some(crate::matrix_game::interface::Hint {
+        parts,
+        total_w,
+        total_h,
+        border_id,
+        otstup,
+        screen_x,
+        screen_y,
+    })
 }
 
 #[cfg(not(target_arch = "wasm32"))]

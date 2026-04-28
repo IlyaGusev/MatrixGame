@@ -26,6 +26,7 @@ use wgpu::util::DeviceExt;
 use crate::matrix_game::camera::Camera;
 use crate::matrix_game::map::MapRenderer;
 use crate::matrix_game::map::{GameMap, GLOBAL_SCALE};
+use crate::matrix_game::map_static::{ObjectType, Objects};
 use crate::matrix_lib::base::storage::Storage;
 use crate::matrix_lib::three_g::texture::{create_texture_from_rgba, decode_texture_bytes};
 
@@ -71,6 +72,10 @@ const MINIMAP_OUT_SCALE: f32 = 0.8;
 const MINIMAP_OUT_INDICATOR_R: f32 = 15.0;
 const MINIMAP_BUILDING_R: f32 = 8.0;
 const MINIMAP_BUILDING_BASE_R: f32 = 8.0;
+/// Per-object marker radii from `MatrixMinimap.hpp:25-29` —
+/// `MINIMAP_ROBOT_R / MINIMAP_FLYER_R / MINIMAP_CANNON_R`.
+const MINIMAP_ROBOT_R: f32 = 8.0;
+const MINIMAP_CANNON_R: f32 = 8.0;
 
 /// Water plane Z — from `renderer/water.rs`, matches `WATER_LEVEL` in the
 /// original. Used both for the heightmap bake (coast cutoff) and for the
@@ -1067,6 +1072,7 @@ impl Minimap {
         screen_h: f32,
         map: &GameMap,
         camera: &Camera,
+        objects: &Objects,
     ) {
         if screen_w <= 1.0 || screen_h <= 1.0 {
             return;
@@ -1181,6 +1187,31 @@ impl Minimap {
                 marker_r
             };
             Self::push_marker(&mut markers, px_px, radius, icon, color);
+        }
+
+        // Robot / cannon markers — port of MatrixMinimap.cpp:679-763.
+        // The C++ walks `CMatrixMapStatic::GetFirstLogic()` and switches
+        // on `GetObjectType()`. We mirror that across the live arena.
+        // Per-side tint via `GetSideColorMM`; building markers above
+        // already use the same `side_colors` table.
+        let robot_r = MINIMAP_ROBOT_R * ui_scale;
+        let cannon_r = MINIMAP_CANNON_R * ui_scale;
+        for id in objects.iter_live() {
+            let Some(obj) = objects.get(id) else { continue };
+            let core = obj.core();
+            let (icon, radius) = match core.obj_type {
+                ObjectType::RobotAi => (self.icon_robot, robot_r),
+                ObjectType::Cannon => (self.icon_turret, cannon_r),
+                _ => continue,
+            };
+            let world_xy = [core.geo_center.x, core.geo_center.y];
+            let pos = self.apply_rotation(self.world_to_map(world_xy[0], world_xy[1]));
+            let color = self
+                .side_colors
+                .get(obj.side() as usize)
+                .copied()
+                .unwrap_or([0.85, 0.85, 0.85, 1.0]);
+            Self::push_marker(&mut markers, pos, radius, icon, color);
         }
         for ev in &self.events {
             let pos =
