@@ -3611,42 +3611,117 @@ impl WeaponMatrix {
     }
 }
 
-/// Shipped-gameplay weapon matrix layout — hand-rolled to mirror the
-/// data the VO loader produces in the original.
+/// Total armor kinds we cache weapon matrices for (matches
+/// ROBOT_ARMOR_CNT = 6).
+const ROBOT_ARMOR_CNT_LOCAL: usize = 6;
+
+/// Process-wide armor → WeaponMatrix table. Populated at startup by
+/// `set_weapon_matrix_for` after the robot VOs load (see
+/// `RobotsRenderer::new`); falls back to an empty matrix when not yet
+/// populated. Mirrors `g_MatrixMap->m_RobotWeaponMatrix[]` (MatrixMap.
+/// hpp:179).
+static GLOBAL_WEAPON_MATRICES: std::sync::OnceLock<
+    std::sync::RwLock<[WeaponMatrix; ROBOT_ARMOR_CNT_LOCAL]>,
+> = std::sync::OnceLock::new();
+
+fn weapon_matrices_slot() -> &'static std::sync::RwLock<[WeaponMatrix; ROBOT_ARMOR_CNT_LOCAL]> {
+    GLOBAL_WEAPON_MATRICES.get_or_init(|| {
+        std::sync::RwLock::new([WeaponMatrix::default(); ROBOT_ARMOR_CNT_LOCAL])
+    })
+}
+
+/// Faithful port of `CMatrixMap::RobotPreload`'s armor-VO weapon-slot
+/// construction (MatrixMap.cpp:270-326). Walks every bone with `id >=
+/// 20` whose name starts with `"W"`, parses the comma-separated slot
+/// spec, and fills out a `WeaponMatrix` mirroring
+/// `m_RobotWeaponMatrix[i]`.
+///
+/// The bone name format is `"W,n[,n...][,I]"` where each `n` is a
+/// 1-based weapon-kind index (RUK_WEAPON_*) the slot accepts and `I`
+/// flips the X-mirror flag (bit 31 of `access_invert`).
+pub fn weapon_matrix_from_vo(
+    vo: &crate::matrix_lib::three_g::vector_object::VoMesh,
+) -> WeaponMatrix {
+    let mut out = WeaponMatrix::default();
+    for m in &vo.matrices {
+        if m.id < 20 {
+            continue;
+        }
+        let parts: Vec<&str> = m.name.split(',').map(|s| s.trim()).collect();
+        if parts.is_empty() || parts[0] != "W" {
+            continue;
+        }
+        if (out.cnt as usize) >= ROBOT_WEAPONS_PER_ROBOT_CNT {
+            break;
+        }
+        let slot_idx = out.cnt as usize;
+        out.list[slot_idx] = WeaponMatrixSlot {
+            id: m.id as i32,
+            access_invert: 0,
+        };
+        out.cnt += 1;
+        // First slot-kind token decides whether this is a common or
+        // extra slot (MatrixMap.cpp:298-304). The C++ checks ONLY the
+        // first kind token because access_invert is still 0; subsequent
+        // tokens just OR in more accepted kinds.
+        let mut first_kind_token = true;
+        for tok in &parts[1..] {
+            if *tok == "I" {
+                out.list[slot_idx].access_invert |= 1u32 << 31;
+                continue;
+            }
+            let Ok(kind) = tok.parse::<i32>() else {
+                continue;
+            };
+            if first_kind_token {
+                first_kind_token = false;
+                if kind == RobotUnitKind::WEAPON_BOMB.0
+                    || kind == RobotUnitKind::WEAPON_MORTAR.0
+                {
+                    out.extra += 1;
+                } else {
+                    out.common += 1;
+                }
+            }
+            if (1..=32).contains(&kind) {
+                out.list[slot_idx].access_invert |= 1u32 << (kind - 1);
+            }
+        }
+    }
+    // MatrixMap.cpp:314-325 — sort slots by bone id ascending.
+    let n = out.cnt as usize;
+    if n > 1 {
+        out.list[..n].sort_by_key(|s| s.id);
+    }
+    out
+}
+
+/// Replace the cached weapon matrix for `kind` (1..=ROBOT_ARMOR_CNT).
+/// Called from the robot-VO loader once per armor.
+pub fn set_weapon_matrix_for(kind: RobotUnitKind, m: WeaponMatrix) {
+    let idx = match kind.0 {
+        n if (1..=ROBOT_ARMOR_CNT_LOCAL as i32).contains(&n) => (n - 1) as usize,
+        _ => return,
+    };
+    if let Ok(mut slot) = weapon_matrices_slot().write() {
+        slot[idx] = m;
+    }
+}
+
+/// Read the cached weapon matrix for `armor_kind`. Returns an empty
+/// matrix if the kind is out of range or hasn't been populated yet.
+/// Faithful port of `g_MatrixMap->m_RobotWeaponMatrix[kind-1]` reads
+/// scattered through CConstructor.cpp.
 pub fn default_weapon_matrix(armor_kind: RobotUnitKind) -> WeaponMatrix {
-    let common_slot = WeaponMatrixSlot {
-        id: 0,
-        access_invert: 1 << 0,
+    let idx = match armor_kind.0 {
+        n if (1..=ROBOT_ARMOR_CNT_LOCAL as i32).contains(&n) => (n - 1) as usize,
+        _ => return WeaponMatrix::default(),
     };
-    let extra_slot_bomb = WeaponMatrixSlot {
-        id: 1,
-        access_invert: ACCESS_EXTRA_BIT_B,
-    };
-
-    let (common, extra) = match armor_kind.0 {
-        1..=4 => (2, 1),
-        5 | 6 => (4, 1),
-        _ => (0, 0),
-    };
-
-    let total = common + extra;
-    let mut list = [WeaponMatrixSlot::default(); ROBOT_WEAPONS_PER_ROBOT_CNT];
-    for slot in list
-        .iter_mut()
-        .take((common as usize).min(ROBOT_WEAPONS_PER_ROBOT_CNT))
-    {
-        *slot = common_slot;
-    }
-    if extra > 0 && (common as usize) < ROBOT_WEAPONS_PER_ROBOT_CNT {
-        list[common as usize] = extra_slot_bomb;
-    }
-
-    WeaponMatrix {
-        cnt: total,
-        common,
-        extra,
-        list,
-    }
+    weapon_matrices_slot()
+        .read()
+        .ok()
+        .map(|slot| slot[idx])
+        .unwrap_or_default()
 }
 
 // ── GetSideColor / GetSideColorMM (MatrixMap.cpp:1014-1015) ─────────────

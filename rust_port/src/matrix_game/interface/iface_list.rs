@@ -169,6 +169,13 @@ pub struct IFaceList {
     pub popup: Option<super::iface_menu::CIFaceMenu>,
     /// Saved config to restore after canceling a popup hover-preview.
     pub popup_restore_pending: Option<RobotConfig>,
+    /// Set when a popup was just closed by clicking outside it. The
+    /// frame-tick handler clears the builder's focused pylon (and
+    /// therefore the right-side preview + price label that were
+    /// frozen while the popup was open). Mirrors the C++ flow where
+    /// CIFaceMenu::ResetMenu drops POPUP_MENU_ACTIVE so the next
+    /// OnMouseMove pass naturally re-runs RemoteUnFocusElement.
+    pub popup_focus_clear_pending: bool,
     /// Port of `g_ConfigHistory` (CHistory.cpp:11) — global history
     /// of committed robot configs cycled by the `hisleft` / `hisright`
     /// buttons.
@@ -235,6 +242,7 @@ impl IFaceList {
             right_pressed: None,
             popup: None,
             popup_restore_pending: None,
+            popup_focus_clear_pending: false,
             history: ConfigHistory::new(),
             r_count_control: CIFaceCounter::new(),
             turret_build: TurretBuild::new(),
@@ -519,6 +527,10 @@ impl IFaceList {
             if !inside {
                 self.popup_restore_pending = self.popup.as_ref().and_then(|p| p.saved_config);
                 self.popup = None;
+                // Mark for the caller to clear the pylon focus that was
+                // frozen while the popup was up — otherwise the focused
+                // pylon's right-side preview + price label keep showing.
+                self.popup_focus_clear_pending = true;
                 // Fall through to regular hit-test so the click can
                 // also engage whatever was clicked outside.
             } else {

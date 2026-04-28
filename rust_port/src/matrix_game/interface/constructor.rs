@@ -1683,6 +1683,39 @@ mod tests {
 
     #[test]
     fn changing_armor_resets_weapons() {
+        // The weapon matrix is normally populated from armor VOs at
+        // startup; tests don't load VOs, so seed a synthetic 4-common
+        // matrix for ARMOR_NUCLEAR and 2-common for ARMOR_PASSIVE so
+        // weapon insertion / reset logic can exercise.
+        let mut nuc = crate::matrix_game::map::WeaponMatrix::default();
+        for _ in 0..4 {
+            nuc.list[nuc.cnt as usize] = crate::matrix_game::map::WeaponMatrixSlot {
+                id: 20 + nuc.cnt,
+                // bits 0,1,2,3,5,7,8,9 — kinds 1,2,3,4,6,8,9,10
+                // (machinegun..repair, excluding mortar=5 and bomb=7
+                // which are extras; ACCESS_EXTRA_BIT_A=bit 4 / B=bit 6
+                // must stay zero for a common slot).
+                access_invert: 0b0000_0011_1010_1111,
+            };
+            nuc.cnt += 1;
+            nuc.common += 1;
+        }
+        crate::matrix_game::map::set_weapon_matrix_for(RobotUnitKind::ARMOR_NUCLEAR, nuc);
+        let mut pas = crate::matrix_game::map::WeaponMatrix::default();
+        for _ in 0..2 {
+            pas.list[pas.cnt as usize] = crate::matrix_game::map::WeaponMatrixSlot {
+                id: 20 + pas.cnt,
+                // bits 0,1,2,3,5,7,8,9 — kinds 1,2,3,4,6,8,9,10
+                // (machinegun..repair, excluding mortar=5 and bomb=7
+                // which are extras; ACCESS_EXTRA_BIT_A=bit 4 / B=bit 6
+                // must stay zero for a common slot).
+                access_invert: 0b0000_0011_1010_1111,
+            };
+            pas.cnt += 1;
+            pas.common += 1;
+        }
+        crate::matrix_game::map::set_weapon_matrix_for(RobotUnitKind::ARMOR_PASSIVE, pas);
+
         let mut b = RobotBuilder::new();
         b.operate_unit(RobotUnitType::Chassis, RobotUnitKind::CHASSIS_TRACK);
         b.operate_unit(RobotUnitType::Armor, RobotUnitKind::ARMOR_NUCLEAR); // 4 common slots
@@ -2080,8 +2113,47 @@ mod robot_config_tests {
         assert_eq!(c.unit_count(), 4);
     }
 
+    /// Build a synthetic 2-common-+1-extra weapon matrix for tests.
+    /// Mirrors the layout the C++ `RobotPreload` produces from a
+    /// typical armor.vo, so the tests below stay independent of any
+    /// real VO loading at test-time (which doesn't happen).
+    fn fake_weapon_matrix(common: i32, extra: i32) -> WeaponMatrix {
+        let mut m = WeaponMatrix::default();
+        let mut next_id = 20;
+        for _ in 0..common {
+            m.list[m.cnt as usize] = crate::matrix_game::map::WeaponMatrixSlot {
+                id: next_id,
+                // Allow weapon kinds 1..=10 except the extra-only ones.
+                // bits 0,1,2,3,5,7,8,9 — kinds 1,2,3,4,6,8,9,10
+                // (machinegun..repair, excluding mortar=5 and bomb=7
+                // which are extras; ACCESS_EXTRA_BIT_A=bit 4 / B=bit 6
+                // must stay zero for a common slot).
+                access_invert: 0b0000_0011_1010_1111,
+            };
+            m.cnt += 1;
+            m.common += 1;
+            next_id += 1;
+        }
+        for _ in 0..extra {
+            m.list[m.cnt as usize] = crate::matrix_game::map::WeaponMatrixSlot {
+                id: next_id,
+                // Bit 4 (BOMB) and bit 6 (FLAMETHROWER) flag the slot
+                // as extra per ACCESS_EXTRA_BIT_*.
+                access_invert: (1 << 4) | (1 << 6),
+            };
+            m.cnt += 1;
+            m.extra += 1;
+            next_id += 1;
+        }
+        m
+    }
+
     #[test]
     fn find_pylon_for_common_weapon_returns_first_empty() {
+        crate::matrix_game::map::set_weapon_matrix_for(
+            RobotUnitKind::ARMOR_ACTIVE,
+            fake_weapon_matrix(2, 1),
+        );
         let m: WeaponMatrix = default_weapon_matrix(RobotUnitKind::ARMOR_ACTIVE);
         let current = [Unit::empty(); MAX_WEAPON_CNT];
         assert_eq!(
@@ -2092,6 +2164,10 @@ mod robot_config_tests {
 
     #[test]
     fn find_pylon_for_super_weapon_returns_extra_slot() {
+        crate::matrix_game::map::set_weapon_matrix_for(
+            RobotUnitKind::ARMOR_ACTIVE,
+            fake_weapon_matrix(2, 1),
+        );
         let m = default_weapon_matrix(RobotUnitKind::ARMOR_ACTIVE);
         let current = [Unit::empty(); MAX_WEAPON_CNT];
         assert_eq!(
@@ -2102,7 +2178,14 @@ mod robot_config_tests {
 
     #[test]
     fn weapon_matrix_is_extra_slot_flags_match() {
-        let m = default_weapon_matrix(RobotUnitKind::ARMOR_NUCLEAR);
+        // ARMOR_FIREPROOF chosen so other tests that seed ARMOR_NUCLEAR
+        // / ARMOR_ACTIVE / ARMOR_PASSIVE for their own assertions don't
+        // race with this one when cargo runs the test set in parallel.
+        crate::matrix_game::map::set_weapon_matrix_for(
+            RobotUnitKind::ARMOR_FIREPROOF,
+            fake_weapon_matrix(4, 1),
+        );
+        let m = default_weapon_matrix(RobotUnitKind::ARMOR_FIREPROOF);
         assert!(!m.is_extra_slot(0));
         assert!(!m.is_extra_slot(3));
         assert!(m.is_extra_slot(4));
