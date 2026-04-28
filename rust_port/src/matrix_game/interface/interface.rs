@@ -814,6 +814,20 @@ impl CInterface {
                 _ => None,
             };
 
+            // `itprice` — port of CInterface.cpp:2356. The per-item
+            // "Стоимость:" label is only visible when there's a focused
+            // element with a non-empty kind. `pricel` ("общая стоимость:")
+            // is the always-on summary header and is NOT gated here —
+            // the original only gates IF_BASE_ITEM_PRICE.
+            let focus_has_kind = ctx
+                .focused_target
+                .map(|t| !t.kind.is_empty())
+                .unwrap_or(false);
+            let itprice_v: Option<bool> = match n {
+                "itprice" => Some(focus_has_kind),
+                _ => None,
+            };
+
             // Right-side per-kind preview / info-text overlay. The C++
             // shows `headN_st` + `iheN_text` etc. for the focused
             // (type, kind) only — see CInterface.cpp:2358-2406.
@@ -886,6 +900,8 @@ impl CInterface {
             } else if let Some(v) = res_v {
                 e.set_visible(v);
             } else if let Some(v) = warn_v {
+                e.set_visible(v);
+            } else if let Some(v) = itprice_v {
                 e.set_visible(v);
             } else if let Some(v) = template_v {
                 e.set_visible(v);
@@ -969,11 +985,33 @@ impl CInterface {
             // every state-image carries a (possibly empty) m_Caption
             // from construction.
             if e.labels.is_empty() {
+                // Position a baseline-anchored label inside the cell:
+                // measure the element height and place the AFT line so
+                // its visual midline sits on the element's vertical
+                // mid-line. Verdana's AFT line_height includes both
+                // ascent and descent, which makes naive align_y=1
+                // (cell_top = mid - line_h/2) place text top-heavy
+                // because most glyph mass sits ABOVE the baseline.
+                // Positioning with align_y=0 + explicit `y` lets us
+                // stay independent of element size_y quirks (some
+                // panel-data entries ship size_y=0) and keeps numeric
+                // readouts visually centred.
+                //
+                // Empirical offsets — 6 pixels from the element top —
+                // line up with the original game's struct/damage cells.
+                let y_off = if e.size_y > 1.0 {
+                    // Centre on the element midline: place baseline at
+                    // mid_y + ascent/3 so the digit body sits over the
+                    // mid (digits have small descender, mostly ascend).
+                    (e.size_y * 0.5 - 5.0).max(0.0)
+                } else {
+                    6.0
+                };
                 e.labels.push(ElementLabel {
                     state: ElementState::Normal,
                     text: new_text.to_string(),
                     x: 0.0,
-                    y: 0.0,
+                    y: y_off,
                     sme_x: 0.0,
                     sme_y: 0.0,
                     align_x: if matches!(e.name.as_str(), "struct" | "damage") {
@@ -981,7 +1019,7 @@ impl CInterface {
                     } else {
                         1 // centered text (rcname)
                     },
-                    align_y: 1,
+                    align_y: 0,
                     wrap: force_wrap,
                     font: "Font.2Small".to_string(),
                     color: [246, 192, 0, 255],
@@ -991,6 +1029,18 @@ impl CInterface {
                     lbl.text = new_text.to_string();
                     if force_wrap {
                         lbl.wrap = true;
+                    }
+                    // Numeric readout cells (`struct` / `damage`) ship
+                    // from panel data with `align_y=0, sme_y=-2` — our
+                    // renderer treats align_y=0 as "cell top at anchor"
+                    // so the digits land 2 px above the cell, looking
+                    // elevated. Force-center them on the element midline
+                    // so the digits sit inside the 11-px cell aligned
+                    // with the adjacent `strucl` / `daml` captions.
+                    if matches!(e.name.as_str(), "struct" | "damage") {
+                        lbl.align_y = 1;
+                        lbl.y = 0.0;
+                        lbl.sme_y = 0.0;
                     }
                 }
             }
@@ -1475,10 +1525,16 @@ fn load_element(stor: &Storage, rec: &str, kind: ElementKind) -> Option<IFaceEle
         }
     }
 
-    // Skip elements that carry no image anywhere — likely data-only
-    // records (ProgressBar anchors, counters) that the renderer
-    // doesn't have a hook for yet.
-    if images.iter().all(|i| i.is_none()) {
+    // Skip elements that carry no image AND no `Labels` block —
+    // those are data-only records (ProgressBar anchors, counters)
+    // the renderer has no hook for. Static elements with attached
+    // Labels but no per-state images (text-only captions like
+    // `pricel` / `weightl` / `chasl` that the C++ uses to print
+    // localised "общая стоимость:" / "корпус:" headers) must stay so
+    // the text pass can render them.
+    if images.iter().all(|i| i.is_none())
+        && stor.block_record(rec, "Labels").is_none()
+    {
         return None;
     }
 

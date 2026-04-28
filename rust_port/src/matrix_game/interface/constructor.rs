@@ -333,17 +333,7 @@ impl RobotBuilder {
         self.focused_price = None;
     }
 
-    /// Drop the cached focused label/description/price without losing
-    /// `focused_element`. Called by the popup-hover handler when the
-    /// cursor leaves all rows — the underlying pylon keeps its focus
-    /// (the popup is anchored to it), but the row-preview readout
-    /// should clear until a row is hovered again.
-    pub fn clear_focused_card(&mut self) {
-        self.focused_text = FocusedText::default();
-        self.focused_price = None;
-    }
-
-    fn refresh_current_focus(&mut self) {
+    pub fn refresh_current_focus(&mut self) {
         let Some(name) = self.focused_element.clone() else {
             return;
         };

@@ -1620,12 +1620,16 @@ fn preview_popup_hover(
     popup.previewed = popup.hovered;
     let Some(idx) = popup.hovered else {
         // Cursor left the popup rows — restore the saved preview
-        // and clear the focused label/price so the Base-panel card
-        // stops showing stale row-preview text.
+        // and re-apply the originating pylon's focused label/price
+        // for the equipped component, so the Base-panel left card
+        // keeps showing the equipped item rather than going blank.
+        // The C++ leaves `m_FocusedElement` pointed at the pylon
+        // for the entire popup lifetime (CIFaceMenu.cpp:383 commented
+        // out), and `Djeans007` only fires on row hover.
         if let Some(saved) = popup.saved_config {
             builder.apply_config(saved);
         }
-        builder.clear_focused_card();
+        builder.refresh_current_focus();
         return;
     };
     let Some(item) = popup.items.get(idx).cloned() else {
