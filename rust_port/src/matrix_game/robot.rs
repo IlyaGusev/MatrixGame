@@ -194,10 +194,14 @@ pub struct Robot {
     /// to decide the transition graph.
     pub animation: Animation,
     /// Port of the first `SMatrixRobotUnit::m_Graph` animation
-    /// cursor (MatrixObjectRobot.hpp). Only the chassis unit is
-    /// rendered right now so we carry exactly one `AnimState`;
-    /// armor / weapon / head each get their own when they land.
+    /// cursor (MatrixObjectRobot.hpp). One `AnimState` per part —
+    /// chassis is the active animation under `do_chassis_animation`,
+    /// the rest get a constant-rate `Takt(cms)` per
+    /// MatrixObjectRobot.cpp:759-776 with an idle reset at anim end.
     pub chassis_anim: crate::matrix_lib::three_g::vector_object::AnimState,
+    pub armor_anim: crate::matrix_lib::three_g::vector_object::AnimState,
+    pub head_anim: crate::matrix_lib::three_g::vector_object::AnimState,
+    pub weapon_anims: [crate::matrix_lib::three_g::vector_object::AnimState; 5],
 
     /// Port of `CMatrixRobot::m_Name` (MatrixRobot.hpp). Display name
     /// composed from chassis/armor/head label parts + total damage
@@ -284,6 +288,9 @@ impl Robot {
             place_add: None,
             animation: Animation::Off,
             chassis_anim: Default::default(),
+            armor_anim: Default::default(),
+            head_anim: Default::default(),
+            weapon_anims: Default::default(),
             name: String::new(),
             team: 0,
             config: crate::matrix_game::interface::constructor::RobotConfig::new(),
@@ -546,6 +553,62 @@ impl Robot {
         self.move_path.clear();
         self.velocity = glam::Vec2::ZERO;
         self.speed = 0.0;
+    }
+
+    /// Port of `CMatrixRobotAI::RotateHull(dest)` (MatrixRobot.cpp:
+    /// 2233-2299). Lerps `hull_forward` toward the unit direction from
+    /// the robot's position to `dest` at rate `m_maxHullSpeed` (loaded
+    /// from `Chars/Armor/ARMOR{N}_ROTATION_SPEED`). The C++ MAX_HULL_ANGLE
+    /// = GRAD2RAD(360) clamp at lines 2288-2296 is dead code (fabs of an
+    /// angle never reaches 2π) so we omit it.
+    ///
+    /// `cms` scales the step like `rotate_robot` — the C++ takt cadence
+    /// is 10 ms, so `sync_mul = cms / 10` keeps real-time behaviour
+    /// independent of the frame rate.
+    pub fn rotate_hull(&mut self, dest: glam::Vec2, cms: i32) {
+        let here = glam::Vec2::new(self.pos_x, self.pos_y);
+        let dest_dir = dest - here;
+        if dest_dir.length_squared() < 1e-8 {
+            return;
+        }
+        let dest_dir_n = dest_dir.normalize();
+
+        // Per-armor max hull rotation speed
+        // (`g_Config.m_ItemChars[ARMOR{N}_ROTATION_SPEED]`,
+        // MatrixRobot.cpp:4200-4214).
+        let armor_kind = self.config.hull.unit.kind.0;
+        let armor_idx = (armor_kind - 1).max(0) as usize;
+        let max_hull_speed = crate::matrix_game::config::global()
+            .item_chars
+            .armor_rotation_speed
+            .get(armor_idx)
+            .copied()
+            .unwrap_or(0.0);
+        if max_hull_speed <= 0.0 {
+            // No armor / no rate configured — snap to chassis forward
+            // so the hull at least doesn't drift away.
+            self.hull_forward = dest_dir_n;
+            return;
+        }
+        let sync_mul = (cms as f32) / 10.0;
+        let max_step = max_hull_speed * sync_mul;
+
+        // `Vec3Truncate(delta, max_step)` — keep delta as-is when its
+        // length is below the cap, otherwise scale to `max_step`. Port
+        // of MatrixRobot.cpp:2283-2285.
+        let delta = dest_dir_n - self.hull_forward;
+        let delta_len = delta.length();
+        let step = if delta_len > max_step && delta_len > 1e-8 {
+            delta * (max_step / delta_len)
+        } else {
+            delta
+        };
+
+        let new_hf = self.hull_forward + step;
+        let l = new_hf.length();
+        if l > 1e-6 {
+            self.hull_forward = new_hf / l;
+        }
     }
 
     /// Port of `CMatrixRobotAI::GetLost(v)` (MatrixRobot.cpp:5188-
@@ -1729,6 +1792,17 @@ impl MapStatic for Robot {
                 self.switch_animation(&vo, Animation::Stay);
             }
         }
+
+        // Hull tracking — port of the no-enemy fall-through at
+        // MatrixRobot.cpp:945-951:
+        //
+        //   RotateHull(D3DXVECTOR3(m_PosX + m_Forward.x, m_PosY + m_Forward.y, 0));
+        //
+        // Without enemy/AI vision logic ported, the hull always tracks
+        // chassis forward so it follows the chassis as it rotates.
+        // Combat/arcade hull-aim lands when those subsystems do.
+        let here = glam::Vec2::new(self.pos_x, self.pos_y);
+        self.rotate_hull(here + self.forward, cms);
     }
 
     fn side(&self) -> i32 {
