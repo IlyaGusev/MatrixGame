@@ -99,13 +99,248 @@ struct ChassisGpu {
     frames: Vec<FrameGpu>,
 }
 
-/// Per-robot draw ticket, rebuilt from scratch each frame in
-/// `sync_robots`. Each ticket emits one indexed draw per chassis
-/// surface of the robot's current VO frame.
-struct RobotDraw {
-    chassis: ChassisKind,
-    vo_frame: usize,
+/// Identifies which mesh slot supplies geometry for a `PartDraw`.
+/// Frame 0 is used for armor/head/weapons (port of CConstructor.cpp
+/// preview path; the C++ steady-state pose for these parts is the
+/// at-rest frame even on animated chassis).
+#[derive(Clone, Copy, Debug)]
+enum PartKind {
+    /// Chassis with active animation cursor frame.
+    Chassis(ChassisKind, usize),
+    /// `kind - 1` index into `RobotsRenderer::armor`.
+    Armor(usize),
+    /// `kind - 1` index into `RobotsRenderer::head`.
+    Head(usize),
+    /// `kind - 1` index into `RobotsRenderer::weapon`.
+    Weapon(usize),
+}
+
+/// Per-part draw ticket, rebuilt from scratch each frame in
+/// `sync_robots`. Each robot emits 1 chassis draw plus optional
+/// armor/head/weapon draws based on its `RobotConfig`.
+struct PartDraw {
+    kind: PartKind,
     instance_offset: u32,
+}
+
+const IDENTITY_MAT: [[f32; 4]; 4] = [
+    [1.0, 0.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0, 0.0],
+    [0.0, 0.0, 0.0, 1.0],
+];
+
+/// Reinterpret a 16-float D3D row-major matrix as a 4x4 row-array.
+fn flat_to_rows(flat: [f32; 16]) -> [[f32; 4]; 4] {
+    [
+        [flat[0], flat[1], flat[2], flat[3]],
+        [flat[4], flat[5], flat[6], flat[7]],
+        [flat[8], flat[9], flat[10], flat[11]],
+        [flat[12], flat[13], flat[14], flat[15]],
+    ]
+}
+
+/// Translation column of a D3D row-major matrix (`_41/_42/_43`).
+fn row_translate(m: &[[f32; 4]; 4]) -> [f32; 3] {
+    [m[3][0], m[3][1], m[3][2]]
+}
+
+/// 4x4 row-major multiply matching D3D's `v_out = v_in * A * B`
+/// convention so `child.m_Matrix = local * parent`.
+fn matmul(a: &[[f32; 4]; 4], b: &[[f32; 4]; 4]) -> [[f32; 4]; 4] {
+    let mut r = [[0.0f32; 4]; 4];
+    for i in 0..4 {
+        for j in 0..4 {
+            r[i][j] = a[i][0] * b[0][j]
+                + a[i][1] * b[1][j]
+                + a[i][2] * b[2][j]
+                + a[i][3] * b[3][j];
+        }
+    }
+    r
+}
+
+/// `pack` transposes D3D row-major → the shader's m0..m3 layout
+/// (each shader row = D3D column). Caller supplies the per-instance
+/// terrain/side tints — preview uses (1,1,1,1) for both, world uses
+/// the per-robot lighting + side color.
+fn pack_part_instance(
+    m: &[[f32; 4]; 4],
+    terrain_color: [f32; 4],
+    side_color: [f32; 4],
+) -> InstanceData {
+    InstanceData {
+        row0: [m[0][0], m[1][0], m[2][0], m[3][0]],
+        row1: [m[0][1], m[1][1], m[2][1], m[3][1]],
+        row2: [m[0][2], m[1][2], m[2][2], m[3][2]],
+        row3: [m[0][3], m[1][3], m[2][3], m[3][3]],
+        terrain_color,
+        unit_offset: [0.0, 0.0, 0.0, 0.0],
+        side_color,
+    }
+}
+
+/// Resolved world matrices for a robot's secondary parts. Each entry
+/// carries the `(kind - 1)` index into the matching GPU mesh table
+/// alongside the D3D row-major world matrix for the part.
+struct PartChain {
+    armor: Option<(usize, [[f32; 4]; 4])>,
+    head: Option<(usize, [[f32; 4]; 4])>,
+    weapons: [Option<(usize, [[f32; 4]; 4])>; 5],
+}
+
+#[derive(Clone, Copy, Debug)]
+struct VoWeaponSlot {
+    id: u32,
+    access_invert: u32,
+}
+
+/// Port of MatrixMap.cpp:270-326. Walks an armor VO's bones with
+/// `id >= 20` whose name starts with `"W,"` and packs the comma-
+/// separated kind list (plus optional `,I` invert flag) into a sorted
+/// slot table.
+fn build_vo_weapon_slots(vo: &vector_object::VoMesh) -> Vec<VoWeaponSlot> {
+    let mut slots: Vec<VoWeaponSlot> = Vec::new();
+    for m in &vo.matrices {
+        if m.id < 20 {
+            continue;
+        }
+        let parts: Vec<&str> = m.name.split(',').map(|s| s.trim()).collect();
+        if parts.is_empty() || parts[0] != "W" {
+            continue;
+        }
+        let mut access_invert: u32 = 0;
+        for tok in &parts[1..] {
+            if *tok == "I" {
+                access_invert |= 1u32 << 31;
+            } else if let Ok(kind) = tok.parse::<i32>() {
+                if (1..=32).contains(&kind) {
+                    access_invert |= 1u32 << (kind - 1);
+                }
+            }
+        }
+        slots.push(VoWeaponSlot {
+            id: m.id,
+            access_invert,
+        });
+    }
+    slots.sort_by_key(|s| s.id);
+    slots
+}
+
+/// Port of `CMatrixRobot::Draw`'s matrix-graph walk
+/// (MatrixObjectRobot.cpp:480-575) + the weapon-slot assignment at
+/// MatrixObjectRobot.cpp:252-268. Returns the world matrices for
+/// armor / head / each pilon weapon, expressed in D3D row-major and
+/// rooted at `chassis_world`.
+fn compute_part_chain(
+    chassis_world: &[[f32; 4]; 4],
+    chassis_gpu: &ChassisGpu,
+    armor_gpus: &[Option<ChassisGpu>],
+    armor_kind: Option<i32>,
+    head_kind: Option<i32>,
+    weapon_kinds: &[Option<i32>; 5],
+) -> PartChain {
+    // Chassis bone-1 mount (MatrixObjectRobot.cpp:490-492).
+    let chassis_bone1 = chassis_gpu
+        .vo_mesh
+        .matrix_by_id(1, 0)
+        .map(flat_to_rows)
+        .unwrap_or(IDENTITY_MAT);
+    let mut p = row_translate(&chassis_bone1);
+
+    // Armor branch (MatrixObjectRobot.cpp:525-545). The C++ rotation
+    // term reduces to identity in the steady state (HullForward = local
+    // Y axis), so we use IDENTITY directly — the chassis_world supplies
+    // the actual robot orientation.
+    let armor_rot = IDENTITY_MAT;
+    let armor_idx = armor_kind.and_then(|k| if k >= 1 { Some((k - 1) as usize) } else { None });
+    let armor_world_opt = armor_idx.and_then(|idx| {
+        let armor_gpu = armor_gpus.get(idx).and_then(|o| o.as_ref())?;
+        let mut m = armor_rot;
+        m[3][0] = p[0];
+        m[3][1] = p[1];
+        m[3][2] = p[2];
+        Some((idx, armor_gpu, matmul(&m, chassis_world)))
+    });
+
+    // Advance `p` by the armor's own bone-1 mount
+    // (MatrixObjectRobot.cpp:571-574).
+    if let Some((_, armor_gpu, _)) = armor_world_opt.as_ref() {
+        if let Some(ab) = armor_gpu.vo_mesh.matrix_by_id(1, 0) {
+            let ab = flat_to_rows(ab);
+            let tlx = ab[3][0];
+            let tly = ab[3][1];
+            let tlz = ab[3][2];
+            p[0] += tlx * armor_rot[0][0] + tly * armor_rot[1][0];
+            p[1] += tlx * armor_rot[0][1] + tly * armor_rot[1][1];
+            p[2] += tlz;
+        }
+    }
+
+    // Head branch (MatrixObjectRobot.cpp:547-559).
+    let head_idx = head_kind.and_then(|k| if k >= 1 { Some((k - 1) as usize) } else { None });
+    let head_world_opt = head_idx.map(|idx| {
+        let mut m = IDENTITY_MAT;
+        m[3][0] = p[0];
+        m[3][1] = p[1];
+        m[3][2] = p[2];
+        (idx, matmul(&m, chassis_world))
+    });
+
+    // Weapon slot assignment + per-weapon worlds.
+    let weapon_slots: Vec<VoWeaponSlot> = armor_world_opt
+        .as_ref()
+        .map(|(_, armor_gpu, _)| build_vo_weapon_slots(&armor_gpu.vo_mesh))
+        .unwrap_or_default();
+
+    let mut weapon_assignments: [Option<(u32, bool, usize)>; 5] = [None; 5];
+    let mut slot_used = vec![false; weapon_slots.len()];
+    for (pilon, wk) in weapon_kinds.iter().enumerate().take(5) {
+        let Some(kind) = wk else { continue };
+        if *kind < 1 {
+            continue;
+        }
+        let weapon_idx = (*kind - 1) as usize;
+        let bit = 1u32 << (*kind - 1);
+        for (t, s) in weapon_slots.iter().enumerate() {
+            if slot_used[t] {
+                continue;
+            }
+            if (s.access_invert & bit) == 0 {
+                continue;
+            }
+            slot_used[t] = true;
+            let invert = (s.access_invert & (1u32 << 31)) != 0;
+            weapon_assignments[pilon] = Some((s.id, invert, weapon_idx));
+            break;
+        }
+    }
+
+    let mut weapons: [Option<(usize, [[f32; 4]; 4])>; 5] = [None; 5];
+    if let Some((_, armor_gpu, armor_world)) = armor_world_opt.as_ref() {
+        for (pilon, assign) in weapon_assignments.iter().enumerate() {
+            let Some((slot_id, invert, weapon_idx)) = assign else {
+                continue;
+            };
+            let Some(slot) = armor_gpu.vo_mesh.matrix_by_id(*slot_id, 0) else {
+                continue;
+            };
+            let mut wm = matmul(&flat_to_rows(slot), armor_world);
+            if *invert {
+                wm[0][0] = -wm[0][0];
+                wm[0][1] = -wm[0][1];
+                wm[0][2] = -wm[0][2];
+            }
+            weapons[pilon] = Some((*weapon_idx, wm));
+        }
+    }
+
+    PartChain {
+        armor: armor_world_opt.map(|(idx, _, m)| (idx, m)),
+        head: head_world_opt,
+        weapons,
+    }
 }
 
 /// Camera override for icon-bake calls into `render_preview_full`.
@@ -143,12 +378,12 @@ pub struct RobotsRenderer {
     head: Vec<Option<ChassisGpu>>,
     /// Per-`RUK_WEAPON_*` weapon mesh.
     weapon: Vec<Option<ChassisGpu>>,
-    /// Per-frame instance buffer: one `InstanceData` per live robot.
-    /// Written contiguously in `sync_robots`; robots read at offset
-    /// `RobotDraw::instance_offset`.
+    /// Per-frame instance buffer: one `InstanceData` per live part
+    /// (chassis + armor + head + per-weapon). Written contiguously in
+    /// `sync_robots`; each `PartDraw::instance_offset` points into here.
     instance_buffer: wgpu::Buffer,
     instance_capacity: u32,
-    draws: Vec<RobotDraw>,
+    draws: Vec<PartDraw>,
     uniform_buffer: wgpu::Buffer,
     fog_color: [f32; 4],
     ambient_color: [f32; 4],
@@ -166,6 +401,10 @@ pub struct RobotsRenderer {
 }
 
 const MAX_LIVE_ROBOTS: u32 = 128;
+/// Up to 8 part instances per robot (1 chassis + 1 armor + 1 head +
+/// 5 weapons). Sized for the worst case so a fully-equipped fleet
+/// can render without a capacity break.
+const MAX_LIVE_INSTANCES: u32 = MAX_LIVE_ROBOTS * 8;
 
 impl RobotsRenderer {
     pub fn new(
@@ -232,7 +471,7 @@ impl RobotsRenderer {
 
         let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Robots Inst VB"),
-            size: (MAX_LIVE_ROBOTS as u64) * std::mem::size_of::<InstanceData>() as u64,
+            size: (MAX_LIVE_INSTANCES as u64) * std::mem::size_of::<InstanceData>() as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -585,6 +824,20 @@ impl RobotsRenderer {
         // ROBOT_*_CNT constants. Missing meshes (older asset bundles
         // pre-dating the pack_bundle update) leave those slots None.
         let (armor, armor_surfs) = load_part_meshes(6, "Armor", &mut tex_cache);
+        // Populate the global weapon-matrix table from the just-loaded
+        // armor VOs. Faithful port of CMatrixMap::RobotPreload's
+        // weapon-slot construction (MatrixMap.cpp:270-326): each
+        // armor's bones with id >= 20 + name "W,..." declare the
+        // weapon attach points.
+        for (idx, slot) in armor.iter().enumerate() {
+            if let Some(g) = slot {
+                let m = crate::matrix_game::map::weapon_matrix_from_vo(&g.vo_mesh);
+                crate::matrix_game::map::set_weapon_matrix_for(
+                    crate::matrix_game::config::RobotUnitKind((idx + 1) as i32),
+                    m,
+                );
+            }
+        }
         let (head, head_surfs) = load_part_meshes(4, "Head", &mut tex_cache);
         let (weapon, weapon_surfs) = load_part_meshes(10, "Weapon", &mut tex_cache);
         log::info!(
@@ -605,7 +858,7 @@ impl RobotsRenderer {
             head,
             weapon,
             instance_buffer,
-            instance_capacity: MAX_LIVE_ROBOTS,
+            instance_capacity: MAX_LIVE_INSTANCES,
             draws: Vec::new(),
             uniform_buffer,
             fog_color,
@@ -860,43 +1113,10 @@ impl RobotsRenderer {
         // ── Build the per-part world matrix chain ─────────────────
         //
         // Faithful port of `CMatrixRobot::Draw`'s matrix-graph walk at
-        // MatrixObjectRobot.cpp:480-575 together with the weapon-slot
-        // table built at MatrixMap.cpp:270-326 and the slot assignment
-        // at MatrixObjectRobot.cpp:252-268.
-        //
-        // All internal math runs in D3D row-major (the on-disk format
-        // of SVOMatrix). The shader reads the transpose (m0..m3 are
-        // the rows of a matrix used with column-vector multiply = the
-        // columns of a D3D row-major matrix), so `pack` transposes on
-        // upload.
-
-        fn flat_to_rows(flat: [f32; 16]) -> [[f32; 4]; 4] {
-            [
-                [flat[0], flat[1], flat[2], flat[3]],
-                [flat[4], flat[5], flat[6], flat[7]],
-                [flat[8], flat[9], flat[10], flat[11]],
-                [flat[12], flat[13], flat[14], flat[15]],
-            ]
-        }
-        fn row_translate(m: &[[f32; 4]; 4]) -> [f32; 3] {
-            // D3D row-major: translation lives in row 3, columns 0-2
-            // (_41/_42/_43).
-            [m[3][0], m[3][1], m[3][2]]
-        }
-        fn matmul(a: &[[f32; 4]; 4], b: &[[f32; 4]; 4]) -> [[f32; 4]; 4] {
-            // Row-major multiply — matches D3D's `v_out = v_in * A * B`
-            // convention so `child.m_Matrix = local * parent`.
-            let mut r = [[0.0f32; 4]; 4];
-            for i in 0..4 {
-                for j in 0..4 {
-                    r[i][j] = a[i][0] * b[0][j]
-                        + a[i][1] * b[1][j]
-                        + a[i][2] * b[2][j]
-                        + a[i][3] * b[3][j];
-                }
-            }
-            r
-        }
+        // MatrixObjectRobot.cpp:480-575 — chassis_world is the
+        // turntable spin (`CConstructor::Render` runs the preview on
+        // an identity-rooted robot), and the bone chain rooted at it
+        // produces armor / head / weapon world matrices.
 
         // D3DXMatrixRotationZ (row-major) used for the turntable spin.
         // The C++ preview itself uses an identity world matrix
@@ -913,217 +1133,32 @@ impl RobotsRenderer {
             ]
         };
 
-        // Chassis mount = chassis.bone(1).translate — port of
-        // MatrixObjectRobot.cpp:490-492 (`tm = m_Unit[0].m_Graph->GetMatrixById(1);
-        //   p = *(D3DXVECTOR3 *)&tm->_41;`).
-        const IDENTITY: [[f32; 4]; 4] = [
-            [1.0, 0.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0, 0.0],
-            [0.0, 0.0, 1.0, 0.0],
-            [0.0, 0.0, 0.0, 1.0],
-        ];
-        let chassis_bone1 = chassis_gpu
-            .vo_mesh
-            .matrix_by_id(1, 0)
-            .map(flat_to_rows)
-            .unwrap_or(IDENTITY);
-        let mut p = row_translate(&chassis_bone1);
+        let chain = compute_part_chain(
+            &chassis_world,
+            chassis_gpu,
+            &self.armor,
+            armor_kind,
+            head_kind,
+            weapon_kinds,
+        );
 
-        // Armor branch (MatrixObjectRobot.cpp:525-545):
-        //   D3DXMatrixIdentity(&m);
-        //   th = D3DXVec3TransformNormal(m_HullForward, m_Core->m_IMatrix);
-        //   m._21 = th.x;   m._22 = th.y;
-        //   m._11 = th.y;   m._12 = -th.x;
-        //   goto calc;  // m._41..43 = p, m_Unit[i].m_Matrix = m * core;
-        //
-        // For the preview the C++ Draw path runs against a robot whose
-        // `m_Core->m_Matrix = identity` and `m_HullForward = (0,1,0)`
-        // (the default in `RNeed(MR_Matrix)` before any animation step);
-        // that yields `th = (0,1,0)` and `m` becomes the identity
-        // rotation. Our chassis_world carries the turntable spin
-        // additionally so armor/head/weapons rotate with it.
-        let armor_rot = IDENTITY; // th=(0,1,0) → m._11=1, m._22=1, off-diag=0
-        let armor_world_opt = armor_kind.and_then(|k| {
-            if k < 1 {
-                return None;
-            }
-            let armor_gpu = self.armor.get((k - 1) as usize).and_then(|o| o.as_ref())?;
-            // m = armor_rot with translation column (_41..43) = p.
-            let mut m = armor_rot;
-            m[3][0] = p[0];
-            m[3][1] = p[1];
-            m[3][2] = p[2];
-            Some((armor_gpu, matmul(&m, &chassis_world)))
-        });
-
-        // After the `calc:` label the C++ advances `p` by the unit's
-        // own bone 1 transformed by the child's rotation (Matrix-
-        // ObjectRobot.cpp:571-574):
-        //   p.x += tm->_41 * m._11 + tm->_42 * m._21;
-        //   p.y += tm->_41 * m._12 + tm->_42 * m._22;
-        //   p.z += tm->_43;
-        // where `tm = m_Unit[i].m_Graph->GetMatrixById(1)` (the unit's
-        // local mount point) and `m` is the child's rotation.
-        if let Some((armor_gpu, _)) = armor_world_opt.as_ref() {
-            if let Some(ab) = armor_gpu.vo_mesh.matrix_by_id(1, 0) {
-                let ab = flat_to_rows(ab);
-                let tlx = ab[3][0];
-                let tly = ab[3][1];
-                let tlz = ab[3][2];
-                p[0] += tlx * armor_rot[0][0] + tly * armor_rot[1][0];
-                p[1] += tlx * armor_rot[0][1] + tly * armor_rot[1][1];
-                p[2] += tlz;
-            }
-        }
-
-        // Head branch (MatrixObjectRobot.cpp:547-559): same shape as
-        // armor but with the accumulated `p`.
-        let head_rot = IDENTITY;
-        let head_gpu_opt = head_kind.and_then(|k| {
-            if k < 1 {
-                return None;
-            }
-            self.head.get((k - 1) as usize).and_then(|o| o.as_ref())
-        });
-        let head_world_opt = head_gpu_opt.map(|_| {
-            let mut m = head_rot;
-            m[3][0] = p[0];
-            m[3][1] = p[1];
-            m[3][2] = p[2];
-            matmul(&m, &chassis_world)
-        });
-
-        // ── Weapon slot table (port of MatrixMap.cpp:270-326) ─────
-        //
-        // For each armor VO, collect matrices with id >= 20 whose name
-        // encodes `"W, kind1, kind2, ..., [I]"`. Each bone becomes a
-        // weapon slot; the `access_invert` bitmask records compatible
-        // weapon kinds (`1 << (kind-1)`) plus `SETBIT(31)` when the
-        // slot name ends in `,I` (invert bit → mirror-flip on X axis
-        // for the attached weapon). Slots are then sorted by bone id.
-        #[derive(Clone, Copy, Debug)]
-        struct WeaponSlot {
-            id: u32,
-            access_invert: u32,
-        }
-        fn build_weapon_slots(vo: &vector_object::VoMesh) -> Vec<WeaponSlot> {
-            let mut slots: Vec<WeaponSlot> = Vec::new();
-            for m in &vo.matrices {
-                if m.id < 20 {
-                    continue;
-                }
-                // Parse comma-separated name: first token must be "W".
-                let parts: Vec<&str> = m.name.split(',').map(|s| s.trim()).collect();
-                if parts.is_empty() || parts[0] != "W" {
-                    continue;
-                }
-                let mut access_invert: u32 = 0;
-                for tok in &parts[1..] {
-                    if *tok == "I" {
-                        access_invert |= 1u32 << 31;
-                    } else if let Ok(kind) = tok.parse::<i32>() {
-                        if (1..=32).contains(&kind) {
-                            access_invert |= 1u32 << (kind - 1);
-                        }
-                    }
-                }
-                slots.push(WeaponSlot {
-                    id: m.id,
-                    access_invert,
-                });
-            }
-            slots.sort_by_key(|s| s.id);
-            slots
-        }
-        let weapon_slots: Vec<WeaponSlot> = armor_world_opt
-            .as_ref()
-            .map(|(armor_gpu, _)| build_weapon_slots(&armor_gpu.vo_mesh))
-            .unwrap_or_default();
-
-        // Slot assignment (port of MatrixObjectRobot.cpp:254-268).
-        // For each weapon in insertion order, grab the first available
-        // slot whose `access_invert` bit for this weapon kind is set.
-        // Records both the bone id and the invert flag for mirroring.
-        let mut weapon_assignments: [Option<(u32, bool)>; 5] = [None; 5];
-        let mut slot_used = vec![false; weapon_slots.len()];
-        for (pilon, wk) in weapon_kinds.iter().enumerate().take(5) {
-            let Some(kind) = wk else {
-                continue;
-            };
-            if *kind < 1 {
-                continue;
-            }
-            let bit = 1u32 << (*kind - 1);
-            for (t, s) in weapon_slots.iter().enumerate() {
-                if slot_used[t] {
-                    continue;
-                }
-                if (s.access_invert & bit) == 0 {
-                    continue;
-                }
-                slot_used[t] = true;
-                let invert = (s.access_invert & (1u32 << 31)) != 0;
-                weapon_assignments[pilon] = Some((s.id, invert));
-                break;
-            }
-        }
-
-        // Compute per-weapon world matrices. Port of
-        // MatrixObjectRobot.cpp:504-522:
-        //   tm = m_Unit[narmor].m_Graph->GetMatrixById(m_Unit[i].m_LinkMatrix);
-        //   m_Unit[i].m_Matrix = (*tm) * m_Unit[narmor].m_Matrix;
-        //   if(m_Unit[i].m_Invert) negate X-axis row (_11.._13).
-        let mut weapon_worlds: [Option<[[f32; 4]; 4]>; 5] = [None; 5];
-        if let Some((armor_gpu, armor_world)) = armor_world_opt.as_ref() {
-            for (pilon, assign) in weapon_assignments.iter().enumerate() {
-                let Some((slot_id, invert)) = assign else {
-                    continue;
-                };
-                let Some(slot) = armor_gpu.vo_mesh.matrix_by_id(*slot_id, 0) else {
-                    continue;
-                };
-                let mut wm = matmul(&flat_to_rows(slot), armor_world);
-                if *invert {
-                    // MatrixObjectRobot.cpp:515-521 — flip X basis (row 0).
-                    wm[0][0] = -wm[0][0];
-                    wm[0][1] = -wm[0][1];
-                    wm[0][2] = -wm[0][2];
-                }
-                weapon_worlds[pilon] = Some(wm);
-            }
-        }
-
-        // `pack` transposes D3D row-major → the shader's m0..m3 layout
-        // (each shader row = D3D column). Matches the convention used
-        // by the existing `robot_instance` at line ~1230.
-        fn pack(m: &[[f32; 4]; 4]) -> InstanceData {
-            InstanceData {
-                row0: [m[0][0], m[1][0], m[2][0], m[3][0]],
-                row1: [m[0][1], m[1][1], m[2][1], m[3][1]],
-                row2: [m[0][2], m[1][2], m[2][2], m[3][2]],
-                row3: [m[0][3], m[1][3], m[2][3], m[3][3]],
-                terrain_color: [1.0, 1.0, 1.0, 1.0],
-                unit_offset: [0.0, 0.0, 0.0, 0.0],
-                // Constructor preview: no side tint. The C++'s
-                // `CConstructor::Render` draws the preview robot with
-                // the default white texture-factor, not via
-                // `GetSideColorTexture` (CConstructor.cpp:340-360).
-                side_color: [1.0, 1.0, 1.0, 1.0],
-            }
-        }
         // Upload all 8 instance slots. Slot assignment:
-        //   0 — chassis, 1 — armor, 2 — head, 3..7 — weapons[0..4]
-        let identity_packed = pack(&IDENTITY);
-        let mut instances = [identity_packed; 8];
+        //   0 — chassis, 1 — armor, 2 — head, 3..7 — weapons[0..4].
+        // Constructor preview tints are flat white (CConstructor.cpp:
+        // 340-360 doesn't apply terrain or side colour).
+        let pack = |m: &[[f32; 4]; 4]| {
+            pack_part_instance(m, [1.0, 1.0, 1.0, 1.0], [1.0, 1.0, 1.0, 1.0])
+        };
+        let mut instances = [pack(&IDENTITY_MAT); 8];
         instances[0] = pack(&chassis_world);
-        if let Some((_, m)) = armor_world_opt.as_ref() {
+        if let Some((_, m)) = chain.armor.as_ref() {
             instances[1] = pack(m);
         }
-        if let Some(m) = head_world_opt.as_ref() {
+        if let Some((_, m)) = chain.head.as_ref() {
             instances[2] = pack(m);
         }
-        for (i, m) in weapon_worlds.iter().enumerate() {
-            if let Some(m) = m {
+        for (i, w) in chain.weapons.iter().enumerate() {
+            if let Some((_, m)) = w {
                 instances[3 + i] = pack(m);
             }
         }
@@ -1159,24 +1194,22 @@ impl RobotsRenderer {
         // chassis, armor, weapons (under armor), head.
         let mut parts: Vec<(&ChassisGpu, u32)> = Vec::with_capacity(8);
         parts.push((chassis_gpu, 0));
-        if let Some((armor_gpu, _)) = armor_world_opt {
-            parts.push((armor_gpu, 1));
+        if let Some((idx, _)) = chain.armor.as_ref() {
+            if let Some(gpu) = self.armor.get(*idx).and_then(|o| o.as_ref()) {
+                parts.push((gpu, 1));
+            }
         }
-        for (pilon, wk) in weapon_kinds.iter().enumerate().take(5) {
-            if let Some(k) = wk {
-                if *k >= 1 {
-                    if let Some(gpu) = self.weapon.get((*k - 1) as usize).and_then(|o| o.as_ref()) {
-                        // Only draw if the bone chain produced a real
-                        // world matrix (otherwise we'd draw at origin).
-                        if weapon_worlds[pilon].is_some() {
-                            parts.push((gpu, 3 + pilon as u32));
-                        }
-                    }
+        for (pilon, w) in chain.weapons.iter().enumerate() {
+            if let Some((idx, _)) = w {
+                if let Some(gpu) = self.weapon.get(*idx).and_then(|o| o.as_ref()) {
+                    parts.push((gpu, 3 + pilon as u32));
                 }
             }
         }
-        if let Some(head_gpu) = head_gpu_opt {
-            parts.push((head_gpu, 2));
+        if let Some((idx, _)) = chain.head.as_ref() {
+            if let Some(gpu) = self.head.get(*idx).and_then(|o| o.as_ref()) {
+                parts.push((gpu, 2));
+            }
         }
 
         for (gpu, instance_idx) in parts {
@@ -1260,16 +1293,108 @@ impl RobotsRenderer {
                 .vo_frame
                 .min(chassis_gpu.frames.len().saturating_sub(1));
 
-            if offset >= self.instance_capacity {
+            // Per-robot lighting / side tint — same values for every
+            // part of this robot.
+            let [terrain_r, terrain_g, terrain_b] = unpack_rgb(
+                map.static_object_color_with_lighting(
+                    robot.pos_x,
+                    robot.pos_y,
+                    Some(point_lights),
+                ),
+            );
+            let terrain_color = [terrain_r, terrain_g, terrain_b, 1.0];
+            let [sr, sg, sb] = crate::matrix_game::side::side_color_rgb(robot.side);
+            let side_color = [sr, sg, sb, 1.0];
+
+            // Robot world matrix in D3D row-major form (the same
+            // basis `robot_instance` builds, but laid out row-by-row
+            // before transpose-pack so the bone chain helper can
+            // multiply it as a parent matrix).
+            let chassis_world = robot_world_d3d_rowmajor(robot, cx, cy);
+
+            // Compute armor / head / weapon worlds.
+            let armor_kind_i = robot.config.hull.unit.kind.0;
+            let head_kind_i = robot.config.head.kind.0;
+            let weapon_kinds: [Option<i32>; 5] = [
+                non_zero_kind(robot.config.weapon[0].kind.0),
+                non_zero_kind(robot.config.weapon[1].kind.0),
+                non_zero_kind(robot.config.weapon[2].kind.0),
+                non_zero_kind(robot.config.weapon[3].kind.0),
+                non_zero_kind(robot.config.weapon[4].kind.0),
+            ];
+            let chain = compute_part_chain(
+                &chassis_world,
+                chassis_gpu,
+                &self.armor,
+                non_zero_kind(armor_kind_i),
+                non_zero_kind(head_kind_i),
+                &weapon_kinds,
+            );
+
+            // Push chassis instance + part instances. Each gets its
+            // own slot in the shared instance buffer with a matching
+            // PartDraw entry.
+            let push_instance = |instance_data: &mut Vec<InstanceData>,
+                                 draws: &mut Vec<PartDraw>,
+                                 offset: &mut u32,
+                                 cap: u32,
+                                 m: &[[f32; 4]; 4],
+                                 kind: PartKind|
+             -> bool {
+                if *offset >= cap {
+                    return false;
+                }
+                instance_data.push(pack_part_instance(m, terrain_color, side_color));
+                draws.push(PartDraw {
+                    kind,
+                    instance_offset: *offset,
+                });
+                *offset += 1;
+                true
+            };
+
+            if !push_instance(
+                &mut instance_data,
+                &mut self.draws,
+                &mut offset,
+                self.instance_capacity,
+                &chassis_world,
+                PartKind::Chassis(robot.chassis, vo_frame),
+            ) {
                 break;
             }
-            instance_data.push(robot_instance(robot, cx, cy, map, Some(point_lights)));
-            self.draws.push(RobotDraw {
-                chassis: robot.chassis,
-                vo_frame,
-                instance_offset: offset,
-            });
-            offset += 1;
+            if let Some((idx, m)) = chain.armor.as_ref() {
+                push_instance(
+                    &mut instance_data,
+                    &mut self.draws,
+                    &mut offset,
+                    self.instance_capacity,
+                    m,
+                    PartKind::Armor(*idx),
+                );
+            }
+            if let Some((idx, m)) = chain.head.as_ref() {
+                push_instance(
+                    &mut instance_data,
+                    &mut self.draws,
+                    &mut offset,
+                    self.instance_capacity,
+                    m,
+                    PartKind::Head(*idx),
+                );
+            }
+            for w in chain.weapons.iter() {
+                if let Some((idx, m)) = w {
+                    push_instance(
+                        &mut instance_data,
+                        &mut self.draws,
+                        &mut offset,
+                        self.instance_capacity,
+                        m,
+                        PartKind::Weapon(*idx),
+                    );
+                }
+            }
         }
 
         if !instance_data.is_empty() {
@@ -1305,16 +1430,40 @@ impl RobotsRenderer {
         );
 
         pass.set_pipeline(&self.pipeline);
+        pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
         for draw in &self.draws {
-            let ck_idx = chassis_kind_index(draw.chassis);
-            let Some(chassis_gpu) = self.chassis.get(ck_idx).and_then(|o| o.as_ref()) else {
+            let (gpu, vo_frame) = match draw.kind {
+                PartKind::Chassis(chassis, frame) => {
+                    let Some(g) =
+                        self.chassis.get(chassis_kind_index(chassis)).and_then(|o| o.as_ref())
+                    else {
+                        continue;
+                    };
+                    (g, frame)
+                }
+                PartKind::Armor(idx) => {
+                    let Some(g) = self.armor.get(idx).and_then(|o| o.as_ref()) else {
+                        continue;
+                    };
+                    (g, 0)
+                }
+                PartKind::Head(idx) => {
+                    let Some(g) = self.head.get(idx).and_then(|o| o.as_ref()) else {
+                        continue;
+                    };
+                    (g, 0)
+                }
+                PartKind::Weapon(idx) => {
+                    let Some(g) = self.weapon.get(idx).and_then(|o| o.as_ref()) else {
+                        continue;
+                    };
+                    (g, 0)
+                }
+            };
+            let Some(frame) = gpu.frames.get(vo_frame) else {
                 continue;
             };
-            let Some(frame) = chassis_gpu.frames.get(draw.vo_frame) else {
-                continue;
-            };
-            pass.set_vertex_buffer(0, chassis_gpu.vertex_buffer.slice(..));
-            pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
+            pass.set_vertex_buffer(0, gpu.vertex_buffer.slice(..));
             for surface in &frame.surfaces {
                 pass.set_bind_group(0, &surface.bind_group, &[]);
                 pass.set_index_buffer(surface.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
@@ -1406,51 +1555,40 @@ fn do_chassis_animation(robot: &mut Robot, vo: &vector_object::VoMesh, now_ms: f
 }
 
 fn chassis_kind_index(c: ChassisKind) -> usize {
+    // Mirror MatrixConfig.hpp:39-43 — RUK_CHASSIS_PNEUMATIC=1,
+    // WHEEL=2, TRACK=3, HOVERCRAFT=4, ANTIGRAVITY=5. The .vo file
+    // index is `kind - 1` (Chassis1.vo = Pneumatic, Chassis5.vo =
+    // Antigravity), so Hovercraft must come BEFORE AntiGravity here.
     match c {
         ChassisKind::Pneumatic => 0,
         ChassisKind::Wheel => 1,
         ChassisKind::Track => 2,
-        ChassisKind::AntiGravity => 3,
-        ChassisKind::Hovercraft => 4,
+        ChassisKind::Hovercraft => 3,
+        ChassisKind::AntiGravity => 4,
     }
 }
 
-/// Build one instance transform for a live `Robot`. Port of the
-/// side/forward/up → `m_Core->m_Matrix._11.._34` column assignment
-/// at MatrixObjectRobot.cpp:443-458 (the branch taken for the normal
-/// land / water / move-out states).
-///
-/// The original D3D row-major assignment:
-///   `_11/_12/_13` = side world xyz  (row 1)
-///   `_21/_22/_23` = forward world xyz (row 2)
-///   `_31/_32/_33` = up world xyz    (row 3)
-///   `_41/_42/_43` = pos world xyz   (row 4)
-///
-/// In D3D row-major, a local point `(1,0,0)` ends up at row 1 = side;
-/// i.e. local X maps to world side, local Y to world forward, local Z
-/// to world up. Our shader is column-major glam and reads the instance
-/// as three basis *columns*: `row0.xyz = x-axis-to-world`,
-/// `row1.xyz = y-axis-to-world`, `row2.xyz = z-axis-to-world`. Under
-/// that convention `row_i.x = side.x (=_11)`, `row_i.y = side.y (=_12)`,
-/// etc. So the instance rows end up literally identical to the D3D
-/// row-major layout — we just copy `_11/_12/_13/_14` into `row0` and
-/// so on, with the fourth column carrying the world translation.
-///
-/// Up is world-Z (terrain-normal slope fitting lands later — needs
-/// `CMatrixMap::GetNormal`). Side = cross(forward, up) ports the
-/// `D3DXVec3Cross(&side, &m_Forward, &up)` at MatrixObjectRobot.cpp:
-/// 450 + :451 Normalize.
-fn robot_instance(
-    r: &Robot,
-    cx: f32,
-    cy: f32,
-    map: &GameMap,
-    point_lights: Option<&PointLightSystem>,
-) -> InstanceData {
-    let [terrain_r, terrain_g, terrain_b] =
-        unpack_rgb(map.static_object_color_with_lighting(r.pos_x, r.pos_y, point_lights));
+/// Returns `Some(k)` for `k >= 1`, else `None`. Convenience for
+/// `RobotConfig` weapon kinds where 0 means "empty pylon".
+fn non_zero_kind(k: i32) -> Option<i32> {
+    if k >= 1 {
+        Some(k)
+    } else {
+        None
+    }
+}
 
-    // forward in XY plane, normalized. pos_x/y is the robot center.
+/// Robot's chassis world matrix in D3D row-major form — the same
+/// basis the C++ assembles at MatrixObjectRobot.cpp:443-458 for the
+/// normal land / water / move-out states. Used as the parent matrix
+/// for `compute_part_chain` and consumed by `pack_part_instance`,
+/// which transposes to the shader's column-vector m0..m3 layout.
+///
+/// D3D row-major assignment (`_11/_12/_13` = side; `_21/_22/_23` =
+/// forward; `_31/_32/_33` = up; `_41/_42/_43` = pos). Up is world-Z
+/// (slope-fit lands later via `CMatrixMap::GetNormal`); side =
+/// `cross(forward, up)`.
+fn robot_world_d3d_rowmajor(r: &Robot, cx: f32, cy: f32) -> [[f32; 4]; 4] {
     let f = {
         let v = r.forward;
         let l = v.length();
@@ -1462,23 +1600,14 @@ fn robot_instance(
     };
     let forward = glam::Vec3::new(f.x, f.y, 0.0);
     let up = glam::Vec3::new(0.0, 0.0, 1.0);
-    // side = cross(forward, up) — MatrixObjectRobot.cpp:450.
     let side = forward.cross(up).normalize_or_zero();
-    // tmp_forward = cross(up, side) — :452. In the planar case with
-    // slope up = (0,0,1), tmp_forward equals forward; we compute it
-    // faithfully so the slope port drops in unchanged.
     let fwd_out = up.cross(side).normalize_or_zero();
-
-    let [sr, sg, sb] = crate::matrix_game::side::side_color_rgb(r.side);
-    InstanceData {
-        row0: [side.x, fwd_out.x, up.x, r.pos_x - cx],
-        row1: [side.y, fwd_out.y, up.y, r.pos_y - cy],
-        row2: [side.z, fwd_out.z, up.z, r.pos_z],
-        row3: [0.0, 0.0, 0.0, 1.0],
-        terrain_color: [terrain_r, terrain_g, terrain_b, 1.0],
-        unit_offset: [0.0, 0.0, 0.0, 0.0],
-        side_color: [sr, sg, sb, 1.0],
-    }
+    [
+        [side.x, side.y, side.z, 0.0],
+        [fwd_out.x, fwd_out.y, fwd_out.z, 0.0],
+        [up.x, up.y, up.z, 0.0],
+        [r.pos_x - cx, r.pos_y - cy, r.pos_z, 1.0],
+    ]
 }
 
 fn resolve_diffuse(
