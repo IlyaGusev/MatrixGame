@@ -1381,17 +1381,16 @@ impl BuildingsRenderer {
                 // overrides from the CVO still win, mirroring the composed
                 // skin the original builds at VectorObject.cpp:2513.
                 let cvo_dir = cvo_path.rsplit_once('/').map(|(d, _)| format!("{d}/"));
-                // Silhouette source — body sub-units only. The original's
-                // `m_Graph = m_GGraph->m_Unit[0].m_Graph`
-                // (MatrixObjectBuilding.cpp) hands the body's VO to the
-                // shadow builder, NOT the animated parts. Including the
-                // BASE's platform / doors here causes their meshes (which
-                // sit below ground at rest under `unit_offset`) to bake
-                // into the silhouette and bleed out as a phantom "spawn
-                // pod" shadow next to the body. CVO body units carry
-                // `id = None` or `id = 0`; animated sub-units (platform = 1,
-                // doors = 2/3 on BASE) get their own id.
-                let is_body = unit.id.map_or(true, |id| id == 0);
+                // Silhouette source — only the first unit in the CVO group
+                // contributes. Filtering on `id` alone is not enough: e.g.
+                // `b0.cvo` (BASE) lists `b0_anim.vo` (the landing pod) as an
+                // anonymous unit with no `Id`, and `b1.cvo`/`b2.cvo`/`b4.cvo`
+                // each have an anonymous `platform.vo` with no `Id`. Both
+                // would pool into the silhouette and project a phantom shadow
+                // next to the body. The original's commented-out projected-
+                // shadow path uses `m_GGraph->m_Unit[0]` — i.e. the first
+                // unit — as the body, so we mirror that.
+                let is_body = !shadow_kinds.contains_key(kind);
                 let shadow_vertex_offset = if is_body {
                     let shadow_mesh =
                         shadow_kinds.entry(*kind).or_insert_with(|| ShadowKindMesh {
