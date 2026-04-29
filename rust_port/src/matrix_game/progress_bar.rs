@@ -217,7 +217,7 @@ impl ProgressBarRenderer {
         queue: &wgpu::Queue,
         read: &dyn Fn(&str) -> Option<Vec<u8>>,
     ) {
-        log::info!("progress bar: load_atlas called");
+        log::debug!("progress bar: load_atlas called");
         if self.atlas_ready {
             return;
         }
@@ -234,7 +234,7 @@ impl ProgressBarRenderer {
         for c in &candidates {
             match read(c) {
                 Some(bytes) => {
-                    log::info!(
+                    log::debug!(
                         "progress bar: candidate {} → {} bytes, trying decode",
                         c,
                         bytes.len(),

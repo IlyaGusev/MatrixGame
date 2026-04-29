@@ -404,7 +404,7 @@ impl InterfaceRenderer {
                 },
             ],
         });
-        log::info!(
+        log::debug!(
             "interface: atlas {} ({} bytes) bound as {}",
             atlas_path,
             bytes.len(),
@@ -772,7 +772,7 @@ impl InterfaceRenderer {
                 }
             }
         }
-        log::info!(
+        log::debug!(
             "interface: preload_for_panels — panels={:?}, {} unique tex paths: {:?}",
             panel_names,
             paths.len(),
@@ -1425,7 +1425,7 @@ impl InterfaceRenderer {
             .map(|(_, c)| *c)
             .unwrap_or(0);
         if LAST_BASE_COUNT.swap(base_count, std::sync::atomic::Ordering::Relaxed) != base_count {
-            log::info!(
+            log::debug!(
                 "interface upload: screen={}x{} scale={:.2} panels={:?} atlases={:?} missing={:?}",
                 screen_w,
                 screen_h,
@@ -1463,7 +1463,7 @@ impl InterfaceRenderer {
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
-            log::info!(
+            log::debug!(
                 "interface: VB grown to {} verts (was {})",
                 new_cap,
                 self.vertex_capacity

@@ -43,15 +43,6 @@ struct AppState {
     /// frames because the DIP fade keeps drawing for 50ms after the
     /// user lifts LMB and has to resample alpha off the same coords.
     marquee_last_rect: Option<[f32; 4]>,
-    /// Map of currently-tracked arena robots → their visibility
-    /// point-light id. Rebuilt per frame in `sync_robot_lights` so
-    /// freshly-spawned robots light up and despawned ones go dark.
-    /// Substitutes for the full mesh / billboard renderer (the
-    /// CMatrixRobotAI draw path) until that lands.
-    robot_lights: std::collections::HashMap<
-        crate::matrix_game::map_static::ObjectId,
-        crate::matrix_game::effects::point_light::PointLightId,
-    >,
     /// Selection-ring renderer — ports `CMatrixEffectSelection`
     /// (MatrixEffectSelection.cpp). Drawn over the terrain after the
     /// object pass; green ring on the ground around the selected
@@ -92,6 +83,10 @@ struct AppState {
     /// Mirrors `g_MatrixMap->IsPaused()` (MatrixMap.hpp:640). Constructor
     /// open / close toggles this; logic takt is gated on it.
     is_paused: bool,
+    /// FPS counter — wall-clock time of the last log emit and number of
+    /// frames since. Drained once a second from `RedrawRequested`.
+    fps_last_log: f64,
+    fps_frames: u32,
 }
 
 pub struct App {
@@ -275,7 +270,6 @@ impl ApplicationHandler for App {
                 lmb_anchor: None,
                 lmb_consumed_by_ui: false,
                 marquee_last_rect: None,
-                robot_lights: std::collections::HashMap::new(),
                 selection_ring,
                 marquee,
                 move_to,
@@ -287,6 +281,8 @@ impl ApplicationHandler for App {
                 robot_icons: crate::matrix_game::interface::RobotIconCache::new(),
                 pause_overlay,
                 is_paused: false,
+                fps_last_log: crate::platform::now_secs(),
+                fps_frames: 0,
             });
         }
 
@@ -342,12 +338,12 @@ impl ApplicationHandler for App {
 
                 // Force resize to match actual canvas dimensions
                 let size = win.inner_size();
-                log::info!(
+                log::debug!(
                     "wasm init: window inner_size = {}x{}",
                     size.width,
                     size.height
                 );
-                log::info!(
+                log::debug!(
                     "wasm init: surface config = {}x{}",
                     gfx.config.width,
                     gfx.config.height
@@ -442,8 +438,7 @@ impl ApplicationHandler for App {
                     lmb_anchor: None,
                     lmb_consumed_by_ui: false,
                     marquee_last_rect: None,
-                    robot_lights: std::collections::HashMap::new(),
-                    selection_ring,
+                        selection_ring,
                     marquee,
                     move_to,
                     iface_list,
@@ -454,6 +449,8 @@ impl ApplicationHandler for App {
                     robot_icons: crate::matrix_game::interface::RobotIconCache::new(),
                     pause_overlay,
                     is_paused: false,
+                    fps_last_log: crate::platform::now_secs(),
+                    fps_frames: 0,
                 });
                 win.request_redraw();
                 hide_loading_overlay();
@@ -516,7 +513,7 @@ impl ApplicationHandler for App {
                                 .iface_list
                                 .on_mouse_right_up(cx, cy, w, h)
                                 .map(|click| {
-                                    log::info!("iface: right-clicked {:?}", click);
+                                    log::debug!("iface: right-clicked {:?}", click);
                                     dispatch_ui_right_click(state, &click);
                                 })
                                 .is_some(),
@@ -539,7 +536,7 @@ impl ApplicationHandler for App {
                                 &state.map,
                             );
                             if !slots.is_empty() {
-                                log::info!("move order: issued to {} robot(s)", slots.len());
+                                log::debug!("move order: issued to {} robot(s)", slots.len());
                                 for (wx, wy) in slots {
                                     let wz = state.map.get_z(wx, wy);
                                     state.move_to.spawn(glam::Vec3::new(wx, wy, wz));
@@ -614,7 +611,7 @@ impl ApplicationHandler for App {
                         ElementState::Released => {
                             state.minimap_dragging = false;
                             if let Some(click) = state.iface_list.on_mouse_up(cx, cy, w, h) {
-                                log::info!("iface: clicked {:?}", click);
+                                log::debug!("iface: clicked {:?}", click);
                                 dispatch_ui_click(state, &click);
                             } else if state.iface_list.turret_build.is_active()
                                 && state.iface_list.turret_build.kind.is_some()
@@ -644,12 +641,12 @@ impl ApplicationHandler for App {
                                             state.shift_down,
                                         );
                                         match hit {
-                                            Some(id) => log::info!(
+                                            Some(id) => log::debug!(
                                                 "selection: hit object {:?}, curr_sel={:?}, selected={}",
                                                 id, state.game.player_side.curr_sel,
                                                 state.game.player_side.selected.len(),
                                             ),
-                                            None => log::info!(
+                                            None => log::debug!(
                                                 "selection: cleared (selected={})",
                                                 state.game.player_side.selected.len(),
                                             ),
@@ -666,7 +663,7 @@ impl ApplicationHandler for App {
                                             h,
                                             state.shift_down,
                                         );
-                                        log::info!("marquee: selected {} robot(s)", n,);
+                                        log::debug!("marquee: selected {} robot(s)", n,);
                                         // Start the 50ms DIP fade — port
                                         // of `CMultiSelection::End` at
                                         // MatrixMultiSelection.cpp:278-279.
@@ -820,6 +817,19 @@ impl ApplicationHandler for App {
                 let now = crate::platform::now_secs();
                 let dt = (now - state.last_time) as f32;
                 state.last_time = now;
+
+                state.fps_frames += 1;
+                let fps_elapsed = now - state.fps_last_log;
+                if fps_elapsed >= 1.0 {
+                    log::info!(
+                        "fps: {:.1} ({} frames / {:.2}s)",
+                        state.fps_frames as f64 / fps_elapsed,
+                        state.fps_frames,
+                        fps_elapsed,
+                    );
+                    state.fps_last_log = now;
+                    state.fps_frames = 0;
+                }
                 // Logic takt first (ports `CMatrixMapLogic::Takt`, which
                 // runs `ProceedLogic` before the graphic takt starts —
                 // MatrixLogic.cpp:2722-2761). Then per-object graphic
@@ -874,11 +884,15 @@ impl ApplicationHandler for App {
                     state.move_to.takt(step_ms as f32);
                 }
 
-                // Per-frame: reconcile point lights for each live
-                // robot so the build-factory spawns are visible even
-                // without a robot renderer. Stand-in for the C++
-                // `CMatrixRobotAI::Draw` path until mesh rendering lands.
-                sync_robot_lights(state);
+                // Robot mesh rendering is in place via
+                // `state.terrain.sync_robots`, so the per-robot point
+                // lights that used to stand in for visibility are no
+                // longer needed. Keeping that helper alive cost ~40 FPS
+                // because every moving robot bumped the point-light
+                // revision, which forced `terrain.takt` to rewrite +
+                // re-upload the entire terrain vertex-colour buffer
+                // each frame. Left out unless we add real point lights
+                // (e.g. weapon flashes) that justify the GPU sync cost.
 
                 // Per-frame interface visibility dispatch — ports the
                 // `CInterface::LogicTakt` branch at
@@ -1205,7 +1219,7 @@ impl ApplicationHandler for App {
                             if LAST_STATE.swap(s, std::sync::atomic::Ordering::Relaxed) != s
                                 || !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed)
                             {
-                                log::info!(
+                                log::debug!(
                                     "preview: query={} robots_renderer={}",
                                     if q_opt.is_some() { "Some" } else { "None" },
                                     if robots_ok { "Some" } else { "None" },
@@ -1357,65 +1371,6 @@ impl ApplicationHandler for App {
 // Init, so missing `robots.dat` is a fatal startup error. See `load_map`
 // (native) and `load_map_async` (wasm) further below.
 
-/// Keep per-robot visibility point lights in sync with the arena.
-/// Every frame: spawn a light for each new `ObjectType::RobotAi`,
-/// drop lights whose target id is no longer valid. Per-side color
-/// so enemy and friendly spawns read apart at a glance.
-fn sync_robot_lights(state: &mut AppState) {
-    use crate::matrix_game::map_static::ObjectType;
-
-    // Build a set of current live robot ids.
-    let mut live_robots: Vec<crate::matrix_game::map_static::ObjectId> = Vec::new();
-    for id in state.game.objects.iter_live() {
-        if let Some(obj) = state.game.objects.get(id) {
-            if matches!(obj.core().obj_type, ObjectType::RobotAi) {
-                live_robots.push(id);
-            }
-        }
-    }
-
-    // Add lights for new robots + update positions for existing ones
-    // so the light follows the robot rising out of the silo.
-    for id in &live_robots {
-        let Some(obj) = state.game.objects.get(*id) else {
-            continue;
-        };
-        let pos = obj.core().geo_center;
-        let lit_pos = [pos.x, pos.y, pos.z + 6.0];
-        if let Some(light_id) = state.robot_lights.get(id).copied() {
-            state.point_lights.set_pos(&state.map, light_id, lit_pos);
-        } else {
-            // Bright yellow for player, red for enemies.
-            let color = if obj.side() == crate::matrix_game::common::PLAYER_SIDE {
-                0xFFFF66
-            } else {
-                0xFF3333
-            };
-            let light_id = state
-                .point_lights
-                .add_light(&state.map, lit_pos, 25.0, color);
-            state.robot_lights.insert(*id, light_id);
-        }
-    }
-
-    // Remove lights for dead robots (tombstone-aware via `is_valid`).
-    let dead: Vec<_> = state
-        .robot_lights
-        .iter()
-        .filter_map(|(id, light_id)| {
-            if state.game.objects.is_valid(*id) {
-                None
-            } else {
-                Some((*id, *light_id))
-            }
-        })
-        .collect();
-    for (id, light_id) in dead {
-        state.point_lights.remove_light(&state.map, light_id);
-        state.robot_lights.remove(&id);
-    }
-}
-
 /// Port of `CMatrixSideUnit::PlayerAction` + the follow-on
 /// `CBuildStack::AddItem` call. Dispatches the button identified by
 /// its `Name` to the right game-state change. Currently handles
@@ -1452,7 +1407,7 @@ fn dispatch_ui_click(state: &mut AppState, click: &crate::matrix_game::interface
             // `heade` / `weape` ("clear this slot"); pass through.
             if let Some(b) = state.game.player_side.builder.as_mut() {
                 b.super_djeans(ty, *kind, pilon, false);
-                log::info!(
+                log::debug!(
                     "popup commit: type={:?} kind={} pilon={} cfg.chassis={} hull={} weap0={}",
                     ty,
                     kind.0,
@@ -1484,7 +1439,7 @@ fn dispatch_ui_click(state: &mut AppState, click: &crate::matrix_game::interface
                 if let Some(obj) = state.game.objects.get(id) {
                     let p = obj.core().geo_center;
                     state.camera.set_xy_strategy([p.x, p.y]);
-                    log::info!("basepl: center camera on building at ({:.1},{:.1})", p.x, p.y);
+                    log::debug!("basepl: center camera on building at ({:.1},{:.1})", p.x, p.y);
                 }
             }
         }
@@ -1498,7 +1453,7 @@ fn dispatch_ui_click(state: &mut AppState, click: &crate::matrix_game::interface
             // 970-975 — reset the build-multiplier counter, validate it
             // against the side's resources, then open the constructor.
             if state.game.player_side.curr_sel != CurrSel::BaseSelected {
-                log::info!("buro: no base selected, ignoring");
+                log::debug!("buro: no base selected, ignoring");
                 return;
             }
             state.iface_list.r_count_control.reset();
@@ -1510,7 +1465,7 @@ fn dispatch_ui_click(state: &mut AppState, click: &crate::matrix_game::interface
             // Pause the game while the constructor is open — port of
             // `g_MatrixMap->Pause(true)` at CConstructor.cpp:975.
             state.is_paused = true;
-            log::info!("buro: opened robot constructor");
+            log::debug!("buro: opened robot constructor");
             // Silence "unused import" on paths we only need in other
             // arms of this match.
             let _ = (BuildingType::Base, ChassisKind::Track);
@@ -1531,7 +1486,7 @@ fn dispatch_ui_click(state: &mut AppState, click: &crate::matrix_game::interface
                 state.game.player_side.curr_sel,
                 CurrSel::BaseSelected | CurrSel::BuildingSelected
             ) {
-                log::info!("buca: no building selected, ignoring");
+                log::debug!("buca: no building selected, ignoring");
                 return;
             }
             let Some(id) = state.game.active_object() else {
@@ -1543,7 +1498,7 @@ fn dispatch_ui_click(state: &mut AppState, click: &crate::matrix_game::interface
             // PREORDER_BUILD_TURRET flag flips before BeginBuildTurret
             // (and thus before `m_CannonForBuild.m_Cannon` is created).
             state.iface_list.turret_build.open_picker(id);
-            log::info!("buca: entered turret-build mode (kind picker)");
+            log::debug!("buca: entered turret-build mode (kind picker)");
             return;
         }
         "cocan" => {
@@ -1562,7 +1517,7 @@ fn dispatch_ui_click(state: &mut AppState, click: &crate::matrix_game::interface
             state.iface_list.popup = None;
             state.iface_list.popup_restore_pending = None;
             state.iface_list.turret_build.cancel();
-            log::info!("cocan: constructor closed");
+            log::debug!("cocan: constructor closed");
             return;
         }
         "cobuild" => {
@@ -1573,7 +1528,7 @@ fn dispatch_ui_click(state: &mut AppState, click: &crate::matrix_game::interface
             if let Some(cfg) = state.iface_list.history.prev() {
                 if let Some(b) = state.game.player_side.builder.as_mut() {
                     b.apply_config(cfg);
-                    log::info!(
+                    log::debug!(
                         "hisleft: loaded preset cursor={}",
                         state.iface_list.history.cursor
                     );
@@ -1585,7 +1540,7 @@ fn dispatch_ui_click(state: &mut AppState, click: &crate::matrix_game::interface
             if let Some(cfg) = state.iface_list.history.next() {
                 if let Some(b) = state.game.player_side.builder.as_mut() {
                     b.apply_config(cfg);
-                    log::info!(
+                    log::debug!(
                         "hisright: loaded preset cursor={}",
                         state.iface_list.history.cursor
                     );
@@ -1619,7 +1574,7 @@ fn dispatch_ui_click(state: &mut AppState, click: &crate::matrix_game::interface
             });
             if let Some(parent) = parent {
                 state.iface_list.turret_build.begin(kind, parent);
-                log::info!("tur{}: selected kind={:?}", n, kind);
+                log::debug!("tur{}: selected kind={:?}", n, kind);
             }
             return;
         }
@@ -1630,7 +1585,7 @@ fn dispatch_ui_click(state: &mut AppState, click: &crate::matrix_game::interface
             // ORDERING_MODE / PREORDER_BUILD_TURRET so the Main panel
             // returns to the building's normal command set.
             state.iface_list.turret_build.cancel();
-            log::info!("ocan: cancelled turret-build mode");
+            log::debug!("ocan: cancelled turret-build mode");
             return;
         }
         _ => {}
@@ -1662,7 +1617,7 @@ fn dispatch_ui_click(state: &mut AppState, click: &crate::matrix_game::interface
         if let Some(b) = state.game.player_side.builder.as_mut() {
             b.super_djeans(ty, kind, pilon, false);
             let p = b.construction_price();
-            log::info!(
+            log::debug!(
                 "constructor: {} {:?}/{} → titan={} elec={} energy={} plasma={} structure={}",
                 name,
                 ty,
@@ -1726,7 +1681,7 @@ fn dispatch_ui_right_click(state: &mut AppState, click: &crate::matrix_game::int
             }
             popup.refresh_affordability(b, &bank);
         }
-        log::info!("popup: opened for pylon {}", name);
+        log::debug!("popup: opened for pylon {}", name);
         state.iface_list.popup_restore_pending = None;
         state.iface_list.popup = Some(popup);
     }
@@ -2190,7 +2145,7 @@ fn try_place_turret(state: &mut AppState, _cx: f32, _cy: f32, _w: f32, _h: f32) 
     // the C++ click path also reads `m_CannonForBuild.m_CanBuildFlag`
     // set by the LogicTakt branch (MatrixSide.cpp:626).
     if !state.iface_list.turret_build.can_build {
-        log::info!("turret: click without valid slot — cancelling placement");
+        log::debug!("turret: click without valid slot — cancelling placement");
         state.iface_list.turret_build.cancel();
         return;
     }
@@ -2225,7 +2180,7 @@ fn try_place_turret(state: &mut AppState, _cx: f32, _cy: f32, _w: f32, _h: f32) 
         b.queue_turret_slot(slot_idx, kind as i32)
     };
     if !placement_ok {
-        log::info!("turret: slot {} no longer free — cancelling", slot_idx);
+        log::debug!("turret: slot {} no longer free — cancelling", slot_idx);
         state.iface_list.turret_build.cancel();
         return;
     }
@@ -2254,7 +2209,7 @@ fn try_place_turret(state: &mut AppState, _cx: f32, _cy: f32, _w: f32, _h: f32) 
             .player_side
             .add_resource_amount(r, -turret_cost.resources[r as usize]);
     }
-    log::info!(
+    log::debug!(
         "turret: placed {:?} on slot {} as object {:?}",
         kind,
         slot_idx,
@@ -2340,7 +2295,7 @@ fn commit_and_queue_robot(state: &mut AppState) {
     use crate::matrix_game::side::CurrSel;
 
     if state.game.player_side.curr_sel != CurrSel::BaseSelected {
-        log::info!("cobuild: no base selected");
+        log::debug!("cobuild: no base selected");
         return;
     }
     let Some(id) = state.game.active_object() else {
@@ -2378,7 +2333,7 @@ fn commit_and_queue_robot(state: &mut AppState) {
     // can't queue robots on enemy / neutral bases even if the panel is
     // somehow open.
     if b.side != state.game.player_side.id {
-        log::info!(
+        log::debug!(
             "cobuild: refused — base side {} != player side {}",
             b.side,
             state.game.player_side.id
@@ -2417,7 +2372,7 @@ fn commit_and_queue_robot(state: &mut AppState) {
     state.iface_list.r_count_control.reset();
     let ctx = build_counter_ctx(state);
     state.iface_list.r_count_control.check_up(ctx);
-    log::info!(
+    log::debug!(
         "cobuild: queued {} (chas={},hull={},head={}); left T/E/En/P={}/{}/{}/{}",
         queued,
         cfg.chassis.kind.0,
@@ -2526,7 +2481,7 @@ fn refresh_progress_bars(state: &mut AppState) {
         // One-shot log so we can verify the rect + fill on first build.
         static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            log::info!(
+            log::debug!(
                 "progress: pushing bar rect=({:.0},{:.0},{:.0},{:.0}) fill={:.2}",
                 rect[0],
                 rect[1],
@@ -2937,7 +2892,7 @@ fn refresh_interface_visibility(state: &mut AppState) {
                 .map(|e| e.name.as_str())
                 .take(20)
                 .collect();
-            log::info!(
+            log::debug!(
                 "iface: Base panel visibility → {} (constructor_active={}, {}/{} elements visible, first: {:?})",
                 p.visible,
                 constructor_active,

@@ -142,7 +142,7 @@ impl RobotBuilder {
     /// * head    = empty (RUK_UNKNOWN)
     /// * weapon[0] = Machinegun (others stay empty)
     pub fn constructor_buttons_init(&mut self) {
-        log::info!("RobotBuilder::constructor_buttons_init starting");
+        log::debug!("RobotBuilder::constructor_buttons_init starting");
         self.super_djeans(
             RobotUnitType::Chassis,
             RobotUnitKind::CHASSIS_PNEUMATIC,
@@ -157,7 +157,7 @@ impl RobotBuilder {
             0,
             false,
         );
-        log::info!(
+        log::debug!(
             "RobotBuilder::constructor_buttons_init done: cfg.chassis={} hull={} head={} weapon[0]={} weapon[1]={} weapon[2]={} weapon[3]={} weapon[4]={}",
             self.cfg().chassis.kind.0,
             self.cfg().hull.unit.kind.0,

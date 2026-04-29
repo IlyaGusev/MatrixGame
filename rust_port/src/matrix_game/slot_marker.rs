@@ -107,12 +107,12 @@ impl SlotMarkerRenderer {
             log::warn!("slot_marker: missing texture {tex_path} in bundle");
             return None;
         };
-        log::info!("slot_marker: loaded {} bytes for {tex_path}", tex_bytes.len());
+        log::debug!("slot_marker: loaded {} bytes for {tex_path}", tex_bytes.len());
         let Some(rgba) = decode_texture_bytes(&tex_bytes) else {
             log::warn!("slot_marker: decode failed for {tex_path}");
             return None;
         };
-        log::info!(
+        log::debug!(
             "slot_marker: decoded {}x{} for {tex_path}",
             rgba.width(),
             rgba.height()

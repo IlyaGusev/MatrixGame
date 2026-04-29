@@ -1036,7 +1036,7 @@ impl RobotsRenderer {
                 frames.push(FrameGpu { surfaces });
             }
 
-            log::info!(
+            log::debug!(
                 "robots: chassis{} frames={} anims: {:?}",
                 n,
                 vo_mesh.frames.len(),
@@ -1233,7 +1233,7 @@ impl RobotsRenderer {
         {
             static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !ONCE.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                log::info!(
+                log::debug!(
                     "preview: drawing chassis={:?} armor={:?} head={:?} weapons={:?} scissor={:?} surface={}x{}",
                     chassis, armor_kind, head_kind, weapon_kinds, scissor_px, surface_w, surface_h,
                 );

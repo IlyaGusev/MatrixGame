@@ -557,7 +557,7 @@ impl IFaceList {
                         })
                     })
                     .unwrap_or_default();
-                log::info!(
+                log::debug!(
                     "iface: mouse_down ({:.0},{:.0}) hit panel='{}' elem='{}'",
                     sx,
                     sy,
@@ -589,7 +589,7 @@ impl IFaceList {
                 true
             }
             None => {
-                log::info!("iface: mouse_down ({:.0},{:.0}) no hit", sx, sy);
+                log::debug!("iface: mouse_down ({:.0},{:.0}) no hit", sx, sy);
                 false
             }
         }
@@ -610,7 +610,7 @@ impl IFaceList {
             self.pressed = None;
             if let Some(idx) = hit {
                 if let Some(item) = popup.items.get(idx).cloned() {
-                    log::info!(
+                    log::debug!(
                         "popup: selected item idx={} kind={} parent={:?}",
                         idx,
                         item.kind.0,

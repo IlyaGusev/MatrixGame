@@ -21,6 +21,7 @@ pub struct PointLightSystem {
     point_lums: Vec<[i32; 3]>,
     next_id: PointLightId,
     revision: u64,
+    dirty: bool,
 }
 
 impl PointLightSystem {
@@ -30,6 +31,7 @@ impl PointLightSystem {
             point_lums: vec![[0, 0, 0]; map.points.len()],
             next_id: 1,
             revision: 0,
+            dirty: false,
         }
     }
 
@@ -49,6 +51,7 @@ impl PointLightSystem {
             color,
         });
         self.recompute(map);
+        self.dirty = false;
         id
     }
 
@@ -58,35 +61,59 @@ impl PointLightSystem {
         let removed = self.lights.len() != old_len;
         if removed {
             self.recompute(map);
+            self.dirty = false;
         }
         removed
     }
 
-    pub fn set_pos(&mut self, map: &GameMap, id: PointLightId, pos: [f32; 3]) -> bool {
+    pub fn set_pos(&mut self, _map: &GameMap, id: PointLightId, pos: [f32; 3]) -> bool {
         let Some(light) = self.lights.iter_mut().find(|light| light.id == id) else {
             return false;
         };
+        if light.pos == pos {
+            return true;
+        }
         light.pos = pos;
-        self.recompute(map);
+        self.dirty = true;
         true
     }
 
-    pub fn set_radius(&mut self, map: &GameMap, id: PointLightId, radius: f32) -> bool {
+    pub fn set_radius(&mut self, _map: &GameMap, id: PointLightId, radius: f32) -> bool {
         let Some(light) = self.lights.iter_mut().find(|light| light.id == id) else {
             return false;
         };
-        light.radius = radius.max(0.001);
-        self.recompute(map);
+        let r = radius.max(0.001);
+        if light.radius == r {
+            return true;
+        }
+        light.radius = r;
+        self.dirty = true;
         true
     }
 
-    pub fn set_color(&mut self, map: &GameMap, id: PointLightId, color: u32) -> bool {
+    pub fn set_color(&mut self, _map: &GameMap, id: PointLightId, color: u32) -> bool {
         let Some(light) = self.lights.iter_mut().find(|light| light.id == id) else {
             return false;
         };
+        if light.color == color {
+            return true;
+        }
         light.color = color;
-        self.recompute(map);
+        self.dirty = true;
         true
+    }
+
+    /// Recompute per-vertex luminance if any mutation happened since the
+    /// last flush. Cheap no-op when nothing changed. Callers that produce
+    /// many `set_pos` updates per frame (robot light follow) should call
+    /// this once after all updates, instead of paying the recompute on
+    /// every individual setter.
+    pub fn flush(&mut self, map: &GameMap) {
+        if !self.dirty {
+            return;
+        }
+        self.recompute(map);
+        self.dirty = false;
     }
 
     pub fn lights(&self) -> &[PointLight] {

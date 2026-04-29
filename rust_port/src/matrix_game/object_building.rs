@@ -312,7 +312,7 @@ impl BuildStack {
                 // ramp HP to 100%, drop invulnerability, flip to IDLE.
                 // Port of MatrixObjectBuilding.cpp:1779-1813.
                 ramp_turret_hp(objs, parent_self_id, slot, 1.0);
-                log::info!(
+                log::debug!(
                     "build: turret completed (kind={} slot={}) side={}",
                     turret_kind,
                     slot,
@@ -957,7 +957,7 @@ impl MapStatic for Building {
                 .build_stack
                 .tick_timer(cms, objs, parent_id, self.state, parent_pos, self.angle)
             {
-                log::info!(
+                log::debug!(
                     "build: factory side={} produced robot {:?} at ({:.0}, {:.0}, {:.0})",
                     self.side,
                     spawned,

@@ -918,12 +918,12 @@ fn read_mount_offset(bytes: &[u8], id: u32, label: &str) -> Option<glam::Vec3> {
         .iter()
         .map(|m| (m.id, m.name.clone()))
         .collect();
-    log::info!("cannons: {label} matrix ids: {:?}", ids);
+    log::debug!("cannons: {label} matrix ids: {:?}", ids);
     let Some(m) = mesh.matrix_by_id(id, 0) else {
         log::warn!("cannons: {label} has no matrix id {id}");
         return None;
     };
-    log::info!(
+    log::debug!(
         "cannons: {label} matrix {id} = [{}, {}, {}]",
         m[12], m[13], m[14]
     );

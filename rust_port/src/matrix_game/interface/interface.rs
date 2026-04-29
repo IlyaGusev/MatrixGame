@@ -250,7 +250,7 @@ impl CInterface {
             .filter(|e| !e.hint_template.is_empty())
             .map(|e| e.name.as_str())
             .collect();
-        log::info!(
+        log::debug!(
             "iface: loaded {} design=({},{}) id={} elements={} hinted={:?}",
             name,
             design_x,
@@ -1529,7 +1529,7 @@ impl CInterface {
         static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let log_once = !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed);
         if log_once {
-            log::info!(
+            log::debug!(
                 "apply_constructor_to_pylons: chassis(kind={})={:?} hull(kind={})={:?} head(kind={})={:?} weapons={:?}",
                 cfg.chassis.kind.0, chassis_src,
                 cfg.hull.unit.kind.0, hull_src,
@@ -1865,7 +1865,7 @@ fn attach_labels(stor: &Storage, panel_rec: &str, panel_name: &str, elements: &m
             attached += 1;
         }
     }
-    log::info!(
+    log::debug!(
         "iface labels: panel={panel_name} attached={attached} label rows"
     );
 }
