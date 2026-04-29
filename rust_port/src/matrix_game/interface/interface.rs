@@ -113,6 +113,30 @@ pub struct MainVisibilityCtx {
     pub constructor_active: bool,
     /// Turret-build mode active — show turret1..4 kind picker.
     pub turret_build_active: bool,
+    /// True once the player has clicked one of `tur1..tur4` and the
+    /// game is in the placement preview. The C++ at CInterface.cpp:1710
+    /// gates the picker buttons on `bld_tu && !(m_CurrentAction ==
+    /// BUILDING_TURRET)` — the picker hides during placement so it
+    /// doesn't shadow the ghost cannon. We mirror that with this flag.
+    pub turret_kind_committed: bool,
+    /// Per-kind picker DISABLED flag (1..=4 in slots 0..3). Port of
+    /// CInterface.cpp:1713-1738: a button goes DISABLED when the
+    /// selected building either has no free turret slot or the player
+    /// can't afford `g_Config.m_CannonsProps[k].m_Resources`.
+    pub turret_disabled: [bool; 4],
+    /// `IF_BUILD_CA` (`buca`) DISABLED flag. Port of CInterface.cpp:
+    /// 1602-1605: `buca` goes DISABLED when no free slot, no remaining
+    /// stack capacity, OR `cant_build_tu` (resource shortage for the
+    /// cheapest cannon kind).
+    pub buca_disabled: bool,
+    /// Per-slot installed turret kind (1..=4) for the building's
+    /// physical turret slots. `Some(k)` ⇒ slot is occupied with a
+    /// cannon of kind `k` (`m_TurretsPlaces[i].m_CannonType`). `None` ⇒
+    /// slot is free. Drives the `bt{N}` icon overlay on the `podl{N}`
+    /// strip — port of `CIFaceList::CreateDynamicTurrets`
+    /// (CInterface.cpp:4572-4621). Indexed 0..turrets_max-1; entries
+    /// past `turrets_max` are ignored.
+    pub installed_turret_kinds: [Option<i32>; 4],
     /// Per-slot cannon kind across the build stack (`m_Top` →
     /// `m_NextStackItem` walk in C++). Index 0 is the head, 1..5 the
     /// queued tail items. `Some(N)` flags a turret of kind N (1..=4);
@@ -404,7 +428,20 @@ impl CInterface {
                     // 1596, 1600). In turret-build mode the picker
                     // (`tur1..4` + `ocan`) replaces them.
                     "buro" if !bld_tu && kind == Some(BuildingType::Base) => e.set_visible(true),
-                    "buca" if !bld_tu => e.set_visible(true),
+                    "buca" if !bld_tu => {
+                        e.set_visible(true);
+                        // Port of CInterface.cpp:1602-1605 — disable `buca`
+                        // when no free turret slot, no remaining stack
+                        // capacity, or no resources for the cheapest
+                        // cannon kind.
+                        if ctx.buca_disabled {
+                            e.cur_state = ElementState::Disabled;
+                            e.def_state = ElementState::Disabled;
+                        } else if matches!(e.cur_state, ElementState::Disabled) {
+                            e.cur_state = ElementState::Normal;
+                            e.def_state = ElementState::Normal;
+                        }
+                    }
                     // Reinforcements ("call from hell") is visible for
                     // any selected building UNLESS we're in turret-
                     // build mode (CInterface.cpp:1607 — `&& !bld_tu`).
@@ -482,11 +519,41 @@ impl CInterface {
         // `bld_tu` else-branch at CInterface.cpp:1696 that flips
         // `IF_ORDER_CANCEL` (`ocan`) on while the player picks a
         // turret kind.
+        //
+        // The C++ at CInterface.cpp:1710 gates the picker on
+        // `bld_tu && !(m_CurrentAction == BUILDING_TURRET)` — the picker
+        // disappears once a kind has been committed and the player is
+        // ghost-placing the cannon. `ocan` stays visible across both
+        // sub-modes (CInterface.cpp:1696). Each tur{N} also flips
+        // DISABLED when the player can't afford it / the building has
+        // no free turret slot (CInterface.cpp:1713-1738).
         if ctx.turret_build_active {
+            let show_picker = !ctx.turret_kind_committed;
             for e in &mut self.elements {
                 let n = e.name.as_str();
-                if matches!(n, "tur1" | "tur2" | "tur3" | "tur4" | "ocan") {
+                if n == "ocan" {
                     e.set_visible(true);
+                    continue;
+                }
+                let pick_idx = match n {
+                    "tur1" => Some(0),
+                    "tur2" => Some(1),
+                    "tur3" => Some(2),
+                    "tur4" => Some(3),
+                    _ => None,
+                };
+                if let Some(idx) = pick_idx {
+                    if !show_picker {
+                        continue;
+                    }
+                    e.set_visible(true);
+                    if ctx.turret_disabled[idx] {
+                        e.cur_state = ElementState::Disabled;
+                        e.def_state = ElementState::Disabled;
+                    } else if matches!(e.cur_state, ElementState::Disabled) {
+                        e.cur_state = ElementState::Normal;
+                        e.def_state = ElementState::Normal;
+                    }
                 }
             }
         }
@@ -570,6 +637,75 @@ impl CInterface {
                 hint_offset_x: 0,
                 hint_offset_y: 0,
             });
+        }
+
+        // Step 8 — dynamic per-slot turret icons over the `podl{N}`
+        // strip. Port of `CIFaceList::CreateDynamicTurrets`
+        // (CInterface.cpp:4572-4621): for each occupied slot `i` on the
+        // selected building, clone `bt{cannon_type}` (an Image-kind
+        // template at base_4 (444,185,32,35) etc.) onto a fresh
+        // `_dynturret_{i}` static at the slot's screen X (table-driven
+        // by `tur_sheme`) and a constant Y of 153.
+        //
+        // The 4 layout schemes use the precomputed `DYN_TX` table from
+        // CInterface.cpp:2710-2720:
+        //   • 1 slot:  index 0
+        //   • 2 slots: indices 1..2
+        //   • 3 slots: indices 3..5
+        //   • 4 slots: indices 6..9
+        // Y is constant 153 (m_DynamicTY).
+        self.elements.retain(|e| !e.name.starts_with("_dynturret_"));
+        if matches!(
+            ctx.curr_sel,
+            CurrSel::BaseSelected | CurrSel::BuildingSelected
+        ) {
+            const DYN_TY: f32 = 153.0;
+            const DYN_TX: [f32; 10] = [
+                280.0, 262.0, 304.0, 242.0, 279.0, 316.0, 231.0, 265.0, 299.0, 333.0,
+            ];
+            const SIZE_X: f32 = 32.0;
+            const SIZE_Y: f32 = 35.0;
+            let tur_max = ctx.building_turrets_max.clamp(0, 4) as usize;
+            let base_idx = match tur_max {
+                1 => 0,
+                2 => 1,
+                3 => 3,
+                4 => 6,
+                _ => return,
+            };
+            for i in 0..tur_max {
+                let Some(kind) = ctx.installed_turret_kinds[i] else {
+                    continue;
+                };
+                let src_name = format!("bt{}", kind);
+                let Some(src_idx) = self.elements.iter().position(|e| e.name == src_name) else {
+                    continue;
+                };
+                let images = self.elements[src_idx].images.clone();
+                let pos_x = DYN_TX[base_idx + i];
+                self.elements.push(IFaceElement {
+                    name: format!("_dynturret_{}", i),
+                    kind: ElementKind::Static,
+                    id: 970, // DYNAMIC_TURRET (CInterface.h:61)
+                    group: 0,
+                    flags: IFEF_VISIBLE,
+                    param1: 0.0,
+                    param2: 0.0,
+                    i_param: 0,
+                    pos_x,
+                    pos_y: DYN_TY,
+                    pos_z: 0.000001,
+                    size_x: SIZE_X,
+                    size_y: SIZE_Y,
+                    images,
+                    labels: Vec::new(),
+                    cur_state: ElementState::Normal,
+                    def_state: ElementState::Normal,
+                    hint_template: String::new(),
+                    hint_offset_x: 0,
+                    hint_offset_y: 0,
+                });
+            }
         }
     }
 

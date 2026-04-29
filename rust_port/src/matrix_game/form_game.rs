@@ -2672,6 +2672,59 @@ fn refresh_interface_visibility(state: &mut AppState) {
         .map(|b| b.active)
         .unwrap_or(false);
     let turret_build_active = state.iface_list.turret_build.is_active();
+    // `kind.is_some()` ↔ player has clicked tur1..tur4 and we're now in
+    // the placement preview (m_CurrentAction == BUILDING_TURRET in C++).
+    // CInterface.cpp:1710 hides the picker buttons in that sub-mode.
+    let turret_kind_committed = state.iface_list.turret_build.kind.is_some();
+
+    // Per-kind picker DISABLED + buca DISABLED — port of
+    // CInterface.cpp:1602-1605 (`buca`) and 1713-1738 (`tur1..4`):
+    // a button is DISABLED when the building has no free turret slot
+    // OR the player can't afford the cannon. `buca` is also disabled
+    // when the build stack is full.
+    //
+    // Also collect per-slot installed `cannon_type` so the Main panel
+    // can overlay `bt{N}` icons on the `podl{N}` strip — port of
+    // `CIFaceList::CreateDynamicTurrets` (CInterface.cpp:4572-4621).
+    let mut turret_disabled = [false; 4];
+    let mut buca_disabled = false;
+    let mut installed_turret_kinds: [Option<i32>; 4] = [None; 4];
+    if matches!(curr_sel, CurrSel::BaseSelected | CurrSel::BuildingSelected) {
+        if let Some(active_id) = state.game.active_object() {
+            if let Some(o) = state.game.objects.get(active_id) {
+                if matches!(o.core().obj_type, ObjectType::Building) {
+                    let b: &Building =
+                        unsafe { &*(o as *const dyn MapStatic as *const Building) };
+                    let has_free_slot = b
+                        .turret_places
+                        .iter()
+                        .any(|p| p.cannon_type < 0);
+                    let stack_full = b.build_stack.is_full();
+                    let cfg = crate::matrix_game::config::global();
+                    let side = &state.game.player_side;
+                    let mut affordable = [false; 4];
+                    for k in 0..4 {
+                        let cost = cfg.turrets.cost_of((k + 1) as i32);
+                        affordable[k] = crate::matrix_game::config::Resource::ALL
+                            .iter()
+                            .all(|r| {
+                                side.get_resource_amount(*r)
+                                    >= cost.resources[*r as usize]
+                            });
+                        turret_disabled[k] = !has_free_slot || !affordable[k];
+                    }
+                    let any_affordable = affordable.iter().any(|a| *a);
+                    buca_disabled = !has_free_slot || stack_full || !any_affordable;
+                    for (i, p) in b.turret_places.iter().take(4).enumerate() {
+                        if p.cannon_type > 0 {
+                            installed_turret_kinds[i] = Some(p.cannon_type);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let ctx = MainVisibilityCtx {
         curr_sel,
         building_kind: kind,
@@ -2680,6 +2733,10 @@ fn refresh_interface_visibility(state: &mut AppState) {
         building_turrets_max: turrets_max,
         constructor_active,
         turret_build_active,
+        turret_kind_committed,
+        turret_disabled,
+        buca_disabled,
+        installed_turret_kinds,
         building_stack_turret_kinds: stack_kinds,
         building_stack_robot_atlas_keys: stack_robot_keys,
     };
