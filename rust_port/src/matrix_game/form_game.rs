@@ -962,6 +962,7 @@ impl ApplicationHandler for App {
                 // `CMatrixRobotAI::RNeed`'s per-robot matrix update —
                 // MatrixObjectRobot.cpp:359-480).
                 state.terrain.sync_robots(
+                    &state.gfx.device,
                     &state.gfx.queue,
                     &mut state.game.objects,
                     &state.map,

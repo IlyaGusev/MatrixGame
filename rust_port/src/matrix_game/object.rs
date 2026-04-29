@@ -861,6 +861,10 @@ struct MaterialUniform {
 #[derive(Copy, Clone, Pod, Zeroable)]
 struct ShadowProjUniform {
     view_proj: [[f32; 4]; 4],
+    /// Map's `m_ShadowColor` (DATA_SHADOWCOLOR / MatrixMap.cpp:1830) unpacked
+    /// into linear `(r, g, b, a)`. Mirrors `D3DRS_TEXTUREFACTOR` for the
+    /// projected-shadow stage in `DrawShadowsProjFast`.
+    shadow_color: [f32; 4],
 }
 
 #[repr(C)]
@@ -1104,6 +1108,9 @@ pub struct ObjectsRenderer {
     ambient_color: [f32; 4],
     light_color: [f32; 4],
     light_dir: [f32; 4],
+    /// Cached `m_ShadowColor` from the map (DATA_SHADOWCOLOR), packed as
+    /// 0xAARRGGBB. Forwarded each frame to the projected-shadow uniform.
+    shadow_color: u32,
     time_ms: f32,
     last_point_light_revision: u64,
 }
@@ -1161,6 +1168,7 @@ impl ObjectsRenderer {
             label: Some("Object Shadows UB"),
             contents: bytemuck::bytes_of(&ShadowProjUniform {
                 view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
+                shadow_color: [0.0, 0.0, 0.0, 0.45],
             }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -1468,6 +1476,7 @@ impl ObjectsRenderer {
             ambient_color,
             light_color,
             light_dir,
+            shadow_color: map.shadow_color,
             time_ms: 0.0,
             last_point_light_revision: 0,
         })
@@ -1537,11 +1546,17 @@ impl ObjectsRenderer {
                 time_ms: [self.time_ms, 0.0, 0.0, 0.0],
             }),
         );
+        let sc = self.shadow_color;
+        let sa = ((sc >> 24) & 0xFF) as f32 / 255.0;
+        let sr = ((sc >> 16) & 0xFF) as f32 / 255.0;
+        let sg = ((sc >> 8) & 0xFF) as f32 / 255.0;
+        let sb = (sc & 0xFF) as f32 / 255.0;
         queue.write_buffer(
             &self.shadow_uniform_buffer,
             0,
             bytemuck::bytes_of(&ShadowProjUniform {
                 view_proj: view_proj.to_cols_array_2d(),
+                shadow_color: [sr, sg, sb, sa],
             }),
         );
 
@@ -1656,7 +1671,7 @@ fn create_shadow_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
         entries: &[
             wgpu::BindGroupLayoutEntry {
                 binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
+                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
@@ -2210,6 +2225,20 @@ fn shadow_texture_projection(
     let dim_x = shadow.dimensions[0].abs().max(0.001);
     let dim_y = shadow.dimensions[1].abs().max(0.001);
     let campos = Vec3::from_array(shadow.camera_pos);
+    // Faithful port of `CMatrixMapObject::SetupMatricesForShadowTextureCalc`
+    // (MatrixObject.cpp:340-372). Static-shadow geometry stored in the CMAP
+    // was baked offline against THIS function's projector — `LookAtLH(campos,
+    // campos+light, camup)` with `_sx = +1/dim.x`, `_sy = +1/dim.y`, then
+    // `OrthoLH(-1, 1, 1, 1000)` (note width = -1 → mProg flips X).
+    //
+    // Composing mView * mProg:
+    //   clip.x = -2 * right·(p - campos) / dim_x
+    //   clip.y = +2 * up·(p - campos) / dim_y
+    //
+    // Our WGSL bake computes `clip.x = 1 - 2*uv.x`, `clip.y = 2*uv.y - 1`,
+    // so we want
+    //   uv.x = +right·(p - campos)/dim_x + 0.5
+    //   uv.y =   +up·(p - campos)/dim_y + 0.5
     let u_row = Vec4::new(
         right.x / dim_x,
         right.y / dim_x,

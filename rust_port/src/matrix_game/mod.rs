@@ -27,6 +27,7 @@ pub mod pause_overlay;
 pub mod progress_bar;
 pub mod render_pipeline;
 pub mod robot;
+pub mod shadow;
 pub mod side;
 pub mod slot_marker;
 pub mod ter_surface;

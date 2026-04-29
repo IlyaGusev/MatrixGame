@@ -14,14 +14,18 @@
 use std::collections::HashMap;
 
 use bytemuck::{Pod, Zeroable};
+use glam::{Mat3, Mat4, Vec3};
 use wgpu::util::DeviceExt;
 
 use crate::matrix_game::camera::Camera;
 use crate::matrix_game::common::{unpack_rgb, FOG_END, FOG_START};
 use crate::matrix_game::effects::point_light::PointLightSystem;
 use crate::matrix_game::map::GameMap;
-use crate::matrix_game::map_static::{MapStatic, ObjectType, Objects};
+use crate::matrix_game::map_static::{MapStatic, ObjectId, ObjectType, Objects};
 use crate::matrix_game::robot::{Animation, ChassisKind, Robot};
+use crate::matrix_game::shadow::{
+    ShadowBatch, ShadowMeshSurface, ShadowMeshVertex, ShadowSystem,
+};
 use crate::matrix_lib::three_g::texture::{
     create_solid_texture, create_texture_from_rgba, decode_texture_bytes,
 };
@@ -107,6 +111,16 @@ struct ChassisGpu {
     vo_mesh: std::sync::Arc<vector_object::VoMesh>,
     vertex_buffer: wgpu::Buffer,
     frames: Vec<FrameGpu>,
+    /// Mesh source for the silhouette baker — vertices in chassis-local
+    /// space plus one entry per material-grouped sub-range, each carrying
+    /// its diffuse texture so alpha-tested cutouts (rare on robots, but
+    /// supported) bake correctly.
+    shadow_source: Option<ChassisShadowSource>,
+}
+
+struct ChassisShadowSource {
+    vertices: Vec<ShadowMeshVertex>,
+    surfaces: Vec<ShadowMeshSurface>,
 }
 
 /// Identifies which mesh slot supplies geometry for a `PartDraw`.
@@ -450,6 +464,11 @@ pub struct RobotsRenderer {
     ambient_color: [f32; 4],
     light_color: [f32; 4],
     light_dir: [f32; 4],
+    /// Cached `m_ShadowColor` (DATA_SHADOWCOLOR) from the map, packed
+    /// as 0xAARRGGBB. Forwarded to `ShadowSystem::update_view` each frame so
+    /// the projected-shadow pipeline uses the map-defined tint instead of a
+    /// hardcoded constant.
+    shadow_color: u32,
     time_ms: f32,
     /// World-center offset applied to every instance so local-
     /// frame vertices share the terrain renderer's origin
@@ -459,6 +478,18 @@ pub struct RobotsRenderer {
     /// preview robot (CConstructor.cpp:264-360). Keeps the world
     /// instance buffer untouched so the main pass is unaffected.
     preview_instance_buffer: wgpu::Buffer,
+    /// Projected-shadow infrastructure (pipelines, sampler, shared UB).
+    /// One system per renderer is fine — pipelines are stateless.
+    shadow_system: ShadowSystem,
+    /// Per-robot baked silhouette texture, keyed by `ObjectId`. Robots
+    /// rotate slowly so the cache keeps the texture from the first time
+    /// the robot was seen and never re-bakes — matches `SHADOW_PROJ_STATIC`
+    /// behavior on dynamic objects when re-bake would be too costly.
+    /// Stale entries are evicted at the start of every `sync_robots`.
+    shadow_textures: HashMap<ObjectId, wgpu::TextureView>,
+    /// Per-robot ground-projection mesh, rebuilt every frame in
+    /// `sync_robots` so the shadow follows the robot as it moves.
+    shadow_batches: Vec<ShadowBatch>,
 }
 
 const MAX_LIVE_ROBOTS: u32 = 128;
@@ -714,6 +745,7 @@ impl RobotsRenderer {
                     vo_mesh,
                     vertex_buffer,
                     frames,
+                    shadow_source: None,
                 });
             }
             (out, surf_count)
@@ -755,8 +787,22 @@ impl RobotsRenderer {
             let top_diffuse = format!("Matrix/Robot/Chassis{}", n);
             let top_gloss = format!("Matrix/Robot/Chassis{}_gloss", n);
 
+            // Accumulate frame-0 surface data into a silhouette source.
+            // Animated chassis frames share vertices, so frame-0's index
+            // partition is enough to capture the at-rest silhouette — same
+            // simplification the C++ uses when `m_FramesCnt <= 1` for the
+            // SHADOW_PROJ_STATIC bake (MatrixShadowManager.cpp:381-393).
+            let mut shadow_surfaces: Vec<ShadowMeshSurface> = Vec::new();
+            let shadow_vertices: Vec<ShadowMeshVertex> = vertices
+                .iter()
+                .map(|v| ShadowMeshVertex {
+                    position: v.position,
+                    normal: v.normal,
+                    uv: v.uv,
+                })
+                .collect();
             let mut frames: Vec<FrameGpu> = Vec::with_capacity(vo_mesh.frames.len());
-            for frame in &vo_mesh.frames {
+            for (frame_index, frame) in vo_mesh.frames.iter().enumerate() {
                 let mut surfaces = Vec::with_capacity(frame.surfaces.len());
                 for surf in &frame.surfaces {
                     if surf.indices.is_empty() {
@@ -776,6 +822,13 @@ impl RobotsRenderer {
                     let (diffuse_view, alpha_test) =
                         resolve_diffuse(&material, device, queue, &mut tex_cache, read_texture)
                             .unwrap_or_else(|| (fallback_tex.clone(), false));
+                    if frame_index == 0 {
+                        shadow_surfaces.push(ShadowMeshSurface {
+                            indices: surf.indices.clone(),
+                            diffuse: diffuse_view.clone(),
+                            alpha_test,
+                        });
+                    }
                     let gloss_view = resolve_texture(
                         material.gloss.as_ref(),
                         device,
@@ -886,10 +939,19 @@ impl RobotsRenderer {
                 chassis_kind_index(ck),
                 vo_mesh.clone(),
             );
+            let shadow_source = if shadow_surfaces.is_empty() {
+                None
+            } else {
+                Some(ChassisShadowSource {
+                    vertices: shadow_vertices,
+                    surfaces: shadow_surfaces,
+                })
+            };
             chassis[chassis_kind_index(ck)] = Some(ChassisGpu {
                 vo_mesh,
                 vertex_buffer,
                 frames,
+                shadow_source,
             });
         }
 
@@ -934,6 +996,8 @@ impl RobotsRenderer {
             armor_surfs + head_surfs + weapon_surfs,
         );
 
+        let shadow_system = ShadowSystem::new(device, config);
+
         Some(Self {
             pipeline,
             pipeline_inverted,
@@ -950,9 +1014,13 @@ impl RobotsRenderer {
             ambient_color,
             light_color,
             light_dir,
+            shadow_color: map.shadow_color,
             time_ms: 0.0,
             center: [cx, cy],
             preview_instance_buffer,
+            shadow_system,
+            shadow_textures: HashMap::new(),
+            shadow_batches: Vec::new(),
         })
     }
 
@@ -1360,6 +1428,7 @@ impl RobotsRenderer {
     /// cursor by. Passed in from `form_game.rs` once per frame.
     pub fn sync_robots(
         &mut self,
+        device: &wgpu::Device,
         queue: &wgpu::Queue,
         objs: &mut Objects,
         map: &GameMap,
@@ -1368,6 +1437,17 @@ impl RobotsRenderer {
     ) {
         let [cx, cy] = self.center;
         self.draws.clear();
+        self.shadow_batches.clear();
+
+        let light_world = Vec3::new(
+            map.light_main_dir[0],
+            map.light_main_dir[1],
+            map.light_main_dir[2],
+        );
+        // Track which robot ids have shadows this frame so dead robots'
+        // baked silhouette textures can be evicted at the end.
+        let mut alive_shadow_ids: std::collections::HashSet<ObjectId> =
+            std::collections::HashSet::new();
 
         let mut instance_data: Vec<InstanceData> = Vec::with_capacity(16);
         let mut offset: u32 = 0;
@@ -1465,6 +1545,66 @@ impl RobotsRenderer {
             // before transpose-pack so the bone chain helper can
             // multiply it as a parent matrix).
             let chassis_world = robot_world_d3d_rowmajor(robot, cx, cy);
+
+            // Projected chassis shadow: rebuild geometry every frame at
+            // the robot's current position; the silhouette texture is
+            // baked once on first sight (cached by ObjectId). Robots
+            // rotate too rarely to justify per-frame texture rebakes —
+            // matches the original's Proj path which also leans on
+            // `m_RChange` flags to skip work for stationary objects
+            // (MatrixObject.cpp:558-668).
+            if let Some(source) = chassis_gpu.shadow_source.as_ref() {
+                let world_uc = robot_world_uncentered(robot);
+                let local_pts: Vec<Vec3> = source
+                    .vertices
+                    .iter()
+                    .map(|v| Vec3::from_array(v.position))
+                    .collect();
+                if let Some(proj) = self.shadow_system.calc_proj(&local_pts, light_world, world_uc)
+                {
+                    let texture = self
+                        .shadow_textures
+                        .entry(id)
+                        .or_insert_with(|| {
+                            // Fall back to a 64-pixel silhouette if the
+                            // bake fails (degenerate light vector etc.).
+                            self.shadow_system
+                                .bake_texture(
+                                    device,
+                                    queue,
+                                    &source.vertices,
+                                    &source.surfaces,
+                                    &proj,
+                                    64,
+                                )
+                                .unwrap_or_else(|| {
+                                    let dummy = device.create_texture(&wgpu::TextureDescriptor {
+                                        label: Some("robot shadow dummy"),
+                                        size: wgpu::Extent3d {
+                                            width: 1,
+                                            height: 1,
+                                            depth_or_array_layers: 1,
+                                        },
+                                        mip_level_count: 1,
+                                        sample_count: 1,
+                                        dimension: wgpu::TextureDimension::D2,
+                                        format: wgpu::TextureFormat::Rgba8Unorm,
+                                        usage: wgpu::TextureUsages::TEXTURE_BINDING
+                                            | wgpu::TextureUsages::COPY_DST,
+                                        view_formats: &[],
+                                    });
+                                    dummy.create_view(&Default::default())
+                                })
+                        })
+                        .clone();
+                    if let Some(batch) = self.shadow_system.build_geometry(
+                        device, map, &proj, &texture, 8, [cx, cy],
+                    ) {
+                        self.shadow_batches.push(batch);
+                    }
+                    alive_shadow_ids.insert(id);
+                }
+            }
 
             // Compute armor / head / weapon worlds.
             let armor_kind_i = robot.config.hull.unit.kind.0;
@@ -1596,6 +1736,12 @@ impl RobotsRenderer {
                 bytemuck::cast_slice(&instance_data),
             );
         }
+
+        // Drop silhouette textures for robots that didn't render this
+        // frame (killed / despawned). Without this the cache leaks one
+        // texture per dead robot for the lifetime of the renderer.
+        self.shadow_textures
+            .retain(|id, _| alive_shadow_ids.contains(id));
     }
 
     pub fn render<'a>(
@@ -1620,6 +1766,13 @@ impl RobotsRenderer {
                 time_ms: [self.time_ms, 0.0, 0.0, 0.0],
             }),
         );
+
+        // Project shadows under each live robot before chassis / parts
+        // overdraw their footprints. Mirrors `DrawShadowsProjFast` running
+        // before the object pass at MatrixMap.cpp:2283.
+        self.shadow_system
+            .update_view(queue, view_proj, self.shadow_color);
+        self.shadow_system.render(pass, &self.shadow_batches);
 
         pass.set_pipeline(&self.pipeline);
         pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
@@ -1871,6 +2024,27 @@ fn robot_world_d3d_rowmajor(r: &Robot, cx: f32, cy: f32) -> [[f32; 4]; 4] {
         [up.x, up.y, up.z, 0.0],
         [r.pos_x - cx, r.pos_y - cy, r.pos_z, 1.0],
     ]
+}
+
+/// Uncentered world matrix for the robot (raw map coordinates). Mirrors
+/// `robot_world_d3d_rowmajor` but skipped the renderer-specific center
+/// offset — the shadow projector uses raw map points.
+fn robot_world_uncentered(r: &Robot) -> Mat4 {
+    let f = {
+        let v = r.forward;
+        let l = v.length();
+        if l > 1e-6 {
+            v / l
+        } else {
+            glam::Vec2::new(0.0, 1.0)
+        }
+    };
+    let forward = Vec3::new(f.x, f.y, 0.0);
+    let up = Vec3::new(0.0, 0.0, 1.0);
+    let side = forward.cross(up).normalize_or_zero();
+    let fwd_out = up.cross(side).normalize_or_zero();
+    let rot = Mat3::from_cols(side, fwd_out, up);
+    Mat4::from_translation(Vec3::new(r.pos_x, r.pos_y, r.pos_z)) * Mat4::from_mat3(rot)
 }
 
 fn resolve_diffuse(

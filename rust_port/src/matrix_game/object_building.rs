@@ -11,14 +11,15 @@
 //! composes it with its local animation matrix. We currently draw frame-0 of
 //! each sub-VO, which matches the at-rest pose the original ships with.
 //!
-//! Shadow generation is deferred: `CMatrixBuilding::RNeed` (MatrixObjectBuilding.cpp:
-//! 167-246) has the stencil/proj branches fully commented out in the shipped
-//! code, so the original skips them for buildings too.
+//! Projected shadows are wired through the shared `ShadowSystem`
+//! (matrix_game::shadow). Each instance gets a baked silhouette texture and a
+//! one-shot ground-projection mesh built against the terrain at spawn — the
+//! `SHADOW_PROJ_STATIC` path in MatrixObjectBuilding.cpp:194-243.
 
 use std::collections::{BTreeMap, HashMap};
 
 use bytemuck::{Pod, Zeroable};
-use glam::{Mat3, Vec4};
+use glam::{Mat3, Mat4, Vec3, Vec4};
 use wgpu::util::DeviceExt;
 
 use crate::matrix_game::camera::Camera;
@@ -32,6 +33,9 @@ use crate::matrix_game::logic::Rnd;
 use crate::matrix_game::robot::{ChassisKind, Robot};
 use crate::matrix_game::config::RobotUnitKind;
 use crate::matrix_game::interface::constructor::RobotConfig;
+use crate::matrix_game::shadow::{
+    ShadowBatch, ShadowMeshSurface, ShadowMeshVertex, ShadowSystem,
+};
 use crate::matrix_lib::three_g::texture::{
     create_solid_texture, create_texture_from_rgba, decode_texture_bytes,
 };
@@ -1223,8 +1227,16 @@ pub struct BuildingsRenderer {
     ambient_color: [f32; 4],
     light_color: [f32; 4],
     light_dir: [f32; 4],
+    /// Cached `m_ShadowColor` from the map (DATA_SHADOWCOLOR), packed as
+    /// 0xAARRGGBB and forwarded to `ShadowSystem::update_view` each frame.
+    shadow_color: u32,
     time_ms: f32,
     last_point_light_revision: u64,
+    /// Projected shadow infrastructure (pipelines, sampler, shared UB).
+    shadow_system: ShadowSystem,
+    /// One ground-projection mesh per building instance. Built once at spawn —
+    /// buildings don't move, so the geometry doesn't need to refresh per frame.
+    shadow_batches: Vec<ShadowBatch>,
 }
 
 impl BuildingsRenderer {
@@ -1295,6 +1307,17 @@ impl BuildingsRenderer {
         let mut loaded_kinds = 0usize;
         let mut missing_kinds = 0usize;
 
+        // Per-kind pooled mesh data used to bake the silhouette texture and
+        // size the projector. Concatenates every sub-unit's frame-0 mesh into
+        // a single buffer (sub-units share the building's local frame at rest;
+        // the floor / door slide animations are runtime-only so the static
+        // bake at frame-0 matches the original's `m_GroupVO`-sourced shadow).
+        struct ShadowKindMesh {
+            vertices: Vec<ShadowMeshVertex>,
+            surfaces: Vec<ShadowMeshSurface>,
+        }
+        let mut shadow_kinds: HashMap<u8, ShadowKindMesh> = HashMap::new();
+
         for (kind, instances) in &by_kind {
             let cvo_path = match building_cvo_path(*kind) {
                 Some(p) => p,
@@ -1358,6 +1381,35 @@ impl BuildingsRenderer {
                 // overrides from the CVO still win, mirroring the composed
                 // skin the original builds at VectorObject.cpp:2513.
                 let cvo_dir = cvo_path.rsplit_once('/').map(|(d, _)| format!("{d}/"));
+                // Silhouette source — body sub-units only. The original's
+                // `m_Graph = m_GGraph->m_Unit[0].m_Graph`
+                // (MatrixObjectBuilding.cpp) hands the body's VO to the
+                // shadow builder, NOT the animated parts. Including the
+                // BASE's platform / doors here causes their meshes (which
+                // sit below ground at rest under `unit_offset`) to bake
+                // into the silhouette and bleed out as a phantom "spawn
+                // pod" shadow next to the body. CVO body units carry
+                // `id = None` or `id = 0`; animated sub-units (platform = 1,
+                // doors = 2/3 on BASE) get their own id.
+                let is_body = unit.id.map_or(true, |id| id == 0);
+                let shadow_vertex_offset = if is_body {
+                    let shadow_mesh =
+                        shadow_kinds.entry(*kind).or_insert_with(|| ShadowKindMesh {
+                            vertices: Vec::new(),
+                            surfaces: Vec::new(),
+                        });
+                    let off = shadow_mesh.vertices.len() as u32;
+                    shadow_mesh
+                        .vertices
+                        .extend(vertices.iter().map(|v| ShadowMeshVertex {
+                            position: v.position,
+                            normal: v.normal,
+                            uv: v.uv,
+                        }));
+                    Some(off)
+                } else {
+                    None
+                };
                 for surf in &frame0.surfaces {
                     if surf.indices.is_empty() {
                         continue;
@@ -1378,6 +1430,22 @@ impl BuildingsRenderer {
                     let (diffuse_view, alpha_test) =
                         resolve_diffuse(&material, device, queue, &mut tex_cache, read_texture)
                             .unwrap_or_else(|| (fallback_tex.clone(), false));
+                    // Mirror this body surface into the silhouette source,
+                    // re-indexed to point into the pooled vertex array.
+                    // Skipped for animated sub-units (platform / doors) —
+                    // their `shadow_vertex_offset` is None.
+                    if let Some(offset) = shadow_vertex_offset {
+                        let shadow_mesh = shadow_kinds
+                            .get_mut(kind)
+                            .expect("body offset implies kind already inserted");
+                        let remapped: Vec<u32> =
+                            surf.indices.iter().map(|i| i + offset).collect();
+                        shadow_mesh.surfaces.push(ShadowMeshSurface {
+                            indices: remapped,
+                            diffuse: diffuse_view.clone(),
+                            alpha_test,
+                        });
+                    }
                     let gloss_view = resolve_texture(
                         material.gloss.as_ref(),
                         device,
@@ -1505,6 +1573,55 @@ impl BuildingsRenderer {
             return None;
         }
 
+        // Bake one shadow batch per building instance. Buildings don't move,
+        // so this is a one-shot at spawn — equivalent to the C++
+        // `MR_ShadowProjGeom | MR_ShadowProjTex` request fired off by
+        // `CMatrixBuilding::OnLoad`. `map_radius` of 10 cells matches the
+        // default the original passes to `ShadowProjBuild` for buildings
+        // (MatrixObjectBuilding.cpp:214). Shadow texture size mirrors the
+        // building's `m_ShadowSize` (default 128, MatrixObjectBuilding.cpp:40).
+        let shadow_system = ShadowSystem::new(device, config);
+        let mut shadow_batches: Vec<ShadowBatch> = Vec::new();
+        let light_world = Vec3::new(
+            map.light_main_dir[0],
+            map.light_main_dir[1],
+            map.light_main_dir[2],
+        );
+        for b in &map.buildings {
+            let Some(mesh) = shadow_kinds.get(&b.kind) else {
+                continue;
+            };
+            if mesh.vertices.is_empty() || mesh.surfaces.is_empty() {
+                continue;
+            }
+            let world_matrix = building_world_matrix(b);
+            let local_pts: Vec<Vec3> = mesh
+                .vertices
+                .iter()
+                .map(|v| Vec3::from_array(v.position))
+                .collect();
+            let Some(proj) = shadow_system.calc_proj(&local_pts, light_world, world_matrix) else {
+                continue;
+            };
+            let texture_size = b.shadow_size.max(32) as u32;
+            let Some(tex) = shadow_system.bake_texture(
+                device,
+                queue,
+                &mesh.vertices,
+                &mesh.surfaces,
+                &proj,
+                texture_size,
+            ) else {
+                continue;
+            };
+            if let Some(batch) =
+                shadow_system.build_geometry(device, map, &proj, &tex, 10, [cx, cy])
+            {
+                shadow_batches.push(batch);
+            }
+        }
+        log::info!("buildings: {} projected shadows built", shadow_batches.len());
+
         Some(Self {
             pipeline,
             batches,
@@ -1513,8 +1630,11 @@ impl BuildingsRenderer {
             ambient_color,
             light_color,
             light_dir,
+            shadow_color: map.shadow_color,
             time_ms: 0.0,
             last_point_light_revision: 0,
+            shadow_system,
+            shadow_batches,
         })
     }
 
@@ -1636,6 +1756,13 @@ impl BuildingsRenderer {
             }),
         );
 
+        // Shadows go down first so the building meshes overdraw their bases.
+        // This mirrors `DrawShadowsProjFast` running before the object pass in
+        // the original's per-frame order (MatrixMap.cpp:2283).
+        self.shadow_system
+            .update_view(queue, view_proj, self.shadow_color);
+        self.shadow_system.render(pass, &self.shadow_batches);
+
         pass.set_pipeline(&self.pipeline);
         for batch in &self.batches {
             pass.set_bind_group(0, &batch.bind_group, &[]);
@@ -1661,6 +1788,21 @@ fn building_cvo_path(kind: u8) -> Option<String> {
         _ => return None,
     };
     Some(format!("Matrix/Building/{name}.cvo"))
+}
+
+/// World matrix for shadow geometry — uncentered (raw map coords). The shadow
+/// system uses raw `map.points[]` heights and only subtracts the renderer's
+/// half-world center when emitting the final ground-vertex positions.
+fn building_world_matrix(b: &BuildingInstance) -> Mat4 {
+    let theta = (b.angle as f32) * std::f32::consts::FRAC_PI_2;
+    let (s, c) = theta.sin_cos();
+    let rot = Mat3::from_cols(
+        Vec3::new(c, s, 0.0),
+        Vec3::new(-s, c, 0.0),
+        Vec3::new(0.0, 0.0, 1.0),
+    );
+    let translation = Vec3::new(b.x, b.y, b.build_z);
+    Mat4::from_translation(translation) * Mat4::from_mat3(rot)
 }
 
 /// Build the per-building instance transform — ports

@@ -24,6 +24,7 @@
 use std::collections::HashMap;
 
 use bytemuck::{Pod, Zeroable};
+use glam::{Mat3, Mat4, Vec3};
 use wgpu::util::DeviceExt;
 
 use crate::matrix_game::camera::Camera;
@@ -33,6 +34,9 @@ use crate::matrix_game::map_static::{
     MapStatic, ObjectCore, ObjectId, ObjectType, Objects, MR_ALL, MR_MATRIX,
 };
 use crate::matrix_game::logic::Rnd;
+use crate::matrix_game::shadow::{
+    ShadowBatch, ShadowMeshSurface, ShadowMeshVertex, ShadowSystem,
+};
 use crate::matrix_lib::three_g::texture::{
     create_solid_texture, create_texture_from_rgba, decode_texture_bytes,
 };
@@ -293,6 +297,15 @@ struct KindGpu {
     turret: Option<CannonMesh>,
     /// `Matrix/Cannon/Shaft{N}.vo` — the barrel.
     shaft: Option<CannonMesh>,
+    /// Mesh source for the silhouette baker — concatenates Basis + Turret +
+    /// Shaft (with mount offsets applied) into a single vertex pool plus
+    /// per-surface index lists. Empty when none of the sub-meshes loaded.
+    shadow_source: Option<KindShadowSource>,
+}
+
+struct KindShadowSource {
+    vertices: Vec<ShadowMeshVertex>,
+    surfaces: Vec<ShadowMeshSurface>,
 }
 
 pub struct CannonsRenderer {
@@ -305,6 +318,9 @@ pub struct CannonsRenderer {
     ambient_color: [f32; 4],
     light_color: [f32; 4],
     light_dir: [f32; 4],
+    /// Cached `m_ShadowColor` from the map (DATA_SHADOWCOLOR), packed as
+    /// 0xAARRGGBB and forwarded to `ShadowSystem::update_view` each frame.
+    shadow_color: u32,
     time_ms: f32,
     center: [f32; 2],
     /// Per-kind instance slot offsets computed each frame by
@@ -316,6 +332,16 @@ pub struct CannonsRenderer {
     /// in the instance buffer. Rendered separately from `draws` because
     /// they only emit the `Basis` sub-mesh (no Turret / Shaft).
     marker_draw: Option<(u32, u32)>,
+    /// Projected-shadow infrastructure (pipelines, sampler, shared UB).
+    shadow_system: ShadowSystem,
+    /// Per-cannon baked silhouette texture, keyed by `ObjectId`. Bake uses
+    /// the cannon's actual world matrix on first sight so the texture's
+    /// orientation matches the projection's axes. Stale entries are evicted
+    /// at the start of every `sync_cannons`.
+    shadow_textures: HashMap<ObjectId, wgpu::TextureView>,
+    /// Per-cannon ground-projection mesh, rebuilt per frame from the
+    /// live cannon list inside `sync_cannons`.
+    shadow_batches: Vec<ShadowBatch>,
 }
 
 const MAX_LIVE_CANNONS: u32 = 64;
@@ -387,6 +413,8 @@ impl CannonsRenderer {
         // baked into the material cache can diverge). We load it
         // once and clone the mesh data cheaply.
         let basis_bytes = read_texture("Matrix/Cannon/Basis.vo");
+
+        let shadow_system = ShadowSystem::new(device, config);
 
         let mut kinds: Vec<KindGpu> = Vec::with_capacity(4);
         let mut loaded = 0;
@@ -470,10 +498,41 @@ impl CannonsRenderer {
             if basis.is_some() || turret.is_some() || shaft.is_some() {
                 loaded += 1;
             }
+
+            // Concatenate the silhouette source rows from every loaded
+            // sub-mesh into one mesh in the kind's local frame. Sub-mesh
+            // index lists are remapped to point into the pooled vertex
+            // buffer.
+            let mut shadow_vertices: Vec<ShadowMeshVertex> = Vec::new();
+            let mut shadow_surfaces: Vec<ShadowMeshSurface> = Vec::new();
+            for sub in [basis.as_ref(), turret.as_ref(), shaft.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                let base = shadow_vertices.len() as u32;
+                shadow_vertices.extend(sub.shadow_vertices.iter().copied());
+                for s in &sub.shadow_surfaces {
+                    shadow_surfaces.push(ShadowMeshSurface {
+                        indices: s.indices.iter().map(|i| i + base).collect(),
+                        diffuse: s.diffuse.clone(),
+                        alpha_test: s.alpha_test,
+                    });
+                }
+            }
+            let shadow_source = if shadow_vertices.is_empty() {
+                None
+            } else {
+                Some(KindShadowSource {
+                    vertices: shadow_vertices,
+                    surfaces: shadow_surfaces,
+                })
+            };
+
             kinds.push(KindGpu {
-                basis,
-                turret,
-                shaft,
+                basis: basis.map(|m| m.mesh),
+                turret: turret.map(|m| m.mesh),
+                shaft: shaft.map(|m| m.mesh),
+                shadow_source,
             });
         }
 
@@ -493,10 +552,14 @@ impl CannonsRenderer {
             ambient_color,
             light_color,
             light_dir,
+            shadow_color: map.shadow_color,
             time_ms: 0.0,
             center: [cx, cy],
             draws: Vec::new(),
             marker_draw: None,
+            shadow_system,
+            shadow_textures: HashMap::new(),
+            shadow_batches: Vec::new(),
         })
     }
 
@@ -515,6 +578,7 @@ impl CannonsRenderer {
     /// path at MatrixSide.cpp:554-558.
     pub fn sync_cannons(
         &mut self,
+        device: &wgpu::Device,
         queue: &wgpu::Queue,
         objs: &mut Objects,
         map: &GameMap,
@@ -524,10 +588,18 @@ impl CannonsRenderer {
         let [cx, cy] = self.center;
         self.draws.clear();
         self.marker_draw = None;
+        self.shadow_batches.clear();
         let mut instance_data: Vec<InstanceData> = Vec::with_capacity(16);
 
         // Group cannons by kind so draws are contiguous.
         let mut by_kind: [Vec<InstanceData>; 4] = [vec![], vec![], vec![], vec![]];
+        let light_world = Vec3::new(
+            map.light_main_dir[0],
+            map.light_main_dir[1],
+            map.light_main_dir[2],
+        );
+        let mut alive_shadow_ids: std::collections::HashSet<ObjectId> =
+            std::collections::HashSet::new();
         for id in objs.iter_live() {
             let Some(obj) = objs.get(id) else { continue };
             if !matches!(obj.core().obj_type, ObjectType::Cannon) {
@@ -536,6 +608,65 @@ impl CannonsRenderer {
             let c: &Cannon = unsafe { &*(obj as *const dyn MapStatic as *const Cannon) };
             let k = ((c.kind - 1).max(0) as usize).min(3);
             by_kind[k].push(cannon_instance(c, cx, cy, map));
+
+            // Per-instance shadow: bake the silhouette using THIS cannon's
+            // world rotation so the texture's projector axes match the
+            // ground-projection's axes. Bake is one-shot (cached by
+            // ObjectId); the ground geometry rebuilds per frame.
+            if let Some(kind_gpu) = self.kinds.get(k) {
+                if let Some(src) = kind_gpu.shadow_source.as_ref() {
+                    let world_uc = cannon_world_uncentered(c);
+                    let local_pts: Vec<Vec3> = src
+                        .vertices
+                        .iter()
+                        .map(|v| Vec3::from_array(v.position))
+                        .collect();
+                    if let Some(proj) =
+                        self.shadow_system.calc_proj(&local_pts, light_world, world_uc)
+                    {
+                        let texture = self
+                            .shadow_textures
+                            .entry(id)
+                            .or_insert_with(|| {
+                                self.shadow_system
+                                    .bake_texture(
+                                        device,
+                                        queue,
+                                        &src.vertices,
+                                        &src.surfaces,
+                                        &proj,
+                                        64,
+                                    )
+                                    .unwrap_or_else(|| {
+                                        let dummy =
+                                            device.create_texture(&wgpu::TextureDescriptor {
+                                                label: Some("cannon shadow dummy"),
+                                                size: wgpu::Extent3d {
+                                                    width: 1,
+                                                    height: 1,
+                                                    depth_or_array_layers: 1,
+                                                },
+                                                mip_level_count: 1,
+                                                sample_count: 1,
+                                                dimension: wgpu::TextureDimension::D2,
+                                                format: wgpu::TextureFormat::Rgba8Unorm,
+                                                usage: wgpu::TextureUsages::TEXTURE_BINDING
+                                                    | wgpu::TextureUsages::COPY_DST,
+                                                view_formats: &[],
+                                            });
+                                        dummy.create_view(&Default::default())
+                                    })
+                            })
+                            .clone();
+                        if let Some(batch) = self.shadow_system.build_geometry(
+                            device, map, &proj, &texture, 6, [cx, cy],
+                        ) {
+                            self.shadow_batches.push(batch);
+                        }
+                        alive_shadow_ids.insert(id);
+                    }
+                }
+            }
         }
         if let Some(g) = ghost {
             let k = ((g.kind - 1).max(0) as usize).min(3);
@@ -584,6 +715,12 @@ impl CannonsRenderer {
                 bytemuck::cast_slice(&instance_data),
             );
         }
+
+        // Drop silhouette textures for cannons that didn't render this frame
+        // (destroyed). Without this the cache leaks one texture per dead
+        // cannon for the renderer's lifetime.
+        self.shadow_textures
+            .retain(|id, _| alive_shadow_ids.contains(id));
     }
 
     pub fn render<'a>(
@@ -608,6 +745,13 @@ impl CannonsRenderer {
                 time_ms: [self.time_ms, 0.0, 0.0, 0.0],
             }),
         );
+
+        // Project cannon shadows first so the cannons overdraw their bases
+        // (matches `DrawShadowsProjFast` running before objects in the
+        // original frame order — MatrixMap.cpp:2283).
+        self.shadow_system
+            .update_view(queue, view_proj, self.shadow_color);
+        self.shadow_system.render(pass, &self.shadow_batches);
 
         pass.set_pipeline(&self.pipeline);
         pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
@@ -662,6 +806,18 @@ impl CannonsRenderer {
             }
         }
     }
+}
+
+/// Uncentered world matrix for a cannon — raw map coordinates (no half-world
+/// shift). Used by the shadow system since `map.points[]` are uncentered.
+fn cannon_world_uncentered(c: &Cannon) -> Mat4 {
+    let (s, co) = c.angle.sin_cos();
+    let rot = Mat3::from_cols(
+        Vec3::new(co, s, 0.0),
+        Vec3::new(-s, co, 0.0),
+        Vec3::new(0.0, 0.0, 1.0),
+    );
+    Mat4::from_translation(Vec3::new(c.pos.x, c.pos.y, c.pos_z)) * Mat4::from_mat3(rot)
 }
 
 fn cannon_instance(c: &Cannon, cx: f32, cy: f32, _map: &GameMap) -> InstanceData {
@@ -779,6 +935,16 @@ fn read_mount_offset(bytes: &[u8], id: u32, label: &str) -> Option<glam::Vec3> {
 // this mesh. Composes the cannon's hierarchical sub-mesh chain
 // (Basis → Turret → Shaft) without needing per-sub-mesh uniforms. Zero
 // for the first mesh in a chain.
+/// Loaded sub-mesh + the silhouette source rows it contributed (for the
+/// shared per-kind shadow bake). The shadow rows hold the SAME mount-offset
+/// vertex positions the renderer uses, so the silhouette captures the full
+/// composite cannon in its assembled local frame.
+struct LoadedMesh {
+    mesh: CannonMesh,
+    shadow_vertices: Vec<ShadowMeshVertex>,
+    shadow_surfaces: Vec<ShadowMeshSurface>,
+}
+
 fn load_mesh(
     bytes: &[u8],
     path: &str,
@@ -793,7 +959,7 @@ fn load_mesh(
     fallback_tex: &wgpu::TextureView,
     black_tex: &wgpu::TextureView,
     transparent_tex: &wgpu::TextureView,
-) -> Option<CannonMesh> {
+) -> Option<LoadedMesh> {
     let mesh: VoMesh = vector_object::parse_vo(bytes)
         .map_err(|e| log::warn!("cannons: parse {path} failed: {e}"))
         .ok()?;
@@ -820,6 +986,15 @@ fn load_mesh(
 
     let frame = mesh.frames.first()?;
     let mut surfaces = Vec::with_capacity(frame.surfaces.len());
+    let shadow_vertices: Vec<ShadowMeshVertex> = vertices
+        .iter()
+        .map(|v| ShadowMeshVertex {
+            position: v.position,
+            normal: v.normal,
+            uv: v.uv,
+        })
+        .collect();
+    let mut shadow_surfaces: Vec<ShadowMeshSurface> = Vec::new();
     for surf in &frame.surfaces {
         if surf.indices.is_empty() {
             continue;
@@ -832,6 +1007,11 @@ fn load_mesh(
         let (diffuse_view, alpha_test) =
             resolve_diffuse(&material, device, queue, tex_cache, read_texture)
                 .unwrap_or_else(|| (fallback_tex.clone(), false));
+        shadow_surfaces.push(ShadowMeshSurface {
+            indices: surf.indices.clone(),
+            diffuse: diffuse_view.clone(),
+            alpha_test,
+        });
         let gloss_view = resolve_texture(
             material.gloss.as_ref(),
             device,
@@ -916,9 +1096,13 @@ fn load_mesh(
         });
     }
 
-    Some(CannonMesh {
-        vertex_buffer,
-        surfaces,
+    Some(LoadedMesh {
+        mesh: CannonMesh {
+            vertex_buffer,
+            surfaces,
+        },
+        shadow_vertices,
+        shadow_surfaces,
     })
 }
 

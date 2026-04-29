@@ -1,5 +1,6 @@
 struct U {
     view_proj: mat4x4<f32>,
+    shadow_color: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> u: U;
 @group(0) @binding(1) var t_shadow: texture_2d<f32>;
@@ -22,7 +23,11 @@ struct VOut {
 }
 
 @fragment fn fs_main(in: VOut) -> @location(0) vec4<f32> {
+    // DrawShadowsProjFast (MatrixMap.cpp:1830-1834):
+    //   colour = D3DTA_TFACTOR              -> u.shadow_color.rgb
+    //   alpha  = MODULATE(TEXTURE, TFACTOR) -> silhouette.a * u.shadow_color.a
     let shadow = textureSample(t_shadow, s_shadow, in.uv).a;
-    if (shadow <= 0.01) { discard; }
-    return vec4<f32>(0.0, 0.0, 0.0, shadow * 0.45);
+    let a = shadow * u.shadow_color.a;
+    if (a <= 0.01) { discard; }
+    return vec4<f32>(u.shadow_color.rgb, a);
 }

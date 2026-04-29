@@ -210,6 +210,10 @@ pub struct GameMap {
     pub light_main_dir: [f32; 3],
     pub ambient_color_obj: u32,
     pub ambient_color: u32,
+    /// Map-defined `ShadowColor` (DATA_SHADOWCOLOR, MatrixMapPrepare.cpp:1204).
+    /// Packed as 0xAARRGGBB and used by `DrawShadowsProjFast` as the
+    /// `D3DRS_TEXTUREFACTOR` (MatrixMap.cpp:1830).
+    pub shadow_color: u32,
     pub terrain2object_influence: f32,
     pub terrain2object_target_color: u32,
     /// Foamline tint — DATA_INSHOREWAVECOLOR, used by the inshore wave pass
@@ -444,6 +448,13 @@ impl GameMap {
             .unwrap_or(0x808080) as u32;
         let ambient_color =
             find_property_int(prop_names, prop_values, "AmbientColor").unwrap_or(0x808080) as u32;
+        // ShadowColor is uninitialized in the C++ default-ctor and only
+        // assigned when the property is present (MatrixMapPrepare.cpp:1204).
+        // Fall back to the alpha-only black that matches the previous
+        // hardcoded `(0,0,0,0.45)` shader constant.
+        let shadow_color =
+            find_property_int(prop_names, prop_values, "ShadowColor").unwrap_or(0x73000000u32 as i32)
+                as u32;
         let mut terrain2object_influence =
             find_property_float(prop_names, prop_values, "Influence").unwrap_or(0.0);
         let inshorewave_color = find_property_int(prop_names, prop_values, "InshorewaveColor")
@@ -625,6 +636,7 @@ impl GameMap {
             light_main_dir,
             ambient_color_obj,
             ambient_color,
+            shadow_color,
             terrain2object_influence,
             terrain2object_target_color,
             inshorewave_color,
@@ -2640,6 +2652,7 @@ impl MapRenderer {
     /// used for the anim step.
     pub fn sync_robots(
         &mut self,
+        device: &wgpu::Device,
         queue: &wgpu::Queue,
         objs: &mut super::map_static::Objects,
         map: &GameMap,
@@ -2649,10 +2662,10 @@ impl MapRenderer {
         slot_markers: &[super::slot_marker::SlotMarker],
     ) {
         if let Some(robots) = &mut self.robots {
-            robots.sync_robots(queue, objs, map, point_lights, cms);
+            robots.sync_robots(device, queue, objs, map, point_lights, cms);
         }
         if let Some(cannons) = &mut self.cannons {
-            cannons.sync_cannons(queue, objs, map, ghost_cannon, &[]);
+            cannons.sync_cannons(device, queue, objs, map, ghost_cannon, &[]);
         }
         if let Some(sm) = &mut self.slot_markers {
             sm.sync(queue, map, slot_markers);
