@@ -317,6 +317,144 @@ impl MapLogic {
         ids
     }
 
+    /// Populate the arena with one [`Robot`] per initial-robot record
+    /// in the CMAP. Ports the robot-spawn loop of `CMatrixMap::
+    /// StaticPrepare2` (MatrixMapPrepare.cpp:1702-1736):
+    ///   - `SSpecialBot::GetRobot` (CConstructor.cpp:1284-1357) builds
+    ///     the live robot with chassis/armor/weapons/head inserted —
+    ///     mirrored here by assembling a `RobotConfig` (with
+    ///     `find_pylon_for` placing each weapon on the armor's pylon
+    ///     matrix exactly like `CheckWeaponLegality`) and setting
+    ///     `robot.config`.
+    ///   - `m_Forward = (-sin(angle), cos(angle))` — the chassis token's
+    ///     third comma field provides the angle.
+    ///   - For non-player sides: `SetTeam(group-1)` if the CMAP group
+    ///     index is 1..=3, else `-1` (deferred-team path that
+    ///     `GroupNoTeamRobot` later resolves).
+    ///
+    /// Returns the spawned robots' arena IDs.
+    pub fn spawn_robots(&mut self, map: &GameMap) -> Vec<ObjectId> {
+        use crate::matrix_game::interface::constructor::{
+            name_of_live, raw_hitpoint_of_live, ArmorUnit, RobotConfig, Unit,
+        };
+        use crate::matrix_game::map::default_weapon_matrix;
+        use crate::matrix_game::object_building::{chassis_from_kind, robot_weapons_from_cfg};
+        use crate::matrix_game::object_robot::{RobotUnitType, MAX_WEAPON_CNT};
+        use crate::matrix_game::robot::Robot;
+
+        let mut ids = Vec::with_capacity(map.robots.len());
+        for inst in &map.robots {
+            // Resolve chassis enum. If the CMAP rec carries an unknown
+            // chassis kind we skip — the C++ `GetRobot` returns NULL on
+            // bad sides / config and the caller skips, but in practice
+            // every shipped map sets all four units.
+            let Some(chassis) = chassis_from_kind(inst.chassis_kind) else {
+                log::warn!(
+                    "spawn_robots: skipping robot at ({:.1}, {:.1}) — invalid chassis kind {}",
+                    inst.x,
+                    inst.y,
+                    inst.chassis_kind.0,
+                );
+                continue;
+            };
+
+            // Assemble RobotConfig — port of `SSpecialBot::GetRobot`'s
+            // unit-insert sequence (CConstructor.cpp:1296-1325). The
+            // weapon-matrix re-placement matches the
+            // `CheckWeaponLegality` loop at :1303-1314.
+            let mut cfg = RobotConfig::new();
+            cfg.chassis = Unit {
+                ty: RobotUnitType::Chassis,
+                kind: inst.chassis_kind,
+                price: Default::default(),
+            };
+            cfg.hull = ArmorUnit {
+                max_common_weapon_cnt: 0,
+                max_extra_weapon_cnt: 0,
+                unit: Unit {
+                    ty: RobotUnitType::Armor,
+                    kind: inst.armor_kind,
+                    price: Default::default(),
+                },
+            };
+            cfg.head = Unit {
+                ty: RobotUnitType::Head,
+                kind: inst.head_kind,
+                price: Default::default(),
+            };
+            // Weapons: legality-place on the armor's pylon matrix.
+            let matrix = default_weapon_matrix(inst.armor_kind);
+            let mut placed = [Unit {
+                ty: RobotUnitType::Weapon,
+                kind: crate::matrix_game::config::RobotUnitKind(0),
+                price: Default::default(),
+            }; MAX_WEAPON_CNT];
+            for w in &inst.weapons {
+                if w.0 == 0 {
+                    continue;
+                }
+                if let Some(pos) = matrix.find_pylon_for(*w, &placed) {
+                    placed[pos] = Unit {
+                        ty: RobotUnitType::Weapon,
+                        kind: *w,
+                        price: Default::default(),
+                    };
+                }
+            }
+            cfg.weapon = placed;
+
+            // Build the live robot. Pos.z = floor z (set by
+            // `load_robots` via GetZ), matching MatrixMapPrepare.cpp:761.
+            let pos = glam::Vec3::new(inst.x, inst.y, inst.z);
+            let mut robot = Robot::new(pos, inst.side as i32, chassis);
+
+            // m_Forward = (-sin(angle), cos(angle)) — :1709-1710.
+            robot.forward = glam::Vec2::new(-inst.angle.sin(), inst.angle.cos());
+            robot.hull_forward = robot.forward;
+
+            robot.config = cfg;
+
+            // HP from chassis+armor+head (port of CalcRobotMass +
+            // InitMaxHitpoint at MatrixRobot.cpp:4150-4293).
+            let hp = raw_hitpoint_of_live(&cfg.chassis, &cfg.hull, &cfg.head) as f32;
+            if hp > 0.0 {
+                robot.hit_point_max = hp;
+                robot.hit_point = hp;
+            }
+            // m_Name — same naming helper used by the construct-from-base
+            // path in `BuildStack::pop` (CConstructor.cpp:218).
+            robot.name = name_of_live(
+                &cfg.chassis,
+                &cfg.hull,
+                &cfg.head,
+                &robot_weapons_from_cfg(&cfg),
+            );
+
+            // Team assignment (MatrixMapPrepare.cpp:1724-1732). Player
+            // side gets a `PGOrderStop` in the C++; we skip that here
+            // because the side-logic group machinery isn't wired yet —
+            // the player's initial robots will sit idle until selected.
+            if inst.side as i32 != PLAYER_SIDE {
+                if (1..=3).contains(&inst.group) {
+                    robot.set_team(inst.group - 1);
+                } else {
+                    // C++ `SetTeam(-1)` — clamp() in our setter floors
+                    // to 0 instead of preserving the deferred sentinel.
+                    // GroupNoTeamRobot (the C++ post-pass that resolves
+                    // -1 into a real team) is not ported yet, so default
+                    // to team 0 for now.
+                    robot.set_team(0);
+                }
+            }
+
+            let id = self.objects.spawn(Box::new(robot));
+            self.objects.add_lt(id);
+            ids.push(id);
+        }
+        log::info!("spawn: {} initial robots", ids.len());
+        ids
+    }
+
     /// Pick the `CurrSel` enum for a given object id — port of the
     /// `switch(ms->GetObjectType())` in `CMatrixSideUnit::SelectObject`
     /// (MatrixSide.cpp).

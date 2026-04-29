@@ -71,7 +71,11 @@ pub struct ShadowProjData {
     pub world_translation_xy: [f32; 2],
 }
 
-/// Per-batch GPU resources for one rendered shadow.
+/// Per-batch GPU resources for one rendered shadow. Cloning is cheap —
+/// every wgpu handle inside is reference-counted, so we clone these
+/// per-frame from the per-object cache in [`crate::matrix_game::object_robot::RobotsRenderer`]
+/// to skip the geometry rebuild for stationary robots.
+#[derive(Clone)]
 pub struct ShadowBatch {
     pub vertex_buffer: wgpu::Buffer,
     pub index_buffer: wgpu::Buffer,

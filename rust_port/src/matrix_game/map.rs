@@ -243,6 +243,11 @@ pub struct GameMap {
     /// spawn). The C++ creates a `CMatrixCannon` for every non-empty
     /// record; we mirror that in `MapLogic::spawn_buildings`.
     pub cannons: Vec<CannonInstance>,
+    /// Initial robot placements from the `robots/*` CMAP table — one
+    /// entry per `SPreRobot` parsed at MatrixMapPrepare.cpp:697-770.
+    /// `MapLogic::spawn_robots` materialises these into live arena
+    /// `Robot`s on world init, matching `StaticPrepare2`'s loop.
+    pub robots: Vec<RobotInstance>,
     /// Per-group max LAND z, size = group_w * group_h.
     /// Ports GetGroupMaxZLand (MatrixMap.hpp:759): returns 0 for empty groups /
     /// groups whose max is negative. Used by the camera to keep the link-point
@@ -391,6 +396,40 @@ pub struct TurretPlaceCmap {
     /// -1 = empty (player can build here), 1..=4 = pre-mounted factory
     /// cannon of that kind.
     pub cannon_type: i32,
+}
+
+/// One initial robot placed by the map. Ports `SPreRobot`
+/// (MatrixMapPrepare.cpp:697-770). The CMAP stores a parametric
+/// description (chassis/armor/head/weapons) plus position, side,
+/// shadow params, and a tactic group index; `MapLogic::spawn_robots`
+/// later assembles a `RobotConfig` and live `Robot` for each entry,
+/// mirroring `StaticPrepare2`'s loop at MatrixMapPrepare.cpp:1702-1736.
+#[derive(Debug, Clone, Copy)]
+pub struct RobotInstance {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    /// Side ID — 1 = player, 2..=8 = AI (matches CMatrixSide convention).
+    pub side: u8,
+    pub shadow: u8,
+    pub shadow_size: i32,
+    /// Tactic group index (1..=3) for AI sides. -1 sentinel value when
+    /// outside that range — `StaticPrepare2` calls `SetTeam(-1)` for
+    /// "no preset team", deferred to `GroupNoTeamRobot`.
+    pub group: i32,
+    /// Chassis spawn angle in radians, from the third comma-separated
+    /// field of the chassis token in `Units`. Used to seed
+    /// `m_Forward = (-sin, cos)` (MatrixMapPrepare.cpp:1709-1710).
+    pub angle: f32,
+    /// Parsed chassis kind — preserves the raw `RUK_CHASSIS_*` value
+    /// (1..=5) so `chassis_from_kind` can resolve the enum at spawn.
+    pub chassis_kind: RobotUnitKind,
+    pub armor_kind: RobotUnitKind,
+    pub head_kind: RobotUnitKind,
+    /// Sequential weapon kinds as parsed from `Units`. Indices here are
+    /// "k-th weapon in the string"; the legality / pylon-pick
+    /// re-shuffles them onto the armor's pylon matrix at spawn.
+    pub weapons: [RobotUnitKind; crate::matrix_game::object_robot::MAX_WEAPON_CNT],
 }
 
 impl GameMap {
@@ -595,10 +634,12 @@ impl GameMap {
         // `CMatrixBuilding::OnLoad`'s `GetZ` lookup.
         let mut buildings = load_buildings(&stor, &units, size_x, size_y);
         let cannons = load_cannons(&stor, &mut buildings);
+        let robots = load_robots(&stor, &units, size_x, size_y);
         log::info!(
-            "map: loaded {} starting buildings, {} cannon records",
+            "map: loaded {} starting buildings, {} cannon records, {} initial robots",
             buildings.len(),
-            cannons.len()
+            cannons.len(),
+            robots.len(),
         );
 
         // No dilation: the stored per-group max is the max of THIS group's
@@ -649,6 +690,7 @@ impl GameMap {
             objects,
             buildings,
             cannons,
+            robots,
             group_max_z_land,
             group_w,
             group_h,
@@ -1675,6 +1717,148 @@ fn load_cannons(
             prop,
             parent_building,
             parent_slot,
+        });
+    }
+    out
+}
+
+/// Port of `RS_ROBOTS` step (MatrixMapPrepare.cpp:697-770) — read the
+/// `robots/{X,Y,Side,Shadow,ShadowSize,Group,Units}` columns and parse
+/// each row's `Units` wstr ("|"-separated tokens of "type,kind[,angle]")
+/// into a [`RobotInstance`]. The chassis token's optional third field
+/// is the spawn angle in radians.
+///
+/// `MRT_*` numeric values come from `ERobotUnitType`
+/// (MatrixObjectRobot.hpp:47-55):
+///   1=Chassis, 2=Weapon, 3=Armor, 4=Head.
+fn load_robots(
+    stor: &Storage,
+    units: &[MapUnit],
+    size_x: usize,
+    size_y: usize,
+) -> Vec<RobotInstance> {
+    let Some(cx) = stor.get_buf("robots", "X") else {
+        return Vec::new();
+    };
+    let Some(cy) = stor.get_buf("robots", "Y") else {
+        return Vec::new();
+    };
+    let Some(cside) = stor.get_buf("robots", "Side") else {
+        return Vec::new();
+    };
+    let Some(cshadow) = stor.get_buf("robots", "Shadow") else {
+        return Vec::new();
+    };
+    let Some(cshsz) = stor.get_buf("robots", "ShadowSize") else {
+        return Vec::new();
+    };
+    let Some(cgroup) = stor.get_buf("robots", "Group") else {
+        return Vec::new();
+    };
+    let Some(cunits) = stor.get_buf("robots", "Units") else {
+        return Vec::new();
+    };
+
+    if cx.arrays_count() == 0 {
+        return Vec::new();
+    }
+
+    let xs = read_f32_array(cx.get_bytes(0));
+    let ys = read_f32_array(cy.get_bytes(0));
+    let sides = cside.get_bytes(0);
+    let shadows = cshadow.get_bytes(0);
+    let shszs = read_i32_array(cshsz.get_bytes(0));
+    let groups = read_i32_array(cgroup.get_bytes(0));
+
+    let n = xs.len().min(ys.len());
+    if n == 0 {
+        return Vec::new();
+    }
+
+    // Mirror of `CMatrixMap::GetZ` (MatrixMap.cpp:1020-1062) — same
+    // floor-z resolver used by `load_buildings`. Returns 0 below water
+    // (the C++ traces from z=1000 down for submerged cells; we clamp).
+    let get_z = |wx: f32, wy: f32| -> f32 {
+        let sx = wx / GLOBAL_SCALE;
+        let sy = wy / GLOBAL_SCALE;
+        let ix = sx.floor() as i32;
+        let iy = sy.floor() as i32;
+        if ix < 0 || iy < 0 || ix >= size_x as i32 || iy >= size_y as i32 {
+            return 0.0;
+        }
+        let u = units[iy as usize * size_x + ix as usize];
+        if u.flags & crate::matrix_game::common::CELLFLAG_FLAT != 0 {
+            return u.a1;
+        }
+        let lx = wx - ix as f32 * GLOBAL_SCALE;
+        let ly = wy - iy as f32 * GLOBAL_SCALE;
+        if ly < lx {
+            u.a1 * lx + u.b1 * ly + u.c1
+        } else {
+            u.a2 * lx + u.b2 * ly + u.c2
+        }
+    };
+
+    const MRT_CHASSIS: i32 = 1;
+    const MRT_WEAPON: i32 = 2;
+    const MRT_ARMOR: i32 = 3;
+    const MRT_HEAD: i32 = 4;
+    const W_CNT: usize = crate::matrix_game::object_robot::MAX_WEAPON_CNT;
+
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let units_str = cunits.get_as_wstr(i);
+
+        let mut chassis_kind = RobotUnitKind(0);
+        let mut armor_kind = RobotUnitKind(0);
+        let mut head_kind = RobotUnitKind(0);
+        let mut weapons = [RobotUnitKind(0); W_CNT];
+        let mut wi = 0usize;
+        let mut angle = 0.0f32;
+
+        for token in units_str.split('|') {
+            if token.is_empty() {
+                continue;
+            }
+            let mut parts = token.split(',');
+            let Some(type_s) = parts.next() else { continue };
+            let Some(kind_s) = parts.next() else { continue };
+            let ty = type_s.trim().parse::<i32>().unwrap_or(0);
+            let kind = kind_s.trim().parse::<i32>().unwrap_or(0);
+            match ty {
+                MRT_CHASSIS => {
+                    chassis_kind = RobotUnitKind(kind);
+                    if let Some(angle_s) = parts.next() {
+                        angle = angle_s.trim().parse::<f32>().unwrap_or(0.0);
+                    }
+                }
+                MRT_ARMOR => armor_kind = RobotUnitKind(kind),
+                MRT_HEAD => head_kind = RobotUnitKind(kind),
+                MRT_WEAPON => {
+                    if wi < W_CNT {
+                        weapons[wi] = RobotUnitKind(kind);
+                        wi += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let x = xs[i];
+        let y = ys[i];
+        out.push(RobotInstance {
+            x,
+            y,
+            z: get_z(x, y),
+            side: *sides.get(i).unwrap_or(&0),
+            shadow: *shadows.get(i).unwrap_or(&0),
+            shadow_size: shszs.get(i).copied().unwrap_or(128),
+            group: groups.get(i).copied().unwrap_or(-1),
+            angle,
+            chassis_kind,
+            armor_kind,
+            head_kind,
+            weapons,
         });
     }
     out

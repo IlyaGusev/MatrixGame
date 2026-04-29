@@ -487,9 +487,53 @@ pub struct RobotsRenderer {
     /// behavior on dynamic objects when re-bake would be too costly.
     /// Stale entries are evicted at the start of every `sync_robots`.
     shadow_textures: HashMap<ObjectId, wgpu::TextureView>,
-    /// Per-robot ground-projection mesh, rebuilt every frame in
-    /// `sync_robots` so the shadow follows the robot as it moves.
+    /// Per-robot ground-projection mesh used by the current frame's
+    /// render pass. Cleared and refilled by `sync_robots` from
+    /// `shadow_cache`.
     shadow_batches: Vec<ShadowBatch>,
+    /// Per-robot cached projected-shadow geometry. Mirrors the C++
+    /// `m_RChange & MR_ShadowProjGeom` gate at MatrixObject.cpp:558:
+    /// each `build_geometry` call allocates 2 GPU buffers + 1 bind
+    /// group, so caching the batch and rebuilding only when the robot
+    /// actually moves/rotates avoids paying that cost every frame for
+    /// an idle robot.
+    shadow_cache: HashMap<ObjectId, CachedShadow>,
+}
+
+/// One entry in [`RobotsRenderer::shadow_cache`]. `sig` is the bit
+/// pattern of the robot's `(pos, forward)` at the time the geometry
+/// was rebuilt — when it matches the current frame's robot state we
+/// reuse `batch` verbatim, mirroring the C++ behaviour where
+/// `MR_ShadowProjGeom` only re-arms after `LowLevelMove` flags it
+/// (MatrixObjectRobot.cpp:984).
+#[derive(Clone)]
+struct CachedShadow {
+    batch: ShadowBatch,
+    sig: ShadowSig,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ShadowSig {
+    /// Bit patterns of pos_x / pos_y / pos_z and forward.x / forward.y.
+    /// Direct `to_bits` comparison gives byte-exact equality without
+    /// pulling in a NaN-tolerant float compare — the values are written
+    /// here verbatim from the robot, so equality matches "no movement
+    /// since last rebuild".
+    bits: [u32; 5],
+}
+
+impl ShadowSig {
+    fn from_robot(r: &Robot) -> Self {
+        Self {
+            bits: [
+                r.pos_x.to_bits(),
+                r.pos_y.to_bits(),
+                r.pos_z.to_bits(),
+                r.forward.x.to_bits(),
+                r.forward.y.to_bits(),
+            ],
+        }
+    }
 }
 
 const MAX_LIVE_ROBOTS: u32 = 128;
@@ -1021,6 +1065,7 @@ impl RobotsRenderer {
             shadow_system,
             shadow_textures: HashMap::new(),
             shadow_batches: Vec::new(),
+            shadow_cache: HashMap::new(),
         })
     }
 
@@ -1546,63 +1591,79 @@ impl RobotsRenderer {
             // multiply it as a parent matrix).
             let chassis_world = robot_world_d3d_rowmajor(robot, cx, cy);
 
-            // Projected chassis shadow: rebuild geometry every frame at
-            // the robot's current position; the silhouette texture is
-            // baked once on first sight (cached by ObjectId). Robots
-            // rotate too rarely to justify per-frame texture rebakes —
-            // matches the original's Proj path which also leans on
-            // `m_RChange` flags to skip work for stationary objects
-            // (MatrixObject.cpp:558-668).
+            // Projected chassis shadow. The geometry rebuild allocates
+            // 2 GPU buffers + 1 bind group per call (`shadow.rs:510-537`),
+            // so we cache the batch per ObjectId and only rebuild when
+            // the robot actually moved/rotated since last frame. Mirrors
+            // the C++ `m_RChange & MR_ShadowProjGeom` gate at
+            // MatrixObject.cpp:558-668 — only `LowLevelMove` arms the
+            // bit (MatrixObjectRobot.cpp:984), so stationary robots
+            // pay nothing each frame. The silhouette texture is baked
+            // once on first sight (cached by ObjectId).
             if let Some(source) = chassis_gpu.shadow_source.as_ref() {
-                let world_uc = robot_world_uncentered(robot);
-                let local_pts: Vec<Vec3> = source
-                    .vertices
-                    .iter()
-                    .map(|v| Vec3::from_array(v.position))
-                    .collect();
-                if let Some(proj) = self.shadow_system.calc_proj(&local_pts, light_world, world_uc)
-                {
-                    let texture = self
-                        .shadow_textures
-                        .entry(id)
-                        .or_insert_with(|| {
-                            // Fall back to a 64-pixel silhouette if the
-                            // bake fails (degenerate light vector etc.).
-                            self.shadow_system
-                                .bake_texture(
-                                    device,
-                                    queue,
-                                    &source.vertices,
-                                    &source.surfaces,
-                                    &proj,
-                                    64,
-                                )
-                                .unwrap_or_else(|| {
-                                    let dummy = device.create_texture(&wgpu::TextureDescriptor {
-                                        label: Some("robot shadow dummy"),
-                                        size: wgpu::Extent3d {
-                                            width: 1,
-                                            height: 1,
-                                            depth_or_array_layers: 1,
-                                        },
-                                        mip_level_count: 1,
-                                        sample_count: 1,
-                                        dimension: wgpu::TextureDimension::D2,
-                                        format: wgpu::TextureFormat::Rgba8Unorm,
-                                        usage: wgpu::TextureUsages::TEXTURE_BINDING
-                                            | wgpu::TextureUsages::COPY_DST,
-                                        view_formats: &[],
-                                    });
-                                    dummy.create_view(&Default::default())
-                                })
-                        })
-                        .clone();
-                    if let Some(batch) = self.shadow_system.build_geometry(
-                        device, map, &proj, &texture, 8, [cx, cy],
-                    ) {
-                        self.shadow_batches.push(batch);
+                let sig = ShadowSig::from_robot(robot);
+                if let Some(cached) = self.shadow_cache.get(&id) {
+                    if cached.sig == sig {
+                        // Stationary since last rebuild — reuse the
+                        // existing batch verbatim.
+                        self.shadow_batches.push(cached.batch.clone());
+                        alive_shadow_ids.insert(id);
                     }
-                    alive_shadow_ids.insert(id);
+                }
+                if !alive_shadow_ids.contains(&id) {
+                    let world_uc = robot_world_uncentered(robot);
+                    let local_pts: Vec<Vec3> = source
+                        .vertices
+                        .iter()
+                        .map(|v| Vec3::from_array(v.position))
+                        .collect();
+                    if let Some(proj) =
+                        self.shadow_system.calc_proj(&local_pts, light_world, world_uc)
+                    {
+                        let texture = self
+                            .shadow_textures
+                            .entry(id)
+                            .or_insert_with(|| {
+                                // Fall back to a 64-pixel silhouette if the
+                                // bake fails (degenerate light vector etc.).
+                                self.shadow_system
+                                    .bake_texture(
+                                        device,
+                                        queue,
+                                        &source.vertices,
+                                        &source.surfaces,
+                                        &proj,
+                                        64,
+                                    )
+                                    .unwrap_or_else(|| {
+                                        let dummy =
+                                            device.create_texture(&wgpu::TextureDescriptor {
+                                                label: Some("robot shadow dummy"),
+                                                size: wgpu::Extent3d {
+                                                    width: 1,
+                                                    height: 1,
+                                                    depth_or_array_layers: 1,
+                                                },
+                                                mip_level_count: 1,
+                                                sample_count: 1,
+                                                dimension: wgpu::TextureDimension::D2,
+                                                format: wgpu::TextureFormat::Rgba8Unorm,
+                                                usage: wgpu::TextureUsages::TEXTURE_BINDING
+                                                    | wgpu::TextureUsages::COPY_DST,
+                                                view_formats: &[],
+                                            });
+                                        dummy.create_view(&Default::default())
+                                    })
+                            })
+                            .clone();
+                        if let Some(batch) = self.shadow_system.build_geometry(
+                            device, map, &proj, &texture, 8, [cx, cy],
+                        ) {
+                            self.shadow_batches.push(batch.clone());
+                            self.shadow_cache.insert(id, CachedShadow { batch, sig });
+                        }
+                        alive_shadow_ids.insert(id);
+                    }
                 }
             }
 
@@ -1737,10 +1798,13 @@ impl RobotsRenderer {
             );
         }
 
-        // Drop silhouette textures for robots that didn't render this
-        // frame (killed / despawned). Without this the cache leaks one
-        // texture per dead robot for the lifetime of the renderer.
+        // Drop silhouette textures + cached batches for robots that
+        // didn't render this frame (killed / despawned). Without this
+        // both caches leak one entry per dead robot for the lifetime
+        // of the renderer.
         self.shadow_textures
+            .retain(|id, _| alive_shadow_ids.contains(id));
+        self.shadow_cache
             .retain(|id, _| alive_shadow_ids.contains(id));
     }
 

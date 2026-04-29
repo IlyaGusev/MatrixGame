@@ -389,7 +389,7 @@ fn pick_balanced_team(objs: &Objects, side: i32) -> i32 {
 /// into the `[WeaponUnit; MAX_WEAPON_CNT]` shape `name_of_live`
 /// expects (the latter is shared with the constructor preview, which
 /// holds `WeaponUnit` values directly).
-fn robot_weapons_from_cfg(
+pub fn robot_weapons_from_cfg(
     cfg: &RobotConfig,
 ) -> [crate::matrix_game::interface::constructor::WeaponUnit; crate::matrix_game::object_robot::MAX_WEAPON_CNT]
 {
