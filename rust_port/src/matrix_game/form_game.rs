@@ -583,8 +583,26 @@ impl ApplicationHandler for App {
                                         // `CMultiSelection::Begin` +
                                         // `End` semantics (MatrixFormGame.
                                         // cpp:763-770, 664-670).
-                                        state.lmb_anchor = Some([cx, cy]);
-                                        state.lmb_consumed_by_ui = false;
+                                        //
+                                        // Pause guard mirrors
+                                        // `CMultiSelection::Begin` at
+                                        // MatrixMultiSelection.cpp:34
+                                        // returning NULL when the map is
+                                        // paused — so while the constructor
+                                        // is open (Pause(true) inside
+                                        // CConstructorPanel::ActivateAndSelect,
+                                        // CConstructor.cpp:975) world
+                                        // clicks neither click-select
+                                        // nor marquee, leaving the
+                                        // constructor open until the
+                                        // user presses `cocan`.
+                                        if !state.is_paused {
+                                            state.lmb_anchor = Some([cx, cy]);
+                                            state.lmb_consumed_by_ui = false;
+                                        } else {
+                                            state.lmb_anchor = None;
+                                            state.lmb_consumed_by_ui = true;
+                                        }
                                     }
                                 }
                             }
