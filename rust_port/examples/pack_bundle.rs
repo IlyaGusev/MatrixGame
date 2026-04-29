@@ -489,8 +489,10 @@ fn main() {
         };
         // Texture stem (C++ LoadObject takes the name part before .vo and
         // loads diffuse/gloss via the material composition machinery).
+        // `_e`-suffixed variants are the enemy-tint diffuse the C++ swaps
+        // in for non-player robots (MatrixObjectRobot.cpp:335-348).
         let stem = format!("Matrix/Robot/Chassis{}", n);
-        for suffix in ["", "_gloss"] {
+        for suffix in ["", "_gloss", "_e", "_e_gloss"] {
             let t = format!("{}{}", stem, suffix);
             if try_pack_texture(&mut bundle, &mut vo_tex_seen, &t) {
                 chassis_tex_count += 1;
@@ -524,10 +526,12 @@ fn main() {
     );
 
     // Pack robot armor / head / weapon meshes for the constructor
-    // preview. Paths follow `OBJECT_PATH_ROBOT_*` from
-    // StringConstants.hpp:177-180. The C++ also ships `_e` enemy-tint
-    // variants; we pack only the player-side base textures since the
-    // preview only renders for PLAYER_SIDE.
+    // preview AND for live enemy units. Paths follow `OBJECT_PATH_ROBOT_*`
+    // from StringConstants.hpp:177-180. We include the `_e` enemy-tint
+    // variants the C++ swaps in for non-player robots
+    // (MatrixObjectRobot.cpp:335-348) — needed for map-spawned enemies
+    // to render with correct side-color blends instead of the player's
+    // yellow team-marker paint.
     let mut robot_part_vo_count = 0;
     let mut robot_part_tex_count = 0;
     let part_specs: [(&str, u32); 3] = [("Armor", 6), ("Head", 4), ("Weapon", 10)];
@@ -547,7 +551,7 @@ fn main() {
                 }
             };
             let stem = format!("Matrix/Robot/{}{}", folder, n);
-            for suffix in ["", "_gloss"] {
+            for suffix in ["", "_gloss", "_e", "_e_gloss"] {
                 let t = format!("{}{}", stem, suffix);
                 if try_pack_texture(&mut bundle, &mut vo_tex_seen, &t) {
                     robot_part_tex_count += 1;

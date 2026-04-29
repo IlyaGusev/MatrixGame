@@ -451,7 +451,24 @@ impl MapLogic {
             self.objects.add_lt(id);
             ids.push(id);
         }
-        log::info!("spawn: {} initial robots", ids.len());
+        // Per-side breakdown so we can verify the CMAP side byte was
+        // parsed correctly (player=1 yellow, AI=2/3/4 red/blue/green).
+        let mut by_side = [0i32; 9];
+        for inst in &map.robots {
+            let s = inst.side as usize;
+            if s < by_side.len() {
+                by_side[s] += 1;
+            }
+        }
+        log::info!(
+            "spawn: {} initial robots (side1={} side2={} side3={} side4={} other={})",
+            ids.len(),
+            by_side[1],
+            by_side[2],
+            by_side[3],
+            by_side[4],
+            by_side[0] + by_side[5] + by_side[6] + by_side[7] + by_side[8],
+        );
         ids
     }
 

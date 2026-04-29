@@ -115,6 +115,20 @@ pub fn resolve_texture_name(raw: &str, prefix: Option<&str>) -> Option<String> {
         return None;
     }
     let normalized = name.trim_start_matches(".\\").replace('\\', "/");
+    // Many shipped VOs reference textures via the original dev's
+    // absolute Windows path, e.g. "D:\\rangers\\Matrix\\Robot\\Chassis3".
+    // After slash-normalisation these read as "D:/rangers/Matrix/...";
+    // crop everything up to and including the project root so the path
+    // matches the pkg's relative keys ("Matrix/Robot/Chassis3"). Without
+    // this the `_e` enemy-tint probe at MatrixObjectRobot.cpp:335-348
+    // ports always misses on chassis 2/3/4/5 and Armor3.
+    let normalized = if let Some(idx) = normalized.find("Matrix/") {
+        normalized[idx..].to_string()
+    } else if let Some(idx) = normalized.find("matrix/") {
+        normalized[idx..].to_string()
+    } else {
+        normalized
+    };
     match prefix {
         Some(prefix) if !normalized.contains('/') => Some(format!("{prefix}{normalized}")),
         _ => Some(normalized),

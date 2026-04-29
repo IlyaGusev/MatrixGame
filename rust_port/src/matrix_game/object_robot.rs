@@ -95,6 +95,13 @@ struct SurfaceGpu {
     num_indices: u32,
     bind_group: wgpu::BindGroup,
     bind_group_preview: wgpu::BindGroup,
+    /// Enemy variant of `bind_group` — same material/uniform/sampler,
+    /// but with the diffuse view swapped to `<top_diffuse>_e` (the
+    /// `_e`-suffixed texture the C++ probes for at
+    /// MatrixObjectRobot.cpp:335-348). Only populated when the `_e`
+    /// variant exists for this surface's diffuse path; render falls
+    /// back to `bind_group` otherwise. Used for `robot.side != PLAYER_SIDE`.
+    bind_group_enemy: Option<wgpu::BindGroup>,
 }
 
 /// One VO-frame's surface list.
@@ -149,6 +156,10 @@ struct PartDraw {
     instance_offset: u32,
     vo_frame: usize,
     invert: bool,
+    /// `true` when the source robot's side is non-player. Selects
+    /// `SurfaceGpu::bind_group_enemy` (the `_e`-textured variant) at
+    /// render time when present; falls back to `bind_group` otherwise.
+    is_enemy: bool,
 }
 
 const IDENTITY_MAT: [[f32; 4]; 4] = [
@@ -639,6 +650,7 @@ impl RobotsRenderer {
          -> (Vec<Option<ChassisGpu>>, usize) {
             let mut out: Vec<Option<ChassisGpu>> = (0..kind_count).map(|_| None).collect();
             let mut surf_count = 0usize;
+            let mut enemy_surf_count = 0usize;
             for n in 1..=kind_count {
                 let vo_path = format!("Matrix/Robot/{}{}.vo", path_prefix, n);
                 let Some(vo_bytes) = read_texture(&vo_path) else {
@@ -686,6 +698,22 @@ impl RobotsRenderer {
                             material =
                                 vector_object::merge_materials(&surface_mat, Some(&material));
                         }
+                        // Probe `<diffuse>_e` for the enemy-tint variant
+                        // (MatrixObjectRobot.cpp:335-348). The C++ swap
+                        // is anchored on the kind-level path; we
+                        // generalise by probing whatever the surface
+                        // actually resolved to, so VO-declared skins
+                        // that happen to point at the same kind path
+                        // also get the swap.
+                        let enemy_diffuse_view = material.diffuse.as_deref().and_then(|d| {
+                            resolve_texture(
+                                Some(&format!("{}_e", d)),
+                                device,
+                                queue,
+                                tex_cache,
+                                read_texture,
+                            )
+                        });
                         let (diffuse_view, alpha_test) =
                             resolve_diffuse(&material, device, queue, tex_cache, read_texture)
                                 .unwrap_or_else(|| (fallback_tex.clone(), false));
@@ -733,7 +761,9 @@ impl RobotsRenderer {
                                 }),
                                 usage: wgpu::BufferUsages::UNIFORM,
                             });
-                        let make_bg = |ub: &wgpu::Buffer, label: &'static str| {
+                        let make_bg = |ub: &wgpu::Buffer,
+                                       diffuse: &wgpu::TextureView,
+                                       label: &'static str| {
                             device.create_bind_group(&wgpu::BindGroupDescriptor {
                                 label: Some(label),
                                 layout: &bgl,
@@ -744,9 +774,7 @@ impl RobotsRenderer {
                                     },
                                     wgpu::BindGroupEntry {
                                         binding: 1,
-                                        resource: wgpu::BindingResource::TextureView(
-                                            &diffuse_view,
-                                        ),
+                                        resource: wgpu::BindingResource::TextureView(diffuse),
                                     },
                                     wgpu::BindGroupEntry {
                                         binding: 2,
@@ -771,14 +799,25 @@ impl RobotsRenderer {
                                 ],
                             })
                         };
-                        let bind_group = make_bg(&uniform_buffer, "Robots Part BG");
-                        let bind_group_preview =
-                            make_bg(&preview_uniform_buffer, "Robots Part BG (preview)");
+                        let bind_group =
+                            make_bg(&uniform_buffer, &diffuse_view, "Robots Part BG");
+                        let bind_group_preview = make_bg(
+                            &preview_uniform_buffer,
+                            &diffuse_view,
+                            "Robots Part BG (preview)",
+                        );
+                        let bind_group_enemy = enemy_diffuse_view.as_ref().map(|d| {
+                            make_bg(&uniform_buffer, d, "Robots Part BG (enemy)")
+                        });
+                        if bind_group_enemy.is_some() {
+                            enemy_surf_count += 1;
+                        }
                         surfaces.push(SurfaceGpu {
                             index_buffer,
                             num_indices: surf.indices.len() as u32,
                             bind_group,
                             bind_group_preview,
+                            bind_group_enemy,
                         });
                     }
                     surf_count += surfaces.len();
@@ -792,11 +831,18 @@ impl RobotsRenderer {
                     shadow_source: None,
                 });
             }
+            log::info!(
+                "robots: {} loaded {}/{} surfaces with `_e` enemy variant",
+                path_prefix,
+                enemy_surf_count,
+                surf_count,
+            );
             (out, surf_count)
         };
 
         let mut chassis: Vec<Option<ChassisGpu>> = (0..chassis_list.len()).map(|_| None).collect();
         let mut total_surfaces = 0usize;
+        let mut chassis_enemy_surf = 0usize;
         for &ck in &chassis_list {
             let n = chassis_kind_index(ck) as u32 + 1;
             let vo_path = format!("Matrix/Robot/Chassis{}.vo", n);
@@ -862,6 +908,16 @@ impl RobotsRenderer {
                             vector_object::parse_material_spec_with_prefix(spec, vo_dir.as_deref());
                         material = vector_object::merge_materials(&surface_mat, Some(&material));
                     }
+                    // Probe `<diffuse>_e` (MatrixObjectRobot.cpp:335-348).
+                    let enemy_diffuse_view = material.diffuse.as_deref().and_then(|d| {
+                        resolve_texture(
+                            Some(&format!("{}_e", d)),
+                            device,
+                            queue,
+                            &mut tex_cache,
+                            read_texture,
+                        )
+                    });
 
                     let (diffuse_view, alpha_test) =
                         resolve_diffuse(&material, device, queue, &mut tex_cache, read_texture)
@@ -918,7 +974,9 @@ impl RobotsRenderer {
                             }),
                             usage: wgpu::BufferUsages::UNIFORM,
                         });
-                    let make_bg = |ub: &wgpu::Buffer, label: &'static str| {
+                    let make_bg = |ub: &wgpu::Buffer,
+                                   diffuse: &wgpu::TextureView,
+                                   label: &'static str| {
                         device.create_bind_group(&wgpu::BindGroupDescriptor {
                             label: Some(label),
                             layout: &bgl,
@@ -929,7 +987,7 @@ impl RobotsRenderer {
                                 },
                                 wgpu::BindGroupEntry {
                                     binding: 1,
-                                    resource: wgpu::BindingResource::TextureView(&diffuse_view),
+                                    resource: wgpu::BindingResource::TextureView(diffuse),
                                 },
                                 wgpu::BindGroupEntry {
                                     binding: 2,
@@ -954,14 +1012,24 @@ impl RobotsRenderer {
                             ],
                         })
                     };
-                    let bind_group = make_bg(&uniform_buffer, "Robots BG");
-                    let bind_group_preview =
-                        make_bg(&preview_uniform_buffer, "Robots BG (preview)");
+                    let bind_group = make_bg(&uniform_buffer, &diffuse_view, "Robots BG");
+                    let bind_group_preview = make_bg(
+                        &preview_uniform_buffer,
+                        &diffuse_view,
+                        "Robots BG (preview)",
+                    );
+                    let bind_group_enemy = enemy_diffuse_view
+                        .as_ref()
+                        .map(|d| make_bg(&uniform_buffer, d, "Robots BG (enemy)"));
+                    if bind_group_enemy.is_some() {
+                        chassis_enemy_surf += 1;
+                    }
                     surfaces.push(SurfaceGpu {
                         index_buffer,
                         num_indices: surf.indices.len() as u32,
                         bind_group,
                         bind_group_preview,
+                        bind_group_enemy,
                     });
                 }
                 total_surfaces += surfaces.len();
@@ -1000,9 +1068,10 @@ impl RobotsRenderer {
         }
 
         log::info!(
-            "robots: {} chassis loaded ({} frame-surface slots)",
+            "robots: {} chassis loaded ({} frame-surface slots, {} with `_e` enemy variant)",
             chassis.iter().filter(|c| c.is_some()).count(),
             total_surfaces,
+            chassis_enemy_surf,
         );
         if chassis.iter().all(|c| c.is_none()) {
             return None;
@@ -1705,6 +1774,7 @@ impl RobotsRenderer {
             // Push chassis instance + part instances. Each gets its
             // own slot in the shared instance buffer with a matching
             // PartDraw entry.
+            let is_enemy = robot.side != crate::matrix_game::common::PLAYER_SIDE;
             let push_instance = |instance_data: &mut Vec<InstanceData>,
                                  draws: &mut Vec<PartDraw>,
                                  offset: &mut u32,
@@ -1723,6 +1793,7 @@ impl RobotsRenderer {
                     instance_offset: *offset,
                     vo_frame,
                     invert,
+                    is_enemy,
                 });
                 *offset += 1;
                 true
@@ -1886,7 +1957,20 @@ impl RobotsRenderer {
             }
             pass.set_vertex_buffer(0, gpu.vertex_buffer.slice(..));
             for surface in &frame.surfaces {
-                pass.set_bind_group(0, &surface.bind_group, &[]);
+                // For non-player robots, prefer the `_e`-textured
+                // bind group (port of MatrixObjectRobot.cpp:335-348);
+                // fall back to default if this surface has no enemy
+                // variant (e.g. weapon kinds that ship without a
+                // `_e` diffuse).
+                let bg = if draw.is_enemy {
+                    surface
+                        .bind_group_enemy
+                        .as_ref()
+                        .unwrap_or(&surface.bind_group)
+                } else {
+                    &surface.bind_group
+                };
+                pass.set_bind_group(0, bg, &[]);
                 pass.set_index_buffer(surface.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 // `first_instance = instance_offset` routes this draw
                 // to the robot's slot in the shared instance buffer.
