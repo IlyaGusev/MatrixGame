@@ -2702,6 +2702,88 @@ fn refresh_interface_visibility(state: &mut AppState) {
         }
     }
 
+    // Selected-robot panel snapshot. Port of the work_group walk at
+    // CInterface.cpp:1227-1311 + CreatePersonal/CreateGroupIcons inputs
+    // — for each selected robot (own side or enemy / single or group),
+    // collect the cached `RobotConfig` and HP readout, plus the
+    // `m_CurrSelNum` index pointing at the active member.
+    let mut robot_panel: Option<crate::matrix_game::interface::RobotPanelCtx> = None;
+    if matches!(curr_sel, CurrSel::RobotsSelected) {
+        use crate::matrix_game::interface::{RobotEntry, RobotPanelCtx};
+        use crate::matrix_game::map_static::ObjectId as OId;
+        use crate::matrix_game::robot::Robot;
+
+        // Snapshot the selected ids + their cfg/HP/name. Read the
+        // robot pointer through MapStatic and downcast — the same
+        // cast pattern the marquee/selection code uses elsewhere.
+        let primary = state.game.player_side.active_object;
+        let ids: Vec<OId> = state.game.player_side.selected.clone();
+        let mut snapshot: Vec<(OId, crate::matrix_game::interface::constructor::RobotConfig, String, i32, i32)> = Vec::with_capacity(ids.len());
+        for id in &ids {
+            let Some(obj) = state.game.objects.get(*id) else { continue };
+            if !matches!(obj.core().obj_type, ObjectType::RobotAi) {
+                continue;
+            }
+            let r: &Robot = unsafe { &*(obj as *const dyn MapStatic as *const Robot) };
+            // C++ stores HP as a float ranging 0..max — UI displays
+            // integers (CInterface.cpp:1503: `Float2Int(lives)`).
+            let hp = r.hit_point.round().max(0.0) as i32;
+            let max_hp = r.hit_point_max.round().max(0.0) as i32;
+            snapshot.push((*id, r.config, r.name.clone(), hp, max_hp));
+        }
+        if !snapshot.is_empty() {
+            // Bake the medium icons (group cells) ahead of time. Each
+            // unique config maps to a single 64×64 atlas key.
+            let format = state.gfx.config.format;
+            let mut group: Vec<RobotEntry> = Vec::with_capacity(snapshot.len());
+            if let Some(robots) = state.terrain.robots() {
+                for (_id, cfg, _name, _hp, _max) in &snapshot {
+                    let key = state.robot_icons.ensure(
+                        &state.gfx.device,
+                        &state.gfx.queue,
+                        format,
+                        robots,
+                        &mut state.iface_renderer,
+                        cfg,
+                    );
+                    group.push(RobotEntry { atlas_key: key });
+                }
+            } else {
+                for _ in &snapshot {
+                    group.push(RobotEntry { atlas_key: None });
+                }
+            }
+            // Selected index: position of `active_object` within the
+            // snapshot. `m_CurrSelNum` in C++ — the C++ panel uses it
+            // to draw the ramka over the active slot and to pick the
+            // robot whose big-portrait + name + HP appear on the left
+            // of the panel.
+            let selected_index = primary
+                .and_then(|p| snapshot.iter().position(|(id, _, _, _, _)| *id == p))
+                .unwrap_or(0);
+            let (_id, cur_cfg, cur_name, cur_hp, cur_max) = &snapshot[selected_index];
+            // Bake / look up the big portrait for the active robot.
+            let personal_atlas_key = state.terrain.robots().and_then(|robots| {
+                state.robot_icons.ensure_big(
+                    &state.gfx.device,
+                    &state.gfx.queue,
+                    format,
+                    robots,
+                    &mut state.iface_renderer,
+                    cur_cfg,
+                )
+            });
+            robot_panel = Some(RobotPanelCtx {
+                group,
+                selected_index,
+                personal_atlas_key,
+                robot_name: cur_name.clone(),
+                robot_hp: *cur_hp,
+                robot_max_hp: *cur_max,
+            });
+        }
+    }
+
     let ctx = MainVisibilityCtx {
         curr_sel,
         building_kind: kind,
@@ -2716,6 +2798,7 @@ fn refresh_interface_visibility(state: &mut AppState) {
         installed_turret_kinds,
         building_stack_turret_kinds: stack_kinds,
         building_stack_robot_atlas_keys: stack_robot_keys,
+        robot_panel: robot_panel.clone(),
     };
     if let Some(p) = state.iface_list.panel_mut("Main") {
         p.refresh_main_visibility(&ctx);
@@ -2724,6 +2807,10 @@ fn refresh_interface_visibility(state: &mut AppState) {
         if let Some(k) = kind {
             let strings = crate::matrix_game::config::global_strings();
             p.apply_main_building_text(k, hit_point, hit_point_max, income_per_minute, &strings.buildings);
+        }
+        // Robot-selection captions — port of CInterface.cpp:1369-1404.
+        if let Some(rp) = robot_panel.as_ref() {
+            p.apply_main_robot_text(&rp.robot_name, rp.robot_hp, rp.robot_max_hp);
         }
     }
     // Top-of-screen permanent HUD — resource pools + robot count. Port

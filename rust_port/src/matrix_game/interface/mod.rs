@@ -26,6 +26,6 @@ pub use history::ConfigHistory;
 pub use iface_element::{ElementKind, ElementState, IFaceElement, StateImage, MAX_STATES};
 pub use iface_list::{Click, IFaceList, TurretBuild};
 pub mod robot_icons;
-pub use interface::{CInterface, MainVisibilityCtx, MAX_STACK_ICONS};
+pub use interface::{CInterface, MainVisibilityCtx, RobotEntry, RobotPanelCtx, MAX_STACK_ICONS};
 pub use robot_icons::RobotIconCache;
 pub use renderer::InterfaceRenderer;

@@ -155,6 +155,51 @@ pub struct MainVisibilityCtx {
     /// `m_MedTexture`/`m_SmallTexture` baked in
     /// `CMatrixRobotAI::CreateTextures` (MatrixRobot.cpp:5342-5380).
     pub building_stack_robot_atlas_keys: [Option<String>; MAX_STACK_ICONS],
+
+    /// Selected-robot-group state. `Some(...)` ⇔ `m_CurrSel ==
+    /// ROBOT_SELECTED` in the C++ — drives the right-bottom robot
+    /// portrait/group panel. Port of `CIFaceList::CreatePersonal` +
+    /// `CreateGroupIcons` + `CreateGroupSelection` (CInterface.cpp:3550,
+    /// 3658, 3773).
+    pub robot_panel: Option<RobotPanelCtx>,
+}
+
+/// Per-frame snapshot driving the robot selection panel — populated
+/// when the player has a multi-selection of robots / a single robot
+/// active. Mirrors the C++ data the LogicTakt branch reads off
+/// `player_side->GetCurGroup()` + `player_side->GetCurSelNum()`.
+#[derive(Debug, Clone)]
+pub struct RobotPanelCtx {
+    /// Up to 9 selected robots (`MAX_SELECTED_GROUP` in C++) in
+    /// insertion order. `None` slots are left empty so we can preserve
+    /// the original 3×3 layout when the group is sparse.
+    pub group: Vec<RobotEntry>,
+    /// `m_CurrSelNum` (MatrixSide.hpp). Index into `group` of the
+    /// currently-active robot whose `_dynpers_` portrait + `_dynramka_`
+    /// frame are emitted.
+    pub selected_index: usize,
+    /// Atlas key for the active robot's 256×256 portrait — port of
+    /// `GetBigTexture()` (MatrixRobot.cpp:5347). `None` when the icon
+    /// hasn't been baked yet (asset-loading races on the first frames).
+    pub personal_atlas_key: Option<String>,
+    /// Display name of the currently-active robot. Drives the `name`
+    /// caption (CInterface.cpp:1369-1376).
+    pub robot_name: String,
+    /// Current / max HP of the active robot — drives the `lives`
+    /// caption (CInterface.cpp:1396-1404).
+    pub robot_hp: i32,
+    pub robot_max_hp: i32,
+}
+
+/// One entry of `RobotPanelCtx::group`. Carries the data the
+/// `CreateGroupIcons` loop reads off each `CMatrixGroupObject`
+/// (CInterface.cpp:3700-3736).
+#[derive(Debug, Clone)]
+pub struct RobotEntry {
+    /// Atlas key for the 64×64 medium portrait. Populated by
+    /// `RobotIconCache::ensure` ahead of the visibility refresh.
+    /// `None` when the icon hasn't been baked yet.
+    pub atlas_key: Option<String>,
 }
 
 /// `MAX_STACK_UNITS` (MatrixObjectBuilding.hpp:43) — 1 head + 5 tail.
@@ -705,6 +750,223 @@ impl CInterface {
                     hint_offset_x: 0,
                     hint_offset_y: 0,
                 });
+            }
+        }
+
+        // Step 9 — selected-robot panel. Port of
+        // `CIFaceList::CreateGroupSelection` (CInterface.cpp:3550),
+        // `CreateGroupIcons` (3658), and `CreatePersonal` (3773), plus
+        // the `IF_NAME_LABEL` / `IF_LIVES_LABEL` visibility branch of
+        // LogicTakt (CInterface.cpp:1369-1404).
+        //
+        // We always wipe the prior frame's dynamic robot-panel elements
+        // and rebuild from scratch — the C++ uses
+        // `DeletePersonal` / `DeleteGroupIcons` / `DeleteGroupSelection`
+        // on group changes, but a per-frame regen is equivalent for
+        // visible-state purposes and avoids the multi-call dance.
+        self.elements.retain(|e| {
+            !e.name.starts_with("_dyngroup_")
+                && !e.name.starts_with("_dynramka_")
+                && !e.name.starts_with("_dynpers_")
+        });
+        if matches!(ctx.curr_sel, CurrSel::RobotsSelected) {
+            if let Some(rp) = ctx.robot_panel.as_ref() {
+                // Names are visible whenever something is selected
+                // (already done in Step 3); the lives/name elements
+                // already get text via `apply_main_robot_text`.
+
+                // Geometry constants per CInterface.cpp:3556 (group
+                // selection ramka) + :3678-3697 (group icons grid) +
+                // :3853 (personal portrait position 81,61, size 114).
+                const GROUP_X0: f32 = 225.0;
+                const GROUP_Y0: f32 = 49.0;
+                const GROUP_DX: f32 = 48.0;
+                const GROUP_DY: f32 = 49.0;
+                const GROUP_W: f32 = 47.0;
+                const GROUP_H: f32 = 36.0;
+                const PERSONAL_X: f32 = 81.0;
+                const PERSONAL_Y: f32 = 61.0;
+                const PERSONAL_SIZE: f32 = 114.0;
+
+                let pos_for = |i: usize| -> (f32, f32) {
+                    let col = (i % 3) as f32;
+                    let row = (i / 3) as f32;
+                    (GROUP_X0 + col * GROUP_DX, GROUP_Y0 + row * GROUP_DY)
+                };
+
+                // 9.a — selection ramka over the active slot. Port of
+                // CreateGroupSelection (CInterface.cpp:3550). The C++
+                // creates 9 ramka statics at z=0.000001 and toggles
+                // `SetVisibility` based on `selected_index`; we emit
+                // only the one over the active slot. Pushed BEFORE the
+                // group icons so it renders BEHIND them — the C++
+                // SortElementsByZ orders descending by zPos so the
+                // higher-z ramka draws first (back), letting the icon
+                // draw on top with the ramka peeking past its edges.
+                let sel_idx = rp.selected_index.min(rp.group.len().saturating_sub(1));
+                if !rp.group.is_empty() {
+                    if let Some(gram_idx) = self.elements.iter().position(|e| e.name == "gram") {
+                        let images = self.elements[gram_idx].images.clone();
+                        // `gram` is an Image-kind template — its
+                        // `StateImage.w/h` carry the authored ramka
+                        // size (CInterface.cpp:3557 reads off
+                        // `FindImageByName(IF_GROUP_RAMKA)`). Fall back
+                        // to the icon-cell size if the data is missing.
+                        let (gw, gh) = images
+                            .first()
+                            .and_then(|i| i.as_ref())
+                            .map(|i| (i.w.max(GROUP_W), i.h.max(GROUP_H)))
+                            .unwrap_or((GROUP_W, GROUP_H));
+                        let (px, py) = pos_for(sel_idx);
+                        self.elements.push(IFaceElement {
+                            name: format!("_dynramka_{}", sel_idx),
+                            kind: ElementKind::Static,
+                            // GROUP_SELECTION_ID + i (CInterface.h:69).
+                            id: 450 + sel_idx as i32,
+                            group: 0,
+                            flags: IFEF_VISIBLE,
+                            param1: 0.0,
+                            param2: 0.0,
+                            i_param: 0,
+                            pos_x: px,
+                            pos_y: py,
+                            pos_z: 0.000001,
+                            size_x: gw,
+                            size_y: gh,
+                            images,
+                            labels: Vec::new(),
+                            cur_state: ElementState::Normal,
+                            def_state: ElementState::Normal,
+                            hint_template: String::new(),
+                            hint_offset_x: 0,
+                            hint_offset_y: 0,
+                        });
+                    }
+                }
+
+                // 9.b — group icons. One per selected robot, sourced
+                // from each entry's pre-baked `m_MedTexture` atlas key.
+                // Robots without a baked icon are skipped (the slot
+                // stays empty until the bake catches up). Pushed AFTER
+                // the ramka so they draw on top of it.
+                for (i, entry) in rp.group.iter().enumerate().take(9) {
+                    let Some(key) = entry.atlas_key.as_ref() else {
+                        continue;
+                    };
+                    let (px, py) = pos_for(i);
+                    let mut images: [Option<StateImage>; MAX_STATES] = Default::default();
+                    images[ElementState::Normal as usize] = Some(StateImage {
+                        x: 0.0,
+                        y: 0.0,
+                        // `w`/`h` are the ATLAS source dimensions — the
+                        // renderer derives the on-screen rect from
+                        // `element.size_x/size_y` and uses these for the
+                        // UV. Match the C++ `CreateStaticFromImage`
+                        // call at CInterface.cpp:3722-3727 which sets
+                        // `xTexPos=0, yTexPos=0, TexWidth=64,
+                        // TexHeight=64`.
+                        w: 64.0,
+                        h: 64.0,
+                        tex_w: 64.0,
+                        tex_h: 64.0,
+                        tex_path: key.clone(),
+                    });
+                    self.elements.push(IFaceElement {
+                        name: format!("_dyngroup_{}", i),
+                        kind: ElementKind::Static,
+                        // GROUP_ICONS_ID + i (CInterface.h:68).
+                        id: 550 + i as i32,
+                        group: 0,
+                        flags: IFEF_VISIBLE,
+                        param1: 0.0,
+                        param2: 0.0,
+                        i_param: 0,
+                        pos_x: px,
+                        pos_y: py,
+                        pos_z: 0.0,
+                        size_x: GROUP_W,
+                        size_y: GROUP_H,
+                        images,
+                        labels: Vec::new(),
+                        cur_state: ElementState::Normal,
+                        def_state: ElementState::Normal,
+                        hint_template: String::new(),
+                        hint_offset_x: 0,
+                        hint_offset_y: 0,
+                    });
+                }
+
+                // 9.c — personal portrait (PERSONAL_ICON_ID, 755).
+                // Port of CreatePersonal (CInterface.cpp:3773). 114×114
+                // at (81, 61), z=0.0000001, sourced from the active
+                // robot's `m_BigTexture` (we use the 256-px baked
+                // entry from `RobotIconCache::ensure_big`).
+                if let Some(key) = rp.personal_atlas_key.as_ref() {
+                    let mut images: [Option<StateImage>; MAX_STATES] = Default::default();
+                    images[ElementState::Normal as usize] = Some(StateImage {
+                        x: 0.0,
+                        y: 0.0,
+                        // `w`/`h` here are the ATLAS source dims (full
+                        // 256×256 baked texture) — the on-screen 114×114
+                        // comes from `element.size_x/size_y`. Mirrors
+                        // CInterface.cpp:3849-3852 which sets
+                        // `xTexPos=0, yTexPos=0, TexWidth=256,
+                        // TexHeight=256` for the big-portrait copy.
+                        w: 256.0,
+                        h: 256.0,
+                        tex_w: 256.0,
+                        tex_h: 256.0,
+                        tex_path: key.clone(),
+                    });
+                    self.elements.push(IFaceElement {
+                        name: "_dynpers_0".to_string(),
+                        kind: ElementKind::Static,
+                        id: 755, // PERSONAL_ICON_ID (CInterface.h:66).
+                        group: 0,
+                        flags: IFEF_VISIBLE,
+                        param1: 0.0,
+                        param2: 0.0,
+                        i_param: 0,
+                        pos_x: PERSONAL_X,
+                        pos_y: PERSONAL_Y,
+                        pos_z: 0.0000001,
+                        size_x: PERSONAL_SIZE,
+                        size_y: PERSONAL_SIZE,
+                        images,
+                        labels: Vec::new(),
+                        cur_state: ElementState::Normal,
+                        def_state: ElementState::Normal,
+                        hint_template: String::new(),
+                        hint_offset_x: 0,
+                        hint_offset_y: 0,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Refresh the dynamic captions on the `Main` panel for a selected
+    /// robot. Port of CInterface.cpp:1369-1404 — sets the `name` static
+    /// to `cur_r->m_Name` and the `lives` static to `"<hp>/<max>"`.
+    pub fn apply_main_robot_text(
+        &mut self,
+        robot_name: &str,
+        hp: i32,
+        max_hp: i32,
+    ) {
+        if self.name != "Main" {
+            return;
+        }
+        let lives_text = format!("{}/{}", hp, max_hp);
+        for e in &mut self.elements {
+            let new_text: Option<&str> = match e.name.as_str() {
+                "name" => Some(robot_name),
+                "lives" => Some(lives_text.as_str()),
+                _ => None,
+            };
+            let Some(new_text) = new_text else { continue };
+            for lbl in &mut e.labels {
+                lbl.text = new_text.to_string();
             }
         }
     }

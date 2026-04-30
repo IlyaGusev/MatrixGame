@@ -29,13 +29,19 @@ use crate::matrix_game::robot::ChassisKind;
 
 use super::renderer::InterfaceRenderer;
 
-/// Render size of the baked icon. The C++ uses 64 for `m_MedTexture`
-/// (MatrixRobot.cpp:5347, 5365). We reuse the same dimension for
-/// every queue slot — the 25×25 small icons just sample it down.
+/// Render size of the baked medium icon. The C++ uses 64 for
+/// `m_MedTexture` (MatrixRobot.cpp:5347, 5365). Used for the build-stack
+/// 25×25 / 42×42 portraits and the Main-panel 47×36 group icons.
 const ICON_SIZE: u32 = 64;
+/// Render size of the baked big portrait — port of `m_BigTexture`
+/// (MatrixRobot.cpp:5347 — 256×256). The Main panel personal icon is
+/// 114×114, the upscale to that size needs the higher source resolution.
+const BIG_ICON_SIZE: u32 = 256;
 
 pub struct RobotIconCache {
-    entries: HashMap<u64, IconEntry>,
+    /// Keyed by `(config_hash, size)` so med-vs-big share the same hash
+    /// space without clobbering each other.
+    entries: HashMap<(u64, u32), IconEntry>,
 }
 
 struct IconEntry {
@@ -65,14 +71,50 @@ impl RobotIconCache {
         iface_renderer: &mut InterfaceRenderer,
         cfg: &RobotConfig,
     ) -> Option<String> {
-        let key = config_hash(cfg);
+        self.ensure_sized(device, queue, format, robots, iface_renderer, cfg, ICON_SIZE)
+    }
+
+    /// Big variant — port of `m_BigTexture` (MatrixRobot.cpp:5347).
+    /// Used by `CIFaceList::CreatePersonal` (CInterface.cpp:3805) for the
+    /// 114×114 personal portrait on the Main panel.
+    pub fn ensure_big(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        format: wgpu::TextureFormat,
+        robots: &RobotsRenderer,
+        iface_renderer: &mut InterfaceRenderer,
+        cfg: &RobotConfig,
+    ) -> Option<String> {
+        self.ensure_sized(
+            device,
+            queue,
+            format,
+            robots,
+            iface_renderer,
+            cfg,
+            BIG_ICON_SIZE,
+        )
+    }
+
+    fn ensure_sized(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        format: wgpu::TextureFormat,
+        robots: &RobotsRenderer,
+        iface_renderer: &mut InterfaceRenderer,
+        cfg: &RobotConfig,
+        size: u32,
+    ) -> Option<String> {
+        let key = (config_hash(cfg), size);
         if let Some(e) = self.entries.get(&key) {
             return Some(e.atlas_key.clone());
         }
-        let texture = render_to_texture(device, queue, format, robots, cfg, ICON_SIZE)?;
-        let atlas_key = format!("_robot_icon_{:016x}", key);
+        let texture = render_to_texture(device, queue, format, robots, cfg, size)?;
+        let atlas_key = format!("_robot_icon_{}_{:016x}", size, key.0);
         let view = texture.create_view(&Default::default());
-        iface_renderer.register_dynamic_atlas(device, &atlas_key, view, ICON_SIZE, ICON_SIZE);
+        iface_renderer.register_dynamic_atlas(device, &atlas_key, view, size, size);
         self.entries.insert(
             key,
             IconEntry {
