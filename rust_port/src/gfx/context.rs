@@ -47,10 +47,13 @@ impl GfxContext {
 
         let size = window.inner_size();
         let caps = surface.get_capabilities(&adapter);
+        // Match the original D3D9 game's gamma-naive pipeline: prefer a
+        // non-sRGB swapchain so shader output is written to memory raw and
+        // the monitor's sRGB decode gives the same look as the reference.
         let format = caps
             .formats
             .iter()
-            .find(|f| f.is_srgb())
+            .find(|f| !f.is_srgb())
             .copied()
             .unwrap_or(caps.formats[0]);
 

@@ -173,7 +173,7 @@ pub fn build_bottom_cpu_batches(stor: &Storage, map: &GameMap, ts_inv: f64) -> B
             // 4×4 block is already averaged and bilinear sampling at the
             // corner of a tile smudges across the DXT boundary without
             // visible seams. Our atlas is uploaded as uncompressed
-            // Rgba8UnormSrgb (see `texture::create_texture_from_rgba_mipped`
+            // Rgba8Unorm (see `texture::create_texture_from_rgba_mipped`
             // — DXT1 encoding is not done), so the `+0.5` centers the sample
             // inside the texel and stops bilinear from reaching into the
             // neighbouring tile. Remove only if/when the atlas is switched
