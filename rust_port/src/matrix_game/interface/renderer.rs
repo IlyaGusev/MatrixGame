@@ -227,16 +227,16 @@ impl InterfaceRenderer {
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             ..Default::default()
         });
-        // Linear sampler for the text atlas. The panel scale is
-        // typically non-integer (~1.4 at 1080p from the 1024×768
-        // design space), and nearest-neighbour sampling at that scale
-        // gives 1-px native stems an inconsistent 1-or-2 output-pixel
-        // width depending on where each glyph's left edge lands.
-        // Linear blends the texels evenly so every stem renders at a
-        // uniform width — slightly softened, but visually consistent.
+        // Nearest sampler for the text atlas. Matches the original
+        // D3D9 path which sets `D3DTEXF_POINT` for UI sampling
+        // (Interface/CIFaceElement.cpp:154-156). At non-integer panel
+        // scales (~1.4× at 1080p) this gives slightly inconsistent
+        // 1-or-2 output-pixel stem widths, but each pixel renders at
+        // full coverage instead of bilinear's fractional-alpha halo
+        // — text reads bright/crisp instead of soft/dim.
         let text_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
             mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
@@ -1674,18 +1674,21 @@ fn emit_rich_line(
     align_y: i32,
     base_color: [u8; 4],
 ) {
+    // Glyphs render at native AFT pixel size (no `* scale`),
+    // matching the original game's 1:1 D3DTEXF_POINT path. The
+    // `scale` parameter is still consumed by the caller layout
+    // (anchor_x / anchor_y come in at scaled panel coords) but
+    // glyph dimensions and inner offsets stay in native pixels.
+    let _ = scale;
     let key = TEXT_ATLAS_KEY;
     let atlas_w = glyph_atlas.width() as f32;
     let atlas_h = glyph_atlas.height() as f32;
-    // Total advance is the sum across all runs.
-    let total_w_native: u32 = runs
+    let total_w: f32 = runs
         .iter()
-        .map(|r| glyph_atlas.measure(font, &r.text))
+        .map(|r| glyph_atlas.measure(font, &r.text) as f32)
         .sum();
-    let line_h_native = glyph_atlas.line_height(font) as f32;
-    let ascent_native = glyph_atlas.ascent(font) as f32;
-    let total_w = total_w_native as f32 * scale;
-    let line_h = line_h_native * scale;
+    let line_h = glyph_atlas.line_height(font) as f32;
+    let ascent = glyph_atlas.ascent(font) as f32;
 
     let start_x = match align_x {
         1 => anchor_x - total_w * 0.5,
@@ -1697,11 +1700,7 @@ fn emit_rich_line(
         2 => anchor_y - line_h,
         _ => anchor_y,
     };
-    // Baseline sits `ascent` pixels below the cell top. AFT bearing_y
-    // is signed offset from baseline to glyph TOP (negative = above
-    // baseline), so the on-screen top row of the glyph quad is
-    // baseline + bearing_y * scale.
-    let baseline_y = cell_top + ascent_native * scale;
+    let baseline_y = cell_top + ascent;
 
     // Open / extend a TEXT_ATLAS_KEY draw run.
     if current_key.as_deref() != Some(key) {
@@ -1737,10 +1736,14 @@ fn emit_rich_line(
                 pen_x_native += advance;
                 continue;
             }
-            let x = start_x + (pen_x_native + g.bearing_x as f32) * scale;
-            let y = baseline_y + g.bearing_y as f32 * scale;
-            let w = g.w as f32 * scale;
-            let h = g.h as f32 * scale;
+            // Glyph origins snap to integer pixels (caller anchors
+            // come in at sub-pixel scaled coords). Native size means
+            // 1:1 texel-to-pixel mapping at any UI scale, matching
+            // the original D3D9 `D3DTEXF_POINT` path.
+            let x = (start_x + pen_x_native + g.bearing_x as f32).round();
+            let y = (baseline_y + g.bearing_y as f32).round();
+            let w = g.w as f32;
+            let h = g.h as f32;
             let u0 = g.atlas_x as f32 / atlas_w;
             let v0 = g.atlas_y as f32 / atlas_h;
             let u1 = (g.atlas_x + g.w) as f32 / atlas_w;
@@ -1783,14 +1786,17 @@ fn emit_wrapped_text(
     align_y: i32,
     base_color: [u8; 4],
 ) {
-    let wrap_native = if scale > 0.0 { wrap_width / scale } else { wrap_width };
-    let lines = wrap_rich_lines(glyph_atlas, font, runs, wrap_native as u32);
+    // Text renders at native pixel size in `emit_rich_line`, so
+    // wrap on the unscaled wrap width and step lines by the native
+    // line height.
+    let _ = scale;
+    let lines = wrap_rich_lines(glyph_atlas, font, runs, wrap_width as u32);
     if lines.is_empty() {
         return;
     }
     // 1 px of leading on top of (ascent + descent) so descenders on
     // one row don't kiss ascenders on the next.
-    let line_h = (glyph_atlas.line_height(font) as f32 + 1.0) * scale;
+    let line_h = glyph_atlas.line_height(font) as f32 + 1.0;
     let block_h = line_h * lines.len() as f32;
     let block_top = match align_y {
         1 => anchor_y - block_h * 0.5,
