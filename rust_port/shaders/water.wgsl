@@ -72,7 +72,11 @@ struct VOut {
 }
 
 @fragment fn fs_main(f: VOut) -> @location(0) vec4<f32> {
-    let n = normalize(f.world_normal);
+    // Fixed-function lighting with D3DRS_NORMALIZENORMALS off: the vertex
+    // normal (length m_WaterNormalLen) gets shrunk by the inverse-transpose
+    // of the 12.5x-scaled world matrix, so the diffuse term stays weak and
+    // the water reads as nearly flat WaterColor. params.x = 1 / water_scale.
+    let n = f.world_normal * u.params.x;
     let ndotl = max(dot(n, -u.light_dir.xyz), 0.0);
     let diffuse = u.water_color.rgb + u.light_color.rgb * ndotl;
 

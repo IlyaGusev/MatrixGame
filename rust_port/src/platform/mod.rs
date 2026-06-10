@@ -6,11 +6,10 @@ mod web;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn now_secs() -> f64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs_f64()
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    EPOCH.get_or_init(Instant::now).elapsed().as_secs_f64()
 }
 
 #[cfg(target_arch = "wasm32")]

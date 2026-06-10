@@ -427,6 +427,61 @@ impl RobotBuilder {
         }
     }
 
+    /// Port of the weapon-pylon writes in `CConstructor::SuperDjeans`
+    /// (CConstructor.cpp:469-528) / `Djeans007` (CConstructor.cpp:
+    /// 582-636). Resolves the *physical* pylon for the UI pylon index
+    /// and unconditionally overwrites it — kind 0 clears the slot, an
+    /// occupied slot is replaced. This is deliberately different from
+    /// `operate_unit`'s weapon path (`CheckWeaponLegality`), which
+    /// only fills the first empty compatible slot.
+    ///
+    /// For `pilon != 4` the physical slot is the (pilon+1)-th common
+    /// (non-extra) slot in the armor's weapon matrix ("fis_pilon");
+    /// for `pilon == 4` it's the first extra slot.
+    fn apply_weapon_to_live(&mut self, kind: RobotUnitKind, pilon: i32) {
+        let hull_kind = self.cfg().hull.unit.kind;
+        if hull_kind.is_empty() {
+            return;
+        }
+        let matrix = default_weapon_matrix(hull_kind);
+        let limit = matrix.cnt as usize;
+        let phys = if pilon != 4 {
+            // CConstructor.cpp:472-486 — count down common slots.
+            let mut pilon_ost = pilon + 1;
+            let mut t = 0usize;
+            while t < limit && pilon_ost > 0 {
+                if !matrix.is_extra_slot(t) {
+                    pilon_ost -= 1;
+                }
+                t += 1;
+            }
+            if t == 0 {
+                return;
+            }
+            t - 1
+        } else {
+            // CConstructor.cpp:500-511 — first extra slot. The C++
+            // falls back to slot 0 when the armor has no extra slot,
+            // but that path is unreachable (callers gate on
+            // m_MaxExtraWeaponCnt); bail out instead.
+            match (0..limit).find(|&t| matrix.is_extra_slot(t)) {
+                Some(t) => t,
+                None => return,
+            }
+        };
+        if phys >= MAX_WEAPON_CNT {
+            return;
+        }
+        self.live_weapons[phys] = WeaponUnit {
+            pos: phys as i32 + 1,
+            unit: Unit {
+                ty: RobotUnitType::Weapon,
+                kind,
+                price: config::global().prices.get(RobotUnitType::Weapon, kind),
+            },
+        };
+    }
+
     /// Refresh cached price / structure totals on the current preset
     /// from the **live preview** state. The C++ draws the pylon icons
     /// off `m_Configs[]` (user intent) but reads price/stats off
@@ -525,15 +580,73 @@ impl RobotBuilder {
                 if p < MAX_WEAPON_CNT {
                     self.cfg_mut().weapon[p].kind = kind;
                 }
-                // Route through operate_unit to pick the real pylon
-                // position from the weapon matrix (the C++ "fis_pilon"
-                // calculation at CConstructor.cpp:472-488).
-                self.operate_unit(RobotUnitType::Weapon, kind);
+                // CConstructor.cpp:472-528 — resolve the physical
+                // pylon ("fis_pilon") and overwrite/clear it directly.
+                self.apply_weapon_to_live(kind, pilon);
             }
             RobotUnitType::Empty => {}
         }
         self.sync_preview_totals();
         self.refresh_current_focus();
+    }
+
+    /// Port of `CConstructor::RemoteOperateUnit` (CConstructor.cpp:
+    /// 362-438) — the pylon-button ON_UN_PRESS handler (wired at
+    /// CInterface.cpp:262). Cycles the mounted component kind with
+    /// wrap-around, then commits via `super_djeans`:
+    /// * head:    0→1→2→3→4→0 (can cycle to empty)
+    /// * armor:   1→…→6→1 (never empty)
+    /// * chassis: 1→…→5→1 (never empty)
+    /// * weapon (common pylon): 0→1→2→3→4→6→8→9→10→0 — kinds 4 and 6
+    ///   jump by 2, skipping mortar (5) and bomb (7) which only fit
+    ///   the extra pylon
+    /// * weapon (extra pylon, `pi5`): 0→5(mortar)→7(bomb)→0
+    pub fn remote_operate_unit(&mut self, element_name: &str) {
+        let cfg = self.cfg();
+        let (ty, kind, pilon) = match element_name {
+            "pihe" => {
+                let k = cfg.head.kind.0;
+                let next = if k == 4 { 0 } else { k + 1 };
+                (RobotUnitType::Head, next, 0)
+            }
+            "pihu" => {
+                let k = cfg.hull.unit.kind.0;
+                let next = if k == 6 { 1 } else { k + 1 };
+                (RobotUnitType::Armor, next, 0)
+            }
+            "pich" => {
+                let k = cfg.chassis.kind.0;
+                let next = if k == 5 { 1 } else { k + 1 };
+                (RobotUnitType::Chassis, next, 0)
+            }
+            "pi1" | "pi2" | "pi3" | "pi4" => {
+                let pilon = match element_name {
+                    "pi1" => 0,
+                    "pi2" => 1,
+                    "pi3" => 2,
+                    _ => 3,
+                };
+                let k = cfg.weapon[pilon as usize].kind.0;
+                let next = if k == 4 || k == 6 {
+                    k + 2
+                } else if k == 10 {
+                    0
+                } else {
+                    k + 1
+                };
+                (RobotUnitType::Weapon, next, pilon)
+            }
+            "pi5" => {
+                let next = match cfg.weapon[4].kind.0 {
+                    0 => 5,
+                    5 => 7,
+                    _ => 0,
+                };
+                (RobotUnitType::Weapon, next, 4)
+            }
+            _ => return,
+        };
+        self.super_djeans(ty, RobotUnitKind(kind), pilon, false);
     }
 
     /// Port of `CConstructor::Djeans007` (CConstructor.cpp:576-671) —
@@ -599,7 +712,9 @@ impl RobotBuilder {
                 if p < MAX_WEAPON_CNT {
                     self.cfg_mut().weapon[p].kind = kind;
                 }
-                self.operate_unit(RobotUnitType::Weapon, kind);
+                // CConstructor.cpp:582-636 — same physical-pylon
+                // overwrite as SuperDjeans.
+                self.apply_weapon_to_live(kind, pilon);
             }
             RobotUnitType::Empty => {}
         }
@@ -936,8 +1051,9 @@ pub fn make_item_replacements(text: &mut FocusedText, ty: RobotUnitType, kind: R
                     )
                     .map(|d| d.damage)
                     .unwrap_or(0);
-                // OBJECT_ROBOT_ABLAZE_PERIOD = 500 ms (MatrixObjectRobot.cpp).
-                adamage = (dmg as f32 * 1000.0 / 500.0).round() as i32;
+                // OBJECT_ROBOT_ABLAZE_PERIOD = 10 (MatrixMapStatic.hpp:94,
+                // CConstructor.cpp:1117).
+                adamage = (dmg as f32 * 1000.0 / 10.0).round() as i32;
             } else if kind == RobotUnitKind::WEAPON_ELECTRIC {
                 let dmg = cfg
                     .robot_damages
@@ -948,8 +1064,9 @@ pub fn make_item_replacements(text: &mut FocusedText, ty: RobotUnitType, kind: R
                     )
                     .map(|d| d.damage)
                     .unwrap_or(0);
-                // OBJECT_SHORTED_PERIOD = 500 ms.
-                adamage = (dmg as f32 * 1000.0 / 500.0).round() as i32;
+                // OBJECT_SHORTED_PERIOD = 50 (MatrixMapStatic.hpp:96,
+                // CConstructor.cpp:1120).
+                adamage = (dmg as f32 * 1000.0 / 50.0).round() as i32;
             } else if kind == RobotUnitKind::WEAPON_BOMB {
                 damage = cfg
                     .robot_damages
@@ -2174,6 +2291,85 @@ mod robot_config_tests {
             m.find_pylon_for(RobotUnitKind::WEAPON_BOMB, &current),
             Some(2)
         );
+    }
+
+    #[test]
+    fn super_djeans_overwrites_occupied_pylon() {
+        // ARMOR_PLASMIC chosen to stay clear of the kinds other tests
+        // seed (NUCLEAR/PASSIVE/ACTIVE/FIREPROOF).
+        crate::matrix_game::map::set_weapon_matrix_for(
+            RobotUnitKind::ARMOR_PLASMIC,
+            fake_weapon_matrix(2, 1),
+        );
+        let mut b = RobotBuilder::new();
+        b.super_djeans(RobotUnitType::Chassis, RobotUnitKind::CHASSIS_TRACK, 0, false);
+        b.super_djeans(RobotUnitType::Armor, RobotUnitKind::ARMOR_PLASMIC, 0, false);
+        b.super_djeans(
+            RobotUnitType::Weapon,
+            RobotUnitKind::WEAPON_MACHINEGUN,
+            0,
+            false,
+        );
+        assert_eq!(b.live_weapons[0].unit.kind, RobotUnitKind::WEAPON_MACHINEGUN);
+        // Replace the occupied pylon (CConstructor.cpp:490-492).
+        b.super_djeans(RobotUnitType::Weapon, RobotUnitKind::WEAPON_CANNON, 0, false);
+        assert_eq!(b.live_weapons[0].unit.kind, RobotUnitKind::WEAPON_CANNON);
+        // Clear it via kind 0.
+        b.super_djeans(RobotUnitType::Weapon, RobotUnitKind::UNKNOWN, 0, false);
+        assert!(b.live_weapons[0].unit.is_empty());
+        // Second common pylon maps to physical slot 1; extra weapon
+        // (pilon 4) maps to the first extra slot (index 2 here).
+        b.super_djeans(RobotUnitType::Weapon, RobotUnitKind::WEAPON_LASER, 1, false);
+        assert_eq!(b.live_weapons[1].unit.kind, RobotUnitKind::WEAPON_LASER);
+        b.super_djeans(RobotUnitType::Weapon, RobotUnitKind::WEAPON_BOMB, 4, false);
+        assert_eq!(b.live_weapons[2].unit.kind, RobotUnitKind::WEAPON_BOMB);
+    }
+
+    #[test]
+    fn remote_operate_unit_cycles_kinds() {
+        crate::matrix_game::map::set_weapon_matrix_for(
+            RobotUnitKind::ARMOR_PLASMIC,
+            fake_weapon_matrix(2, 1),
+        );
+        let mut b = RobotBuilder::new();
+        b.super_djeans(RobotUnitType::Chassis, RobotUnitKind::CHASSIS_TRACK, 0, false);
+        b.super_djeans(RobotUnitType::Armor, RobotUnitKind::ARMOR_PLASMIC, 0, false);
+
+        // Chassis 3 → 4; 5 wraps to 1.
+        b.remote_operate_unit("pich");
+        assert_eq!(b.cfg().chassis.kind.0, RobotUnitKind::CHASSIS_TRACK.0 + 1);
+        b.cfg_mut().chassis.kind = RobotUnitKind(5);
+        b.remote_operate_unit("pich");
+        assert_eq!(b.cfg().chassis.kind.0, 1);
+
+        // Head cycles through 0 (empty allowed).
+        assert!(b.cfg().head.kind.is_empty());
+        b.remote_operate_unit("pihe");
+        assert_eq!(b.cfg().head.kind.0, 1);
+        b.cfg_mut().head.kind = RobotUnitKind(4);
+        b.remote_operate_unit("pihe");
+        assert_eq!(b.cfg().head.kind.0, 0);
+
+        // Common weapon pylon skips mortar (5) and bomb (7): 4→6, 6→8,
+        // 10 wraps to 0, 0→1.
+        b.super_djeans(RobotUnitType::Weapon, RobotUnitKind(4), 0, false);
+        b.remote_operate_unit("pi1");
+        assert_eq!(b.cfg().weapon[0].kind.0, 6);
+        b.remote_operate_unit("pi1");
+        assert_eq!(b.cfg().weapon[0].kind.0, 8);
+        b.cfg_mut().weapon[0].kind = RobotUnitKind(10);
+        b.remote_operate_unit("pi1");
+        assert_eq!(b.cfg().weapon[0].kind.0, 0);
+        b.remote_operate_unit("pi1");
+        assert_eq!(b.cfg().weapon[0].kind.0, 1);
+
+        // Extra pylon: 0→5→7→0.
+        b.remote_operate_unit("pi5");
+        assert_eq!(b.cfg().weapon[4].kind.0, 5);
+        b.remote_operate_unit("pi5");
+        assert_eq!(b.cfg().weapon[4].kind.0, 7);
+        b.remote_operate_unit("pi5");
+        assert_eq!(b.cfg().weapon[4].kind.0, 0);
     }
 
     #[test]

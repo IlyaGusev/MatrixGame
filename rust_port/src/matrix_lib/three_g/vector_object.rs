@@ -459,12 +459,20 @@ fn parse_frames(stor: &Storage, indices: &[u16]) -> Result<Vec<VoFrame>> {
             }
             let surface = read_i32(unions_data, union_off).max(0) as usize;
             let base = read_i32(unions_data, union_off + 4);
+            let ibase = read_i32(unions_data, union_off + 8);
             let tri_cnt = read_i32(unions_data, union_off + 16).max(0) as usize;
             let tri_start = read_i32(unions_data, union_off + 20).max(0) as usize;
 
             let dst_idx = surface.min(surfs.len().saturating_sub(1));
             let dst = &mut surfs[dst_idx];
-            let start = tri_start * 3;
+            // SVOUnion's m_IBase (VectorObject.hpp:200-212): when negative,
+            // the draw call starts at -m_IBase instead of m_TriStart*3
+            // (VectorObject.cpp:1366-1371).
+            let start = if ibase < 0 {
+                (-ibase) as usize
+            } else {
+                tri_start * 3
+            };
             let end = start + tri_cnt * 3;
             if end > indices.len() {
                 continue;
@@ -599,8 +607,8 @@ use std::sync::{Arc, OnceLock, RwLock};
 /// needs to walk frame durations to drive animation without holding
 /// a direct reference to the GPU-side renderer.
 ///
-/// Indexed by `ChassisKind as usize`. `None` for kinds whose VO
-/// failed to load.
+/// Indexed by `ChassisKind::kind_index()` (RUK kind − 1). `None` for
+/// kinds whose VO failed to load.
 static CHASSIS_VOS: OnceLock<RwLock<[Option<Arc<VoMesh>>; 5]>> = OnceLock::new();
 
 fn chassis_slot() -> &'static RwLock<[Option<Arc<VoMesh>>; 5]> {
@@ -792,5 +800,87 @@ impl AnimState {
         let (idx, t) = anim_frame(vo, self.anim, self.frame).unwrap_or((0, 0));
         self.vo_frame = idx;
         t
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wstr(s: &str) -> Vec<u8> {
+        let mut v: Vec<u8> = s.encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
+        v.extend_from_slice(&[0, 0]);
+        v
+    }
+
+    /// Single-array CDataBuf: 12-byte header, data, one 12-byte table entry.
+    fn databuf(element_size: u32, data: &[u8], count: u32) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&(12 + data.len() as u32).to_le_bytes());
+        v.extend_from_slice(&1u32.to_le_bytes());
+        v.extend_from_slice(&element_size.to_le_bytes());
+        v.extend_from_slice(data);
+        v.extend_from_slice(&12u32.to_le_bytes());
+        v.extend_from_slice(&count.to_le_bytes());
+        v.extend_from_slice(&count.to_le_bytes());
+        v
+    }
+
+    fn strg(records: &[(&str, &[(&str, Vec<u8>)])]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&0x47525453u32.to_le_bytes());
+        v.extend_from_slice(&0u32.to_le_bytes()); // version 0 = uncompressed
+        v.extend_from_slice(&(records.len() as u32).to_le_bytes());
+        for (rec, items) in records {
+            v.extend_from_slice(&wstr(rec));
+            v.extend_from_slice(&(items.len() as u32).to_le_bytes());
+            for (item, data) in *items {
+                v.extend_from_slice(&wstr(item));
+                v.extend_from_slice(&0u32.to_le_bytes());
+                v.extend_from_slice(&(data.len() as u32).to_le_bytes());
+                v.extend_from_slice(data);
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn negative_ibase_overrides_tri_start() {
+        let verts = vec![0u8; 3 * 32];
+        let idx: Vec<u8> = [0u16, 1, 2, 2, 1, 0]
+            .iter()
+            .flat_map(|i| i.to_le_bytes())
+            .collect();
+
+        // SVOKadr: bounds/radius zero, UnionStart=0 (@40), UnionCnt=1 (@44).
+        let mut kadr = vec![0u8; SVO_KADR_SIZE];
+        kadr[44..48].copy_from_slice(&1u32.to_le_bytes());
+        let frame_unions = 0u32.to_le_bytes().to_vec();
+
+        // SVOUnion: surface=0, base=0, m_IBase=-3, vercnt=3, tricnt=1,
+        // tristart=999 (out of range — must be ignored when m_IBase < 0).
+        let mut un = Vec::new();
+        for v in [0i32, 0, -3, 3, 1, 999] {
+            un.extend_from_slice(&v.to_le_bytes());
+        }
+
+        let raw = strg(&[
+            ("verts", &[("data", databuf(32, &verts, 3))]),
+            ("idxs", &[("data", databuf(2, &idx, 6))]),
+            (
+                "frames",
+                &[
+                    ("data", databuf(SVO_KADR_SIZE as u32, &kadr, 1)),
+                    ("unions", databuf(4, &frame_unions, 1)),
+                ],
+            ),
+            (
+                "unions",
+                &[("data", databuf(SVO_UNION_SIZE as u32, &un, 1))],
+            ),
+        ]);
+
+        let vo = parse_vo(&raw).expect("parse_vo");
+        assert_eq!(vo.frames[0].surfaces[0].indices, vec![2, 1, 0]);
     }
 }

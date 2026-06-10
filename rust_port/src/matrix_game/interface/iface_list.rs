@@ -348,13 +348,14 @@ impl IFaceList {
             if let Some(popup) = self.popup.as_mut() {
                 popup.hovered = hovered;
             }
-            if hovered.is_some() {
-                // An open popup suppresses hints — matches the
-                // `POPUP_MENU_ACTIVE` gate in `CheckShowHintLogic`
-                // (CInterface.cpp:4542-4549).
-                self.hint_system.clear();
-                return (None, None);
-            }
+            // While POPUP_MENU_ACTIVE the C++ blocks ALL non-static
+            // OnMouseMove (CInterface.cpp:979) — no button focus/hover
+            // transitions fire, so the popup hover-preview isn't
+            // clobbered. Hints are suppressed too, matching the
+            // `POPUP_MENU_ACTIVE` gate in `CheckShowHintLogic`
+            // (CInterface.cpp:4542-4549).
+            self.hint_system.clear();
+            return (None, None);
         }
         let new_focus = self.hit_test(sx, sy, screen_w, screen_h);
 
@@ -378,7 +379,12 @@ impl IFaceList {
                 if let Some(p) = self.panels.get_mut(pi) {
                     if let Some(e) = p.elements.get_mut(ei) {
                         let is_button = matches!(e.kind, super::iface_element::ElementKind::Button);
-                        if is_button && !pressed_self {
+                        // CIFaceElement::Reset (CIFaceElement.cpp:300-308)
+                        // restores m_DefState only when not DISABLED.
+                        if is_button
+                            && !pressed_self
+                            && !matches!(e.cur_state, ElementState::Disabled)
+                        {
                             e.cur_state = e.def_state;
                         }
                         prev_pair = Some((p.name.clone(), e.name.clone()));
@@ -388,21 +394,37 @@ impl IFaceList {
             if let Some((pi, ei)) = new_focus {
                 if let Some(p) = self.panels.get_mut(pi) {
                     if let Some(e) = p.elements.get_mut(ei) {
-                        let was_normal = matches!(e.cur_state, ElementState::Normal);
                         let is_button = matches!(e.kind, super::iface_element::ElementKind::Button);
                         if is_button {
-                            if self.pressed != Some((pi, ei)) {
-                                e.cur_state = ElementState::Focused;
-                            } else {
+                            if self.pressed == Some((pi, ei)) {
                                 e.cur_state = ElementState::Pressed;
+                            } else {
+                                // CIFaceButton::OnMouseMove (CIFaceButton
+                                // .cpp:145-169): every type transitions
+                                // NORMAL→FOCUSED; CHECK / CHECK_SPECIAL
+                                // additionally PRESSED_UNFOCUSED→PRESSED.
+                                // All other states (DISABLED in
+                                // particular) stay put.
+                                use super::iface_element::ButtonType;
+                                match e.cur_state {
+                                    ElementState::Normal => {
+                                        e.cur_state = ElementState::Focused;
+                                        super::sound::play(super::sound::UiSound::BEnter);
+                                    }
+                                    ElementState::PressedUnfocused
+                                        if matches!(
+                                            e.button_type,
+                                            ButtonType::Check | ButtonType::CheckSpecial
+                                        ) =>
+                                    {
+                                        e.cur_state = ElementState::Pressed;
+                                        super::sound::play(super::sound::UiSound::BEnter);
+                                    }
+                                    _ => {}
+                                }
                             }
                         }
                         new_pair = Some((p.name.clone(), e.name.clone()));
-                        // CIFaceButton.cpp:147-169 — focus transition
-                        // on a button fires `S_BENTER`.
-                        if is_button && was_normal {
-                            super::sound::play(super::sound::UiSound::BEnter);
-                        }
                     }
                 }
             }
@@ -421,7 +443,7 @@ impl IFaceList {
     /// no hint template.
     fn refresh_hint_hover(&mut self, screen_w: f32, screen_h: f32) {
         let clear = |h: &mut HintSystem| {
-            h.set_hovered(None, None, None, 0, 0, 0.0, 0.0, 0.0, 0.0);
+            h.set_hovered(None, None, None, 0, 0, 0.0, 0.0);
         };
         let Some((pi, ei)) = self.focused else {
             clear(&mut self.hint_system);
@@ -441,7 +463,7 @@ impl IFaceList {
             return;
         }
         let panel_px = panel.resolved_pos(screen_w, screen_h, scale);
-        let [ex, ey, w, h] = elem.rect_in_panel(panel_px, scale);
+        let [ex, ey, _, _] = elem.rect_in_panel(panel_px, scale);
         self.hint_system.set_hovered(
             Some(&panel.name),
             Some(&elem.name),
@@ -450,8 +472,6 @@ impl IFaceList {
             elem.hint_offset_y,
             ex,
             ey,
-            w,
-            h,
         );
     }
 
@@ -534,6 +554,20 @@ impl IFaceList {
                 // Fall through to regular hit-test so the click can
                 // also engage whatever was clicked outside.
             } else {
+                // Click inside the ramka but NOT on a row — the C++
+                // `OnMenuItemPress` (CIFaceMenu.cpp:386-395, invoked
+                // from CInterface.cpp:1049) treats this as cancel:
+                // `ResetMenu(true)` closes the popup and restores the
+                // saved config, same as the outside-click path above.
+                let on_row = self
+                    .screen_to_panel_design("Base", sx, sy, screen_w, screen_h)
+                    .and_then(|(dx, dy)| self.popup.as_ref().unwrap().hit_test_design(dx, dy))
+                    .is_some();
+                if !on_row {
+                    self.popup_restore_pending = self.popup.as_ref().and_then(|p| p.saved_config);
+                    self.popup = None;
+                    self.popup_focus_clear_pending = true;
+                }
                 // Treat as "captured by UI"; selection commit on
                 // mouse-up via on_mouse_up's popup branch.
                 return true;
@@ -572,20 +606,72 @@ impl IFaceList {
                 // ON_PRESS action without touching `m_CurState`
                 // (CIFaceStatic.cpp:53-57) — so `conl`/`conr`/`conf`
                 // etc. must stay at `def_state` when clicked.
+                //
+                // Per-type transitions ported from CIFaceButton::
+                // OnMouseLBDown (CIFaceButton.cpp:33-95):
+                //   PUSH:          FOCUSED → PRESSED
+                //   CHECK:         PRESSED → FOCUSED (unlatch, def=NORMAL)
+                //                  FOCUSED → PRESSED (latch, def=PRESSED_UNFOCUSED)
+                //   CHECK_SPECIAL: FOCUSED → PRESSED (latch only)
+                //   CHECK_PUSH:    FOCUSED → PRESSED (def=NORMAL; latches on up)
                 if is_button {
+                    use super::iface_element::ButtonType;
+                    let mut latched = false;
+                    let mut transitioned = false;
                     if let Some(p) = self.panels.get_mut(pi) {
                         if let Some(e) = p.elements.get_mut(ei) {
-                            e.cur_state = ElementState::Pressed;
+                            match e.button_type {
+                                ButtonType::Push => {
+                                    if matches!(e.cur_state, ElementState::Focused) {
+                                        e.cur_state = ElementState::Pressed;
+                                        transitioned = true;
+                                    }
+                                }
+                                ButtonType::Check => match e.cur_state {
+                                    ElementState::Pressed => {
+                                        e.cur_state = ElementState::Focused;
+                                        e.def_state = ElementState::Normal;
+                                        transitioned = true;
+                                    }
+                                    ElementState::Focused => {
+                                        e.cur_state = ElementState::Pressed;
+                                        e.def_state = ElementState::PressedUnfocused;
+                                        latched = true;
+                                        transitioned = true;
+                                    }
+                                    _ => {}
+                                },
+                                ButtonType::CheckSpecial => {
+                                    if matches!(e.cur_state, ElementState::Focused) {
+                                        e.cur_state = ElementState::Pressed;
+                                        e.def_state = ElementState::PressedUnfocused;
+                                        latched = true;
+                                        transitioned = true;
+                                    }
+                                }
+                                ButtonType::CheckPush => {
+                                    if matches!(e.cur_state, ElementState::Focused) {
+                                        e.cur_state = ElementState::Pressed;
+                                        e.def_state = ElementState::Normal;
+                                        transitioned = true;
+                                    }
+                                }
+                            }
                         }
+                        // CHECK / CHECK_SPECIAL unlatch their group
+                        // siblings at LBDown time (CInterface.cpp:
+                        // 1095-1097).
+                        if latched {
+                            p.check_group_reset(ei);
+                        }
+                    }
+                    // CIFaceButton.cpp:33-95 — sound only fires when a
+                    // press/unpress transition actually happened.
+                    if transitioned {
+                        super::sound::play(super::sound::for_push_button_down(&elem_name));
                     }
                 }
                 self.pressed = Some((pi, ei));
-                // CIFaceButton.cpp:33-95 — generic LBDown sound dispatch.
-                // Disabled buttons don't fire (CIFaceButton.cpp:35-37
-                // returns true before any sound).
-                if is_button && !was_disabled {
-                    super::sound::play(super::sound::for_push_button_down(&elem_name));
-                }
                 true
             }
             None => {
@@ -622,8 +708,9 @@ impl IFaceList {
                     });
                 }
             }
-            // Click inside popup but not on any item — leave popup
-            // open so the user can pick another item.
+            // Release off-row (the press landed on a row, otherwise
+            // on_mouse_down's chrome-cancel already closed the popup)
+            // — leave the popup open so the user can pick again.
             return None;
         }
 
@@ -631,8 +718,12 @@ impl IFaceList {
 
         // Reset the pressed element's state (matching cursor position).
         let release_hit = self.hit_test(sx, sy, screen_w, screen_h);
+        let released_on_elem = release_hit == Some((pi, ei));
+        let mut click: Option<Click> = None;
+        let mut group_reset = false;
         if let Some(p) = self.panels.get_mut(pi) {
             if let Some(e) = p.elements.get_mut(ei) {
+                use super::iface_element::ButtonType;
                 let is_button = matches!(e.kind, super::iface_element::ElementKind::Button);
                 if matches!(e.cur_state, ElementState::Disabled)
                     || matches!(e.def_state, ElementState::Disabled)
@@ -640,28 +731,55 @@ impl IFaceList {
                     e.cur_state = ElementState::Disabled;
                     return None;
                 }
-                // Buttons cycle Pressed → Focused/Normal on release
-                // (CIFaceButton.cpp:105-109). Statics leave state
-                // untouched (CIFaceStatic.cpp:59-61 only fires
+                // Per-type release transitions ported from CIFaceButton::
+                // OnMouseLBUp (CIFaceButton.cpp:97-123). Statics leave
+                // state untouched (CIFaceStatic.cpp:59-61 only fires
                 // Action(ON_UN_PRESS)) so don't reassign.
                 if is_button {
-                    e.cur_state = if release_hit == Some((pi, ei)) {
-                        ElementState::Focused
-                    } else {
-                        e.def_state
-                    };
+                    match e.button_type {
+                        ButtonType::Push => {
+                            // PRESSED → FOCUSED when released on the
+                            // element; def_state otherwise (the C++
+                            // never calls OnMouseLBUp off-element — the
+                            // next mouse-move Reset()s it instead).
+                            e.cur_state = if released_on_elem {
+                                ElementState::Focused
+                            } else {
+                                e.def_state
+                            };
+                        }
+                        ButtonType::CheckPush => {
+                            // Latch on release (CIFaceButton.cpp:110-122)
+                            // + CheckGroupReset (CInterface.cpp:1159-1163).
+                            if released_on_elem {
+                                if matches!(e.cur_state, ElementState::Pressed)
+                                    && matches!(e.def_state, ElementState::Normal)
+                                {
+                                    e.cur_state = ElementState::PressedUnfocused;
+                                    e.def_state = ElementState::PressedUnfocused;
+                                }
+                                group_reset = true;
+                            }
+                        }
+                        // CHECK / CHECK_SPECIAL did their work on LBDown;
+                        // OnMouseLBUp is a no-op for them.
+                        ButtonType::Check | ButtonType::CheckSpecial => {}
+                    }
                 }
-                if release_hit == Some((pi, ei)) {
+                if released_on_elem {
                     // Emit the click for buttons AND statics so the
                     // dispatcher can route Static ON_PRESS hooks like
                     // `basepl` (IF_BASE_PLANT → CIFaceList::JumpToBuilding,
                     // CInterface.cpp:585) + the resource-plant statics
                     // (titan/electr/energy/plasma).
-                    return Some(Click::Button(e.name.clone()));
+                    click = Some(Click::Button(e.name.clone()));
                 }
             }
+            if group_reset {
+                p.check_group_reset(ei);
+            }
         }
-        None
+        click
     }
 
     /// Right-mouse-button down. Captures the press so RBUp can compare

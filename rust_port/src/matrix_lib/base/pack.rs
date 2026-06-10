@@ -169,13 +169,15 @@ fn parse_folder(
             bail!("file record {i} out of bounds");
         }
 
-        let entry = parse_file_rec(data, rec_offset)?;
-
-        // Skip free records (m_Free is at offset 142 within record)
+        // Skip free records (m_Free at offset 142) before parsing anything
+        // else — the original ReadFolder (Pack.cpp:203-223) never validates
+        // a free slot, whose other fields may hold garbage.
         let free = read_u32(data, rec_offset + 142)?;
         if free != 0 {
             continue;
         }
+
+        let entry = parse_file_rec(data, rec_offset)?;
 
         if entry.file_type == FileType::Folder {
             let folder_path = if prefix.is_empty() {
@@ -235,4 +237,45 @@ fn read_fixed_string(data: &[u8], offset: usize, max_len: usize) -> String {
 
 fn normalize_path(path: &str) -> String {
     path.replace('\\', "/").to_uppercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file_rec(
+        real_name: &str,
+        file_type: u32,
+        free: u32,
+        real_size: u32,
+        offset: u32,
+    ) -> Vec<u8> {
+        let mut rec = vec![0u8; FILE_REC_SIZE];
+        rec[4..8].copy_from_slice(&real_size.to_le_bytes());
+        rec[71..71 + real_name.len()].copy_from_slice(real_name.as_bytes());
+        rec[134..138].copy_from_slice(&file_type.to_le_bytes());
+        rec[142..146].copy_from_slice(&free.to_le_bytes());
+        rec[150..154].copy_from_slice(&offset.to_le_bytes());
+        rec
+    }
+
+    #[test]
+    fn free_record_with_garbage_type_is_skipped() {
+        let data_offset = 4 + 12 + 2 * FILE_REC_SIZE;
+
+        let mut pkg = Vec::new();
+        pkg.extend_from_slice(&4u32.to_le_bytes()); // root folder offset
+        pkg.extend_from_slice(&0u32.to_le_bytes()); // folder size (unused)
+        pkg.extend_from_slice(&2u32.to_le_bytes()); // rec_num
+        pkg.extend_from_slice(&(FILE_REC_SIZE as u32).to_le_bytes()); // rec_size
+        pkg.extend_from_slice(&file_rec("stale.bin", 0xDEADBEEF, 1, 999, 999));
+        pkg.extend_from_slice(&file_rec("hello.txt", 0, 0, 5, data_offset as u32));
+        pkg.extend_from_slice(&5u32.to_le_bytes()); // block size header
+        pkg.extend_from_slice(b"hello");
+
+        let archive = PkgArchive::from_bytes(pkg).expect("free record must not abort load");
+        assert!(archive.exists("hello.txt"));
+        assert!(!archive.exists("stale.bin"));
+        assert_eq!(archive.read_file("hello.txt").unwrap(), b"hello");
+    }
 }

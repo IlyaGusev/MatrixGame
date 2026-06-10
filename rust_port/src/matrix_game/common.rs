@@ -89,6 +89,19 @@ pub const HITPOINT_SHOW_TIME_MS: i32 = 1000;
 /// 0.0008/ms → ~1.25 seconds for a full open or close.
 pub const BASE_FLOOR_SPEED: f32 = 0.0008;
 
+/// `Float2Int` (Math3D.hpp:307) — x87 `fistp` round-to-nearest. The FPU
+/// default is round-half-to-even, but game data never lands exactly on .5
+/// boundaries, so `.round()` is an exact match in practice.
+pub fn float2int(f: f32) -> i32 {
+    f.round() as i32
+}
+
+/// `TruncFloat` (Math3D.hpp) — truncation toward zero, unlike `floor()`
+/// which differs for negative inputs.
+pub fn trunc_float(f: f32) -> i32 {
+    f as i32
+}
+
 // ── Binary read helpers ─────────────────────────────────────────────────────
 
 pub fn rd_u32(d: &[u8], o: &mut usize) -> u32 {

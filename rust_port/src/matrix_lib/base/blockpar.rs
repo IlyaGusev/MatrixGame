@@ -143,11 +143,15 @@ impl BlockPar {
     /// insensitive; case-sensitive lookups should use `entries()` directly.
     pub fn par_get_ne(&self, name: &str) -> Option<&str> {
         let key = name.to_ascii_lowercase();
-        let idx = *self.name_index.get(&key)?.first()?;
-        match &self.entries[idx] {
-            Entry::Par { value, .. } => Some(value.as_str()),
-            _ => None,
-        }
+        // The original scans all same-named entries and returns the first
+        // *unit* (m_Type==1), skipping blocks that share the name.
+        self.name_index
+            .get(&key)?
+            .iter()
+            .find_map(|&idx| match &self.entries[idx] {
+                Entry::Par { value, .. } => Some(value.as_str()),
+                _ => None,
+            })
     }
 
     /// Ports `BlockGet(name)` — returns the first child block by name.
@@ -593,6 +597,18 @@ mod tests {
     fn case_insensitive_lookup() {
         let bp = BlockPar::parse("alphatest = 1\n");
         assert_eq!(bp.par_get_ne("AlphaTest"), Some("1"));
+    }
+
+    #[test]
+    fn par_skips_block_with_same_name() {
+        let bp = BlockPar::parse(
+            "Dup {\n\
+             \x20 Inner = 1\n\
+             }\n\
+             Dup = value\n",
+        );
+        assert_eq!(bp.par_get_ne("Dup"), Some("value"));
+        assert!(bp.block_get("Dup").is_some());
     }
 
     #[test]

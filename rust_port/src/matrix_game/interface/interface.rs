@@ -9,7 +9,8 @@
 use crate::matrix_lib::base::storage::Storage;
 
 use super::iface_element::{
-    ElementKind, ElementLabel, ElementState, IFaceElement, StateImage, IFEF_VISIBLE, MAX_STATES,
+    ButtonType, ElementKind, ElementLabel, ElementState, IFaceElement, StateImage, IFEF_VISIBLE,
+    MAX_STATES,
 };
 
 /// Design-space dimensions the C++ positions/sizes are authored in
@@ -326,6 +327,27 @@ impl CInterface {
         name: &str,
     ) -> Option<&crate::matrix_game::interface::iface_element::IFaceElement> {
         self.elements.iter().find(|e| e.name == name)
+    }
+
+    /// Port of `CIFaceElement::CheckGroupReset` (CIFaceElement.cpp:
+    /// 84-97): when a check-type button latches, every OTHER check-type
+    /// button sharing its `group` unlatches back to Normal/Normal. The
+    /// C++ also fires `Action(ON_UN_PRESS)` for CHECK / CHECK_SPECIAL;
+    /// we dispatch clicks by name instead of via actions, so that part
+    /// is inert here.
+    pub fn check_group_reset(&mut self, pressed_idx: usize) {
+        let Some(group) = self.elements.get(pressed_idx).map(|e| e.group) else {
+            return;
+        };
+        for (i, e) in self.elements.iter_mut().enumerate() {
+            if i == pressed_idx || e.group != group {
+                continue;
+            }
+            if matches!(e.kind, ElementKind::Button) && e.button_type.is_check() {
+                e.cur_state = ElementState::Normal;
+                e.def_state = ElementState::Normal;
+            }
+        }
     }
 
     /// Look up a constructor-template element by `(type, kind)` —
@@ -663,6 +685,7 @@ impl CInterface {
             self.elements.push(IFaceElement {
                 name: format!("_dynstack_{}", i + 1),
                 kind: ElementKind::Static,
+                button_type: ButtonType::default(),
                 id: STACK_ICON_BASE + i as i32,
                 group: 0,
                 flags: IFEF_VISIBLE,
@@ -731,6 +754,7 @@ impl CInterface {
                 self.elements.push(IFaceElement {
                     name: format!("_dynturret_{}", i),
                     kind: ElementKind::Static,
+                    button_type: ButtonType::default(),
                     id: 970, // DYNAMIC_TURRET (CInterface.h:61)
                     group: 0,
                     flags: IFEF_VISIBLE,
@@ -821,6 +845,7 @@ impl CInterface {
                         self.elements.push(IFaceElement {
                             name: format!("_dynramka_{}", sel_idx),
                             kind: ElementKind::Static,
+                            button_type: ButtonType::default(),
                             // GROUP_SELECTION_ID + i (CInterface.h:69).
                             id: 450 + sel_idx as i32,
                             group: 0,
@@ -874,6 +899,7 @@ impl CInterface {
                     self.elements.push(IFaceElement {
                         name: format!("_dyngroup_{}", i),
                         kind: ElementKind::Static,
+                        button_type: ButtonType::default(),
                         // GROUP_ICONS_ID + i (CInterface.h:68).
                         id: 550 + i as i32,
                         group: 0,
@@ -921,6 +947,7 @@ impl CInterface {
                     self.elements.push(IFaceElement {
                         name: "_dynpers_0".to_string(),
                         kind: ElementKind::Static,
+                        button_type: ButtonType::default(),
                         id: 755, // PERSONAL_ICON_ID (CInterface.h:66).
                         group: 0,
                         flags: IFEF_VISIBLE,
@@ -1461,24 +1488,61 @@ impl CInterface {
     /// `SetStateText` with offset `m_titX+25` etc.
     ///
     /// We rebuild the dynamic icons + text labels each frame: dropping
-    /// any `_dynprice_*` / `_dynsumm_*` from the previous frame, then
-    /// pushing a fresh static for every non-zero entry. The icon image
-    /// is borrowed from the `titan` / `electr` / `energy` / `plasma`
-    /// IFaceImage element (the `FindImageByName` source); the text
-    /// label is appended directly to the dynamic element.
+    /// any `_dynprice_*` / `_dynsumm_*` / `_dynwarn_*` from the previous
+    /// frame, then pushing a fresh static for every non-zero entry. The
+    /// icon image is borrowed from the `titan` / `electr` / `energy` /
+    /// `plasma` IFaceImage element (the `FindImageByName` source); the
+    /// text label is appended directly to the dynamic element.
+    ///
+    /// Compatibility wrapper that assumes infinite side resources (no
+    /// shortage feedback). Call sites with the player side at hand
+    /// should use [`apply_constructor_prices_res`].
     pub fn apply_constructor_prices(
         &mut self,
         constructor_active: bool,
         focused_price: Option<&crate::matrix_game::interface::constructor::UnitPrice>,
         summ_price: &crate::matrix_game::interface::constructor::UnitPrice,
     ) {
+        self.apply_constructor_prices_res(
+            constructor_active,
+            focused_price,
+            summ_price,
+            &[i32::MAX; 4],
+        );
+    }
+
+    /// Same as [`apply_constructor_prices`] but with the side's
+    /// resource pools threaded in for shortage feedback:
+    ///
+    /// * a `warn` DYNAMIC_WARNING icon under each summ icon whose
+    ///   resource is short — `GetResourcesAmount(r) < res[r] * counter`
+    ///   (CInterface.cpp:1832-1845 visibility gate, 3284-3288 creation
+    ///   at `(x + icon_w, y + 22)`);
+    /// * price text recoloured red `0xFFFF0000` when short, gold
+    ///   `0xFFF6C000` otherwise (CInterface.cpp:2108-2288). The C++
+    ///   compares BOTH the summ row and the per-item row against the
+    ///   summ total (`total_res`), so the unit row reddens with the
+    ///   same flag.
+    ///
+    /// `summ_price` already carries the build-count multiplier (the
+    /// call site multiplies, matching `CreateSummPrice(m_Counter)`).
+    pub fn apply_constructor_prices_res(
+        &mut self,
+        constructor_active: bool,
+        focused_price: Option<&crate::matrix_game::interface::constructor::UnitPrice>,
+        summ_price: &crate::matrix_game::interface::constructor::UnitPrice,
+        side_resources: &[i32; 4],
+    ) {
         if self.name != "Base" {
             return;
         }
         // Always wipe last frame's dynamic price entries — they're
         // re-emitted from scratch below if the constructor is active.
-        self.elements
-            .retain(|e| !e.name.starts_with("_dynsumm_") && !e.name.starts_with("_dynprice_"));
+        self.elements.retain(|e| {
+            !e.name.starts_with("_dynsumm_")
+                && !e.name.starts_with("_dynprice_")
+                && !e.name.starts_with("_dynwarn_")
+        });
         if !constructor_active {
             return;
         }
@@ -1512,6 +1576,24 @@ impl CInterface {
                 resolve("plasma"),
             ]
         };
+        // `warn` image template — `FindImageByName(IF_BASE_WARNING)`
+        // (CInterface.cpp:3257), the per-resource shortage icon.
+        let warn_icon: Option<(StateImage, f32, f32)> = {
+            let e = self.elements.iter().find(|e| e.name == "warn");
+            e.and_then(|e| {
+                let img = e.images.first()?.as_ref()?.clone();
+                let w = if img.w > 0.0 { img.w } else { 16.0 };
+                let h = if img.h > 0.0 { img.h } else { 16.0 };
+                Some((img, w, h))
+            })
+        };
+
+        // Shortage per resource — `GetResourcesAmount(r) < res[r]`
+        // where `res` already includes the counter multiplier
+        // (CInterface.cpp:1834-1844).
+        let short = |r: usize| side_resources[r] < summ_price.resources[r];
+        const GOLD: [u8; 4] = [246, 192, 0, 255]; // 0xFFF6C000
+        const RED: [u8; 4] = [255, 0, 0, 255]; // 0xFFFF0000
 
         // Helper: push one icon + price text pair as a dynamic static.
         // Mirrors `CreateStaticFromImage` (CInterface.cpp:3170 etc.).
@@ -1523,7 +1605,8 @@ impl CInterface {
                     icon_h: f32,
                     pos_x: f32,
                     pos_y: f32,
-                    price: i32| {
+                    price: i32,
+                    color: [u8; 4]| {
             let mut images: [Option<StateImage>; MAX_STATES] = Default::default();
             images[ElementState::Normal as usize] = Some(icon);
             // Price text label sits to the RIGHT of the icon (the C++
@@ -1545,11 +1628,12 @@ impl CInterface {
                 align_y: 1,
                 wrap: false,
                 font: "Font.2Small".to_string(),
-                color: [246, 192, 0, 255],
+                color,
             };
             elements.push(IFaceElement {
                 name: format!("{name_prefix}{res_idx}"),
                 kind: ElementKind::Static,
+                button_type: ButtonType::default(),
                 id: 0,
                 group: 0,
                 flags: IFEF_VISIBLE,
@@ -1591,6 +1675,7 @@ impl CInterface {
             let Some((img, w, h)) = icons[r as usize].clone() else {
                 continue;
             };
+            let color = if short(r as usize) { RED } else { GOLD };
             push(
                 &mut self.elements,
                 "_dynsumm_",
@@ -1601,7 +1686,41 @@ impl CInterface {
                 x,
                 y,
                 v,
+                color,
             );
+            // DYNAMIC_WARNING icon under the summ icon at
+            // `(x + icon_w, y + 22)` (CInterface.cpp:3284-3288),
+            // visible only while the resource is short
+            // (CInterface.cpp:1832-1845).
+            if short(r as usize) {
+                if let Some((wimg, ww, wh)) = warn_icon.clone() {
+                    let mut images: [Option<StateImage>; MAX_STATES] = Default::default();
+                    images[ElementState::Normal as usize] = Some(wimg);
+                    self.elements.push(IFaceElement {
+                        name: format!("_dynwarn_{}", r as usize),
+                        kind: ElementKind::Static,
+                        button_type: ButtonType::default(),
+                        id: 0,
+                        group: 0,
+                        flags: IFEF_VISIBLE,
+                        param1: 0.0,
+                        param2: 0.0,
+                        i_param: 0,
+                        pos_x: x + w,
+                        pos_y: y + 22.0,
+                        pos_z: 0.0,
+                        size_x: ww,
+                        size_y: wh,
+                        images,
+                        labels: Vec::new(),
+                        cur_state: ElementState::Normal,
+                        def_state: ElementState::Normal,
+                        hint_template: String::new(),
+                        hint_offset_x: 0,
+                        hint_offset_y: 0,
+                    });
+                }
+            }
             // CInterface.cpp:3285 — advance by `s->m_xSize + 31`.
             x += w + 31.0;
         }
@@ -1619,6 +1738,10 @@ impl CInterface {
                 let Some((img, w, h)) = icons[r as usize].clone() else {
                     continue;
                 };
+                // The C++ reddens the unit row against `total_res` (the
+                // summ totals), not the unit price — CInterface.cpp:
+                // 2231-2241 etc. Mirror that.
+                let color = if short(r as usize) { RED } else { GOLD };
                 push(
                     &mut self.elements,
                     "_dynprice_",
@@ -1629,6 +1752,7 @@ impl CInterface {
                     x,
                     y,
                     v,
+                    color,
                 );
                 x += w + 25.0;
             }
@@ -1886,11 +2010,15 @@ fn load_element(stor: &Storage, rec: &str, kind: ElementKind) -> Option<IFaceEle
     let pos_z = parse_f32(stor, rec, "zPos").unwrap_or(0.0);
     let size_x = parse_f32(stor, rec, "xSize").unwrap_or(0.0);
     let size_y = parse_f32(stor, rec, "ySize").unwrap_or(0.0);
+    // `m_Type = (IFaceElementType)pbp2->Par(L"type").GetInt()`
+    // (CInterface.cpp:237) — push vs the three check sub-kinds.
+    let button_type = ButtonType::from_i32(parse_i32(stor, rec, "type").unwrap_or(0));
     let def_state_raw = parse_i32(stor, rec, "dState").unwrap_or(0);
     let def_state = match def_state_raw {
         1 => ElementState::Focused,
         2 => ElementState::Pressed,
         3 => ElementState::Disabled,
+        4 => ElementState::PressedUnfocused,
         _ => ElementState::Normal,
     };
 
@@ -1907,6 +2035,13 @@ fn load_element(stor: &Storage, rec: &str, kind: ElementKind) -> Option<IFaceEle
     ] {
         if let Some(img) = parse_state_image(stor, rec, prefix, size_x, size_y) {
             images[idx] = Some(img);
+        }
+    }
+    // `sPressedUnFocused*` is only authored (and only loaded) for the
+    // check-type buttons (CInterface.cpp:469-476).
+    if matches!(kind, ElementKind::Button) && button_type.is_check() {
+        if let Some(img) = parse_state_image(stor, rec, "sPressedUnFocused", size_x, size_y) {
+            images[ElementState::PressedUnfocused as usize] = Some(img);
         }
     }
 
@@ -1945,6 +2080,7 @@ fn load_element(stor: &Storage, rec: &str, kind: ElementKind) -> Option<IFaceEle
     Some(IFaceElement {
         name,
         kind,
+        button_type,
         id,
         group,
         flags: IFEF_VISIBLE,
@@ -2075,6 +2211,7 @@ fn attach_labels(stor: &Storage, panel_rec: &str, panel_name: &str, elements: &m
                 "sFocused" => ElementState::Focused,
                 "sPressed" => ElementState::Pressed,
                 "sDisabled" => ElementState::Disabled,
+                "sPressedUnFocused" => ElementState::PressedUnfocused,
                 _ => continue,
             };
             // Decode `A,R,G,B` (the C++ packs aRGB via the same field

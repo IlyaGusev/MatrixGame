@@ -255,9 +255,10 @@ impl BuildStack {
         if self.timer < total {
             return None;
         }
-        if parent_state != BaseState::Closed {
-            // Wait — the C++ explicitly gates production on
-            // BASE_CLOSED (MatrixObjectBuilding.cpp:1690).
+        if matches!(head.kind, PendingKind::Robot(_)) && parent_state != BaseState::Closed {
+            // Wait — the C++ gates only robot production on
+            // BASE_CLOSED (MatrixObjectBuilding.cpp:1690); the turret
+            // branch (:1776) completes regardless of base state.
             return None;
         }
 
@@ -269,14 +270,11 @@ impl BuildStack {
             PendingKind::Robot(cfg) => {
                 let spawn_pos = glam::Vec3::new(parent_pos.x, parent_pos.y, parent_pos.z);
                 let chassis = chassis_from_kind(cfg.chassis.kind).unwrap_or(ChassisKind::Track);
-                // Port of CConstructor.cpp:115-122 — auto-balance the
-                // freshly-built robot across the side's three teams.
-                // Tally each team's existing robot count for this side
-                // and pick the least-populated; on ties the C++ rolls
-                // a `Rnd(0,2)`. We mirror that with a deterministic
-                // `(tick % 3)` here — the arena RNG isn't accessible
-                // from this scope, and the choice is only a tie-break.
-                let team = pick_balanced_team(objs, head.side);
+                // The C++ computes a balanced team but then
+                // unconditionally overwrites it with
+                // `m_NewBorn->m_Team = 0;` (CConstructor.cpp:121) —
+                // every factory robot ships on team 0.
+                let team = 0;
                 let mut robot = Robot::new(spawn_pos, head.side, chassis);
                 robot.robot_spawn(parent_self_id, parent_angle_quad, parent_pos.z);
                 robot.set_team(team);
@@ -345,43 +343,6 @@ fn ramp_turret_hp(objs: &mut Objects, parent_id: ObjectId, slot: i32, progress: 
         }
         c.tick_construction(progress);
         return;
-    }
-}
-
-/// Port of `CConstructor::ProduceRobot`'s team-balance block at
-/// CConstructor.cpp:117-122. Counts robots on `side` per team and
-/// returns the least-populated team index. Ties resolve to team 0
-/// (the C++ rolls a Rnd(0,2) on tie; we deterministically pick 0,
-/// matching the line at CConstructor.cpp:122 that immediately
-/// overrides whatever was assigned to `0` anyway).
-fn pick_balanced_team(objs: &Objects, side: i32) -> i32 {
-    let mut counts = [0i32; 3];
-    for id in objs.iter_live() {
-        let Some(obj) = objs.get(id) else {
-            continue;
-        };
-        if !matches!(obj.core().obj_type, ObjectType::RobotAi) {
-            continue;
-        }
-        // SAFETY: dynamic dispatch via the trait — `as *const dyn ... as *const Robot`
-        // would be unsound here without confirming the type is Robot. We use
-        // `Robot`'s public field via an inline cast since RobotAi is the only
-        // ObjectType that maps to Robot.
-        let r: &Robot = unsafe { &*(obj as *const dyn MapStatic as *const Robot) };
-        if r.side != side {
-            continue;
-        }
-        let t = r.team().clamp(0, 2) as usize;
-        counts[t] += 1;
-    }
-    if counts[0] < counts[1] && counts[0] < counts[2] {
-        0
-    } else if counts[1] < counts[0] && counts[1] < counts[2] {
-        1
-    } else if counts[2] < counts[0] && counts[2] < counts[1] {
-        2
-    } else {
-        0
     }
 }
 
@@ -2497,7 +2458,7 @@ mod tests {
         let mut w = MapLogic::with_seed(1);
         let mut b = Building::from_instance(&inst(0, PLAYER_SIDE as u8));
         b.init_max_hitpoint(1000.0);
-        b.state = BaseState::Closed; // CBuildStack only completes when closed
+        b.state = BaseState::Closed; // turret builds complete regardless of state; Closed is the rest state
         let parent_id = w.objects.spawn(Box::new(b));
         w.objects.add_lt(parent_id);
         // Re-borrow to wire self_id + queue the turret.
@@ -2546,6 +2507,37 @@ mod tests {
         assert_eq!(cm.state, CannonState::Idle);
         assert_eq!(cm.hit_point, cm.hit_point_max);
         assert!(!cm.invulnerable);
+    }
+
+    #[test]
+    fn closed_gate_applies_to_robots_only() {
+        // The C++ gates only the robot branch on BASE_CLOSED
+        // (MatrixObjectBuilding.cpp:1690); turrets (:1776) complete
+        // regardless — non-base factories never animate to Closed.
+        let mut objs = Objects::new();
+        let parent_id = objs.spawn(Box::new(Building::from_instance(&inst(1, 1))));
+
+        let mut bs = BuildStack::new();
+        assert!(bs.add_item(PendingItem {
+            kind: PendingKind::Turret { slot: 0, turret_kind: 1 },
+            side: 1,
+        }));
+        let total = turret_build_time_ms();
+        bs.tick_timer(total, &mut objs, parent_id, BaseState::Opened, glam::Vec3::ZERO, 0);
+        assert!(bs.is_empty(), "turret completes while base not Closed");
+
+        let mut bs = BuildStack::new();
+        let mut cfg = RobotConfig::new();
+        cfg.hull.unit.kind = RobotUnitKind::ARMOR_PASSIVE;
+        assert!(bs.add_item(PendingItem {
+            kind: PendingKind::Robot(cfg),
+            side: 1,
+        }));
+        let total = robot_build_time_ms();
+        let spawned =
+            bs.tick_timer(total, &mut objs, parent_id, BaseState::Opened, glam::Vec3::ZERO, 0);
+        assert!(spawned.is_none());
+        assert_eq!(bs.items(), 1, "robot waits for BASE_CLOSED");
     }
 
     #[test]

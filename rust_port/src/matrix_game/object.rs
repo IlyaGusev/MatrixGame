@@ -245,6 +245,12 @@ pub struct MapObject {
     /// indexes into the `Anim,<states>` table in the Ids behaviour
     /// string. -1 for non-BEHF_ANIM objects.
     pub anim_state: i32,
+    /// Cached BEHAVIOUR field (post-`+` strip) from the Ids row. The
+    /// C++ re-reads `g_MatrixMap->IdsGet(m_Type)` whenever `Damage` /
+    /// `ApplyAnimState` needs the state table (MatrixObject.cpp:269);
+    /// the world-scope Ids table isn't reachable from `damage` here,
+    /// so `apply_ids_row` keeps a copy.
+    pub behaviour: String,
 }
 
 impl MapObject {
@@ -299,6 +305,7 @@ impl MapObject {
             break_hit_point: 0,
             break_hit_point_max: 0,
             anim_state: -1,
+            behaviour: String::new(),
         }
     }
 
@@ -343,6 +350,7 @@ impl MapObject {
             self.object_state |= OBJECT_STATE_SPECIAL;
             on_before_win_inc();
         }
+        self.behaviour = beh.clone();
 
         if wstr::compare_first(&beh, "Burn") {
             self.beh_flag = BehFlag::Burn;
@@ -365,11 +373,12 @@ impl MapObject {
             }
             true
         } else if wstr::compare_first(&beh, "Anim") {
-            // "Anim" or "AnimP" (Portret)
-            // (MatrixObject.cpp:1060-1075). The 5th char (index 4) was
-            // `temp[5]` in C++ — that 1-based indexing counts the `,`
-            // after "Anim", so we look at char index 4 in Rust.
-            if beh.chars().nth(4) == Some('P') {
+            // "Anim,<states>" or Portret "Anim,P..."
+            // (MatrixObject.cpp:1060-1075). The C++ checks `temp[5]`
+            // — 0-based (CWStr.hpp:195), i.e. the char right after
+            // the `,` that follows "Anim". A literal "AnimP" has no
+            // index 5 and stays BEHF_ANIM.
+            if beh.chars().nth(5) == Some('P') {
                 self.beh_flag = BehFlag::Portret;
                 // MatrixObject.cpp:1066-1067 —
                 //   m_PhotoTime = g_MatrixMap->Rnd(1000,2000);
@@ -501,7 +510,10 @@ impl MapStatic for MapObject {
             let rx = Mat3::from_cols_array(&[1.0, 0.0, 0.0, 0.0, cx, sx, 0.0, -sx, cx]);
             let ry = Mat3::from_cols_array(&[cy, 0.0, -sy, 0.0, 1.0, 0.0, sy, 0.0, cy]);
             let rz = Mat3::from_cols_array(&[cz, sz, 0.0, -sz, cz, 0.0, 0.0, 0.0, 1.0]);
-            let rot = rx * ry * rz * self.scale;
+            // C++ row-major `mx * my * mz` (MatrixObject.cpp:392) ==
+            // column-major `rz * ry * rx`; scale is applied to all nine
+            // rotation elements afterwards (uniform, so order-free).
+            let rot = rz * ry * rx * self.scale;
 
             self.core.matrix = Mat4::from_cols(
                 rot.x_axis.extend(0.0),
@@ -678,24 +690,22 @@ impl MapStatic for MapObject {
                 // current `anim_state`. Field index 3 is "next state"
                 // in the `#`-joined `<id>:<anim>:<hp>:<next>:...` spec
                 // (MatrixObject.cpp:269-286). The damage path uses
-                // index 3 (vs index 4 in `IsAnimEnd` transitions); we
-                // reproduce that exactly.
-                //
-                // We don't hold the BEHAVIOUR field here — the
-                // caller-visible way is to fetch it via the Ids table,
-                // which is world-scope and not threaded in. For now,
-                // mark the object with the next-state transition
-                // deferred; emit a log so maps that rely on it report
-                // cleanly.
-                log::debug!(
-                    "MapObject BEHF_ANIM death transition skipped (state-table \
-                     lookup needs Ids-row threading); obj_type={}, anim_state={}",
-                    self.type_id,
-                    self.anim_state,
-                );
-                // Mark as "broken" so the Anim subclass state isn't
-                // stuck at 0hp taking repeated damage.
-                self.break_hit_point = 2_000_000_000;
+                // index 3 (vs index 4 in `IsAnimEnd` transitions);
+                // `ApplyAnimState(newstate)` re-seeds HP from the new
+                // state's entry. No transition → HP stays ≤ 0.
+                let beh = self.behaviour.clone();
+                let state_table = wstr::str_par(&beh, 1, ",");
+                let cnt = wstr::count_par(state_table, "#");
+                for i in 0..cnt {
+                    let entry = wstr::str_par(state_table, i, "#");
+                    if wstr::int_par(entry, 0, ":") == self.anim_state {
+                        let newstate = wstr::int_par(entry, 3, ":");
+                        if newstate >= 0 {
+                            self.apply_anim_state(newstate, &beh);
+                            break;
+                        }
+                    }
+                }
             }
         }
 
@@ -2259,7 +2269,8 @@ fn shadow_texture_projection(
 }
 
 /// Build the same static-object transform order used by the original renderer:
-/// Rx * Ry * Rz, then uniform scale, then translation into centered render space.
+/// row-major `mx * my * mz` (MatrixObject.cpp:392) — column-major Rz * Ry * Rx —
+/// then uniform scale, then translation into centered render space.
 fn instance_matrix(
     obj: &ObjectInstance,
     cx: f32,
@@ -2288,7 +2299,7 @@ fn object_rotation(obj: &ObjectInstance) -> Mat3 {
     let rx = Mat3::from_cols_array(&[1.0, 0.0, 0.0, 0.0, cxr, sx, 0.0, -sx, cxr]);
     let ry = Mat3::from_cols_array(&[cyr, 0.0, -sy, 0.0, 1.0, 0.0, sy, 0.0, cyr]);
     let rz = Mat3::from_cols_array(&[cz, sz, 0.0, -sz, cz, 0.0, 0.0, 0.0, 1.0]);
-    rx * ry * rz
+    rz * ry * rx
 }
 
 fn resolve_texture(
@@ -2364,15 +2375,24 @@ mod tests {
     }
 
     #[test]
-    fn anim_vs_animp_split_on_fifth_char() {
-        let anim_plain = "path*vo*tex******Anim";
+    fn anim_vs_portret_split_on_index_5() {
+        // C++ checks `temp[5] == 'P'` with 0-based indexing
+        // (MatrixObject.cpp:1062, CWStr.hpp:195) — the char after the
+        // `,` following "Anim". A literal "AnimP" is BEHF_ANIM; only
+        // rows like "Anim,P..." are Portret.
+        let anim_plain = "path*vo*tex******Anim,0:1:100";
         let animp = "path*vo*tex******AnimP";
+        let portret = "path*vo*tex******Anim,P";
         let mut a = MapObject::from_instance(&inst());
+        let mut ap = MapObject::from_instance(&inst());
         let mut p = MapObject::from_instance(&inst());
         let a_lt = a.apply_ids_row(anim_plain, &mut Rnd::new(1), || {});
-        let p_lt = p.apply_ids_row(animp, &mut Rnd::new(1), || {});
+        let ap_lt = ap.apply_ids_row(animp, &mut Rnd::new(1), || {});
+        let p_lt = p.apply_ids_row(portret, &mut Rnd::new(1), || {});
         assert_eq!(a.beh_flag, BehFlag::Anim);
         assert!(a_lt, "Anim opts into AddLT");
+        assert_eq!(ap.beh_flag, BehFlag::Anim, "literal AnimP is BEHF_ANIM in C++");
+        assert!(ap_lt);
         assert_eq!(p.beh_flag, BehFlag::Portret);
         assert!(!p_lt, "Portret is Takt-driven, not logic-temp");
     }
@@ -2425,7 +2445,7 @@ mod tests {
         // "displayed" interval.
         let mut rng = Rnd::new(42);
         let mut o = MapObject::from_instance(&inst());
-        assert!(!o.apply_ids_row("path*vo*tex******AnimP", &mut rng, || {}));
+        assert!(!o.apply_ids_row("path*vo*tex******Anim,P", &mut rng, || {}));
         assert_eq!(o.beh_flag, BehFlag::Portret);
         assert!(o.photo_time >= 1000 && o.photo_time <= 2000);
         assert_eq!(o.photo, 0);
@@ -2653,6 +2673,51 @@ mod tests {
         o.apply_anim_state(99, "Anim,0:5:100#1:3:50#2:7:0");
         assert_eq!(o.anim_state, 99);
         assert_eq!(o.break_hit_point, prev);
+    }
+
+    #[test]
+    fn anim_death_transitions_to_next_state_and_reseeds_hp() {
+        // BEHF_ANIM death (MatrixObject.cpp:269-286): look up the
+        // current state's entry, take field 3 as the next state and
+        // ApplyAnimState it (re-seeding HP). next=-1 → no transition,
+        // HP stays ≤ 0.
+        use crate::matrix_game::config::WeaponDamage;
+        use crate::matrix_game::effects::weapon::{weap_to_index, WEAPON_GUN};
+        use crate::matrix_game::map_static::Objects;
+
+        let mut rng = Rnd::new(1);
+        let mut o = MapObject::from_instance(&inst());
+        assert!(o.apply_ids_row(
+            "path*vo*tex******Anim,0:1:100:1#1:2:50:-1",
+            &mut rng,
+            || {},
+        ));
+        assert_eq!(o.beh_flag, BehFlag::Anim);
+        assert_eq!(o.break_hit_point, 100);
+
+        let mut objs = Objects::new();
+        objs.object_damages.table[weap_to_index(WEAPON_GUN).unwrap()] = WeaponDamage {
+            damage: 100,
+            mindamage: 0,
+            friend_damage: 0,
+        };
+        let id = objs.spawn(Box::new(o));
+
+        // First kill: state 0 → 1, HP re-seeded from state 1's entry.
+        objs.apply_damage(id, WEAPON_GUN, glam::Vec3::ZERO, glam::Vec3::Z, PLAYER_SIDE, None);
+        let mo = unsafe {
+            &*(objs.get(id).unwrap() as *const dyn MapStatic as *const MapObject)
+        };
+        assert_eq!(mo.anim_state, 1);
+        assert_eq!(mo.break_hit_point, 50);
+
+        // Second kill: state 1 has next=-1 — no transition, HP ≤ 0.
+        objs.apply_damage(id, WEAPON_GUN, glam::Vec3::ZERO, glam::Vec3::Z, PLAYER_SIDE, None);
+        let mo = unsafe {
+            &*(objs.get(id).unwrap() as *const dyn MapStatic as *const MapObject)
+        };
+        assert_eq!(mo.anim_state, 1);
+        assert!(mo.break_hit_point <= 0);
     }
 
     #[test]

@@ -328,7 +328,8 @@ impl SlotMarkerRenderer {
             0,
             bytemuck::bytes_of(&Uniforms {
                 view_proj: view_proj.to_cols_array_2d(),
-                color: [0.4, 1.0, 0.4, 0.7],
+                // 0x80FFFFFF — translucent white (MatrixEffect.cpp:360).
+                color: [1.0, 1.0, 1.0, 0.5],
             }),
         );
         pass.set_pipeline(&self.pipeline);

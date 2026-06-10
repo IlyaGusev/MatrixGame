@@ -14,8 +14,8 @@ use wgpu::util::DeviceExt;
 
 use crate::matrix_game::camera::Camera;
 use crate::matrix_game::common::{
-    unpack_rgb, CELLFLAG_BRIDGE, CELLFLAG_FLAT, CELLFLAG_LAND, CELLFLAG_WATER, FOG_END, FOG_START,
-    MAP_GROUP_SIZE, TEX_BOTTOM_SIZE,
+    float2int, unpack_rgb, CELLFLAG_BRIDGE, CELLFLAG_FLAT, CELLFLAG_LAND, CELLFLAG_WATER, FOG_END,
+    FOG_START, MAP_GROUP_SIZE, TEX_BOTTOM_SIZE,
 };
 use crate::matrix_game::effects::point_light::{PointLightRenderer, PointLightSystem};
 use crate::matrix_game::map_group::{DrawBatch, Vertex};
@@ -384,7 +384,7 @@ pub struct CannonInstance {
 }
 
 /// One entry in `m_TurretsPlaces[]`. Coordinates are in MOVE-cell units
-/// (`x / GLOBAL_SCALE_MOVE`, floored), matching the C++ at
+/// (`Float2Int(x / GLOBAL_SCALE_MOVE)`), matching the C++ at
 /// MatrixMapPrepare.cpp:852-853 — slot equality + the snap test in
 /// `IsInPlaces` work against these int coords.
 #[derive(Debug, Clone, Copy)]
@@ -604,9 +604,10 @@ impl GameMap {
         // Compute surface normals — ports PointCalcNormals (MatrixMapPrepare.cpp:20-105)
         let _w = size_x + 1;
         let normals = compute_normals(&points, size_x, size_y);
-        let units = compute_units(&points, size_x, size_y);
+        let mut units = compute_units(&points, size_x, size_y);
         let (move_cells, size_move_x, size_move_y) =
             load_move_cells(&stor, &points, size_x, size_y);
+        load_bridges(&stor, &mut points, &mut units, size_x, size_y);
         // Debug: count impassable-for-Track cells per size bucket.
         let mut track_blocked = [0usize; 5];
         let mut all_zero = 0usize;
@@ -786,12 +787,13 @@ impl GameMap {
     pub const GLOBAL_SCALE_MOVE: f32 = GLOBAL_SCALE / 2.0;
 
     /// World coords → move-cell coords. Mirrors
-    /// `TruncFloat(x * INVERT(GLOBAL_SCALE_MOVE))` used throughout
-    /// MatrixRobot.cpp (e.g. :377).
+    /// `Float2Int(x * INVERT(GLOBAL_SCALE_MOVE))` in `PlaceGet` /
+    /// `MapPosCalc` / `GetLost` (MatrixLogic.cpp:468-470,
+    /// MatrixRobot.hpp:355).
     pub fn world_to_move(&self, wx: f32, wy: f32) -> (i32, i32) {
         (
-            (wx / Self::GLOBAL_SCALE_MOVE).floor() as i32,
-            (wy / Self::GLOBAL_SCALE_MOVE).floor() as i32,
+            float2int(wx / Self::GLOBAL_SCALE_MOVE),
+            float2int(wy / Self::GLOBAL_SCALE_MOVE),
         )
     }
 
@@ -1258,6 +1260,74 @@ fn compute_units(points: &[CompilePoint], size_x: usize, size_y: usize) -> Vec<M
     units
 }
 
+/// Bridges pass (MatrixMapPrepare.cpp:1448-1532). Each `bridges/Data`
+/// array is a CRect (left, top, right, bottom — 4×i32) followed by
+/// `(right-left) * (bottom-top)` row-major deck heights. Every covered
+/// unit gets `CELLFLAG_BRIDGE` and its plane coefficients rebuilt from
+/// the deck z values (closed form of the `D3DXPlaneFromPoints` math,
+/// same as `compute_units`); point z is overwritten so `GetZ` returns
+/// deck height on bridge cells.
+fn load_bridges(
+    stor: &Storage,
+    points: &mut [CompilePoint],
+    units: &mut [MapUnit],
+    size_x: usize,
+    size_y: usize,
+) {
+    let Some(br) = stor.get_buf("bridges", "Data") else {
+        return;
+    };
+    let stride = size_x + 1;
+    for rec in 0..br.arrays_count() {
+        let bytes = br.get_bytes(rec);
+        if bytes.len() < 16 {
+            continue;
+        }
+        let rd =
+            |o: usize| i32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
+        let (left, top, right, bottom) = (rd(0), rd(4), rd(8), rd(12));
+        if left < 0 || top < 0 || right <= left || bottom <= top {
+            continue;
+        }
+        let dx = (right - left) as usize;
+        let dy = (bottom - top) as usize;
+        let z = read_f32_array(&bytes[16..]);
+        if right > size_x as i32 + 1 || bottom > size_y as i32 + 1 || z.len() < dx * dy {
+            log::warn!("map: bridge record {rec} out of bounds; skipping");
+            continue;
+        }
+        for y in top as usize..bottom as usize {
+            for x in left as usize..right as usize {
+                let zi = (y - top as usize) * dx + (x - left as usize);
+                let z0 = z[zi];
+                if x + 1 < right as usize && y + 1 < bottom as usize {
+                    let u = &mut units[y * size_x + x];
+                    u.flags |= CELLFLAG_BRIDGE;
+                    let z1 = z[zi + 1];
+                    let z2 = z[zi + dx + 1];
+                    let z3 = z[zi + dx];
+                    if z0 == z1 && z0 == z2 && z0 == z3 {
+                        u.flags |= CELLFLAG_FLAT;
+                        u.a1 = z0;
+                    } else {
+                        u.flags &= !CELLFLAG_FLAT;
+                        u.a1 = (z1 - z0) / GLOBAL_SCALE;
+                        u.b1 = (z2 - z1) / GLOBAL_SCALE;
+                        u.c1 = z0;
+                        u.a2 = (z2 - z3) / GLOBAL_SCALE;
+                        u.b2 = (z3 - z0) / GLOBAL_SCALE;
+                        u.c2 = z0;
+                    }
+                }
+                points[y * stride + x].z = z0;
+            }
+        }
+    }
+    if br.arrays_count() > 0 {
+        log::info!("map: applied {} bridge records", br.arrays_count());
+    }
+}
+
 fn cross(a: &[f32; 3], b: &[f32; 3]) -> [f32; 3] {
     [
         a[1] * b[2] - a[2] * b[1],
@@ -1656,7 +1726,7 @@ fn load_cannons(
     for i in 0..n {
         let cxv = cx_arr[i];
         let cyv = cy_arr[i];
-        let prop = props.get(i).copied().unwrap_or(0);
+        let mut prop = props.get(i).copied().unwrap_or(0);
         let kind = kinds.get(i).copied().unwrap_or(1);
         let side = sides.get(i).copied().unwrap_or(0);
         let angle = angles.get(i).copied().unwrap_or(0.0);
@@ -1684,8 +1754,8 @@ fn load_cannons(
             }
             if let Some(bi) = best {
                 let bld = &mut buildings[bi];
-                let coord_x = (cxv / GameMap::GLOBAL_SCALE_MOVE).floor() as i32;
-                let coord_y = (cyv / GameMap::GLOBAL_SCALE_MOVE).floor() as i32;
+                let coord_x = float2int(cxv / GameMap::GLOBAL_SCALE_MOVE);
+                let coord_y = float2int(cyv / GameMap::GLOBAL_SCALE_MOVE);
                 let cannon_type = if prop == 1 { kind as i32 } else { -1 };
                 bld.turret_places.push(TurretPlaceCmap {
                     coord: (coord_x, coord_y),
@@ -1697,12 +1767,16 @@ fn load_cannons(
                 parent_building = Some(bi);
                 // Inherit the parent base's side (MatrixMapPrepare.cpp:850).
                 owning_side = bld.side;
+            } else if prop == 1 {
+                // No building in range — demote to an empty slot
+                // (MatrixMapPrepare.cpp:842-845).
+                prop = 2;
             }
         }
 
-        // Skip prop=2 records entirely — they're empty placement slots
-        // (no Cannon entity). prop=0 + prop=1 + orphaned prop=2 with no
-        // parent become live cannons.
+        // Skip prop=2 records — empty placement slots and orphaned
+        // factory cannons spawn no Cannon entity (MatrixMapPrepare.cpp:
+        // 863-873).
         if prop == 2 {
             continue;
         }
@@ -2022,12 +2096,6 @@ fn blend_color(a: u32, b: u32, t: f32) -> u32 {
     let bg = (b >> 8) & 0xFF;
     let bb = b & 0xFF;
     (lerp(ar, br) << 16) | (lerp(ag, bg) << 8) | lerp(ab, bb)
-}
-
-fn float2int(x: f32) -> i32 {
-    // The original uses x87 `fistp` via Float2Int. Rust has no direct stable
-    // equivalent, so use nearest-integer rounding for the current viewer port.
-    x.round() as i32
 }
 
 fn find_property_int(
@@ -2366,11 +2434,19 @@ impl MapRenderer {
             total_tris
         );
 
-        // Reflection texture for the gloss pass — falls back to a warm highlight
-        // if the asset isn't found (matches TEXTURE_PATH_REFLECTION from
-        // StringConstants.hpp:124).
+        // Reflection texture for the gloss pass — the per-sky `Reflection`
+        // param from the Sky block (MatrixMapPrepare.cpp:1137), defaulting
+        // to TEXTURE_PATH_REFLECTION (StringConstants.hpp:124) when absent.
+        // Falls back to a warm highlight if the asset isn't found.
+        let reflection_path = matrix_data
+            .block_record("da", "Sky")
+            .and_then(|sky_root| matrix_data.block_record(&sky_root, &map.sky_name))
+            .and_then(|sky_rec| matrix_data.block_param(&sky_rec, "Reflection"))
+            .map(|p| p.trim().replace('\\', "/"))
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| "Matrix/Textures/reflection".to_string());
         let reflection_view = if let Some(rgba) =
-            read_texture("Matrix/Textures/reflection").and_then(|data| decode_texture_bytes(&data))
+            read_texture(&reflection_path).and_then(|data| decode_texture_bytes(&data))
         {
             create_texture_from_rgba_mipped(device, queue, &rgba, 6)
         } else {

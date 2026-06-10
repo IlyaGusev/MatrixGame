@@ -419,6 +419,14 @@ pub fn marquee_select(
         Vec::new()
     };
 
+    // MatrixMultiSelection.cpp:211 — a tiny drag (rect area < 9 px²)
+    // collapses to a single robot: break on the first in-rect hit.
+    let only_one =
+        (rect_max[0] - rect_min[0]).abs() * (rect_max[1] - rect_min[1]).abs() < 9.0;
+    // MatrixMultiSelection.cpp:257 — the marquee itself adds at most 9
+    // objects (`m_SelItems.Len()/sizeof(DWORD) < 9`).
+    let mut added = 0usize;
+
     for id in logic.objects.iter_live() {
         let Some(obj) = logic.objects.get(id) else {
             continue;
@@ -442,9 +450,16 @@ pub fn marquee_select(
             && sx <= rect_max[0]
             && sy >= rect_min[1]
             && sy <= rect_max[1]
-            && !hits.contains(&id)
         {
-            hits.push(id);
+            if added < 9 && !hits.contains(&id) {
+                hits.push(id);
+                added += 1;
+            }
+            // C++ `if (only_one && o->IsRobot()) break;` — every hit
+            // here is a robot.
+            if only_one {
+                break;
+            }
         }
     }
     let n = hits.len();

@@ -46,8 +46,8 @@ wasm-pack build --target web --out-dir pkg
 cargo run --example pack_bundle
 
 # Serve locally
-python3 -m http.server 8099
-# open http://localhost:8099
+python3 -m http.server 8081
+# open http://localhost:8081
 ```
 
 ### Rebuild and Rerun
@@ -56,7 +56,7 @@ When asked to "rebuild and rerun":
 
 1. `wasm-pack build --dev --target web --out-dir pkg` (~2s incremental vs ~46s release)
 2. Bump `?v=N` → `?v=N+1` in `index.html` import line
-3. `fuser -k 8099/tcp 2>/dev/null; nohup python3 -m http.server 8099 > /dev/null 2>&1 &`
+3. Ensure a server is on 8081 (a long-lived one is usually already running; `http.server` serves files fresh from disk, so no restart is needed): `ss -tln | grep -q :8081 || nohup python3 -m http.server 8081 > /dev/null 2>&1 &`
 
 When asked to just "rebuild", skip step 3. Use `--dev` by default; only use release (`wasm-pack build --target web --out-dir pkg`) when explicitly requested.
 

@@ -697,10 +697,15 @@ pub fn build_hint(
             }
             continue;
         }
-        // _MOD:M — update the modifier for the next bitmap-emitting
-        // directive. `L`/`C`/`T:N`/`CR:N`/`CL:N`/`COPY`.
+        // _MOD:M — the C++ emits an immediate ZERO-SIZE element with
+        // the parsed hem (`elems[nelem].bmp = NULL`, MatrixHint.cpp:
+        // 662-666): `_MOD:L` forces a line break, `_MOD:T:n` moves the
+        // cursor right now. It does NOT change the sticky `modif`
+        // (only `_TEXTP:` does that). Run the positioning pass with a
+        // 0×0 part and discard the resulting coordinate.
         if let Some(rest) = directive.strip_prefix("_MOD:") {
-            modif = parse_mod(rest);
+            let hem = parse_mod(rest);
+            let _ = pass1_position(hem, &mut cx, &mut cy, &mut cw, &mut ch, 0, 0, &mut new_coord);
             continue;
         }
         if let Some(rest) = directive.strip_prefix("_TEXTP:") {
@@ -1177,8 +1182,6 @@ struct HoverTarget {
     offset_y: i32,
     elem_screen_x: f32,
     elem_screen_y: f32,
-    elem_w_px: f32,
-    elem_h_px: f32,
 }
 
 impl HintSystem {
@@ -1199,8 +1202,6 @@ impl HintSystem {
         offset_y: i32,
         elem_screen_x: f32,
         elem_screen_y: f32,
-        elem_w_px: f32,
-        elem_h_px: f32,
     ) {
         let target = match (panel_name, elem_name, template_name) {
             (Some(p), Some(e), Some(t)) if !t.is_empty() => Some(HoverTarget {
@@ -1211,8 +1212,6 @@ impl HintSystem {
                 offset_y,
                 elem_screen_x,
                 elem_screen_y,
-                elem_w_px,
-                elem_h_px,
             }),
             _ => None,
         };
@@ -1299,10 +1298,11 @@ impl HintSystem {
         let total_w_px = total_w_design as f32 * scale;
         let total_h_px = total_h_design as f32 * scale;
 
-        let elem_cx = hov.elem_screen_x + hov.elem_w_px * 0.5;
-        let elem_bottom = hov.elem_screen_y + hov.elem_h_px;
-        let desired_x = elem_cx + hov.offset_x as f32 * scale;
-        let desired_y = elem_bottom + hov.offset_y as f32 * scale;
+        // C++ anchors at the element's TOP-LEFT plus the authored hint
+        // offset: `x = m_PosElInX + m_Hint.x; y = m_PosElInY + m_Hint.y`
+        // (CIFaceButton.cpp:138-139).
+        let desired_x = hov.elem_screen_x + hov.offset_x as f32 * scale;
+        let desired_y = hov.elem_screen_y + hov.offset_y as f32 * scale;
         // Port of `CorrectCoordinates` (CInterface.cpp:4356-4437).
         let Some((sx, sy)) = correct_coordinates(
             &hov.elem_name,
@@ -1455,5 +1455,44 @@ mod tests {
     #[test]
     fn parse_argb_parses_color() {
         assert_eq!(parse_argb("FFCBCCCE"), [0xCB, 0xCC, 0xCE, 0xFF]);
+    }
+
+    fn part_pos(p: &HintPart) -> (i32, i32) {
+        match p {
+            HintPart::Text { x, y, .. } => (*x, *y),
+            HintPart::Bitmap { x, y, .. } => (*x, *y),
+        }
+    }
+
+    fn layout(template: &str) -> Vec<HintPart> {
+        let border = ChromeBorder::default();
+        let bitmaps = HashMap::new();
+        let repl = HintReplacer::default();
+        let mut atlas = crate::matrix_game::interface::text::GlyphAtlas::new();
+        let (parts, ..) =
+            build_hint(template, &border, &bitmaps, &repl, &mut atlas, |_| Some((10, 10)))
+                .unwrap();
+        parts
+    }
+
+    /// `_MOD:L` is an immediate zero-size element (MatrixHint.cpp:
+    /// 662-666) — it forces a line break NOW instead of modifying the
+    /// next `_TEXT:`.
+    #[test]
+    fn mod_l_breaks_line_immediately() {
+        let parts = layout("0|_TEXT:ab|_MOD:L|_TEXT:cd");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(part_pos(&parts[0]), (0, 0));
+        let (x1, y1) = part_pos(&parts[1]);
+        assert_eq!(x1, 0, "second text must restart at the left edge");
+        assert!(y1 > 0, "second text must move to a new line, got y={y1}");
+    }
+
+    /// `_MOD:T:n` moves the cursor to absolute X = n immediately.
+    #[test]
+    fn mod_tab_moves_cursor_immediately() {
+        let parts = layout("0|_TEXT:ab|_MOD:T:50|_TEXT:cd");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(part_pos(&parts[1]), (50, 0));
     }
 }

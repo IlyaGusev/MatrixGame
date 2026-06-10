@@ -47,7 +47,7 @@ struct CamParam {
     dist_max: f32,
     angle_param: f32, // default pitch parameter
     height: f32,      // link-point height above terrain
-    wheel_step: f32,  // `dist_param` delta per mouse-wheel notch
+    wheel_step: f32,  // raw CamMouseWheelStep; zoom() scales it by 4.5
     move_speed: f32,  // pan speed (world units/ms)
 }
 
@@ -60,7 +60,7 @@ const STRATEGY_DEFAULTS: CamParam = CamParam {
     dist_max: 250.0,
     angle_param: 0.4,
     height: 140.0,
-    wheel_step: 0.225,
+    wheel_step: 0.05,
     move_speed: 1.05,
 };
 
@@ -258,8 +258,9 @@ impl Camera {
 
     /// Ports ZoomInStep/OutStep (MatrixCamera.hpp:275-289). `notches` is an
     /// integer-ish wheel delta (positive = zoom in, shrinks distance).
+    /// The original steps by `CamMouseWheelStep * 4.5` (0.05 * 4.5 = 0.225).
     pub fn zoom(&mut self, notches: f32) {
-        self.dist_param -= self.params.wheel_step * notches;
+        self.dist_param -= self.params.wheel_step * 4.5 * notches;
         self.dist_param = self.dist_param.clamp(0.25, 4.0);
     }
 
@@ -421,7 +422,7 @@ impl Camera {
 
     // ── Derived transforms ────────────────────────────────────────────────
 
-    pub fn eye_pos(&self) -> Vec3 {
+    fn eye_unclamped(&self) -> Vec3 {
         let lp = self.link_point;
         let sz = self.angle_z.sin();
         let cz = self.angle_z.cos();
@@ -440,19 +441,31 @@ impl Camera {
         // this convention. The previous formula had sin/cos swapped, which
         // treated AX as elevation and pushed the eye past the zenith at
         // high AX, producing the left/right flip and the look_at singularity.
-        let mut eye = Vec3::new(
+        Vec3::new(
             lp.x - sz * sx * self.dist,
             lp.y + cz * sx * self.dist,
             lp.z + cx * self.dist,
-        );
+        )
+    }
+
+    /// Ground-clamp lift applied to the eye Z — port of the BeforeDraw clamp
+    /// at MatrixCamera.cpp:748-755 (`m_MatViewInversed._43 < GetZ(...) + 10`).
+    /// Returns how far the eye must be raised (0 when no clamp engages).
+    fn ground_lift(&self, eye: Vec3) -> f32 {
         if let Some(sample_ground) = &self.sample_ground {
             let wx = eye.x + self.map_cx;
             let wy = eye.y + self.map_cy;
             let min_z = sample_ground(wx, wy) + 10.0;
             if eye.z < min_z {
-                eye.z = min_z;
+                return min_z - eye.z;
             }
         }
+        0.0
+    }
+
+    pub fn eye_pos(&self) -> Vec3 {
+        let mut eye = self.eye_unclamped();
+        eye.z += self.ground_lift(eye);
         eye
     }
 
@@ -462,13 +475,24 @@ impl Camera {
     /// the operation order reverses: `S * T(0,0,-Dist) * Rx(AX) * Rz(-AZ) * T(-LP)`.
     /// Constructing the matrix explicitly (rather than via `look_at_lh`) avoids
     /// the near-zenith singularity when the camera is nearly top-down.
+    ///
+    /// The terrain ground clamp (MatrixCamera.cpp:748-755) is applied here too:
+    /// the original lifts `m_MatViewInversed._43` and re-inverts into m_MatView,
+    /// so the *rendered* view is lifted. Lifting the eye by `dz` while keeping
+    /// the rotation equals post-multiplying by `T(0, 0, -dz)`.
     pub fn view_matrix(&self) -> Mat4 {
         let s = Mat4::from_scale(Vec3::new(1.0, -1.0, -1.0));
         let t2 = Mat4::from_translation(Vec3::new(0.0, 0.0, -self.dist));
         let rx = Mat4::from_rotation_x(self.angle_x);
         let rz = Mat4::from_rotation_z(-self.angle_z);
         let t1 = Mat4::from_translation(-self.link_point);
-        s * t2 * rx * rz * t1
+        let view = s * t2 * rx * rz * t1;
+        let lift = self.ground_lift(self.eye_unclamped());
+        if lift > 0.0 {
+            view * Mat4::from_translation(Vec3::new(0.0, 0.0, -lift))
+        } else {
+            view
+        }
     }
 
     /// Map center X the camera subtracts from every world position

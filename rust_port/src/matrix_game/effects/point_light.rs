@@ -534,6 +534,8 @@ mod tests {
             camera_angle: 0.0,
             camera_pos: None,
             tex_union_dim: 16,
+            shadow_color: 0,
+            robots: Vec::new(),
             water_color: 0,
             sky_color: 0,
             sky_name: String::new(),

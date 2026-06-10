@@ -417,7 +417,12 @@ impl Water {
                 water_color,
                 light_color,
                 light_dir,
-                params: [1.0, 0.0, 0.0, 0.0],
+                // params.x: lighting-normal scale. The original lights water
+                // with D3DRS_NORMALIZENORMALS off, so the 12.5x world scale's
+                // inverse-transpose shrinks the (already water_normal_len
+                // long) vertex normal by 1/water_scale, leaving the diffuse
+                // term ~12x weaker than a normalized normal would give.
+                params: [1.0 / water_scale, 0.0, 0.0, 0.0],
                 fog_color,
                 fog_params: [FOG_START, FOG_END, 0.0, 0.0],
             }),
@@ -801,7 +806,10 @@ impl Water {
             return;
         }
 
-        self.angle += steps;
+        // CMatrixWater::Takt (MatrixWater.cpp:294-308) starts k at 1 and
+        // increments once per elapsed WATER_TIME_PERIOD, so FillVB advances
+        // m_angle by N+1 — in steady state that's 2 per 60 ms.
+        self.angle += steps + 1;
         let (lattice_z, lattice_normals) =
             build_wave_lattice(self.angle, self.water_normal_len, &self.phase_offsets);
 
@@ -835,7 +843,7 @@ impl Water {
                 water_color: self.water_color,
                 light_color: self.light_color,
                 light_dir: self.light_dir,
-                params: [1.0, 0.0, 0.0, 0.0],
+                params: [1.0 / self.water_scale, 0.0, 0.0, 0.0],
                 fog_color: self.fog_color,
                 fog_params: [FOG_START, FOG_END, 0.0, 0.0],
             }),
@@ -953,7 +961,7 @@ impl Water {
                 water_color: self.water_color,
                 light_color: self.light_color,
                 light_dir: self.light_dir,
-                params: [1.0, 0.0, 0.0, 0.0],
+                params: [1.0 / self.water_scale, 0.0, 0.0, 0.0],
                 fog_color: self.fog_color,
                 fog_params: [FOG_START, FOG_END, 0.0, 0.0],
             }),

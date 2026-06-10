@@ -933,6 +933,9 @@ impl InterfaceRenderer {
                     ElementState::Pressed => [0.8, 0.8, 0.8, 1.0],
                     ElementState::Disabled => [0.5, 0.5, 0.5, 0.8],
                     ElementState::Normal => [1.0, 1.0, 1.0, 1.0],
+                    // Latched check buttons draw their authored
+                    // `sPressedUnFocused` art untinted.
+                    ElementState::PressedUnfocused => [1.0, 1.0, 1.0, 1.0],
                 };
                 open_run(
                     &key,

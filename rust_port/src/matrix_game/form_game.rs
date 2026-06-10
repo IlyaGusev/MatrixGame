@@ -485,10 +485,10 @@ impl ApplicationHandler for App {
             }
 
             // ── Mouse input (MatrixFormGame.cpp:530-642) ──
-            // Middle or right button toggles MouseCam mode (rotate-on-drag).
-            // Right-click down also issues move orders to the selected
-            // robots (C++: `CMatrixSideUnit::OnRButtonDown`, dispatched
-            // alongside the camera-rotate state toggle).
+            // Middle button toggles MouseCam mode (rotate-on-drag,
+            // MatrixFormGame.cpp:631-642 — VK_MBUTTON only). Right-click
+            // issues move orders to the selected robots
+            // (C++: `CMatrixSideUnit::OnRButtonDown`).
             WindowEvent::MouseInput {
                 state: btn_state,
                 button,
@@ -498,49 +498,51 @@ impl ApplicationHandler for App {
                 let [cx, cy] = state.cursor;
                 let w = state.gfx.config.width as f32;
                 let h = state.gfx.config.height as f32;
-                if matches!(button, MouseButton::Middle | MouseButton::Right) {
+                if button == MouseButton::Middle {
                     let pressed = btn_state == ElementState::Pressed;
+                    state.camera.on_rotate_button(pressed, cx, cy);
+                } else if button == MouseButton::Right {
                     // RMB → UI first (CIFaceButton::OnMouseRBDown opens
                     // the constructor popup menu when a pylon catches
-                    // the press). Camera-rotate + move-orders only run
-                    // if no UI element claims the event.
-                    let ui_consumed_rmb = if button == MouseButton::Right {
-                        match btn_state {
-                            ElementState::Pressed => {
-                                state.iface_list.on_mouse_right_down(cx, cy, w, h)
-                            }
-                            ElementState::Released => state
-                                .iface_list
-                                .on_mouse_right_up(cx, cy, w, h)
-                                .map(|click| {
-                                    log::debug!("iface: right-clicked {:?}", click);
-                                    dispatch_ui_right_click(state, &click);
-                                })
-                                .is_some(),
+                    // the press). Move-orders only run if no UI element
+                    // claims the event.
+                    let ui_consumed_rmb = match btn_state {
+                        ElementState::Pressed => {
+                            state.iface_list.on_mouse_right_down(cx, cy, w, h)
                         }
-                    } else {
-                        false
+                        ElementState::Released => state
+                            .iface_list
+                            .on_mouse_right_up(cx, cy, w, h)
+                            .map(|click| {
+                                log::debug!("iface: right-clicked {:?}", click);
+                                dispatch_ui_right_click(state, &click);
+                            })
+                            .is_some(),
                     };
-                    if !ui_consumed_rmb {
-                        state.camera.on_rotate_button(pressed, cx, cy);
-                        if button == MouseButton::Right
-                            && pressed
-                            && !state.game.player_side.selected.is_empty()
-                        {
-                            let slots = state.game.order_move_to_at(
-                                &state.camera,
-                                cx,
-                                cy,
-                                w,
-                                h,
-                                &state.map,
-                            );
-                            if !slots.is_empty() {
-                                log::debug!("move order: issued to {} robot(s)", slots.len());
-                                for (wx, wy) in slots {
-                                    let wz = state.map.get_z(wx, wy);
-                                    state.move_to.spawn(glam::Vec3::new(wx, wy, wz));
-                                }
+                    // World move-orders are gated on the cursor not being
+                    // over any interface element or the minimap — port of
+                    // the `g_IFaceList->m_InFocus == UNKNOWN` guard at
+                    // MatrixFormGame.cpp:756-760.
+                    let over_ui = state.iface_list.hit_test(cx, cy, w, h).is_some()
+                        || state.minimap.click_to_world(cx, cy).is_some();
+                    if !ui_consumed_rmb
+                        && !over_ui
+                        && btn_state == ElementState::Pressed
+                        && !state.game.player_side.selected.is_empty()
+                    {
+                        let slots = state.game.order_move_to_at(
+                            &state.camera,
+                            cx,
+                            cy,
+                            w,
+                            h,
+                            &state.map,
+                        );
+                        if !slots.is_empty() {
+                            log::debug!("move order: issued to {} robot(s)", slots.len());
+                            for (wx, wy) in slots {
+                                let wz = state.map.get_z(wx, wy);
+                                state.move_to.spawn(glam::Vec3::new(wx, wy, wz));
                             }
                         }
                     }
@@ -554,6 +556,7 @@ impl ApplicationHandler for App {
                                     if let Some(b) = state.game.player_side.builder.as_mut() {
                                         b.apply_config(cfg);
                                     }
+                                    reset_build_counter(state);
                                 }
                                 state.minimap_dragging = false;
                                 state.lmb_anchor = None;
@@ -563,6 +566,7 @@ impl ApplicationHandler for App {
                                     if let Some(b) = state.game.player_side.builder.as_mut() {
                                         b.apply_config(cfg);
                                     }
+                                    reset_build_counter(state);
                                 }
                                 match state.minimap.click(cx, cy) {
                                     MinimapClick::BeginDrag(tgt) => {
@@ -725,8 +729,13 @@ impl ApplicationHandler for App {
                     let w = state.gfx.config.width as f32;
                     let h = state.gfx.config.height as f32;
                     let (unfocused, focused) = state.iface_list.on_mouse_move(cx, cy, w, h);
+                    let mut preview_changed = false;
                     if let Some(b) = state.game.player_side.builder.as_mut() {
-                        preview_popup_hover(b, state.iface_list.popup.as_mut());
+                        preview_changed =
+                            preview_popup_hover(b, state.iface_list.popup.as_mut());
+                    }
+                    if preview_changed {
+                        reset_build_counter(state);
                     }
                     // Route Base-panel focus changes into the
                     // constructor — port of CConstructor.cpp:903-958
@@ -815,7 +824,10 @@ impl ApplicationHandler for App {
 
             WindowEvent::RedrawRequested => {
                 let now = crate::platform::now_secs();
-                let dt = (now - state.last_time) as f32;
+                // Clamp each takt to 100 ms like the original render loop
+                // (3g.cpp:425-433, `tt1 = min(100, cur_takt)`) — keeps a
+                // tab-switch / debugger pause from fast-forwarding logic.
+                let dt = ((now - state.last_time) as f32).min(0.1);
                 state.last_time = now;
 
                 state.fps_frames += 1;
@@ -1417,6 +1429,7 @@ fn dispatch_ui_click(state: &mut AppState, click: &crate::matrix_game::interface
                     b.cfg().weapon[0].kind.0,
                 );
             }
+            reset_build_counter(state);
             state.iface_list.popup = None;
             state.iface_list.popup_restore_pending = None;
             state.iface_list.popup_focus_clear_pending = true;
@@ -1533,6 +1546,7 @@ fn dispatch_ui_click(state: &mut AppState, click: &crate::matrix_game::interface
                         state.iface_list.history.cursor
                     );
                 }
+                reset_build_counter(state);
             }
             return;
         }
@@ -1545,6 +1559,7 @@ fn dispatch_ui_click(state: &mut AppState, click: &crate::matrix_game::interface
                         state.iface_list.history.cursor
                     );
                 }
+                reset_build_counter(state);
             }
             return;
         }
@@ -1592,13 +1607,29 @@ fn dispatch_ui_click(state: &mut AppState, click: &crate::matrix_game::interface
     }
 
     // ── Constructor pylon buttons (LMB) ──────────────────────────
-    // The C++ does NOT cycle on left-click — pylons fire only on
-    // RBDown (which opens the popup, see dispatch_ui_right_click).
-    // Left-click is a no-op so we eat the event here for parity.
+    // Port of the pylon ON_UN_PRESS wiring at CInterface.cpp:262 —
+    // left-click fires CConstructor::RemoteOperateUnit, which cycles
+    // the mounted component kind with wrap-around.
     if matches!(
         name,
         "pich" | "pihu" | "pihe" | "pi1" | "pi2" | "pi3" | "pi4" | "pi5"
     ) {
+        if state.game.player_side.curr_sel != CurrSel::BaseSelected {
+            return;
+        }
+        let active = state
+            .game
+            .player_side
+            .builder
+            .as_ref()
+            .map(|b| b.active)
+            .unwrap_or(false);
+        if active {
+            if let Some(b) = state.game.player_side.builder.as_mut() {
+                b.remote_operate_unit(name);
+            }
+            reset_build_counter(state);
+        }
         return;
     }
 
@@ -1629,6 +1660,7 @@ fn dispatch_ui_click(state: &mut AppState, click: &crate::matrix_game::interface
                 b.construction_structure(),
             );
         }
+        reset_build_counter(state);
         return;
     }
 
@@ -1687,15 +1719,18 @@ fn dispatch_ui_right_click(state: &mut AppState, click: &crate::matrix_game::int
     }
 }
 
+/// Returns `true` when the hover changed the live preview config so
+/// the caller can reset the build counter (Djeans007 resets
+/// `m_RCountControl` at CConstructor.cpp:578).
 fn preview_popup_hover(
     builder: &mut crate::matrix_game::interface::constructor::RobotBuilder,
     popup: Option<&mut crate::matrix_game::interface::iface_menu::CIFaceMenu>,
-) {
+) -> bool {
     let Some(popup) = popup else {
-        return;
+        return false;
     };
     if popup.previewed == popup.hovered {
-        return;
+        return false;
     }
     popup.previewed = popup.hovered;
     let Some(idx) = popup.hovered else {
@@ -1710,10 +1745,10 @@ fn preview_popup_hover(
             builder.apply_config(saved);
         }
         builder.refresh_current_focus();
-        return;
+        return true;
     };
     let Some(item) = popup.items.get(idx).cloned() else {
-        return;
+        return false;
     };
     let ty = popup.parent.unit_type();
     builder.djeans007(ty, item.kind, popup.parent.pilon());
@@ -1723,6 +1758,7 @@ fn preview_popup_hover(
     // panel so hovering a popup row gives the same readouts as
     // hovering the equivalent template button would.
     builder.set_labels_and_price(ty, item.kind);
+    true
 }
 
 /// Seed dynamic `[key]` replacement values on `IFaceList::hint_replacer`
@@ -2285,6 +2321,18 @@ fn build_counter_ctx(state: &AppState) -> crate::matrix_game::interface::counter
         max_side_robots: bases * 3 + if bases == 0 { 0 } else { 4 } + factories,
         active_base_stack_items,
     }
+}
+
+/// Port of the `m_RCountControl->Reset()` at the top of every
+/// `SuperDjeans` / `Djeans007` (CConstructor.cpp:443,578) plus the
+/// trailing `m_RCountControl->CheckUp()` — every component change
+/// resets the build multiplier to 1 and revalidates it against the
+/// side's resources/caps. Called on each dispatch path that mutates
+/// the constructor's configuration.
+fn reset_build_counter(state: &mut AppState) {
+    state.iface_list.r_count_control.reset();
+    let ctx = build_counter_ctx(state);
+    state.iface_list.r_count_control.check_up(ctx);
 }
 
 /// Port of `CConstructor::RemoteBuild` (CConstructor.cpp:223-250).
@@ -2968,7 +3016,13 @@ fn refresh_interface_visibility(state: &mut AppState) {
             .builder
             .as_ref()
             .and_then(|b| b.focused_price);
-        p.apply_constructor_prices(constructor_active, focused_price_owned.as_ref(), &summ_price);
+        let side_res = state.game.player_side.resources;
+        p.apply_constructor_prices_res(
+            constructor_active,
+            focused_price_owned.as_ref(),
+            &summ_price,
+            &side_res,
+        );
         if was_visible != p.visible {
             let n_vis = p.elements.iter().filter(|e| e.visible()).count();
             let n_total = p.elements.len();

@@ -640,7 +640,7 @@ impl MapLogic {
             if r.side != self.player_side.id {
                 continue;
             }
-            let chassis = r.chassis as usize;
+            let chassis = r.chassis.kind_index();
             let (mx, my) = place_find_near_with_blockers(
                 map,
                 chassis,
@@ -1718,6 +1718,49 @@ impl PartialOrd for Node {
     }
 }
 
+/// Per-cell traversal weight grid stamped from the blocker list —
+/// the Rust analogue of the persistent `m_Weight` stamps
+/// `FindLocalPath` writes into the move grid (MatrixLogic.cpp:1278-
+/// 1300). Base = 1.0; each blocker stamps a footprint window around
+/// `pos` (weight 6.0) and `dest` (weight 40.0). `max` between old
+/// and new matches C++ `if(w<200) w=200` / `if(w<30) w=30`
+/// semantics (MatrixLogic.cpp:1285, 1297).
+///
+/// The C++ 4-way costs are 5 / 30 / 200; Rust rescales to 1 / 6 / 40
+/// so the octile heuristic stays admissible at step=1.
+fn blocker_weight_grid(sx: i32, sy: i32, blockers: &[Blocker]) -> Vec<f32> {
+    let w = sx as usize;
+    let mut weight = vec![1.0_f32; w * sy as usize];
+    const W_POS: f32 = 6.0; // C++ 30 / 5
+    const W_DEST: f32 = 40.0; // C++ 200 / 5
+    let mut stamp = |c: MovePt, new_w: f32| {
+        // Footprint window = `[c.x-(S-1) .. c.x+S) × [c.y-(S-1) ..
+        // c.y+S)` — same `other_size[i]=4` window the C++ uses at
+        // :1278-1287 and :1290-1299.
+        for dy in -(ROBOT_MOVECELLS_PER_SIZE - 1)..ROBOT_MOVECELLS_PER_SIZE {
+            for dx in -(ROBOT_MOVECELLS_PER_SIZE - 1)..ROBOT_MOVECELLS_PER_SIZE {
+                let bx = c.x + dx;
+                let by = c.y + dy;
+                if bx >= 0 && by >= 0 && bx < sx && by < sy {
+                    let i = (by as usize) * w + (bx as usize);
+                    if weight[i] < new_w {
+                        weight[i] = new_w;
+                    }
+                }
+            }
+        }
+    };
+    for b in blockers {
+        // Dest first (higher weight) then pos — stamp order matches
+        // C++ and the `max` semantics make it order-insensitive.
+        stamp(b.dest, W_DEST);
+        if let Some(p) = b.pos {
+            stamp(p, W_POS);
+        }
+    }
+    weight
+}
+
 /// A* on the move grid with 8-way connectivity. Returns a path
 /// inclusive of `start` and `goal` as move-cell upper-left corners.
 /// The robot's 4×4 footprint must be passable at every cell on the
@@ -1762,40 +1805,9 @@ pub fn find_path(
         return None;
     }
 
-    // Per-cell traversal weight grid. Base = 1.0; each blocker stamps
-    // a footprint window around `pos` (weight 6.0) and `dest`
-    // (weight 40.0). `max` between old and new matches C++ `if(w<200)
-    // w=200` / `if(w<30) w=30` semantics (MatrixLogic.cpp:1285, 1297).
     let w = sx as usize;
     let h = sy as usize;
-    let mut weight = vec![1.0_f32; w * h];
-    const W_POS: f32 = 6.0; // C++ 30 / 5
-    const W_DEST: f32 = 40.0; // C++ 200 / 5
-    let stamp = |grid: &mut [f32], c: MovePt, new_w: f32| {
-        // Footprint window = `[c.x-(S-1) .. c.x+S) × [c.y-(S-1) ..
-        // c.y+S)` — same `other_size[i]=4` window the C++ uses at
-        // :1278-1287 and :1290-1299.
-        for dy in -(ROBOT_MOVECELLS_PER_SIZE - 1)..ROBOT_MOVECELLS_PER_SIZE {
-            for dx in -(ROBOT_MOVECELLS_PER_SIZE - 1)..ROBOT_MOVECELLS_PER_SIZE {
-                let bx = c.x + dx;
-                let by = c.y + dy;
-                if bx >= 0 && by >= 0 && bx < sx && by < sy {
-                    let i = (by as usize) * w + (bx as usize);
-                    if grid[i] < new_w {
-                        grid[i] = new_w;
-                    }
-                }
-            }
-        }
-    };
-    for b in blockers {
-        // Dest first (higher weight) then pos — stamp order matches
-        // C++ and the `max` semantics make it order-insensitive.
-        stamp(&mut weight, b.dest, W_DEST);
-        if let Some(p) = b.pos {
-            stamp(&mut weight, p, W_POS);
-        }
-    }
+    let mut weight = blocker_weight_grid(sx, sy, blockers);
     // Never penalise our own start cell — the C++ never does because
     // path_list[0] of the *current* robot was never added to its own
     // blocker list.
@@ -1906,20 +1918,30 @@ pub fn find_path(
 /// segment to the latest kept waypoint is passable — yielding a
 /// shorter path of diagonal straight runs.
 ///
-/// **No blocker awareness** — matches C++ where `OptimizeMovePath`
-/// takes only `(chassis, size, cnt, path)` and never consults the
-/// dynamic-blocker list. Blockers affected A* cost; the optimizer
-/// collapses the resulting path on pure terrain passability.
-pub fn optimize_path(map: &GameMap, path: &[MovePt], chassis_kind: usize) -> Vec<MovePt> {
+/// Blocker awareness: `CanOptimize` (MatrixLogic.cpp:1893-1916) also
+/// rejects any shortcut whose footprint touches a cell with
+/// `m_Weight >= 40` on the C++ 5/30/200 scale — i.e. the weight-200
+/// destination stamps other robots / cannons leave behind. We rebuild
+/// the same weight grid from `blockers` and apply the rescaled
+/// threshold.
+pub fn optimize_path(
+    map: &GameMap,
+    path: &[MovePt],
+    chassis_kind: usize,
+    blockers: &[Blocker],
+) -> Vec<MovePt> {
     if path.len() <= 2 {
         return path.to_vec();
     }
+    let weight = blocker_weight_grid(map.size_move_x as i32, map.size_move_y as i32, blockers);
     let mut out = Vec::with_capacity(path.len());
     out.push(path[0]);
     let mut anchor = 0usize;
     let mut i = 1usize;
     while i < path.len() {
-        if i + 1 < path.len() && line_of_sight(map, path[anchor], path[i + 1], chassis_kind) {
+        if i + 1 < path.len()
+            && line_of_sight(map, path[anchor], path[i + 1], chassis_kind, &weight)
+        {
             i += 1;
         } else {
             out.push(path[i]);
@@ -1930,7 +1952,22 @@ pub fn optimize_path(map: &GameMap, path: &[MovePt], chassis_kind: usize) -> Vec
     out
 }
 
-fn line_of_sight(map: &GameMap, a: MovePt, b: MovePt, chassis_kind: usize) -> bool {
+/// Port of `CMatrixMapLogic::CanOptimize` (MatrixLogic.cpp:1838-1916):
+/// every step along the line must be footprint-passable AND no cell of
+/// the size×size footprint window may carry a blocker weight at or
+/// above the C++ 40 threshold — 8.0 on our 1/6/40 rescale, so only
+/// the weight-40 `dest` stamps trip it. Like the C++ (whose Bresenham
+/// loop pre-increments past the first cell), the weight check skips
+/// the starting cell.
+fn line_of_sight(
+    map: &GameMap,
+    a: MovePt,
+    b: MovePt,
+    chassis_kind: usize,
+    weight: &[f32],
+) -> bool {
+    const BLOCK_WEIGHT: f32 = 8.0; // C++ 40 / 5
+    let w = map.size_move_x;
     let dx = b.x - a.x;
     let dy = b.y - a.y;
     let steps = dx.abs().max(dy.abs());
@@ -1944,6 +1981,19 @@ fn line_of_sight(map: &GameMap, a: MovePt, b: MovePt, chassis_kind: usize) -> bo
         let y = (a.y as f32 + fy * s as f32).round() as i32;
         if !footprint_passable(map, x, y, chassis_kind) {
             return false;
+        }
+        if s == 0 {
+            continue;
+        }
+        // footprint_passable guarantees the size×size window is in
+        // bounds here.
+        for fy_c in 0..ROBOT_MOVECELLS_PER_SIZE {
+            for fx_c in 0..ROBOT_MOVECELLS_PER_SIZE {
+                let i = ((y + fy_c) as usize) * w + (x + fx_c) as usize;
+                if weight[i] >= BLOCK_WEIGHT {
+                    return false;
+                }
+            }
         }
     }
     true

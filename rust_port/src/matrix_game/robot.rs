@@ -14,6 +14,7 @@ use crate::matrix_game::map_static::{
     MapStatic, ObjectCore, ObjectId, ObjectType, Objects, MR_ALL, MR_MATRIX,
 };
 use crate::matrix_game::map_trace::{self, MovePath, ROBOT_FOOTPRINT_HALF};
+use crate::matrix_game::object_cannon::{Cannon, CannonState};
 use crate::matrix_game::logic::Rnd;
 
 /// Port of `ERobotState` (MatrixRobot.hpp). Full enum is 20+
@@ -49,6 +50,19 @@ pub enum ChassisKind {
 }
 
 impl ChassisKind {
+    /// Config-table / passability-bit (nsh) index — `m_Unit[0].m_Kind - 1`
+    /// with RUK_CHASSIS_HOVERCRAFT=4, ANTIGRAVITY=5 (MatrixConfig.hpp:39-43).
+    /// NOT the enum discriminant: Hovercraft sorts BEFORE AntiGravity.
+    pub fn kind_index(self) -> usize {
+        match self {
+            ChassisKind::Pneumatic => 0,
+            ChassisKind::Wheel => 1,
+            ChassisKind::Track => 2,
+            ChassisKind::Hovercraft => 3,
+            ChassisKind::AntiGravity => 4,
+        }
+    }
+
     /// Default height offset above the spawn platform for each
     /// chassis (approximate, matches the per-chassis height tables
     /// scattered through MatrixRobot.cpp).
@@ -502,7 +516,7 @@ impl Robot {
     /// end-of-path taper.
     pub fn rotate_robot(&mut self, cms: i32, dest: glam::Vec2) -> (bool, f32) {
         let max_rot =
-            crate::matrix_game::config::global().chassis.rotation_speed[self.chassis as usize];
+            crate::matrix_game::config::global().chassis.rotation_speed[self.chassis.kind_index()];
         let sync_mul = (cms as f32) / 10.0;
         let rot_speed = max_rot * sync_mul;
 
@@ -633,7 +647,7 @@ impl Robot {
 
         let lost = (lerp * lost_len) + v + glam::Vec2::new(self.pos_x, self.pos_y);
         let (mx, my) = map.world_to_move(lost.x, lost.y);
-        let chassis = self.chassis as usize;
+        let chassis = self.chassis.kind_index();
         let Some((dx, dy)) = logic::place_find_near(
             map,
             objs,
@@ -683,7 +697,7 @@ impl Robot {
 
         // Recompute path if stale / empty.
         if !self.move_path.is_active() {
-            let chassis = self.chassis as usize;
+            let chassis = self.chassis.kind_index();
             let start = match logic::place_find_near(
                 map,
                 objs,
@@ -727,33 +741,59 @@ impl Robot {
                 let Some(other_obj) = objs.get(id) else {
                     continue;
                 };
-                if !matches!(other_obj.core().obj_type, ObjectType::RobotAi) {
-                    continue;
-                }
-                let other: &Robot =
-                    unsafe { &*(other_obj as *const dyn MapStatic as *const Robot) };
-                let (omx, omy) = map.world_to_move(other.pos_x, other.pos_y);
-                let pos =
-                    map_trace::MovePt::new(omx - ROBOT_FOOTPRINT_HALF, omy - ROBOT_FOOTPRINT_HALF);
-                // C++ :1626-1645: if MoveTo exists, blocker =
-                // (current_pos, move_to_dest); otherwise blocker =
-                // (none, current_pos) — robot is stationary at its
-                // "destination". MoveReturn folds the same way.
-                if let Some((dx, dy)) = other.move_to_coords() {
-                    blockers.push(map_trace::Blocker {
-                        pos: Some(pos),
-                        dest: map_trace::MovePt::new(dx, dy),
-                    });
-                } else if let Some((dx, dy)) = other.return_coords() {
-                    blockers.push(map_trace::Blocker {
-                        pos: Some(pos),
-                        dest: map_trace::MovePt::new(dx, dy),
-                    });
-                } else {
-                    blockers.push(map_trace::Blocker {
-                        pos: None,
-                        dest: pos,
-                    });
+                match other_obj.core().obj_type {
+                    ObjectType::RobotAi => {
+                        let other: &Robot =
+                            unsafe { &*(other_obj as *const dyn MapStatic as *const Robot) };
+                        let (omx, omy) = map.world_to_move(other.pos_x, other.pos_y);
+                        let pos = map_trace::MovePt::new(
+                            omx - ROBOT_FOOTPRINT_HALF,
+                            omy - ROBOT_FOOTPRINT_HALF,
+                        );
+                        // C++ :1626-1645: if MoveTo exists, blocker =
+                        // (current_pos, move_to_dest); otherwise blocker =
+                        // (none, current_pos) — robot is stationary at its
+                        // "destination". MoveReturn folds the same way.
+                        if let Some((dx, dy)) = other.move_to_coords() {
+                            blockers.push(map_trace::Blocker {
+                                pos: Some(pos),
+                                dest: map_trace::MovePt::new(dx, dy),
+                            });
+                        } else if let Some((dx, dy)) = other.return_coords() {
+                            blockers.push(map_trace::Blocker {
+                                pos: Some(pos),
+                                dest: map_trace::MovePt::new(dx, dy),
+                            });
+                        } else {
+                            blockers.push(map_trace::Blocker {
+                                pos: None,
+                                dest: pos,
+                            });
+                        }
+                    }
+                    ObjectType::Cannon => {
+                        // C++ :1646-1652: every live cannon is a stationary
+                        // weight-200 destination blocker at
+                        // Float2Int(pos / GLOBAL_SCALE_MOVE) - size/2.
+                        let cannon: &Cannon =
+                            unsafe { &*(other_obj as *const dyn MapStatic as *const Cannon) };
+                        if matches!(
+                            cannon.state,
+                            CannonState::Dip | CannonState::UnderConstruction
+                        ) {
+                            continue; // IsLiveCannon (MatrixMapStatic.hpp:228)
+                        }
+                        use crate::matrix_game::common::float2int;
+                        let cx = float2int(cannon.pos.x / GameMap::GLOBAL_SCALE_MOVE)
+                            - ROBOT_FOOTPRINT_HALF;
+                        let cy = float2int(cannon.pos.y / GameMap::GLOBAL_SCALE_MOVE)
+                            - ROBOT_FOOTPRINT_HALF;
+                        blockers.push(map_trace::Blocker {
+                            pos: None,
+                            dest: map_trace::MovePt::new(cx, cy),
+                        });
+                    }
+                    _ => {}
                 }
             }
 
@@ -762,7 +802,7 @@ impl Robot {
                 self.stop_moving();
                 return;
             };
-            let opt = map_trace::optimize_path(map, &raw, chassis);
+            let opt = map_trace::optimize_path(map, &raw, chassis, &blockers);
             self.move_path.total_len = map_trace::path_total_length(&opt);
             self.move_path.followed_len = 0.0;
             self.move_path.pts = opt;
@@ -890,7 +930,7 @@ impl Robot {
         if obst_coll {
             let o = sphere_robot_to_aabb_obstacle_collision(
                 map,
-                self.chassis as usize,
+                self.chassis.kind_index(),
                 self.pos_x,
                 self.pos_y,
                 r,
@@ -960,7 +1000,7 @@ impl Robot {
 
         // Water + slope correction (MatrixRobot.cpp:2420-2442).
         let cfg = crate::matrix_game::config::global();
-        let chassis_idx = self.chassis as usize;
+        let chassis_idx = self.chassis.kind_index();
         let mut k = if (self.object_state & crate::matrix_game::map_static::ROBOT_FLAG_ONWATER) != 0
         {
             cfg.chassis.water_corr[chassis_idx]
@@ -1027,6 +1067,8 @@ impl Robot {
     fn robot_to_object_collision(&mut self, objs: &Objects, vel: glam::Vec2) -> glam::Vec2 {
         const COLLIDE_BOT_R: f32 = 18.0;
         const COLLIDE_BOT_2R: f32 = COLLIDE_BOT_R + COLLIDE_BOT_R;
+        // `CANNON_COLLIDE_R` (MatrixObjectCannon.hpp:20).
+        const CANNON_COLLIDE_R: f32 = 20.0;
 
         // `my_pos + vel` — where the robot would end up this tick without
         // any collision response. The callback uses this for the distance
@@ -1040,18 +1082,35 @@ impl Robot {
             let Some(other_obj) = objs.get(id) else {
                 continue;
             };
-            if !matches!(other_obj.core().obj_type, ObjectType::RobotAi) {
-                continue;
-            }
-            let other: &Robot = unsafe { &*(other_obj as *const dyn MapStatic as *const Robot) };
-            let their_pos = glam::Vec2::new(other.pos_x, other.pos_y);
-            let dv = my_pos - their_pos;
-            let dist = dv.length();
-            if dist < COLLIDE_BOT_2R && dist > 1.0e-3 {
-                let correction = (COLLIDE_BOT_2R - dist) * 0.5;
-                result += (dv / dist) * correction;
-                self.cols += 1;
-                far_col = true;
+            match other_obj.core().obj_type {
+                ObjectType::RobotAi => {
+                    let other: &Robot =
+                        unsafe { &*(other_obj as *const dyn MapStatic as *const Robot) };
+                    let their_pos = glam::Vec2::new(other.pos_x, other.pos_y);
+                    let dv = my_pos - their_pos;
+                    let dist = dv.length();
+                    if dist < COLLIDE_BOT_2R && dist > 1.0e-3 {
+                        let correction = (COLLIDE_BOT_2R - dist) * 0.5;
+                        result += (dv / dist) * correction;
+                        self.cols += 1;
+                        far_col = true;
+                    }
+                }
+                ObjectType::Cannon => {
+                    // Cannon branch of CollisionCallback (MatrixRobot.cpp:
+                    // 3036-3066). Correction is UNHALVED — the cannon
+                    // never moves, so the robot takes the whole push-out.
+                    let cannon: &Cannon =
+                        unsafe { &*(other_obj as *const dyn MapStatic as *const Cannon) };
+                    let dv = my_pos - cannon.pos;
+                    let dist = dv.length();
+                    if dist < COLLIDE_BOT_R + CANNON_COLLIDE_R && dist > 1.0e-3 {
+                        let correction = COLLIDE_BOT_R + CANNON_COLLIDE_R - dist;
+                        result += (dv / dist) * correction;
+                        self.cols += 1;
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -1109,7 +1168,7 @@ const GET_LOST_MAX: f32 = 180.0;
 /// Per-chassis move speed from `g_Config.m_ItemChars[CHASSIS{N}_MOVE_SPEED]`.
 /// Delegates to the global config loaded at startup.
 fn chassis_max_speed(c: ChassisKind) -> f32 {
-    crate::matrix_game::config::global().chassis.move_speed[c as usize]
+    crate::matrix_game::config::global().chassis.move_speed[c.kind_index()]
 }
 
 /// `CMatrixMap::RndFloat(0,1)` equivalent — returns a uniform float
@@ -1774,7 +1833,7 @@ impl MapStatic for Robot {
         // MatrixObjectRobot.cpp:424) are handled by the per-tick
         // SwitchAnimation call below because SwitchAnimation is
         // idempotent when target == current.
-        let chassis_idx = self.chassis as usize;
+        let chassis_idx = self.chassis.kind_index();
         if let Some(vo) = crate::matrix_lib::three_g::vector_object::chassis_vo(chassis_idx) {
             if self.speed.abs() <= 0.01 {
                 self.switch_animation(&vo, Animation::Stay);

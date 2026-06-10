@@ -1400,7 +1400,9 @@ fn lerp_color_u32(c1: u32, c2: u32, t: f32) -> [f32; 4] {
 }
 
 fn flash_color(c1: u32, c2: u32, time_ms: f32) -> [f32; 4] {
-    let t = ((std::f32::consts::TAU * time_ms / MINIMAP_FLASH_PERIOD_MS).sin() * 0.5) + 0.5;
+    // C++ `sin(M_PI_MUL(m_Time/MINIMAP_FLASH_PERIOD))` (MatrixMinimap.cpp:417)
+    // — M_PI_MUL(x) = x*π, a 200 ms flash cycle.
+    let t = ((std::f32::consts::PI * time_ms / MINIMAP_FLASH_PERIOD_MS).sin() * 0.5) + 0.5;
     lerp_color_u32(c1, c2, t)
 }
 

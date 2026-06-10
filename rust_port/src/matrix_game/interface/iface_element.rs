@@ -12,9 +12,10 @@
 //! into an enum and keep one `IFaceElement` struct with a `kind`
 //! discriminant. Functionally equivalent, cheaper per-element.
 
-/// `IFaceElementState` (Interface/Interface.h:36-45). The C++ names
-/// these `sNormal`/`sFocused`/`sPressed`/`sDisabled` — we keep the
-/// same order since the state index is encoded in animation configs.
+/// `IFaceElementState` (Interface/Interface.h:28-37). The C++ names
+/// these `sNormal`/`sFocused`/`sPressed`/`sDisabled`/
+/// `sPressedUnFocused` — we keep the same order since the state index
+/// is encoded in animation configs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u8)]
 pub enum ElementState {
@@ -23,9 +24,49 @@ pub enum ElementState {
     Focused = 1,
     Pressed = 2,
     Disabled = 3,
+    /// `IFACE_PRESSED_UNFOCUSED` — a latched check button the cursor
+    /// has left. Only check-type buttons ever enter this state.
+    PressedUnfocused = 4,
 }
 
-pub const MAX_STATES: usize = 4;
+/// `MAX_STATES` (Interface/Interface.h:8).
+pub const MAX_STATES: usize = 5;
+
+/// Button sub-types decoded from the element's `type` param
+/// (`IFaceElementType`, Interface/Interface.h:13-26). Only the values
+/// the shipped data authors on Button elements are modelled; anything
+/// else behaves as a plain push button.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ButtonType {
+    /// `IFACE_PUSH_BUTTON` (2) — momentary.
+    #[default]
+    Push,
+    /// `IFACE_CHECK_BUTTON` (4) — toggles; second click unlatches.
+    Check,
+    /// `IFACE_CHECK_BUTTON_SPECIAL` (7) — latches; only the group
+    /// reset unlatches it (conf* presets).
+    CheckSpecial,
+    /// `IFACE_CHECK_PUSH_BUTTON` (8) — latches on release.
+    CheckPush,
+}
+
+impl ButtonType {
+    pub fn from_i32(v: i32) -> Self {
+        match v {
+            4 => ButtonType::Check,
+            7 => ButtonType::CheckSpecial,
+            8 => ButtonType::CheckPush,
+            _ => ButtonType::Push,
+        }
+    }
+
+    /// True for the three check types that load `sPressedUnFocused`
+    /// art and participate in `CheckGroupReset` (CInterface.cpp:469,
+    /// CIFaceElement.cpp:87-89).
+    pub fn is_check(self) -> bool {
+        !matches!(self, ButtonType::Push)
+    }
+}
 
 /// `SStateImage` in the C++ (Interface/Interface.h) — a sub-rect on a
 /// texture atlas used for one state of the element. `tex_w` / `tex_h`
@@ -115,6 +156,9 @@ pub const IFEF_CLEARRECT: u32 = 1 << 1;
 pub struct IFaceElement {
     pub name: String,
     pub kind: ElementKind,
+    /// `m_Type` sub-kind for Button elements, parsed from the `type`
+    /// param (CInterface.cpp:237). Push for everything else.
+    pub button_type: ButtonType,
     pub id: i32,
     pub group: i32,
     pub flags: u32,

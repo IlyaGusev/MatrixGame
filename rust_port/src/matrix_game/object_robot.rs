@@ -2018,12 +2018,13 @@ const ANIMSPEED_PNEU: f32 = 0.155;
 ///
 ///   * STAY/BEGINMOVE/ENDMOVE(+back variants) + Hover/Pneu/Antigrav
 ///     → normal constant-rate `Takt(cms)` (line 791).
-///   * ROTATE (Track/Wheel/Pneu) → speed-based advance scaled by
-///     `k = ANIMSPEED / m_RotSpeed` clamped to 3 (lines 802-840).
-///     After advancing, switches to STAY (line 838).
-///   * MOVE/BEGINMOVE/ENDMOVE(+back variants) (Track/Wheel/Pneu)
-///     → speed-based advance scaled by `k = ANIMSPEED / m_Speed`
-///     clamped to 3 (lines 842-880).
+///   * ROTATE → speed-based advance scaled by `k = ANIMSPEED /
+///     m_RotSpeed` clamped to 3 for Track/Wheel/Pneu, default k=1
+///     otherwise (lines 802-840). After advancing, switches to STAY
+///     (line 838).
+///   * MOVE/BEGINMOVE/ENDMOVE(+back variants) → speed-based advance
+///     scaled by `k = ANIMSPEED / m_Speed` clamped to 3 for
+///     Track/Wheel/Pneu, default k=1 otherwise (lines 842-880).
 ///   * Anything else (e.g. Track/Wheel in STAY) → no advance. The
 ///     cursor stays put, so the tracks are motionless when the
 ///     robot is stopped.
@@ -2047,24 +2048,28 @@ fn do_chassis_animation(robot: &mut Robot, vo: &vector_object::VoMesh, now_ms: f
     if matches!(anim, Animation::Rotate) {
         // ROTATE branch (MatrixObjectRobot.cpp:802-840). The C++ scales
         // the cursor advance by `k = ANIMSPEED / m_RotSpeed`, so a faster
-        // rotation cycles the chassis animation faster (Track/Wheel only,
-        // since those have visible turning anims). Only those three
-        // chassis kinds are exercised — Hover/AntiGrav fall through.
+        // rotation cycles the chassis animation faster. Default k=1 —
+        // only Track/Wheel/Pneumatic override (:809-822), Hover/AntiGrav
+        // still advance.
         let animspeed = match robot.chassis {
-            Track => ANIMSPEED_TRACK,
-            Wheel => ANIMSPEED_WHEEL,
-            Pneumatic => ANIMSPEED_PNEU,
-            _ => return,
+            Track => Some(ANIMSPEED_TRACK),
+            Wheel => Some(ANIMSPEED_WHEEL),
+            Pneumatic => Some(ANIMSPEED_PNEU),
+            _ => None,
         };
-        let rot_speed = crate::matrix_game::config::global()
-            .chassis
-            .rotation_speed
-            .get(robot.chassis as usize)
-            .copied()
-            .unwrap_or(0.0)
-            .abs()
-            .max(1e-3);
-        let k = (animspeed / rot_speed).min(3.0);
+        let k = if let Some(animspeed) = animspeed {
+            let rot_speed = crate::matrix_game::config::global()
+                .chassis
+                .rotation_speed
+                .get(chassis_kind_index(robot.chassis))
+                .copied()
+                .unwrap_or(0.0)
+                .abs()
+                .max(1e-3);
+            (animspeed / rot_speed).min(3.0)
+        } else {
+            1.0
+        };
         while now_ms > robot.chassis_anim.next_anim_time {
             let frame_time = robot.chassis_anim.next_frame(vo) as f32;
             let add = k * frame_time;
@@ -2091,18 +2096,24 @@ fn do_chassis_animation(robot: &mut Robot, vo: &vector_object::VoMesh, now_ms: f
             | Animation::EndMoveBack
     );
     if is_move_like {
+        // Default k=1 — only Track/Wheel/Pneumatic scale by m_Speed
+        // (MatrixObjectRobot.cpp:849-865); Hover/AntiGrav still advance.
         let animspeed = match robot.chassis {
-            Track => ANIMSPEED_TRACK,
-            Wheel => ANIMSPEED_WHEEL,
-            Pneumatic => ANIMSPEED_PNEU,
-            _ => return, // Hover/Antigrav aren't in the MOVE branch here.
+            Track => Some(ANIMSPEED_TRACK),
+            Wheel => Some(ANIMSPEED_WHEEL),
+            Pneumatic => Some(ANIMSPEED_PNEU),
+            _ => None,
         };
-        // Avoid div-by-zero when robot is stationary; the C++
-        // divides directly and relies on m_Speed being non-zero
-        // during MOVE states. If it reaches zero we clamp `k` to
-        // its upper limit (3), which freezes the animation.
-        let speed = robot.speed.abs().max(1e-3);
-        let k = (animspeed / speed).min(3.0);
+        let k = if let Some(animspeed) = animspeed {
+            // Avoid div-by-zero when robot is stationary; the C++
+            // divides directly and relies on m_Speed being non-zero
+            // during MOVE states. If it reaches zero we clamp `k` to
+            // its upper limit (3), which freezes the animation.
+            let speed = robot.speed.abs().max(1e-3);
+            (animspeed / speed).min(3.0)
+        } else {
+            1.0
+        };
         while now_ms > robot.chassis_anim.next_anim_time {
             let frame_time = robot.chassis_anim.next_frame(vo) as f32;
             let add = k * frame_time;
@@ -2119,17 +2130,9 @@ fn do_chassis_animation(robot: &mut Robot, vo: &vector_object::VoMesh, now_ms: f
 }
 
 fn chassis_kind_index(c: ChassisKind) -> usize {
-    // Mirror MatrixConfig.hpp:39-43 — RUK_CHASSIS_PNEUMATIC=1,
-    // WHEEL=2, TRACK=3, HOVERCRAFT=4, ANTIGRAVITY=5. The .vo file
-    // index is `kind - 1` (Chassis1.vo = Pneumatic, Chassis5.vo =
-    // Antigravity), so Hovercraft must come BEFORE AntiGravity here.
-    match c {
-        ChassisKind::Pneumatic => 0,
-        ChassisKind::Wheel => 1,
-        ChassisKind::Track => 2,
-        ChassisKind::Hovercraft => 3,
-        ChassisKind::AntiGravity => 4,
-    }
+    // `m_Kind - 1` per MatrixConfig.hpp:39-43 — the .vo file index
+    // too (Chassis4.vo = Hovercraft, Chassis5.vo = Antigravity).
+    c.kind_index()
 }
 
 /// Returns `Some(k)` for `k >= 1`, else `None`. Convenience for
