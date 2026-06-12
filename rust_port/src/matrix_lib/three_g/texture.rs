@@ -172,6 +172,30 @@ fn decode_dds(data: &[u8]) -> Option<image::RgbaImage> {
     } else if is_dxt3 || is_dxt5 {
         16
     } else {
+        // Uncompressed variants the shipped data uses (LandSpots /
+        // splash / dust decals): 16-bit A8L8 (DDPF_LUMINANCE|
+        // DDPF_ALPHAPIXELS, L mask 0xFF, A mask 0xFF00) and 8-bit
+        // pure alpha (DDPF_ALPHA).
+        let pf_flags = u32::from_le_bytes([data[80], data[81], data[82], data[83]]);
+        let bits = u32::from_le_bytes([data[88], data[89], data[90], data[91]]);
+        let n = (width * height) as usize;
+        if pf_flags & 0x4 == 0 && bits == 16 && pixel_data.len() >= n * 2 {
+            let mut img = image::RgbaImage::new(width, height);
+            for (i, p) in img.pixels_mut().enumerate() {
+                let l = pixel_data[i * 2];
+                let a = pixel_data[i * 2 + 1];
+                *p = image::Rgba([l, l, l, a]);
+            }
+            return Some(img);
+        }
+        if pf_flags & 0x4 == 0 && bits == 8 && pixel_data.len() >= n {
+            let mut img = image::RgbaImage::new(width, height);
+            for (i, p) in img.pixels_mut().enumerate() {
+                let a = pixel_data[i];
+                *p = image::Rgba([255, 255, 255, a]);
+            }
+            return Some(img);
+        }
         return None;
     };
 

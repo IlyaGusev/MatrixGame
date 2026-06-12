@@ -511,6 +511,32 @@ impl Camera {
         proj * self.view_matrix()
     }
 
+    /// Project an **uncentered** world point to screen pixels (origin
+    /// top-left). `None` when the point sits behind the camera. Port
+    /// of `CMatrixCamera::Project` for the HP-bar placement.
+    pub fn project_to_screen(
+        &self,
+        world: Vec3,
+        screen_w: f32,
+        screen_h: f32,
+    ) -> Option<glam::Vec2> {
+        let centered = world - Vec3::new(self.map_cx, self.map_cy, 0.0);
+        let clip = self.view_proj() * centered.extend(1.0);
+        if clip.w <= 0.0 {
+            return None;
+        }
+        Some(glam::Vec2::new(
+            (clip.x / clip.w * 0.5 + 0.5) * screen_w,
+            (1.0 - (clip.y / clip.w * 0.5 + 0.5)) * screen_h,
+        ))
+    }
+
+    /// Camera position in uncentered world coordinates — the
+    /// `GetFrustumCenter()` the C++ uses as trace origin.
+    pub fn eye_pos_world(&self) -> Vec3 {
+        self.eye_pos() + Vec3::new(self.map_cx, self.map_cy, 0.0)
+    }
+
     /// World-space camera basis vectors. Derived from `inverse(view)`
     /// where the view matrix sends world→view: the inverse columns
     /// are the view axes expressed in world. After the `S = diag(1,-1,-1)`
@@ -762,5 +788,36 @@ mod tests {
         let b = 0.1;
         assert!((angle_dist(a, b) - 0.2).abs() < eps);
         assert!((angle_dist(b, a) + 0.2).abs() < eps);
+    }
+
+    /// `project_to_screen` must be the exact inverse of
+    /// `screen_to_world_ray` — a world point projected to the screen,
+    /// re-cast as a ray, must pass through that point.
+    #[test]
+    fn project_roundtrips_with_pick_ray() {
+        let (w, h) = (1920.0f32, 1080.0f32);
+        let mut cam = Camera::new(w / h);
+        cam.set_map(640.0, 640.0);
+        cam.set_xy_strategy([300.0, 280.0]);
+        // Settle the interpolators.
+        for _ in 0..200 {
+            cam.takt(16.0);
+        }
+        for world in [
+            Vec3::new(300.0, 300.0, 5.0),
+            Vec3::new(250.0, 350.0, 30.0),
+            Vec3::new(380.0, 260.0, 0.0),
+        ] {
+            let p = cam
+                .project_to_screen(world, w, h)
+                .expect("point in front of camera");
+            let (origin, dir) = cam.screen_to_world_ray(p.x, p.y, w, h);
+            // Distance from the ray to the world point.
+            let d = (world - origin).cross(dir).length();
+            assert!(
+                d < 0.05,
+                "ray misses projected point by {d} (screen {p:?}, world {world:?})"
+            );
+        }
     }
 }

@@ -11,7 +11,13 @@ fn main() {
         "MATRIX/TEXTURES/HINTS/BORDER0.PNG",
         "MATRIX/TEXTURES/HINTS/ICON_TITAN.PNG",
     ];
-    for pkg_name in ["robots.pkg", "common.pkg", "forms.pkg", "mainmenu.pkg", "russian.pkg"] {
+    for pkg_name in [
+        "robots.pkg",
+        "common.pkg",
+        "forms.pkg",
+        "mainmenu.pkg",
+        "russian.pkg",
+    ] {
         let Ok(data) = std::fs::read(format!("../Data/{pkg_name}")) else {
             println!("skip {pkg_name}");
             continue;

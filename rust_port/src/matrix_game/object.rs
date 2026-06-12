@@ -25,13 +25,13 @@ use crate::matrix_game::effects::point_light::PointLightSystem;
 use crate::matrix_game::effects::weapon::{
     is_fire_weapon, Weapon, WEAPON_ABLAZE, WEAPON_FLAMETHROWER, WEAPON_PLASMA,
 };
+use crate::matrix_game::logic::Rnd;
 use crate::matrix_game::map::{GameMap, ObjectInstance, ObjectShadow};
 use crate::matrix_game::map_static::{
     MapStatic, ObjectCore, ObjectId, ObjectType, Objects, MR_ALL, MR_GRAPH, MR_MATRIX,
     MR_SHADOW_PROJ_GEOM, MR_SHADOW_PROJ_TEX, OBJECT_STATE_ABLAZE, OBJECT_STATE_BURNED,
     OBJECT_STATE_SHADOW_SPECIAL, OBJECT_STATE_SPECIAL, OBJECT_STATE_TRACE_INVISIBLE,
 };
-use crate::matrix_game::logic::Rnd;
 use crate::matrix_lib::base::storage::Storage;
 use crate::matrix_lib::base::wstr;
 use crate::matrix_lib::three_g::texture::{
@@ -661,8 +661,17 @@ impl MapStatic for MapObject {
                     // `--g_MatrixMap->m_BeforeWinCount` + side bookkeeping
                     // — deferred: sides unported.
                 }
-                // `CMatrixEffect::CreateExplosion` when BEHAVIOUR's 4th
-                // comma-field == "Explode" — deferred (effects unported).
+                // `CreateExplosion(geo, ExplosionObject, true)` when
+                // BEHAVIOUR's 4th comma-field == "Explode"
+                // (MatrixObject.cpp:224-227).
+                if wstr::str_par(&self.behaviour, 3, ",") == "Explode" {
+                    objs.pending_explosions
+                        .push(crate::matrix_game::map_static::ExplosionSpawn {
+                            pos: self.core.geo_center,
+                            props: &crate::matrix_game::effects::explosion::EXPLOSION_OBJECT,
+                            fire: true,
+                        });
+                }
                 // `Init(newtype)` to swap in the ruined variant
                 // (MatrixObject.cpp:233) — deferred: requires VO/skin
                 // reload + re-running apply_ids_row on the replacement
@@ -709,9 +718,27 @@ impl MapStatic for MapObject {
             }
         }
 
-        // BEHF_TERRON (MatrixObject.cpp:142-187): death → explosion
-        // sequence + music-volume + win-flag. Deferred until effects
-        // + sides + music land.
+        // BEHF_TERRON (MatrixObject.cpp:142-187). Pain animation /
+        // sounds / progress bar / music-volume not ported; HP
+        // depletion + the death flags are.
+        if self.beh_flag == BehFlag::Terron
+            && self.object_state & crate::matrix_game::map_static::OBJECT_STATE_TERRON_EXPL == 0
+        {
+            if let Some(entry) = objs.object_damages.get(weap) {
+                if self.break_hit_point > entry.mindamage {
+                    self.break_hit_point -= entry.damage;
+                }
+            }
+            if self.break_hit_point <= 0 {
+                // OBJECT_STATE_SPECIAL → MMFLAG_TERRON_DEAD win flag —
+                // the map-flags word isn't reachable from here; the
+                // win-condition scan reads the EXPL state instead.
+                self.object_state |= crate::matrix_game::map_static::OBJECT_STATE_TERRON_EXPL;
+                // Death animation runs for 5s of ablaze TTL
+                // (MatrixObject.cpp:177).
+                self.ablaze_ttl = 5000;
+            }
+        }
 
         false
     }
@@ -774,23 +801,90 @@ impl MapStatic for MapObject {
             return;
         }
 
-        // IsAblaze branch — MatrixObject.cpp:1534-1609. The C++ emits
-        // fire / smoke effects every OBJECT_ABLAZE_PERIOD ms and after
-        // 5s (`m_BurnTimeTotal > 5000`) flips to OBJECT_STATE_BURNED.
-        // The effect emission + per-tick Damage(WEAPON_ABLAZE) loop
-        // need the Effects + Pick subsystems; the burn-out timer is
-        // portable now since it's just state.
+        // IsAblaze branch — MatrixObject.cpp:1534-1609. Every
+        // OBJECT_ABLAZE_PERIOD the C++ rolls `IRND(10000) < ablaze_ttl`
+        // and, on success, picks a point on the mesh (4 attempts) and
+        // spawns a flame + smoke (big variant while TTL > 3700), then
+        // calls Damage(WEAPON_ABLAZE) — which for BEHF_BURN objects is
+        // a hit sound only, so it has nothing to port. The TTL decay /
+        // ABLAZE unmark already runs in `static_takt` (base-class takt,
+        // MatrixMapStatic.cpp:108-121).
         if self.object_state & OBJECT_STATE_ABLAZE != 0 {
             self.burn_time_total = self.burn_time_total.saturating_add(ms);
 
-            // CSound::AddSound + effect emission on `next_time` cycle
-            // — deferred (CMatrixEffect unported). The timer itself is
-            // advanced so when effects land, cadence is already right.
             self.next_time = self.next_time.saturating_sub(ms);
             while self.next_time <= 0 {
                 self.next_time += crate::matrix_game::common::OBJECT_ABLAZE_PERIOD_MS;
-                // Here the C++ rolls an RNG vs TTL to decide whether to
-                // emit; skipped until effects are ported.
+                use crate::matrix_game::effects::explosion::FireAnim;
+                use crate::matrix_game::effects::smoke_and_fire::{frnd, fsrnd, Smoke};
+                use crate::matrix_game::effects::GameEffect;
+                let origin = glam::Vec3::new(
+                    self.core.matrix.w_axis.x,
+                    self.core.matrix.w_axis.y,
+                    self.core.matrix.w_axis.z,
+                );
+                // Visual-only randomness (the C++ Damage call this roll
+                // gates is sound-only here) — local seeded stream.
+                let mut vrng = crate::matrix_game::logic::Rnd::new(
+                    ((self.burn_time_total as i32) ^ ((origin.x + origin.y) as i32)).max(1),
+                );
+                if (vrng.next() % 10000) as i32 >= self.ablaze_ttl {
+                    continue;
+                }
+                let r = self.core.radius.max(3.0);
+                // 4-attempt mesh pick (bounding-sphere stand-in).
+                let mut found = None;
+                for _ in 0..4 {
+                    let p = origin
+                        + glam::Vec3::new(
+                            fsrnd(&mut vrng, r),
+                            fsrnd(&mut vrng, r),
+                            frnd(&mut vrng, r * 2.0),
+                        );
+                    let dir = (origin - p).normalize_or_zero();
+                    if dir == glam::Vec3::ZERO {
+                        continue;
+                    }
+                    if let Some(t) = crate::matrix_game::map_trace::pick_sphere(
+                        p,
+                        dir,
+                        self.core.geo_center,
+                        self.core.radius,
+                    ) {
+                        found = Some((p, dir, t));
+                        break;
+                    }
+                }
+                if let Some((p, dir, t)) = found {
+                    if self.ablaze_ttl > 3700 {
+                        let fp = p + dir * (t + 6.0);
+                        objs.pending_effects.push(GameEffect::FireAnim(FireAnim::new(
+                            fp,
+                            20.0,
+                            30.0 + frnd(&mut vrng, 20.0),
+                            (self.ablaze_ttl as f32 - frnd(&mut vrng, 4000.0)).max(1.0),
+                        )));
+                        objs.pending_effects.push(GameEffect::Smoke(Smoke::new(
+                            fp + glam::Vec3::new(0.0, 0.0, 10.0),
+                            100.0,
+                            1300.0,
+                            20.0,
+                            0x8030_3030,
+                            false,
+                            1.0 / 30.0,
+                        )));
+                    } else {
+                        objs.pending_effects.push(GameEffect::Smoke(Smoke::new(
+                            p + dir * (t + 2.0),
+                            100.0,
+                            1300.0,
+                            20.0,
+                            0x4030_3030,
+                            false,
+                            1.0 / 30.0,
+                        )));
+                    }
+                }
             }
 
             // MatrixObject.cpp:1576-1609: 5s after ignition, flip to
@@ -2391,7 +2485,11 @@ mod tests {
         let p_lt = p.apply_ids_row(portret, &mut Rnd::new(1), || {});
         assert_eq!(a.beh_flag, BehFlag::Anim);
         assert!(a_lt, "Anim opts into AddLT");
-        assert_eq!(ap.beh_flag, BehFlag::Anim, "literal AnimP is BEHF_ANIM in C++");
+        assert_eq!(
+            ap.beh_flag,
+            BehFlag::Anim,
+            "literal AnimP is BEHF_ANIM in C++"
+        );
         assert!(ap_lt);
         assert_eq!(p.beh_flag, BehFlag::Portret);
         assert!(!p_lt, "Portret is Takt-driven, not logic-temp");
@@ -2687,11 +2785,7 @@ mod tests {
 
         let mut rng = Rnd::new(1);
         let mut o = MapObject::from_instance(&inst());
-        assert!(o.apply_ids_row(
-            "path*vo*tex******Anim,0:1:100:1#1:2:50:-1",
-            &mut rng,
-            || {},
-        ));
+        assert!(o.apply_ids_row("path*vo*tex******Anim,0:1:100:1#1:2:50:-1", &mut rng, || {},));
         assert_eq!(o.beh_flag, BehFlag::Anim);
         assert_eq!(o.break_hit_point, 100);
 
@@ -2704,18 +2798,28 @@ mod tests {
         let id = objs.spawn(Box::new(o));
 
         // First kill: state 0 → 1, HP re-seeded from state 1's entry.
-        objs.apply_damage(id, WEAPON_GUN, glam::Vec3::ZERO, glam::Vec3::Z, PLAYER_SIDE, None);
-        let mo = unsafe {
-            &*(objs.get(id).unwrap() as *const dyn MapStatic as *const MapObject)
-        };
+        objs.apply_damage(
+            id,
+            WEAPON_GUN,
+            glam::Vec3::ZERO,
+            glam::Vec3::Z,
+            PLAYER_SIDE,
+            None,
+        );
+        let mo = unsafe { &*(objs.get(id).unwrap() as *const dyn MapStatic as *const MapObject) };
         assert_eq!(mo.anim_state, 1);
         assert_eq!(mo.break_hit_point, 50);
 
         // Second kill: state 1 has next=-1 — no transition, HP ≤ 0.
-        objs.apply_damage(id, WEAPON_GUN, glam::Vec3::ZERO, glam::Vec3::Z, PLAYER_SIDE, None);
-        let mo = unsafe {
-            &*(objs.get(id).unwrap() as *const dyn MapStatic as *const MapObject)
-        };
+        objs.apply_damage(
+            id,
+            WEAPON_GUN,
+            glam::Vec3::ZERO,
+            glam::Vec3::Z,
+            PLAYER_SIDE,
+            None,
+        );
+        let mo = unsafe { &*(objs.get(id).unwrap() as *const dyn MapStatic as *const MapObject) };
         assert_eq!(mo.anim_state, 1);
         assert!(mo.break_hit_point <= 0);
     }
@@ -2815,8 +2919,8 @@ mod tests {
     #[test]
     fn sens_logic_takt_transitions_on_nearby_robot() {
         use crate::matrix_game::logic::MapLogic;
-        use crate::matrix_game::map_static::{MapStatic, ObjectType};
         use crate::matrix_game::logic::Rnd;
+        use crate::matrix_game::map_static::{MapStatic, ObjectType};
 
         // Build a world with one SENS mapobject at the origin and a
         // "robot" (stub MapStatic with ObjectType::RobotAi) 30 units

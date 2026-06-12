@@ -21,7 +21,10 @@ fn main() {
     };
     println!("Models/Cannons -> rec={cannons_rec}");
     // List child blocks first.
-    if let (Some(names), Some(recs)) = (stor.get_buf(&cannons_rec, "2"), stor.get_buf(&cannons_rec, "3")) {
+    if let (Some(names), Some(recs)) = (
+        stor.get_buf(&cannons_rec, "2"),
+        stor.get_buf(&cannons_rec, "3"),
+    ) {
         let n = names.arrays_count();
         println!("Cannons child blocks ({n}):");
         for i in 0..n {
@@ -29,7 +32,10 @@ fn main() {
         }
     }
     // Also list top-level params of the Cannons block.
-    if let (Some(k), Some(v)) = (stor.get_buf(&cannons_rec, "0"), stor.get_buf(&cannons_rec, "1")) {
+    if let (Some(k), Some(v)) = (
+        stor.get_buf(&cannons_rec, "0"),
+        stor.get_buf(&cannons_rec, "1"),
+    ) {
         let n = k.arrays_count();
         println!("Cannons top-level params ({n}):");
         for i in 0..n.min(30) {
@@ -38,7 +44,10 @@ fn main() {
     }
     // Models/Cannons children are enumerated — use the "2"/"3" columns
     // to find whatever names the data team picked.
-    let (names_buf, recs_buf) = (stor.get_buf(&cannons_rec, "2"), stor.get_buf(&cannons_rec, "3"));
+    let (names_buf, recs_buf) = (
+        stor.get_buf(&cannons_rec, "2"),
+        stor.get_buf(&cannons_rec, "3"),
+    );
     let child_names: Vec<String> = names_buf
         .map(|b| (0..b.arrays_count()).map(|i| b.get_as_wstr(i)).collect())
         .unwrap_or_default();

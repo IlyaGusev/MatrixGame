@@ -119,11 +119,11 @@ pub struct VoSurfaceMesh {
     pub texture_ref: Option<String>,
 }
 
+use crate::matrix_lib::three_g::texture::parse_scroll;
 pub use crate::matrix_lib::three_g::texture::{
     has_trans_suffix, merge_materials, parse_material_spec, parse_material_spec_with_prefix,
     resolve_alpha_test_with_txt, MaterialSpec,
 };
-use crate::matrix_lib::three_g::texture::parse_scroll;
 
 pub fn parse_vo(data: &[u8]) -> Result<VoMesh> {
     let stor = Storage::from_bytes(data).context("parsing VO as CStorage")?;

@@ -37,7 +37,6 @@ pub const SOLID_ATLAS_KEY: &str = "__solid__";
 /// CIFaceMenu::CreateMenu).
 pub const POPUP_BAKED_KEY: &str = "__popup_baked__";
 
-
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 struct Vertex {
@@ -372,6 +371,8 @@ impl InterfaceRenderer {
             candidates.push(base.clone());
             candidates.push(format!("{base}.png"));
             candidates.push(format!("{base}.PNG"));
+            candidates.push(format!("{base}.dds"));
+            candidates.push(format!("{base}.DDS"));
         }
         candidates.dedup();
         let mut bytes: Option<Vec<u8>> = None;
@@ -545,8 +546,7 @@ impl InterfaceRenderer {
 
         let tex_w = 512u32;
         let tex_h = 512u32;
-        let mut buf =
-            image::RgbaImage::from_pixel(tex_w, tex_h, image::Rgba([0, 0, 0, 0]));
+        let mut buf = image::RgbaImage::from_pixel(tex_w, tex_h, image::Rgba([0, 0, 0, 0]));
 
         // Resolve a chrome sprite by element name → (atlas pixels, src_x,
         // src_y, sprite_w, sprite_h). The C++ reads `els->m_Image`,
@@ -561,13 +561,7 @@ impl InterfaceRenderer {
             // For Image-kind entries, sprite size lives in img.w / img.h
             // (parsed from `Width`/`Height` in parse_image_element).
             // The element's `size_x/size_y` is 0 so we ignore it.
-            Some((
-                cpu,
-                img.x as i32,
-                img.y as i32,
-                img.w as i32,
-                img.h as i32,
-            ))
+            Some((cpu, img.x as i32, img.y as i32, img.w as i32, img.h as i32))
         };
 
         // Faithful port of `CBitmap::MergeWithAlpha` — alpha-blend a
@@ -630,7 +624,16 @@ impl InterfaceRenderer {
         }
         if let Some((src, sx, sy, sw, sh)) = get_sprite("bottomleft") {
             // CIFaceMenu.cpp:143 — drawn at (0, h - BOTTOMLEFT_HEIGHT - mod).
-            merge(&mut buf, src, sx, sy, sw, sh, 0, h - BOTTOMLEFT_HEIGHT - MOD);
+            merge(
+                &mut buf,
+                src,
+                sx,
+                sy,
+                sw,
+                sh,
+                0,
+                h - BOTTOMLEFT_HEIGHT - MOD,
+            );
         }
         if let Some((src, sx, sy, sw, sh)) = get_sprite("bottomright") {
             // CIFaceMenu.cpp:150 — drawn at (w - BOTTOMRIGHT_WIDTH - 4,
@@ -818,7 +821,9 @@ impl InterfaceRenderer {
         screen_w: f32,
         screen_h: f32,
     ) {
-        self.upload_inner(device, queue, panels, popup, hint, chrome, screen_w, screen_h);
+        self.upload_inner(
+            device, queue, panels, popup, hint, chrome, screen_w, screen_h,
+        );
     }
 
     /// Compatibility shim — same as upload_with_popup with no popup.
@@ -891,6 +896,7 @@ impl InterfaceRenderer {
         // (or wasn't preloaded) so the element silently skips drawing.
         let mut per_panel_missing: std::collections::BTreeMap<String, u32> =
             std::collections::BTreeMap::new();
+
         for panel in panels {
             if !panel.visible {
                 continue;
@@ -999,24 +1005,21 @@ impl InterfaceRenderer {
             // needs the PopupMenu chrome panel for sprite lookups; bail
             // out cleanly if it isn't present (e.g. if the panel data
             // didn't load).
-            let popup_baked_size = if let Some(popup_panel) = panels
-                .iter()
-                .find(|p| p.name == "PopupMenu")
-                .copied()
-            {
-                self.bake_popup(
-                    device,
-                    queue,
-                    popup_panel,
-                    // C++ `width` is the per-popup item-width param
-                    // (CIFaceMenu.h: WEAPON_MENU_WIDTH etc.). We carry
-                    // it on `popup.item_w`.
-                    popup.item_w as i32,
-                    popup.items.len() as i32,
-                )
-            } else {
-                None
-            };
+            let popup_baked_size =
+                if let Some(popup_panel) = panels.iter().find(|p| p.name == "PopupMenu").copied() {
+                    self.bake_popup(
+                        device,
+                        queue,
+                        popup_panel,
+                        // C++ `width` is the per-popup item-width param
+                        // (CIFaceMenu.h: WEAPON_MENU_WIDTH etc.). We carry
+                        // it on `popup.item_w`.
+                        popup.item_w as i32,
+                        popup.items.len() as i32,
+                    )
+                } else {
+                    None
+                };
             let popup_panel = panels.iter().find(|p| p.name == "PopupMenu");
             let base_panel = panels.iter().find(|p| p.name == "Base");
             if let Some(base_panel) = base_panel {
@@ -1161,8 +1164,7 @@ impl InterfaceRenderer {
                 // w × 18, repositioned to the hovered row's y. Drawn
                 // BEFORE the row text so labels render on top.
                 if let (Some(hi), Some((bake_w, _bake_h))) = (popup.hovered, popup_baked_size) {
-                    let row_y = oy
-                        + (CIFaceMenu::ITEMS_TOP + popup.item_h * hi as f32) * scale;
+                    let row_y = oy + (CIFaceMenu::ITEMS_TOP + popup.item_h * hi as f32) * scale;
                     let img = super::iface_element::StateImage {
                         x: bake_w as f32,
                         y: 0.0,
@@ -1320,10 +1322,8 @@ impl InterfaceRenderer {
                         2 => elem.size_y,
                         _ => 0.0,
                     };
-                    let design_anchor_x =
-                        elem.pos_x + base_x + label.x + label.sme_x;
-                    let design_anchor_y =
-                        elem.pos_y + base_y + label.y + label.sme_y;
+                    let design_anchor_x = elem.pos_x + base_x + label.x + label.sme_x;
+                    let design_anchor_y = elem.pos_y + base_y + label.y + label.sme_y;
                     let anchor_x = px + design_anchor_x * scale;
                     let anchor_y = py + design_anchor_y * scale;
                     // Skip labels whose anchor falls inside the popup
@@ -1360,8 +1360,7 @@ impl InterfaceRenderer {
                         // `label.sme_x` is an extra offset that's
                         // applied at render time too, so it shrinks
                         // the wrap budget by the same amount.
-                        let wrap_width =
-                            (elem.size_x - label.x - label.sme_x).max(0.0) * scale;
+                        let wrap_width = (elem.size_x - label.x - label.sme_x).max(0.0) * scale;
                         emit_wrapped_text(
                             &mut all_verts,
                             &mut current_key,
@@ -1531,7 +1530,13 @@ fn emit_hint(
         if let Some(atlas) = atlases.get(&atlas_key) {
             let tw = atlas.width as f32;
             let th = atlas.height as f32;
-            open_run(&atlas_key, current_key, current_start, all_verts, draw_groups);
+            open_run(
+                &atlas_key,
+                current_key,
+                current_start,
+                all_verts,
+                draw_groups,
+            );
             for d in hint.slice_draws(chrome, scale) {
                 let u0 = d.tex_x as f32 / tw;
                 let v0 = d.tex_y as f32 / th;
@@ -1539,12 +1544,36 @@ fn emit_hint(
                 let v1 = (d.tex_y + d.tex_h) as f32 / th;
                 let (x, y, w, h) = (d.screen_x, d.screen_y, d.screen_w, d.screen_h);
                 all_verts.extend_from_slice(&[
-                    Vertex { pos: [x, y], uv: [u0, v0], tint: [1.0; 4] },
-                    Vertex { pos: [x + w, y], uv: [u1, v0], tint: [1.0; 4] },
-                    Vertex { pos: [x, y + h], uv: [u0, v1], tint: [1.0; 4] },
-                    Vertex { pos: [x + w, y], uv: [u1, v0], tint: [1.0; 4] },
-                    Vertex { pos: [x + w, y + h], uv: [u1, v1], tint: [1.0; 4] },
-                    Vertex { pos: [x, y + h], uv: [u0, v1], tint: [1.0; 4] },
+                    Vertex {
+                        pos: [x, y],
+                        uv: [u0, v0],
+                        tint: [1.0; 4],
+                    },
+                    Vertex {
+                        pos: [x + w, y],
+                        uv: [u1, v0],
+                        tint: [1.0; 4],
+                    },
+                    Vertex {
+                        pos: [x, y + h],
+                        uv: [u0, v1],
+                        tint: [1.0; 4],
+                    },
+                    Vertex {
+                        pos: [x + w, y],
+                        uv: [u1, v0],
+                        tint: [1.0; 4],
+                    },
+                    Vertex {
+                        pos: [x + w, y + h],
+                        uv: [u1, v1],
+                        tint: [1.0; 4],
+                    },
+                    Vertex {
+                        pos: [x, y + h],
+                        uv: [u0, v1],
+                        tint: [1.0; 4],
+                    },
                 ]);
             }
         }
@@ -1553,7 +1582,15 @@ fn emit_hint(
     // ── Parts (text + inline bitmaps) ───────────────────────────────
     for part in &hint.parts {
         match part {
-            HintPart::Text { x, y, h, text, font, color, .. } => {
+            HintPart::Text {
+                x,
+                y,
+                h,
+                text,
+                font,
+                color,
+                ..
+            } => {
                 if text.is_empty() {
                     continue;
                 }
@@ -1561,14 +1598,12 @@ fn emit_hint(
                 // (explicit `<br>` or wrap). The hint layout already
                 // picked the per-line widths; here we render each
                 // `\n`-separated sub-line at its own vertical stride.
-                let line_stride_px =
-                    (glyph_atlas.line_height(font) as f32 + 1.0) * scale;
+                let line_stride_px = (glyph_atlas.line_height(font) as f32 + 1.0) * scale;
                 let line_h = glyph_atlas.line_height(font) as f32;
                 let line_count = text.split('\n').count().max(1) as f32;
                 // Natural visible height of the text block — matches the
                 // renderer's per-line stride, with no trailing leading.
-                let natural_h_design =
-                    line_h + (line_h + 1.0) * (line_count - 1.0);
+                let natural_h_design = line_h + (line_h + 1.0) * (line_count - 1.0);
                 // When the layout reserved more vertical space than the
                 // text actually needs (e.g. `_HEIGHT:23` on the
                 // BuildTurret price row sets h=23 around a 13-px-tall
@@ -1615,12 +1650,36 @@ fn emit_hint(
                 let pw = *w as f32 * scale;
                 let ph = *h as f32 * scale;
                 all_verts.extend_from_slice(&[
-                    Vertex { pos: [px, py], uv: [0.0, 0.0], tint: [1.0; 4] },
-                    Vertex { pos: [px + pw, py], uv: [1.0, 0.0], tint: [1.0; 4] },
-                    Vertex { pos: [px, py + ph], uv: [0.0, 1.0], tint: [1.0; 4] },
-                    Vertex { pos: [px + pw, py], uv: [1.0, 0.0], tint: [1.0; 4] },
-                    Vertex { pos: [px + pw, py + ph], uv: [1.0, 1.0], tint: [1.0; 4] },
-                    Vertex { pos: [px, py + ph], uv: [0.0, 1.0], tint: [1.0; 4] },
+                    Vertex {
+                        pos: [px, py],
+                        uv: [0.0, 0.0],
+                        tint: [1.0; 4],
+                    },
+                    Vertex {
+                        pos: [px + pw, py],
+                        uv: [1.0, 0.0],
+                        tint: [1.0; 4],
+                    },
+                    Vertex {
+                        pos: [px, py + ph],
+                        uv: [0.0, 1.0],
+                        tint: [1.0; 4],
+                    },
+                    Vertex {
+                        pos: [px + pw, py],
+                        uv: [1.0, 0.0],
+                        tint: [1.0; 4],
+                    },
+                    Vertex {
+                        pos: [px + pw, py + ph],
+                        uv: [1.0, 1.0],
+                        tint: [1.0; 4],
+                    },
+                    Vertex {
+                        pos: [px, py + ph],
+                        uv: [0.0, 1.0],
+                        tint: [1.0; 4],
+                    },
                 ]);
             }
         }
@@ -1752,12 +1811,36 @@ fn emit_rich_line(
             let u1 = (g.atlas_x + g.w) as f32 / atlas_w;
             let v1 = (g.atlas_y + g.h) as f32 / atlas_h;
             all_verts.extend_from_slice(&[
-                Vertex { pos: [x, y], uv: [u0, v0], tint },
-                Vertex { pos: [x + w, y], uv: [u1, v0], tint },
-                Vertex { pos: [x, y + h], uv: [u0, v1], tint },
-                Vertex { pos: [x + w, y], uv: [u1, v0], tint },
-                Vertex { pos: [x + w, y + h], uv: [u1, v1], tint },
-                Vertex { pos: [x, y + h], uv: [u0, v1], tint },
+                Vertex {
+                    pos: [x, y],
+                    uv: [u0, v0],
+                    tint,
+                },
+                Vertex {
+                    pos: [x + w, y],
+                    uv: [u1, v0],
+                    tint,
+                },
+                Vertex {
+                    pos: [x, y + h],
+                    uv: [u0, v1],
+                    tint,
+                },
+                Vertex {
+                    pos: [x + w, y],
+                    uv: [u1, v0],
+                    tint,
+                },
+                Vertex {
+                    pos: [x + w, y + h],
+                    uv: [u1, v1],
+                    tint,
+                },
+                Vertex {
+                    pos: [x, y + h],
+                    uv: [u0, v1],
+                    tint,
+                },
             ]);
             pen_x_native += advance;
         }
@@ -1842,8 +1925,13 @@ fn wrap_rich_lines(
 ) -> Vec<Vec<RichRun>> {
     // Tokenise the rich stream into (word_or_space, color, hard_break).
     enum Tok {
-        Word { text: String, color: Option<[u8; 4]> },
-        Space { color: Option<[u8; 4]> },
+        Word {
+            text: String,
+            color: Option<[u8; 4]>,
+        },
+        Space {
+            color: Option<[u8; 4]>,
+        },
         Break,
     }
     let mut toks: Vec<Tok> = Vec::new();
@@ -1852,17 +1940,26 @@ fn wrap_rich_lines(
         for c in run.text.chars() {
             if c == '\n' {
                 if !buf.is_empty() {
-                    toks.push(Tok::Word { text: std::mem::take(&mut buf), color: run.color });
+                    toks.push(Tok::Word {
+                        text: std::mem::take(&mut buf),
+                        color: run.color,
+                    });
                 }
                 toks.push(Tok::Break);
             } else if c == '\r' {
                 if !buf.is_empty() {
-                    toks.push(Tok::Word { text: std::mem::take(&mut buf), color: run.color });
+                    toks.push(Tok::Word {
+                        text: std::mem::take(&mut buf),
+                        color: run.color,
+                    });
                 }
                 // Skip CR; LF will trigger Break.
             } else if c.is_whitespace() {
                 if !buf.is_empty() {
-                    toks.push(Tok::Word { text: std::mem::take(&mut buf), color: run.color });
+                    toks.push(Tok::Word {
+                        text: std::mem::take(&mut buf),
+                        color: run.color,
+                    });
                 }
                 toks.push(Tok::Space { color: run.color });
             } else {
@@ -1870,7 +1967,10 @@ fn wrap_rich_lines(
             }
         }
         if !buf.is_empty() {
-            toks.push(Tok::Word { text: buf, color: run.color });
+            toks.push(Tok::Word {
+                text: buf,
+                color: run.color,
+            });
         }
     }
 
@@ -1879,23 +1979,24 @@ fn wrap_rich_lines(
     let mut current: Vec<RichRun> = Vec::new();
     let mut current_w: u32 = 0;
 
-    let push_line = |current: &mut Vec<RichRun>, current_w: &mut u32, lines: &mut Vec<Vec<RichRun>>| {
-        // Trim trailing spaces from the line being closed.
-        while let Some(last) = current.last() {
-            if last.text.chars().all(|c| c == ' ') {
-                current.pop();
-            } else {
-                break;
+    let push_line =
+        |current: &mut Vec<RichRun>, current_w: &mut u32, lines: &mut Vec<Vec<RichRun>>| {
+            // Trim trailing spaces from the line being closed.
+            while let Some(last) = current.last() {
+                if last.text.chars().all(|c| c == ' ') {
+                    current.pop();
+                } else {
+                    break;
+                }
             }
-        }
-        if !current.is_empty() {
-            lines.push(std::mem::take(current));
-        } else {
-            // Preserve empty lines from explicit breaks.
-            lines.push(Vec::new());
-        }
-        *current_w = 0;
-    };
+            if !current.is_empty() {
+                lines.push(std::mem::take(current));
+            } else {
+                // Preserve empty lines from explicit breaks.
+                lines.push(Vec::new());
+            }
+            *current_w = 0;
+        };
 
     for tok in toks {
         match tok {
@@ -1907,7 +2008,10 @@ fn wrap_rich_lines(
                 if wrap_width_px > 0 && current_w + space_w > wrap_width_px {
                     push_line(&mut current, &mut current_w, &mut lines);
                 } else {
-                    current.push(RichRun { text: " ".to_string(), color });
+                    current.push(RichRun {
+                        text: " ".to_string(),
+                        color,
+                    });
                     current_w += space_w;
                 }
             }
@@ -1985,7 +2089,10 @@ mod tests {
     use super::*;
 
     fn r(text: &str) -> Vec<RichRun> {
-        vec![RichRun { text: text.to_string(), color: None }]
+        vec![RichRun {
+            text: text.to_string(),
+            color: None,
+        }]
     }
 
     fn line_text(line: &[RichRun]) -> String {
@@ -2005,7 +2112,11 @@ mod tests {
         let mut a = GlyphAtlas::new();
         let lines = wrap_rich_lines(&mut a, "Font.2Ranger", &r("alpha beta gamma delta"), 60);
         assert!(lines.len() >= 2);
-        let joined: String = lines.iter().map(|l| line_text(l)).collect::<Vec<_>>().join(" ");
+        let joined: String = lines
+            .iter()
+            .map(|l| line_text(l))
+            .collect::<Vec<_>>()
+            .join(" ");
         assert_eq!(joined.split_whitespace().count(), 4);
     }
 
@@ -2022,9 +2133,18 @@ mod tests {
     fn wrap_preserves_color_runs() {
         let mut a = GlyphAtlas::new();
         let runs = vec![
-            RichRun { text: "Damage ".to_string(), color: None },
-            RichRun { text: "30".to_string(), color: Some([247, 195, 0, 255]) },
-            RichRun { text: " HP".to_string(), color: None },
+            RichRun {
+                text: "Damage ".to_string(),
+                color: None,
+            },
+            RichRun {
+                text: "30".to_string(),
+                color: Some([247, 195, 0, 255]),
+            },
+            RichRun {
+                text: " HP".to_string(),
+                color: None,
+            },
         ];
         let lines = wrap_rich_lines(&mut a, "Font.2Ranger", &runs, 1000);
         assert_eq!(lines.len(), 1);
@@ -2033,7 +2153,11 @@ mod tests {
             .iter()
             .filter(|r| r.color == Some([247, 195, 0, 255]))
             .count();
-        assert!(gold_count > 0, "color override lost during wrap: {:?}", lines[0]);
+        assert!(
+            gold_count > 0,
+            "color override lost during wrap: {:?}",
+            lines[0]
+        );
     }
 
     #[test]

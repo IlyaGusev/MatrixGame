@@ -19,8 +19,8 @@
 //! atlas-driven UI emit loop draws the icon with no additional
 //! plumbing.
 
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
 use crate::matrix_game::interface::constructor::RobotConfig;
@@ -71,7 +71,15 @@ impl RobotIconCache {
         iface_renderer: &mut InterfaceRenderer,
         cfg: &RobotConfig,
     ) -> Option<String> {
-        self.ensure_sized(device, queue, format, robots, iface_renderer, cfg, ICON_SIZE)
+        self.ensure_sized(
+            device,
+            queue,
+            format,
+            robots,
+            iface_renderer,
+            cfg,
+            ICON_SIZE,
+        )
     }
 
     /// Big variant — port of `m_BigTexture` (MatrixRobot.cpp:5347).

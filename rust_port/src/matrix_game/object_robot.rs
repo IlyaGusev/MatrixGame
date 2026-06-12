@@ -23,9 +23,7 @@ use crate::matrix_game::effects::point_light::PointLightSystem;
 use crate::matrix_game::map::GameMap;
 use crate::matrix_game::map_static::{MapStatic, ObjectId, ObjectType, Objects};
 use crate::matrix_game::robot::{Animation, ChassisKind, Robot};
-use crate::matrix_game::shadow::{
-    ShadowBatch, ShadowMeshSurface, ShadowMeshVertex, ShadowSystem,
-};
+use crate::matrix_game::shadow::{ShadowBatch, ShadowMeshSurface, ShadowMeshVertex, ShadowSystem};
 use crate::matrix_lib::three_g::texture::{
     create_solid_texture, create_texture_from_rgba, decode_texture_bytes,
 };
@@ -190,10 +188,7 @@ fn matmul(a: &[[f32; 4]; 4], b: &[[f32; 4]; 4]) -> [[f32; 4]; 4] {
     let mut r = [[0.0f32; 4]; 4];
     for i in 0..4 {
         for j in 0..4 {
-            r[i][j] = a[i][0] * b[0][j]
-                + a[i][1] * b[1][j]
-                + a[i][2] * b[2][j]
-                + a[i][3] * b[3][j];
+            r[i][j] = a[i][0] * b[0][j] + a[i][1] * b[1][j] + a[i][2] * b[2][j] + a[i][3] * b[3][j];
         }
     }
     r
@@ -283,9 +278,16 @@ fn compute_part_chain(
     //   th.x = dot(hull_forward, side)
     //   th.y = dot(hull_forward, forward)
     // (z component is zero for a planar hull direction).
-    let side = glam::Vec3::new(chassis_world[0][0], chassis_world[0][1], chassis_world[0][2]);
-    let forward =
-        glam::Vec3::new(chassis_world[1][0], chassis_world[1][1], chassis_world[1][2]);
+    let side = glam::Vec3::new(
+        chassis_world[0][0],
+        chassis_world[0][1],
+        chassis_world[0][2],
+    );
+    let forward = glam::Vec3::new(
+        chassis_world[1][0],
+        chassis_world[1][1],
+        chassis_world[1][2],
+    );
     let hf3 = glam::Vec3::new(hull_forward.x, hull_forward.y, 0.0);
     // Normalize so the rotation block stays orthonormal even if the
     // caller passes a non-unit hull_forward. The C++ keeps m_HullForward
@@ -371,8 +373,9 @@ fn compute_part_chain(
             // (`m_RobotWeaponMatrix[...].list[pilon-1]`).
             let mut fis_pilon_1 = pilon_1;
             let preferred = slots.get((pilon_1 - 1) as usize);
-            let preferred_accepts =
-                preferred.map(|s| (s.access_invert & bit) != 0).unwrap_or(false);
+            let preferred_accepts = preferred
+                .map(|s| (s.access_invert & bit) != 0)
+                .unwrap_or(false);
             if !preferred_accepts {
                 // WeaponInsert step 2: scan for the `pilon`-th compatible
                 // slot (1-based). MatrixObjectRobot.cpp:126-132 — note
@@ -592,12 +595,11 @@ impl RobotsRenderer {
             contents: bytemuck::bytes_of(&uniform_init),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
-        let preview_uniform_buffer =
-            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Robots Preview UB"),
-                contents: bytemuck::bytes_of(&uniform_init),
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            });
+        let preview_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Robots Preview UB"),
+            contents: bytemuck::bytes_of(&uniform_init),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
 
         let bgl = create_bgl(device);
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -799,16 +801,15 @@ impl RobotsRenderer {
                                 ],
                             })
                         };
-                        let bind_group =
-                            make_bg(&uniform_buffer, &diffuse_view, "Robots Part BG");
+                        let bind_group = make_bg(&uniform_buffer, &diffuse_view, "Robots Part BG");
                         let bind_group_preview = make_bg(
                             &preview_uniform_buffer,
                             &diffuse_view,
                             "Robots Part BG (preview)",
                         );
-                        let bind_group_enemy = enemy_diffuse_view.as_ref().map(|d| {
-                            make_bg(&uniform_buffer, d, "Robots Part BG (enemy)")
-                        });
+                        let bind_group_enemy = enemy_diffuse_view
+                            .as_ref()
+                            .map(|d| make_bg(&uniform_buffer, d, "Robots Part BG (enemy)"));
                         if bind_group_enemy.is_some() {
                             enemy_surf_count += 1;
                         }
@@ -974,44 +975,43 @@ impl RobotsRenderer {
                             }),
                             usage: wgpu::BufferUsages::UNIFORM,
                         });
-                    let make_bg = |ub: &wgpu::Buffer,
-                                   diffuse: &wgpu::TextureView,
-                                   label: &'static str| {
-                        device.create_bind_group(&wgpu::BindGroupDescriptor {
-                            label: Some(label),
-                            layout: &bgl,
-                            entries: &[
-                                wgpu::BindGroupEntry {
-                                    binding: 0,
-                                    resource: ub.as_entire_binding(),
-                                },
-                                wgpu::BindGroupEntry {
-                                    binding: 1,
-                                    resource: wgpu::BindingResource::TextureView(diffuse),
-                                },
-                                wgpu::BindGroupEntry {
-                                    binding: 2,
-                                    resource: wgpu::BindingResource::TextureView(&gloss_view),
-                                },
-                                wgpu::BindGroupEntry {
-                                    binding: 3,
-                                    resource: wgpu::BindingResource::TextureView(&back_view),
-                                },
-                                wgpu::BindGroupEntry {
-                                    binding: 4,
-                                    resource: wgpu::BindingResource::TextureView(&mask_view),
-                                },
-                                wgpu::BindGroupEntry {
-                                    binding: 5,
-                                    resource: wgpu::BindingResource::Sampler(&sampler),
-                                },
-                                wgpu::BindGroupEntry {
-                                    binding: 6,
-                                    resource: mat_uniform.as_entire_binding(),
-                                },
-                            ],
-                        })
-                    };
+                    let make_bg =
+                        |ub: &wgpu::Buffer, diffuse: &wgpu::TextureView, label: &'static str| {
+                            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                                label: Some(label),
+                                layout: &bgl,
+                                entries: &[
+                                    wgpu::BindGroupEntry {
+                                        binding: 0,
+                                        resource: ub.as_entire_binding(),
+                                    },
+                                    wgpu::BindGroupEntry {
+                                        binding: 1,
+                                        resource: wgpu::BindingResource::TextureView(diffuse),
+                                    },
+                                    wgpu::BindGroupEntry {
+                                        binding: 2,
+                                        resource: wgpu::BindingResource::TextureView(&gloss_view),
+                                    },
+                                    wgpu::BindGroupEntry {
+                                        binding: 3,
+                                        resource: wgpu::BindingResource::TextureView(&back_view),
+                                    },
+                                    wgpu::BindGroupEntry {
+                                        binding: 4,
+                                        resource: wgpu::BindingResource::TextureView(&mask_view),
+                                    },
+                                    wgpu::BindGroupEntry {
+                                        binding: 5,
+                                        resource: wgpu::BindingResource::Sampler(&sampler),
+                                    },
+                                    wgpu::BindGroupEntry {
+                                        binding: 6,
+                                        resource: mat_uniform.as_entire_binding(),
+                                    },
+                                ],
+                            })
+                        };
                     let bind_group = make_bg(&uniform_buffer, &diffuse_view, "Robots BG");
                     let bind_group_preview = make_bg(
                         &preview_uniform_buffer,
@@ -1411,8 +1411,7 @@ impl RobotsRenderer {
         // the turntable spin around Z, so rotating the hull_forward by
         // that same spin keeps the armor identity-aligned within the
         // chassis frame — the rotation cancels out.
-        let preview_hull_forward =
-            glam::Vec2::new(chassis_world[1][0], chassis_world[1][1]);
+        let preview_hull_forward = glam::Vec2::new(chassis_world[1][0], chassis_world[1][1]);
         let chain = compute_part_chain(
             &chassis_world,
             chassis_gpu,
@@ -1427,9 +1426,8 @@ impl RobotsRenderer {
         //   0 — chassis, 1 — armor, 2 — head, 3..7 — weapons[0..4].
         // Constructor preview tints are flat white (CConstructor.cpp:
         // 340-360 doesn't apply terrain or side colour).
-        let pack = |m: &[[f32; 4]; 4]| {
-            pack_part_instance(m, [1.0, 1.0, 1.0, 1.0], [1.0, 1.0, 1.0, 1.0])
-        };
+        let pack =
+            |m: &[[f32; 4]; 4]| pack_part_instance(m, [1.0, 1.0, 1.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
         let mut instances = [pack(&IDENTITY_MAT); 8];
         instances[0] = pack(&chassis_world);
         if let Some((_, m)) = chain.armor.as_ref() {
@@ -1577,6 +1575,100 @@ impl RobotsRenderer {
                 continue;
             }
             let robot: &mut Robot = unsafe { &mut *(obj as *mut dyn MapStatic as *mut Robot) };
+            // DIP robots render their own part meshes tumbling at the
+            // wreck-piece transforms (CMatrixRobot::Draw DIP branch,
+            // MatrixObjectRobot.cpp:1045-1061). Texture factor is the
+            // fixed 0xFF808080 gray; no shadows.
+            if robot.state == crate::matrix_game::robot::RobotState::Dip {
+                use crate::matrix_game::robot::DipPart;
+                let [sr, sg, sb] = crate::matrix_game::side::side_color_rgb(robot.side);
+                let side_color = [sr, sg, sb, 1.0];
+                let gray = [0.502, 0.502, 0.502, 1.0];
+                let is_enemy = robot.side != crate::matrix_game::common::PLAYER_SIDE;
+                let t = crate::matrix_game::map::current_elapsed_ms() as f32;
+                for u in &robot.dip_units {
+                    if u.ttl <= 0.0 || offset >= self.instance_capacity {
+                        continue;
+                    }
+                    let resolved = match u.part {
+                        DipPart::Chassis => self
+                            .chassis
+                            .get(chassis_kind_index(robot.chassis))
+                            .and_then(|o| o.as_ref())
+                            .map(|g| {
+                                (
+                                    PartKind::Chassis(robot.chassis),
+                                    robot
+                                        .chassis_anim
+                                        .vo_frame
+                                        .min(g.frames.len().saturating_sub(1)),
+                                )
+                            }),
+                        DipPart::Head => non_zero_kind(robot.config.head.kind.0)
+                            .map(|k| (k - 1) as usize)
+                            .and_then(|idx| {
+                                self.head.get(idx).and_then(|o| o.as_ref()).map(|g| {
+                                    (
+                                        PartKind::Head(idx),
+                                        robot
+                                            .head_anim
+                                            .vo_frame
+                                            .min(g.frames.len().saturating_sub(1)),
+                                    )
+                                })
+                            }),
+                        DipPart::Weapon(p) => non_zero_kind(robot.config.weapon[p].kind.0)
+                            .map(|k| (k - 1) as usize)
+                            .and_then(|idx| {
+                                self.weapon.get(idx).and_then(|o| o.as_ref()).map(|g| {
+                                    (
+                                        PartKind::Weapon(idx),
+                                        robot.weapon_anims[p]
+                                            .vo_frame
+                                            .min(g.frames.len().saturating_sub(1)),
+                                    )
+                                })
+                            }),
+                    };
+                    let Some((kind, vo_frame)) = resolved else {
+                        continue;
+                    };
+                    // D3DXMatrixRotationYawPitchRoll(dy·t, dp·t, dr·t);
+                    // the C++ composes a geo-center pivot but then
+                    // overwrites the translation with m_Pos
+                    // (MatrixRobot.cpp:261-270), so the net world is
+                    // plain R + pos. `yaw` keeps the stay-chassis
+                    // orientation; `freeze_t` stops the spin clock for
+                    // landed pieces.
+                    let te = u.freeze_t.unwrap_or(t);
+                    let rot = glam::Quat::from_rotation_z(u.yaw)
+                        * glam::Quat::from_euler(
+                            glam::EulerRot::YXZ,
+                            u.dy * te,
+                            u.dp * te,
+                            u.dr * te,
+                        );
+                    let rx = rot * Vec3::X;
+                    let ry = rot * Vec3::Y;
+                    let rz = rot * Vec3::Z;
+                    let m: [[f32; 4]; 4] = [
+                        [rx.x, rx.y, rx.z, 0.0],
+                        [ry.x, ry.y, ry.z, 0.0],
+                        [rz.x, rz.y, rz.z, 0.0],
+                        [u.pos.x - cx, u.pos.y - cy, u.pos.z, 1.0],
+                    ];
+                    instance_data.push(pack_part_instance(&m, gray, side_color));
+                    self.draws.push(PartDraw {
+                        kind,
+                        instance_offset: offset,
+                        vo_frame,
+                        invert: u.invert,
+                        is_enemy,
+                    });
+                    offset += 1;
+                }
+                continue;
+            }
             let ck_idx = chassis_kind_index(robot.chassis);
             let Some(chassis_gpu) = self.chassis.get(ck_idx).and_then(|o| o.as_ref()) else {
                 continue;
@@ -1610,33 +1702,36 @@ impl RobotsRenderer {
             // advances at the constant Takt rate.
             tick_part_anim(
                 &mut robot.armor_anim,
-                self.armor.get(
-                    non_zero_kind(robot.config.hull.unit.kind.0)
-                        .map(|k| (k - 1) as usize)
-                        .unwrap_or(usize::MAX),
-                )
-                .and_then(|o| o.as_ref()),
+                self.armor
+                    .get(
+                        non_zero_kind(robot.config.hull.unit.kind.0)
+                            .map(|k| (k - 1) as usize)
+                            .unwrap_or(usize::MAX),
+                    )
+                    .and_then(|o| o.as_ref()),
                 cms,
             );
             tick_part_anim(
                 &mut robot.head_anim,
-                self.head.get(
-                    non_zero_kind(robot.config.head.kind.0)
-                        .map(|k| (k - 1) as usize)
-                        .unwrap_or(usize::MAX),
-                )
-                .and_then(|o| o.as_ref()),
+                self.head
+                    .get(
+                        non_zero_kind(robot.config.head.kind.0)
+                            .map(|k| (k - 1) as usize)
+                            .unwrap_or(usize::MAX),
+                    )
+                    .and_then(|o| o.as_ref()),
                 cms,
             );
             for (pilon, weap_anim) in robot.weapon_anims.iter_mut().enumerate() {
                 tick_part_anim(
                     weap_anim,
-                    self.weapon.get(
-                        non_zero_kind(robot.config.weapon[pilon].kind.0)
-                            .map(|k| (k - 1) as usize)
-                            .unwrap_or(usize::MAX),
-                    )
-                    .and_then(|o| o.as_ref()),
+                    self.weapon
+                        .get(
+                            non_zero_kind(robot.config.weapon[pilon].kind.0)
+                                .map(|k| (k - 1) as usize)
+                                .unwrap_or(usize::MAX),
+                        )
+                        .and_then(|o| o.as_ref()),
                     cms,
                 );
             }
@@ -1644,11 +1739,7 @@ impl RobotsRenderer {
             // Per-robot lighting / side tint — same values for every
             // part of this robot.
             let [terrain_r, terrain_g, terrain_b] = unpack_rgb(
-                map.static_object_color_with_lighting(
-                    robot.pos_x,
-                    robot.pos_y,
-                    Some(point_lights),
-                ),
+                map.static_object_color_with_lighting(robot.pos_x, robot.pos_y, Some(point_lights)),
             );
             let terrain_color = [terrain_r, terrain_g, terrain_b, 1.0];
             let [sr, sg, sb] = crate::matrix_game::side::side_color_rgb(robot.side);
@@ -1687,7 +1778,8 @@ impl RobotsRenderer {
                         .map(|v| Vec3::from_array(v.position))
                         .collect();
                     if let Some(proj) =
-                        self.shadow_system.calc_proj(&local_pts, light_world, world_uc)
+                        self.shadow_system
+                            .calc_proj(&local_pts, light_world, world_uc)
                     {
                         let texture = self
                             .shadow_textures
@@ -1726,7 +1818,12 @@ impl RobotsRenderer {
                             })
                             .clone();
                         if let Some(batch) = self.shadow_system.build_geometry(
-                            device, map, &proj, &texture, 8, [cx, cy],
+                            device,
+                            map,
+                            &proj,
+                            &texture,
+                            8,
+                            [cx, cy],
                         ) {
                             self.shadow_batches.push(batch.clone());
                             self.shadow_cache.insert(id, CachedShadow { batch, sig });
@@ -1756,19 +1853,66 @@ impl RobotsRenderer {
                 robot.hull_forward,
             );
 
+            // Write the weapon muzzle transforms back to the game
+            // object — the renderer is the only place the real part
+            // chain exists. Combine the weapon mesh's barrel bone
+            // (matrix id 1) with the pylon world like the C++ fire
+            // control does (MatrixRobot.cpp:1390-1394). `wp.world` is
+            // in centered render space — add the map center back.
+            {
+                let mut mounts: [Option<crate::matrix_game::robot::WeaponMount>; 5] = [None; 5];
+                for (pilon, w) in chain.weapons.iter().enumerate() {
+                    let Some(wp) = w else { continue };
+                    let bone1 = self
+                        .weapon
+                        .get(wp.idx)
+                        .and_then(|o| o.as_ref())
+                        .and_then(|g| g.vo_mesh.matrix_by_id(1, 0))
+                        .map(flat_to_rows)
+                        .unwrap_or(IDENTITY_MAT);
+                    let m = matmul(&bone1, &wp.world);
+                    let pos = glam::Vec3::new(m[3][0] + cx, m[3][1] + cy, m[3][2]);
+                    let dir = glam::Vec3::new(m[1][0], m[1][1], m[1][2]).normalize_or_zero();
+                    mounts[pilon] = Some(crate::matrix_game::robot::WeaponMount { pos, dir });
+                }
+                robot.weapon_mounts = mounts;
+
+                // Part origins for the death scatter (`m_Unit[i].m_Pos`
+                // seeds at MatrixRobot.cpp:2056-2107 read the unit
+                // world matrices; only the renderer has them).
+                let uncenter = |m: &[[f32; 4]; 4]| {
+                    glam::Vec3::new(m[3][0] + cx, m[3][1] + cy, m[3][2])
+                };
+                let mut weapons: [Option<(glam::Vec3, bool)>; 5] = [None; 5];
+                for (pilon, w) in chain.weapons.iter().enumerate() {
+                    if let Some(wp) = w {
+                        weapons[pilon] = Some((uncenter(&wp.world), wp.invert));
+                    }
+                }
+                robot.part_snapshot = crate::matrix_game::robot::DipPartSnapshot {
+                    chassis: Some(uncenter(&chassis_world)),
+                    head: chain.head.as_ref().map(|(_, m)| uncenter(m)),
+                    weapons,
+                };
+            }
+
             // Resolved per-part vo_frame indices, clamped to each
             // mesh's frame count.
             let armor_frame = chain.armor.as_ref().and_then(|(idx, _)| {
-                self.armor
-                    .get(*idx)
-                    .and_then(|o| o.as_ref())
-                    .map(|g| robot.armor_anim.vo_frame.min(g.frames.len().saturating_sub(1)))
+                self.armor.get(*idx).and_then(|o| o.as_ref()).map(|g| {
+                    robot
+                        .armor_anim
+                        .vo_frame
+                        .min(g.frames.len().saturating_sub(1))
+                })
             });
             let head_frame = chain.head.as_ref().and_then(|(idx, _)| {
-                self.head
-                    .get(*idx)
-                    .and_then(|o| o.as_ref())
-                    .map(|g| robot.head_anim.vo_frame.min(g.frames.len().saturating_sub(1)))
+                self.head.get(*idx).and_then(|o| o.as_ref()).map(|g| {
+                    robot
+                        .head_anim
+                        .vo_frame
+                        .min(g.frames.len().saturating_sub(1))
+                })
             });
 
             // Push chassis instance + part instances. Each gets its
@@ -1915,8 +2059,10 @@ impl RobotsRenderer {
         for draw in &self.draws {
             let gpu = match draw.kind {
                 PartKind::Chassis(chassis) => {
-                    let Some(g) =
-                        self.chassis.get(chassis_kind_index(chassis)).and_then(|o| o.as_ref())
+                    let Some(g) = self
+                        .chassis
+                        .get(chassis_kind_index(chassis))
+                        .and_then(|o| o.as_ref())
                     else {
                         continue;
                     };
@@ -2080,9 +2226,7 @@ fn do_chassis_animation(robot: &mut Robot, vo: &vector_object::VoMesh, now_ms: f
         // in progress. We mirror that here so the chassis animation
         // doesn't get stuck in ROTATE.
         robot.animation = Animation::Stay;
-        robot
-            .chassis_anim
-            .set_anim_by_name(vo, "Stay", true);
+        robot.chassis_anim.set_anim_by_name(vo, "Stay", true);
         return;
     }
 

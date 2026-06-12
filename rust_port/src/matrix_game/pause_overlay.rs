@@ -89,18 +89,29 @@ impl PauseOverlay {
 
         // Static fullscreen triangle covering NDC.
         let verts = [
-            OverlayVertex { pos: [-1.0, -1.0], color: PAUSE_TINT_RGBA },
-            OverlayVertex { pos: [3.0, -1.0], color: PAUSE_TINT_RGBA },
-            OverlayVertex { pos: [-1.0, 3.0], color: PAUSE_TINT_RGBA },
+            OverlayVertex {
+                pos: [-1.0, -1.0],
+                color: PAUSE_TINT_RGBA,
+            },
+            OverlayVertex {
+                pos: [3.0, -1.0],
+                color: PAUSE_TINT_RGBA,
+            },
+            OverlayVertex {
+                pos: [-1.0, 3.0],
+                color: PAUSE_TINT_RGBA,
+            },
         ];
-        let vertex_buffer =
-            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Pause Overlay VB"),
-                contents: bytemuck::cast_slice(&verts),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
+        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Pause Overlay VB"),
+            contents: bytemuck::cast_slice(&verts),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
 
-        Self { pipeline, vertex_buffer }
+        Self {
+            pipeline,
+            vertex_buffer,
+        }
     }
 
     pub fn draw<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {

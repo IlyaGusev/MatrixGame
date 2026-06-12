@@ -15,7 +15,9 @@ fn main() {
         p.design_y,
         p.elements.len()
     );
-    let watch = ["gram", "name", "lives", "mp1", "mp2", "prog", "ovhe", "inro", "lero"];
+    let watch = [
+        "gram", "name", "lives", "mp1", "mp2", "prog", "ovhe", "inro", "lero",
+    ];
     for e in &p.elements {
         if watch.contains(&e.name.as_str()) {
             let img0 = e.images.first().and_then(|x| x.as_ref());
@@ -27,18 +29,14 @@ fn main() {
                     )
                 })
                 .unwrap_or_else(|| "no img".to_string());
-            let labels: Vec<String> = e.labels.iter().map(|l| format!("[{:?} \"{}\"]", l.state, l.text)).collect();
+            let labels: Vec<String> = e
+                .labels
+                .iter()
+                .map(|l| format!("[{:?} \"{}\"]", l.state, l.text))
+                .collect();
             println!(
                 "  {:8} kind={:?} pos=({}, {}, z={}) size=({}, {}) {} labels={:?}",
-                e.name,
-                e.kind,
-                e.pos_x,
-                e.pos_y,
-                e.pos_z,
-                e.size_x,
-                e.size_y,
-                img_info,
-                labels,
+                e.name, e.kind, e.pos_x, e.pos_y, e.pos_z, e.size_x, e.size_y, img_info, labels,
             );
         }
     }

@@ -24,18 +24,16 @@ use wgpu::util::DeviceExt;
 
 use crate::matrix_game::camera::Camera;
 use crate::matrix_game::common::{unpack_rgb, FOG_END, FOG_START, PLAYER_SIDE};
+use crate::matrix_game::config::RobotUnitKind;
 use crate::matrix_game::effects::point_light::PointLightSystem;
+use crate::matrix_game::interface::constructor::RobotConfig;
+use crate::matrix_game::logic::Rnd;
 use crate::matrix_game::map::{BuildingInstance, GameMap};
 use crate::matrix_game::map_static::{
     MapStatic, ObjectCore, ObjectId, ObjectType, Objects, MR_ALL,
 };
-use crate::matrix_game::logic::Rnd;
 use crate::matrix_game::robot::{ChassisKind, Robot};
-use crate::matrix_game::config::RobotUnitKind;
-use crate::matrix_game::interface::constructor::RobotConfig;
-use crate::matrix_game::shadow::{
-    ShadowBatch, ShadowMeshSurface, ShadowMeshVertex, ShadowSystem,
-};
+use crate::matrix_game::shadow::{ShadowBatch, ShadowMeshSurface, ShadowMeshVertex, ShadowSystem};
 use crate::matrix_lib::three_g::texture::{
     create_solid_texture, create_texture_from_rgba, decode_texture_bytes,
 };
@@ -301,6 +299,12 @@ impl BuildStack {
                     &robot_weapons_from_cfg(&cfg),
                 );
                 let id = objs.spawn(Box::new(robot));
+                if let Some(obj) = objs.get_mut(id) {
+                    let r: &mut crate::matrix_game::robot::Robot = unsafe {
+                        &mut *(obj as *mut dyn MapStatic as *mut crate::matrix_game::robot::Robot)
+                    };
+                    r.self_id = Some(id);
+                }
                 objs.add_lt(id);
                 Some(id)
             }
@@ -333,7 +337,9 @@ fn ramp_turret_hp(objs: &mut Objects, parent_id: ObjectId, slot: i32, progress: 
 
     let live: Vec<ObjectId> = objs.iter_live().collect();
     for id in live {
-        let Some(obj) = objs.get_mut(id) else { continue };
+        let Some(obj) = objs.get_mut(id) else {
+            continue;
+        };
         if !matches!(obj.core().obj_type, ObjectType::Cannon) {
             continue;
         }
@@ -352,8 +358,8 @@ fn ramp_turret_hp(objs: &mut Objects, parent_id: ObjectId, slot: i32, progress: 
 /// holds `WeaponUnit` values directly).
 pub fn robot_weapons_from_cfg(
     cfg: &RobotConfig,
-) -> [crate::matrix_game::interface::constructor::WeaponUnit; crate::matrix_game::object_robot::MAX_WEAPON_CNT]
-{
+) -> [crate::matrix_game::interface::constructor::WeaponUnit;
+       crate::matrix_game::object_robot::MAX_WEAPON_CNT] {
     let mut out = [crate::matrix_game::interface::constructor::WeaponUnit::empty();
         crate::matrix_game::object_robot::MAX_WEAPON_CNT];
     for (i, w) in cfg.weapon.iter().enumerate() {
@@ -654,10 +660,7 @@ impl Building {
                     let scale = GameMap::GLOBAL_SCALE_MOVE;
                     TurretPlace {
                         coord: p.coord,
-                        world: glam::Vec2::new(
-                            p.coord.0 as f32 * scale,
-                            p.coord.1 as f32 * scale,
-                        ),
+                        world: glam::Vec2::new(p.coord.0 as f32 * scale, p.coord.1 as f32 * scale),
                         angle: p.angle,
                         cannon_type: p.cannon_type,
                     }
@@ -895,6 +898,51 @@ impl MapStatic for Building {
     /// ported. Structure preserved so the body lands in-place later.
     fn takt(&mut self, _cms: i32, _rng: &mut Rnd, _objs: &mut Objects) {}
 
+    fn show_hitpoint(&mut self) {
+        Building::show_hitpoint(self);
+    }
+
+    /// `CMatrixBuilding::BeforeDraw` PB block (MatrixObjectBuilding.cpp:
+    /// 931-948): anchored over the roof (ground + 90 for the base /
+    /// + 80 otherwise), PB_BUILDING_WIDTH=200 starting `radius` left
+    /// of the projected point.
+    fn hitpoint_bar(
+        &self,
+        map: &crate::matrix_game::map::GameMap,
+    ) -> Option<crate::matrix_game::map_static::HpBar> {
+        if self.show_hitpoint_time <= 0
+            || self.hit_point <= 0.0
+            || matches!(self.state, BaseState::Dip | BaseState::DipExploded)
+        {
+            return None;
+        }
+        let geo = self.core.geo_center;
+        let anchor = if self.kind == BuildingType::Base {
+            // `GetGeoCenter() - m_Matrix._21/22 * 20` — the building
+            // world matrix here is translation-only, so rebuild the
+            // rotated y-axis from the quarter-turn angle.
+            let ang = (self.angle & 3) as f32 * std::f32::consts::FRAC_PI_2;
+            let (s, c) = ang.sin_cos();
+            let y_axis = glam::Vec2::new(-s, c);
+            let p = glam::Vec2::new(geo.x - y_axis.x * 20.0, geo.y - y_axis.y * 20.0);
+            glam::Vec3::new(p.x, p.y, map.get_z(p.x, p.y) + 90.0)
+        } else {
+            glam::Vec3::new(geo.x, geo.y, map.get_z(geo.x, geo.y) + 80.0)
+        };
+        Some(crate::matrix_game::map_static::HpBar {
+            anchor,
+            width: 200.0,
+            fill: (self.hit_point / self.hit_point_max.max(1.0)).clamp(0.0, 1.0),
+            // The C++ starts the bar `GetRadius()` (mesh-AABB
+            // half-diagonal, ~75-100 for buildings) left of the
+            // anchor; our core radius is the smaller selection-ring
+            // value, which visibly right-shifts the 200px bar.
+            // Center it instead.
+            x_off: -100.0,
+            y_off: 0.0,
+        })
+    }
+
     /// Port of `CMatrixBuilding::LogicTakt` (MatrixObjectBuilding.cpp:495-891).
     ///
     /// Currently ported: under-attack + show-hitpoint countdown timers
@@ -953,11 +1001,102 @@ impl MapStatic for Building {
             // (:605-667).
         }
 
-        // DIP explosion sequence (MatrixObjectBuilding.cpp:672-808) —
-        // deferred. The HP<0 branch decrements HP by `cms` and emits
-        // periodic explosions + sounds; ruin replacement uses
-        // `StaticAdd<CMatrixMapObject>` + `AddEffectSpawner`, both
-        // unported.
+        // DIP explosion sequence (MatrixObjectBuilding.cpp:672-808):
+        // `m_HitPoint` counts down as a timer; explosions pop every
+        // BUILDING_EXPLOSION_PERIOD (10ms) at random points within the
+        // radius, 4% of them the bigger Boom2. A dying BASE finishes
+        // with a real WEAPON_BIGBOOM blast. (Ruin-mesh replacement is
+        // still deferred with the mesh-swap system.)
+        if self.state == BaseState::Dip {
+            self.hit_point -= cms as f32;
+            let now = crate::matrix_game::map::current_elapsed_ms();
+            if self.next_explosion_time == 0 {
+                self.next_explosion_time = now as i32;
+            }
+            let mut vrng = crate::matrix_game::logic::Rnd::new(
+                ((now as i32) ^ ((self.pos.x + self.pos.y) as i32)).max(1),
+            );
+            use crate::matrix_game::effects::smoke_and_fire::{frnd, fsrnd};
+            let radius = self.core.radius.max(20.0);
+            // Aim point sits 60 units behind the building along its
+            // facing (`m_Pos - m_Core->m_Matrix._21/22 * 60`, :782-784);
+            // candidates scatter around it and a 4-attempt Pick puts
+            // the explosion on the mesh surface (+2 along the ray).
+            let pos0 = glam::Vec3::new(
+                self.pos.x - self.core.matrix.y_axis.x * 60.0,
+                self.pos.y - self.core.matrix.y_axis.y * 60.0,
+                self.core.matrix.w_axis.z,
+            );
+            while now > self.next_explosion_time as i64 {
+                self.next_explosion_time += 10; // BUILDING_EXPLOSION_PERIOD
+                let mut found = None;
+                for _ in 0..4 {
+                    let pos = pos0
+                        + glam::Vec3::new(
+                            fsrnd(&mut vrng, radius),
+                            fsrnd(&mut vrng, radius),
+                            frnd(&mut vrng, 2.0 * radius),
+                        );
+                    let dir = (pos0 - pos).normalize_or_zero();
+                    if dir == glam::Vec3::ZERO {
+                        continue;
+                    }
+                    if let Some(t) = crate::matrix_game::map_trace::pick_sphere(
+                        pos,
+                        dir,
+                        self.core.geo_center,
+                        self.core.radius,
+                    ) {
+                        found = Some(pos + dir * (t + 2.0));
+                        break;
+                    }
+                }
+                let Some(pos) = found else { continue };
+                let props = if frnd(&mut vrng, 1.0) < 0.04 {
+                    &crate::matrix_game::effects::explosion::EXPLOSION_BUILDING_BOOM2
+                } else {
+                    &crate::matrix_game::effects::explosion::EXPLOSION_BUILDING_BOOM
+                };
+                objs.pending_explosions
+                    .push(crate::matrix_game::map_static::ExplosionSpawn {
+                        pos,
+                        props,
+                        fire: false,
+                    });
+            }
+            // downtime = -1000 (-3000 more for BASE) —
+            // MatrixObjectBuilding.cpp:672-692.
+            let downtime = if self.kind == BuildingType::Base {
+                -1000.0 - 2000.0
+            } else {
+                -1000.0
+            };
+            if self.kind == BuildingType::Base && self.hit_point < downtime + 100.0 {
+                // The base's final blast is a REAL bigboom (:681-687).
+                if let (Some(self_id), Some(map)) =
+                    (self.self_id, crate::matrix_game::map::current_map())
+                {
+                    use crate::matrix_game::effects::weapon::{
+                        weapon_takt, WeaponEffect, WeaponHandler, WEAPON_BIGBOOM,
+                    };
+                    let mut w = WeaponEffect::new(WEAPON_BIGBOOM, 0, WeaponHandler::None);
+                    w.set_owner(self_id, self.side);
+                    w.modify(self.core.geo_center, glam::Vec3::Z, glam::Vec3::ZERO);
+                    let wid = objs.weapons.create(w);
+                    if let Some(we) = objs.weapons.get_mut(wid) {
+                        we.fire_begin(glam::Vec3::ZERO, Some(self_id));
+                    }
+                    weapon_takt(objs, wid, 1.0, map, _rng);
+                    if let Some(we) = objs.weapons.get_mut(wid) {
+                        we.fire_end();
+                    }
+                    objs.weapons.release(wid);
+                }
+                self.state = BaseState::DipExploded;
+            } else if self.hit_point < downtime {
+                self.state = BaseState::DipExploded;
+            }
+        }
 
         // BUILDING_BASE platform animation (MatrixObjectBuilding.cpp:
         // 810-854). Runs for BASE buildings only — the other kinds
@@ -1048,11 +1187,19 @@ impl MapStatic for Building {
             return false;
         }
 
-        // `damagek` — difficulty scaling; unported. The C++ drops down
-        // to 1.0 when either the attacker is on our side or we're not
-        // the player, which handles every non-player target. Only
-        // enemy-vs-player uses the scale factor.
-        let damagek = 1.0f32;
+        // `damagek` — difficulty scaling (MatrixObjectBuilding.cpp:
+        // 261-262): only enemy-vs-player uses the scale factor; a
+        // friendly hit on the player additionally scales by the
+        // friendly-fire coefficient.
+        let difficulty = crate::matrix_game::config::global().difficulty;
+        let mut damagek = if friendly_fire || self.side != PLAYER_SIDE {
+            1.0f32
+        } else {
+            difficulty.k_damage_enemy_to_player
+        };
+        if friendly_fire && self.side == PLAYER_SIDE {
+            damagek *= difficulty.k_friendly_fire;
+        }
 
         // MatrixObjectBuilding.cpp:281-292.
         if self.hit_point > entry.mindamage as f32 {
@@ -1075,7 +1222,10 @@ impl MapStatic for Building {
 
         // MatrixObjectBuilding.cpp:308-341 — death transition.
         if self.hit_point <= 0.0 {
-            // Sound + kill-stat bookkeeping deferred.
+            // Death sounds deferred.
+            if attacker_side != 0 && !friendly_fire {
+                objs.inc_side_stat(attacker_side, |s| s.building_kill += 1);
+            }
             self.hit_point = -1.0;
             self.state = BaseState::Dip;
             // Schedule the first explosion to fire on the next logic
@@ -1094,6 +1244,9 @@ impl MapStatic for Building {
     }
     fn need_repair(&self) -> bool {
         self.hit_point < self.hit_point_max
+    }
+    fn is_live(&self) -> bool {
+        !matches!(self.state, BaseState::Dip | BaseState::DipExploded)
     }
 }
 
@@ -1353,11 +1506,10 @@ impl BuildingsRenderer {
                 // unit — as the body, so we mirror that.
                 let is_body = !shadow_kinds.contains_key(kind);
                 let shadow_vertex_offset = if is_body {
-                    let shadow_mesh =
-                        shadow_kinds.entry(*kind).or_insert_with(|| ShadowKindMesh {
-                            vertices: Vec::new(),
-                            surfaces: Vec::new(),
-                        });
+                    let shadow_mesh = shadow_kinds.entry(*kind).or_insert_with(|| ShadowKindMesh {
+                        vertices: Vec::new(),
+                        surfaces: Vec::new(),
+                    });
                     let off = shadow_mesh.vertices.len() as u32;
                     shadow_mesh
                         .vertices
@@ -1398,8 +1550,7 @@ impl BuildingsRenderer {
                         let shadow_mesh = shadow_kinds
                             .get_mut(kind)
                             .expect("body offset implies kind already inserted");
-                        let remapped: Vec<u32> =
-                            surf.indices.iter().map(|i| i + offset).collect();
+                        let remapped: Vec<u32> = surf.indices.iter().map(|i| i + offset).collect();
                         shadow_mesh.surfaces.push(ShadowMeshSurface {
                             indices: remapped,
                             diffuse: diffuse_view.clone(),
@@ -1580,7 +1731,10 @@ impl BuildingsRenderer {
                 shadow_batches.push(batch);
             }
         }
-        log::info!("buildings: {} projected shadows built", shadow_batches.len());
+        log::info!(
+            "buildings: {} projected shadows built",
+            shadow_batches.len()
+        );
 
         Some(Self {
             pipeline,
@@ -2050,7 +2204,10 @@ mod tests {
         let pad = 30.0_f32;
         let scale = GameMap::GLOBAL_SCALE_MOVE;
         let cell = |dx: f32, dy: f32, ang: f32| TurretPlaceCmap {
-            coord: (((100.0 + dx) / scale).floor() as i32, ((100.0 + dy) / scale).floor() as i32),
+            coord: (
+                ((100.0 + dx) / scale).floor() as i32,
+                ((100.0 + dy) / scale).floor() as i32,
+            ),
             angle: ang,
             cannon_type: -1,
         };
@@ -2429,7 +2586,10 @@ mod tests {
             assert_eq!(p.cannon_type, -1, "fresh slots empty");
         }
 
-        assert!(b.queue_turret_slot(2, 3), "slot 2 should accept turret kind 3");
+        assert!(
+            b.queue_turret_slot(2, 3),
+            "slot 2 should accept turret kind 3"
+        );
         assert_eq!(b.turret_places[2].cannon_type, 3);
         assert_eq!(b.turrets_have, 1);
 
@@ -2464,8 +2624,7 @@ mod tests {
         // Re-borrow to wire self_id + queue the turret.
         {
             let obj = w.objects.get_mut(parent_id).unwrap();
-            let bb: &mut Building =
-                unsafe { &mut *(obj as *mut dyn MapStatic as *mut Building) };
+            let bb: &mut Building = unsafe { &mut *(obj as *mut dyn MapStatic as *mut Building) };
             bb.self_id = Some(parent_id);
             assert!(bb.queue_turret_slot(0, 1));
         }
@@ -2495,8 +2654,11 @@ mod tests {
         w.takt(total / 2);
         let half = w.objects.get(cannon_id).unwrap();
         let cm = unsafe { &*(half as *const dyn MapStatic as *const Cannon) };
-        assert!(cm.hit_point > 80.0 && cm.hit_point < 130.0,
-            "expected ~100, got {}", cm.hit_point);
+        assert!(
+            cm.hit_point > 80.0 && cm.hit_point < 130.0,
+            "expected ~100, got {}",
+            cm.hit_point
+        );
         assert!(cm.invulnerable);
         assert_eq!(cm.state, CannonState::UnderConstruction);
 
@@ -2519,11 +2681,21 @@ mod tests {
 
         let mut bs = BuildStack::new();
         assert!(bs.add_item(PendingItem {
-            kind: PendingKind::Turret { slot: 0, turret_kind: 1 },
+            kind: PendingKind::Turret {
+                slot: 0,
+                turret_kind: 1
+            },
             side: 1,
         }));
         let total = turret_build_time_ms();
-        bs.tick_timer(total, &mut objs, parent_id, BaseState::Opened, glam::Vec3::ZERO, 0);
+        bs.tick_timer(
+            total,
+            &mut objs,
+            parent_id,
+            BaseState::Opened,
+            glam::Vec3::ZERO,
+            0,
+        );
         assert!(bs.is_empty(), "turret completes while base not Closed");
 
         let mut bs = BuildStack::new();
@@ -2534,8 +2706,14 @@ mod tests {
             side: 1,
         }));
         let total = robot_build_time_ms();
-        let spawned =
-            bs.tick_timer(total, &mut objs, parent_id, BaseState::Opened, glam::Vec3::ZERO, 0);
+        let spawned = bs.tick_timer(
+            total,
+            &mut objs,
+            parent_id,
+            BaseState::Opened,
+            glam::Vec3::ZERO,
+            0,
+        );
         assert!(spawned.is_none());
         assert_eq!(bs.items(), 1, "robot waits for BASE_CLOSED");
     }

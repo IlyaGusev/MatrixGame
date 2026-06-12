@@ -2302,7 +2302,12 @@ mod robot_config_tests {
             fake_weapon_matrix(2, 1),
         );
         let mut b = RobotBuilder::new();
-        b.super_djeans(RobotUnitType::Chassis, RobotUnitKind::CHASSIS_TRACK, 0, false);
+        b.super_djeans(
+            RobotUnitType::Chassis,
+            RobotUnitKind::CHASSIS_TRACK,
+            0,
+            false,
+        );
         b.super_djeans(RobotUnitType::Armor, RobotUnitKind::ARMOR_PLASMIC, 0, false);
         b.super_djeans(
             RobotUnitType::Weapon,
@@ -2310,9 +2315,17 @@ mod robot_config_tests {
             0,
             false,
         );
-        assert_eq!(b.live_weapons[0].unit.kind, RobotUnitKind::WEAPON_MACHINEGUN);
+        assert_eq!(
+            b.live_weapons[0].unit.kind,
+            RobotUnitKind::WEAPON_MACHINEGUN
+        );
         // Replace the occupied pylon (CConstructor.cpp:490-492).
-        b.super_djeans(RobotUnitType::Weapon, RobotUnitKind::WEAPON_CANNON, 0, false);
+        b.super_djeans(
+            RobotUnitType::Weapon,
+            RobotUnitKind::WEAPON_CANNON,
+            0,
+            false,
+        );
         assert_eq!(b.live_weapons[0].unit.kind, RobotUnitKind::WEAPON_CANNON);
         // Clear it via kind 0.
         b.super_djeans(RobotUnitType::Weapon, RobotUnitKind::UNKNOWN, 0, false);
@@ -2332,7 +2345,12 @@ mod robot_config_tests {
             fake_weapon_matrix(2, 1),
         );
         let mut b = RobotBuilder::new();
-        b.super_djeans(RobotUnitType::Chassis, RobotUnitKind::CHASSIS_TRACK, 0, false);
+        b.super_djeans(
+            RobotUnitType::Chassis,
+            RobotUnitKind::CHASSIS_TRACK,
+            0,
+            false,
+        );
         b.super_djeans(RobotUnitType::Armor, RobotUnitKind::ARMOR_PLASMIC, 0, false);
 
         // Chassis 3 → 4; 5 wraps to 1.

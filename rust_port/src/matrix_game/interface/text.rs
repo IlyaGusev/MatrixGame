@@ -159,8 +159,7 @@ impl AftFont {
             // offset to centre).
             let layer1 = decode_layer(bytes, o, 0x10, 0x14, 0x18, 0x20, 0x24, false)?;
             let layer2 = decode_layer(bytes, o, 0x28, 0x2C, 0x30, 0x38, 0x3C, true)?;
-            let (width, height, bearing_x, bearing_y, pixels) =
-                composite_layers(layer1, layer2);
+            let (width, height, bearing_x, bearing_y, pixels) = composite_layers(layer1, layer2);
             glyphs.insert(
                 code,
                 AftGlyph {
@@ -173,7 +172,11 @@ impl AftFont {
                 },
             );
         }
-        Ok(Self { line_height, ascent, glyphs })
+        Ok(Self {
+            line_height,
+            ascent,
+            glyphs,
+        })
     }
 
     fn glyph(&self, codepoint: u32) -> Option<&AftGlyph> {
@@ -250,10 +253,7 @@ fn decode_layer(
 /// bmp1's solid pixels override bmp2's halo at the strokes that bmp2
 /// only hints at. Returns a degenerate (0×0) glyph when both layers
 /// are absent (used for whitespace).
-fn composite_layers(
-    layer1: Option<Layer>,
-    layer2: Option<Layer>,
-) -> (u32, u32, i32, i32, Vec<u8>) {
+fn composite_layers(layer1: Option<Layer>, layer2: Option<Layer>) -> (u32, u32, i32, i32, Vec<u8>) {
     match (layer1, layer2) {
         (None, None) => (0, 0, 0, 0, Vec::new()),
         (Some(l), None) | (None, Some(l)) => {
@@ -263,8 +263,7 @@ fn composite_layers(
             let left = l1.bearing_x.min(l2.bearing_x);
             let top = l1.bearing_y.min(l2.bearing_y);
             let right = (l1.bearing_x + l1.width as i32).max(l2.bearing_x + l2.width as i32);
-            let bottom =
-                (l1.bearing_y + l1.height as i32).max(l2.bearing_y + l2.height as i32);
+            let bottom = (l1.bearing_y + l1.height as i32).max(l2.bearing_y + l2.height as i32);
             let w = (right - left) as u32;
             let h = (bottom - top) as u32;
             let mut out = vec![0u8; (w * h) as usize];
@@ -453,10 +452,7 @@ impl GlyphAtlas {
     /// Native pixel line height for the named font. Used by the
     /// wrap / multi-line layout to step between lines.
     pub fn line_height(&self, font: &str) -> u32 {
-        self.fonts
-            .get(font)
-            .map(|f| f.line_height)
-            .unwrap_or(12)
+        self.fonts.get(font).map(|f| f.line_height).unwrap_or(12)
     }
 
     /// Native ascent (top-of-cell to baseline) for the named font.
@@ -469,10 +465,7 @@ impl GlyphAtlas {
 
     /// Pixel advance of `text` rendered with `font`.
     pub fn measure(&self, font: &str, text: &str) -> u32 {
-        self.fonts
-            .get(font)
-            .map(|f| f.measure(text))
-            .unwrap_or(0)
+        self.fonts.get(font).map(|f| f.measure(text)).unwrap_or(0)
     }
 
     /// Look up (and lazily atlas-pack) the glyph for `codepoint` in
@@ -579,7 +572,10 @@ pub fn parse_rich_text(text: &str) -> Vec<RichRun> {
             let rest = &text[i..];
             if let Some((color, consumed)) = try_parse_open_color(rest) {
                 if !buf.is_empty() {
-                    runs.push(RichRun { text: std::mem::take(&mut buf), color: current });
+                    runs.push(RichRun {
+                        text: std::mem::take(&mut buf),
+                        color: current,
+                    });
                 }
                 current = Some(color);
                 i += consumed;
@@ -587,7 +583,10 @@ pub fn parse_rich_text(text: &str) -> Vec<RichRun> {
             }
             if let Some(consumed) = try_parse_close_color(rest) {
                 if !buf.is_empty() {
-                    runs.push(RichRun { text: std::mem::take(&mut buf), color: current });
+                    runs.push(RichRun {
+                        text: std::mem::take(&mut buf),
+                        color: current,
+                    });
                 }
                 current = None;
                 i += consumed;
@@ -602,7 +601,10 @@ pub fn parse_rich_text(text: &str) -> Vec<RichRun> {
         i = ch_end;
     }
     if !buf.is_empty() {
-        runs.push(RichRun { text: buf, color: current });
+        runs.push(RichRun {
+            text: buf,
+            color: current,
+        });
     }
     runs
 }
@@ -699,7 +701,11 @@ mod tests {
             .iter()
             .enumerate()
             .any(|(i, &v)| v == 0 && i > 0 && i < g.pixels.len() - 1);
-        assert!(any_gap, "colon must have a transparent gap row: {:?}", g.pixels);
+        assert!(
+            any_gap,
+            "colon must have a transparent gap row: {:?}",
+            g.pixels
+        );
     }
 
     #[test]
@@ -707,8 +713,7 @@ mod tests {
         // When a SMOOTH font ships both bitmaps, the parser must pick
         // bmp2 (the full antialiased glyph) — bmp1 is a smaller
         // sparse mask that doesn't render anything legible on its own.
-        let bytes =
-            include_bytes!("../../../assets/fonts/VERDANA_10_2_SMOOTH.AFT");
+        let bytes = include_bytes!("../../../assets/fonts/VERDANA_10_2_SMOOTH.AFT");
         let f = AftFont::parse(bytes).unwrap();
         // For 'O', bmp1 width is 8 vs bmp2 width 10 in this font;
         // assert we picked the wider (bmp2) bitmap.
@@ -720,8 +725,7 @@ mod tests {
     fn smooth_decoder_produces_gray() {
         // The decoder still handles the SMOOTH format even though the
         // font map currently points at the plain variants.
-        let bytes =
-            include_bytes!("../../../assets/fonts/VERDANA_10_2_SMOOTH.AFT");
+        let bytes = include_bytes!("../../../assets/fonts/VERDANA_10_2_SMOOTH.AFT");
         let f = AftFont::parse(bytes).unwrap();
         let g = f.glyph(b'O' as u32).unwrap();
         let has_gray = g.pixels.iter().any(|&p| p > 0 && p < 255);
@@ -732,7 +736,10 @@ mod tests {
     fn rich_text_no_tags() {
         assert_eq!(
             parse_rich_text("hello"),
-            vec![RichRun { text: "hello".to_string(), color: None }]
+            vec![RichRun {
+                text: "hello".to_string(),
+                color: None
+            }]
         );
     }
 

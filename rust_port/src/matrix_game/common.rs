@@ -46,6 +46,9 @@ pub const TRACE_ANYOBJECT: u32 =
 pub const TRACE_OBJECTSPHERE: u32 = 1 << 10;
 pub const TRACE_SKIP_INVISIBLE: u32 = 1 << 11;
 pub const TRACE_NONOBJECT: u32 = TRACE_LANDSCAPE | TRACE_WATER;
+/// `TRACE_ALL` (MatrixMap.hpp:41) — everything except the
+/// sphere-approximation flag.
+pub const TRACE_ALL: u32 = !TRACE_OBJECTSPHERE;
 
 // ── EObjectTypeProperty (Common.hpp:176-191) ─────────────────────────────
 //

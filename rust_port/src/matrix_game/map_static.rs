@@ -180,6 +180,17 @@ pub trait MapStatic {
     fn takt(&mut self, cms: i32, rng: &mut Rnd, objs: &mut Objects);
     fn logic_takt(&mut self, cms: i32, rng: &mut Rnd, objs: &mut Objects);
 
+    /// `ShowHitpoint()` — arm the floating HP bar over the object for
+    /// `HITPOINT_SHOW_TIME` (1000 ms). Called every frame for the
+    /// object under the mouse cursor (MatrixMap.cpp:1150-1178).
+    fn show_hitpoint(&mut self) {}
+
+    /// Floating HP-bar placement — the `m_PB.Modify` blocks of the
+    /// per-type `BeforeDraw`. `None` while the bar is hidden.
+    fn hitpoint_bar(&self, _map: &crate::matrix_game::map::GameMap) -> Option<HpBar> {
+        None
+    }
+
     // Default-noop virtuals so subclasses can opt in as they're ported.
     fn before_draw(&mut self) {}
     fn free_dynamic_resources(&mut self) {}
@@ -203,6 +214,14 @@ pub trait MapStatic {
     /// `dir` must be normalized for the returned `t` to be a distance.
     fn pick(&self, origin: Vec3, dir: Vec3) -> Option<f32> {
         ray_sphere_pick(self.core().geo_center, self.core().radius, origin, dir)
+    }
+
+    /// Port of the `IsLive*` state checks `FitToMask` makes
+    /// (MatrixMap.hpp:75-77): robots in `ROBOT_DIP`, cannons in
+    /// `CANNON_DIP` and buildings in `BUILDING_DIP*` stop matching
+    /// trace/search masks. Default: alive.
+    fn is_live(&self) -> bool {
+        true
     }
 
     /// Port of `virtual bool Damage(EWeapon, pos, dir, attacker_side,
@@ -274,6 +293,11 @@ pub fn fit_to_mask(obj: &dyn MapStatic, mask: u32) -> bool {
     // `TRACE_SKIP_INVISIBLE`: objects opting out of trace visibility
     // (MatrixMapStatic.hpp:51, set by OTP_INVLOGIC="1") are filtered.
     if mask & TRACE_SKIP_INVISIBLE != 0 && obj.object_state() & OBJECT_STATE_TRACE_INVISIBLE != 0 {
+        return false;
+    }
+    // `IsLiveRobot()` / `IsLiveCannon()` / `IsLiveBuilding()` — dead
+    // (DIP) objects stop matching (MatrixMap.hpp:75-77).
+    if !obj.is_live() {
         return false;
     }
     match obj.core().obj_type {
@@ -375,6 +399,72 @@ pub struct Objects {
     /// (MatrixConfig.cpp:507-535). Same shape as `object_damages` plus
     /// a per-EBuildingType max-HP vector.
     pub building_damages: BuildingDamages,
+
+    /// Slab of live `CMatrixEffectWeapon`s (see effects/weapon.rs).
+    /// Lives here so damage / projectile / robot-takt paths can reach
+    /// it through their `&mut Objects`.
+    pub weapons: crate::matrix_game::effects::weapon::Weapons,
+    /// Gameplay effects spawned mid-takt; `MapLogic` drains this into
+    /// its effect list each frame (effects/mod.rs `effects_takt`).
+    pub pending_effects: Vec<crate::matrix_game::effects::GameEffect>,
+    /// Per-side kill counters — port of the `IncStatValue(STAT_*)`
+    /// calls in the Damage paths (`CMatrixSideUnit::m_Statistic`).
+    /// Indexed by side id (0..=8).
+    pub side_stats: [SideStats; 9],
+    /// Landscape-spot spawn queue (`CreateLandscapeSpot` calls) —
+    /// drained by the render side which owns the spot list + geometry.
+    pub pending_spots: Vec<crate::matrix_game::effects::landscape_spot::SpotSpawn>,
+    /// Deferred explosion spawns — `CreateExplosion` calls from damage
+    /// paths (which carry no RNG/map); built in `effects_takt`.
+    pub pending_explosions: Vec<ExplosionSpawn>,
+    /// Size of the debris mesh catalog (set by the renderer at init;
+    /// 0 = no mesh debris, e.g. in tests).
+    pub debris_catalog_len: usize,
+    /// `deb_type` of each catalog entry (first comma-field of the
+    /// `Models/Debris` par name) — explosions pick debris meshes only
+    /// from entries matching their preset's `deb_type`
+    /// (MatrixEffectExplosion.cpp:323-331).
+    pub debris_types: Vec<i32>,
+    /// `HitTo` notices for robots whose box is checked out when their
+    /// own hitscan weapon lands (the C++ calls the fire-end handler
+    /// synchronously; here the robot drains its entries right after
+    /// `weapons_logic_takt`). `(shooter, victim (side, type), hit pos)`.
+    pub pending_hit_notices: Vec<(ObjectId, Option<(i32, ObjectType)>, glam::Vec3)>,
+    /// Self-despawn queue — an object can't `remove()` itself while
+    /// its box is checked out by a takt driver, so DIP wrecks queue
+    /// here and `flush_removals` (run by the takt drivers after each
+    /// walk) finishes the job. Stands in for the C++
+    /// `g_MatrixMap->StaticDelete(this)` calls from DIPTakt.
+    pending_removals: Vec<ObjectId>,
+}
+
+/// One floating HP bar (`CMatrixProgressBar` placement). `anchor` is
+/// projected to the screen; the bar's top-left lands at
+/// `(screen.x + x_off, screen.y + y_off)`.
+#[derive(Debug, Clone, Copy)]
+pub struct HpBar {
+    pub anchor: glam::Vec3,
+    pub width: f32,
+    /// 0..1 HP fraction (`m_HitPoint * m_MaxHitPointInversed`).
+    pub fill: f32,
+    pub x_off: f32,
+    pub y_off: f32,
+}
+
+/// A queued `CreateExplosion(pos, props, fire)` call.
+pub struct ExplosionSpawn {
+    pub pos: glam::Vec3,
+    pub props: &'static crate::matrix_game::effects::explosion::ExplosionProps,
+    pub fire: bool,
+}
+
+/// The kill-stat subset of `CMatrixSideUnit`'s statistics
+/// (MatrixSide.hpp `EStat`).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SideStats {
+    pub robot_kill: i32,
+    pub turret_kill: i32,
+    pub building_kill: i32,
 }
 
 impl Default for Objects {
@@ -394,6 +484,36 @@ impl Objects {
             arcaded_object: None,
             object_damages: ObjectDamages::default(),
             building_damages: BuildingDamages::default(),
+            weapons: Default::default(),
+            pending_effects: Vec::new(),
+            side_stats: [SideStats::default(); 9],
+            pending_spots: Vec::new(),
+            pending_explosions: Vec::new(),
+            debris_catalog_len: 0,
+            debris_types: Vec::new(),
+            pending_hit_notices: Vec::new(),
+            pending_removals: Vec::new(),
+        }
+    }
+
+    /// Queue a despawn that takes effect after the current takt walk.
+    pub fn remove_deferred(&mut self, id: ObjectId) {
+        self.pending_removals.push(id);
+    }
+
+    /// Apply queued despawns. Called by the takt drivers once all
+    /// boxes are back in their slots.
+    pub fn flush_removals(&mut self) {
+        while let Some(id) = self.pending_removals.pop() {
+            self.remove(id);
+        }
+    }
+
+    /// Bump a side's kill stats — port of
+    /// `g_MatrixMap->GetSideById(side)->IncStatValue(stat)`.
+    pub fn inc_side_stat(&mut self, side: i32, f: impl FnOnce(&mut SideStats)) {
+        if let Some(s) = self.side_stats.get_mut(side as usize) {
+            f(s);
         }
     }
 
@@ -462,6 +582,13 @@ impl Objects {
             .get(id.index as usize)
             .map(|s| s.generation == id.generation)
             .unwrap_or(false)
+    }
+
+    /// True when the slot is alive but its box is temporarily checked
+    /// out by a takt driver (take-the-box pattern) — i.e. the object
+    /// exists but is unreachable through `get`/`get_mut` right now.
+    pub fn is_checked_out(&self, id: ObjectId) -> bool {
+        self.gen_matches(id) && !self.is_valid(id)
     }
 
     pub fn len(&self) -> usize {
@@ -594,6 +721,7 @@ impl Objects {
             cursor = self.next_logic_object;
         }
         self.next_logic_object = None;
+        self.flush_removals();
     }
 
     /// Used by tests + future sides code. Iterates the logic-temp list
@@ -675,6 +803,53 @@ impl Objects {
             }
             hit = true;
             if visit(center, id) == Control::Break {
+                return hit;
+            }
+        }
+        hit
+    }
+
+    /// 3D-distance variant of [`find_objects`] — ports the
+    /// `FindObjects(const D3DXVECTOR3 &pos, ...)` overload
+    /// (MatrixMap.cpp:2814+). The weapon paths (missile seek, blast
+    /// radii, flame proximity, repair seek) all use this one: an
+    /// object only counts as in-range when
+    /// `|geo_center - pos| - radius*oscale < radius` in full 3D.
+    ///
+    /// The callback's first argument is the SEARCH center (matching
+    /// the C++ `callback(pos, ms, user)`), unlike `find_objects` which
+    /// historically passes the object center.
+    pub fn find_objects_3d(
+        &self,
+        pos: Vec3,
+        radius: f32,
+        oscale: f32,
+        mask: u32,
+        skip: Option<ObjectId>,
+        mut visit: impl FnMut(Vec3, ObjectId) -> Control,
+    ) -> bool {
+        let mut hit = false;
+        for (i, slot) in self.slots.iter().enumerate() {
+            let obj = match slot.obj.as_deref() {
+                Some(o) => o,
+                None => continue,
+            };
+            let id = ObjectId {
+                index: i as u32,
+                generation: slot.generation,
+            };
+            if Some(id) == skip {
+                continue;
+            }
+            if !fit_to_mask(obj, mask) {
+                continue;
+            }
+            let dist = (obj.core().geo_center - pos).length() - obj.core().radius * oscale;
+            if dist >= radius {
+                continue;
+            }
+            hit = true;
+            if visit(pos, id) == Control::Break {
                 return hit;
             }
         }

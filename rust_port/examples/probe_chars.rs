@@ -16,7 +16,10 @@ fn main() {
     for (i, c) in turrets.cannons.iter().enumerate() {
         println!(
             "Turret {} -> hitpoint={} strength={} res={:?}",
-            i + 1, c.hitpoint, c.strength, c.resources
+            i + 1,
+            c.hitpoint,
+            c.strength,
+            c.resources
         );
     }
 

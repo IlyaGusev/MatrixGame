@@ -421,8 +421,7 @@ pub fn marquee_select(
 
     // MatrixMultiSelection.cpp:211 — a tiny drag (rect area < 9 px²)
     // collapses to a single robot: break on the first in-rect hit.
-    let only_one =
-        (rect_max[0] - rect_min[0]).abs() * (rect_max[1] - rect_min[1]).abs() < 9.0;
+    let only_one = (rect_max[0] - rect_min[0]).abs() * (rect_max[1] - rect_min[1]).abs() < 9.0;
     // MatrixMultiSelection.cpp:257 — the marquee itself adds at most 9
     // objects (`m_SelItems.Len()/sizeof(DWORD) < 9`).
     let mut added = 0usize;
@@ -446,11 +445,7 @@ pub fn marquee_select(
         let ndc_y = clip.y / clip.w;
         let sx = (ndc_x * 0.5 + 0.5) * screen_w;
         let sy = (1.0 - (ndc_y * 0.5 + 0.5)) * screen_h;
-        if sx >= rect_min[0]
-            && sx <= rect_max[0]
-            && sy >= rect_min[1]
-            && sy <= rect_max[1]
-        {
+        if sx >= rect_min[0] && sx <= rect_max[0] && sy >= rect_min[1] && sy <= rect_max[1] {
             if added < 9 && !hits.contains(&id) {
                 hits.push(id);
                 added += 1;

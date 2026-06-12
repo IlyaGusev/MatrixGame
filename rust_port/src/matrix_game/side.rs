@@ -16,8 +16,8 @@
 //! Resources / stats / kill counters / logical groups etc. land when
 //! their call sites need them.
 
-use crate::matrix_game::map_static::ObjectId;
 use crate::matrix_game::config::{Resource, MAX_RESOURCES};
+use crate::matrix_game::map_static::ObjectId;
 
 /// Port of the hard-coded 9000 cap inside `CMatrixSideUnit::AddResourceAmount`
 /// (MatrixSide.hpp:438-443). Every `AddResourceAmount` call clamps the

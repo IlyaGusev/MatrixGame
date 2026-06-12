@@ -147,10 +147,25 @@ impl TurretBuild {
     }
 }
 
+/// An armed order from the robot-orders panel awaiting its world
+/// click — the `ORDERING_MODE` + `PREORDER_*` flag pair
+/// (Interface/CInterface.h:49-57). Clicking the map executes it;
+/// `ocan` / right-click clears it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreOrder {
+    /// `PREORDER_FIRE` — attack the clicked object, or the bare
+    /// ground when nothing is under the cursor (MatrixSide.cpp:702-713).
+    Fire,
+    /// `PREORDER_MOVE`.
+    Move,
+}
+
 pub struct IFaceList {
     /// In front-to-back order — the FIRST panel receives events first
     /// (matches `LIST_ADD` prepend behaviour in the original).
     pub panels: Vec<CInterface>,
+    /// Robot-order awaiting a map click (`ofi` / `ogo` buttons).
+    pub pre_order: Option<PreOrder>,
     /// `(panel_idx, element_idx)` for the currently-focused element,
     /// mirrors `CIFaceList::m_FocusedInterface` + `m_FocusedElement`.
     pub focused: Option<(usize, usize)>,
@@ -237,6 +252,7 @@ impl IFaceList {
     pub fn new() -> Self {
         Self {
             panels: Vec::new(),
+            pre_order: None,
             focused: None,
             pressed: None,
             right_pressed: None,

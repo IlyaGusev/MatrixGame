@@ -11,6 +11,7 @@ pub mod ai_group;
 
 use crate::matrix_game::camera::Camera;
 use crate::matrix_game::common::{PLAYER_SIDE, TRACE_ANYOBJECT};
+use crate::matrix_game::config::Resource;
 use crate::matrix_game::config::{
     self, BuildingDamages, BuildingLabels, ChassisChars, GlobalConfig, HeadCharsTable,
     ItemCharsTable, ItemDescriptions, ItemLabels, ObjectDamages, PriceTable, RobotDamages,
@@ -20,7 +21,6 @@ use crate::matrix_game::map::GameMap;
 use crate::matrix_game::map_static::{MapStatic, ObjectId, ObjectType, Objects};
 use crate::matrix_game::object::MapObject;
 use crate::matrix_game::object_building::{Building, BuildingType};
-use crate::matrix_game::config::Resource;
 use crate::matrix_game::side::{CurrSel, Side};
 use crate::matrix_lib::base::storage::Storage;
 
@@ -61,6 +61,9 @@ pub const COLLIDE_BOT_R: f32 = 18.0;
 /// the logic state mutates every tick.
 pub struct MapLogic {
     pub objects: Objects,
+    /// Live gameplay effects (projectiles, blasts, flame streams) —
+    /// the `CMatrixEffect` list on `CMatrixMap`, gameplay subset.
+    pub effects: Vec<crate::matrix_game::effects::GameEffect>,
     /// The shared RNG — matches `CMatrixMapLogic::m_Rnd`
     /// (MatrixLogic.hpp:75).
     pub rng: Rnd,
@@ -89,6 +92,7 @@ impl MapLogic {
     pub fn with_seed(seed: i32) -> Self {
         Self {
             objects: Objects::new(),
+            effects: Vec::new(),
             rng: Rnd::new(seed),
             tick: 0,
             elapsed_ms: 0,
@@ -112,6 +116,21 @@ impl MapLogic {
         let rem = step_ms - full * LOGIC_TAKT_PERIOD_MS;
         if rem > 0 {
             self.objects.proceed_logic(rem, &mut self.rng);
+        }
+        // Notices addressed to robots that died before draining them.
+        self.objects.pending_hit_notices.clear();
+        // Gameplay effects tick on the frame clock — the effect-list
+        // walk in `CMatrixMap::Takt`. Needs the scoped map for traces;
+        // outside a `MapScope` (unit tests of unrelated systems) the
+        // projectiles simply hold still.
+        if let Some(map) = crate::matrix_game::map::current_map() {
+            crate::matrix_game::effects::effects_takt(
+                &mut self.effects,
+                step_ms as f32,
+                map,
+                &mut self.objects,
+                &mut self.rng,
+            );
         }
         // Port of the per-building `m_ResourcePeriod` tick at
         // MatrixObjectBuilding.cpp:605-667. The C++ advances the
@@ -146,10 +165,16 @@ impl MapLogic {
         let timings = Timings::from_matrix_data(matrix_data).unwrap_or_default();
         let turrets = TurretProps::from_matrix_data(matrix_data).unwrap_or_default();
         let robot_damages = RobotDamages::from_matrix_data(matrix_data).unwrap_or_default();
+        let cannon_damages =
+            config::CannonDamages::from_matrix_data(matrix_data).unwrap_or_default();
+        let flyer_damages = config::FlyerDamages::from_matrix_data(matrix_data).unwrap_or_default();
+        let weapon_radius = config::WeaponRadius::from_matrix_data(matrix_data).unwrap_or_default();
         let weapon_cooldown = WeaponCooldown::from_matrix_data(matrix_data).unwrap_or_default();
         let weapon_strength_ai =
             WeaponStrengthAI::from_matrix_data(matrix_data).unwrap_or_default();
+        let overheat = config::Overheat::from_matrix_data(matrix_data).unwrap_or_default();
         let head_chars = HeadCharsTable::from_matrix_data(matrix_data).unwrap_or_default();
+        let difficulty = config::Difficulty::from_matrix_data(matrix_data);
         log::info!(
             "config: loaded prices+chars+timings (unit_robot_ms={}, base_hp={})",
             timings.unit_robot,
@@ -162,9 +187,14 @@ impl MapLogic {
             timings,
             turrets,
             robot_damages,
+            cannon_damages,
+            flyer_damages,
+            weapon_radius,
             weapon_cooldown,
             weapon_strength_ai,
+            overheat,
             head_chars,
+            difficulty,
         });
         // String-heavy tables — labels, descriptions, robot-name parts.
         let labels = ItemLabels::from_matrix_data(matrix_data).unwrap_or_default();
@@ -305,6 +335,13 @@ impl MapLogic {
                 c.parent_slot,
             );
             let cid = self.objects.spawn(Box::new(cannon));
+            if let Some(obj) = self.objects.get_mut(cid) {
+                let c: &mut crate::matrix_game::object_cannon::Cannon = unsafe {
+                    &mut *(obj as *mut dyn MapStatic
+                        as *mut crate::matrix_game::object_cannon::Cannon)
+                };
+                c.self_id = Some(cid);
+            }
             self.objects.add_lt(cid);
             spawned_cannons += 1;
         }
@@ -448,6 +485,12 @@ impl MapLogic {
             }
 
             let id = self.objects.spawn(Box::new(robot));
+            if let Some(obj) = self.objects.get_mut(id) {
+                let r: &mut crate::matrix_game::robot::Robot = unsafe {
+                    &mut *(obj as *mut dyn MapStatic as *mut crate::matrix_game::robot::Robot)
+                };
+                r.self_id = Some(id);
+            }
             self.objects.add_lt(id);
             ids.push(id);
         }
@@ -662,6 +705,116 @@ impl MapLogic {
         out
     }
 
+    /// Right-click attack/repair order — the order-issuing slice of
+    /// `CMatrixSideUnit::OnRButtonDown` → `PGOrderAttack` /
+    /// `CMatrixRobotAI::Fire` (MatrixSide.cpp:5146/5195). When the
+    /// cursor ray hits an object, every selected robot gets a FIRE
+    /// order at it: enemies get weapon type 0; own damaged units get
+    /// the repair type 2 when the robot mounts a repairer. The group
+    /// attack-tactics (move into range, re-target) live in the side AI
+    /// and aren't ported yet — out-of-range robots simply hold fire.
+    ///
+    /// Returns the target when an order was issued.
+    pub fn order_fire_at_screen(
+        &mut self,
+        camera: &Camera,
+        sx: f32,
+        sy: f32,
+        screen_w: f32,
+        screen_h: f32,
+    ) -> Option<ObjectId> {
+        use crate::matrix_game::robot::Robot;
+
+        let (origin, dir) = camera.screen_to_world_ray(sx, sy, screen_w, screen_h);
+        let (hit, _t) = self
+            .objects
+            .pick_object(origin, dir, TRACE_ANYOBJECT, None)?;
+        let (tgt_side, tgt_pos, needs_repair) = {
+            let o = self.objects.get(hit)?;
+            (o.side(), o.core().geo_center, o.need_repair())
+        };
+        let player = self.player_side.id;
+        // Neutral scenery isn't an attack target via this path.
+        if tgt_side <= 0 {
+            return None;
+        }
+        let repair_own = tgt_side == player && needs_repair;
+        let attack = tgt_side != player;
+        if !attack && !repair_own {
+            return None;
+        }
+        let selected: Vec<ObjectId> = self.player_side.selected.clone();
+        let mut issued = false;
+        for id in selected {
+            let Some(obj) = self.objects.get_mut(id) else {
+                continue;
+            };
+            if !matches!(obj.core().obj_type, ObjectType::RobotAi) {
+                continue;
+            }
+            let r: &mut Robot = unsafe { &mut *(obj as *mut dyn MapStatic as *mut Robot) };
+            if r.side != player {
+                continue;
+            }
+            r.fire(tgt_pos, if attack { 0 } else { 2 });
+            issued = true;
+        }
+        issued.then_some(hit)
+    }
+
+    /// Explicit attack order at a world position — the
+    /// `PGOrderAttack(group, point, NULL)` half of the PREORDER_FIRE
+    /// click (MatrixSide.cpp:712): every selected robot opens fire at
+    /// the point, object there or not.
+    pub fn order_fire_at_point(&mut self, pos: glam::Vec3) -> usize {
+        use crate::matrix_game::robot::Robot;
+        let player = self.player_side.id;
+        let selected: Vec<ObjectId> = self.player_side.selected.clone();
+        let mut issued = 0;
+        for id in selected {
+            let Some(obj) = self.objects.get_mut(id) else {
+                continue;
+            };
+            if !matches!(obj.core().obj_type, ObjectType::RobotAi) {
+                continue;
+            }
+            let r: &mut Robot = unsafe { &mut *(obj as *mut dyn MapStatic as *mut Robot) };
+            if r.side != player {
+                continue;
+            }
+            r.fire(pos, 0);
+            issued += 1;
+        }
+        issued
+    }
+
+    /// `PGOrderStop` for the selection (MatrixSide.cpp via IF_ORDER_STOP,
+    /// CInterface.cpp:3472): break off fire + movement.
+    pub fn order_stop(&mut self) {
+        use crate::matrix_game::robot::{OrderType, Robot};
+        let player = self.player_side.id;
+        let selected: Vec<ObjectId> = self.player_side.selected.clone();
+        for id in selected {
+            let Some(obj) = self.objects.get_mut(id) else {
+                continue;
+            };
+            if !matches!(obj.core().obj_type, ObjectType::RobotAi) {
+                continue;
+            }
+            let r: &mut Robot = unsafe { &mut *(obj as *mut dyn MapStatic as *mut Robot) };
+            if r.side != player {
+                continue;
+            }
+            // Convert FIRE → STOP_FIRE (processed next takt) and drop
+            // movement orders; the robot decelerates to a stand.
+            r.stop_fire();
+            r.orders.remove_type(OrderType::MoveTo);
+            r.orders.remove_type(OrderType::MoveToBack);
+            r.velocity = glam::Vec2::ZERO;
+            r.speed = 0.0;
+        }
+    }
+
     /// Return the active-selection id if it's still a live object.
     pub fn active_object(&self) -> Option<ObjectId> {
         let id = self.player_side.active_object?;
@@ -731,11 +884,12 @@ impl MapLogic {
                 continue;
             }
             // SAFETY: ObjectType::Building slots only hold `Building`.
-            let b: &Building =
-                unsafe { &*(obj as *const dyn MapStatic as *const Building) };
-            if matches!(b.state, crate::matrix_game::object_building::BaseState::Dip
-                | crate::matrix_game::object_building::BaseState::DipExploded)
-            {
+            let b: &Building = unsafe { &*(obj as *const dyn MapStatic as *const Building) };
+            if matches!(
+                b.state,
+                crate::matrix_game::object_building::BaseState::Dip
+                    | crate::matrix_game::object_building::BaseState::DipExploded
+            ) {
                 continue;
             }
             if b.kind == BuildingType::Base {
@@ -775,11 +929,12 @@ impl MapLogic {
             if obj.side() != side_id {
                 continue;
             }
-            let b: &Building =
-                unsafe { &*(obj as *const dyn MapStatic as *const Building) };
-            if matches!(b.state, crate::matrix_game::object_building::BaseState::Dip
-                | crate::matrix_game::object_building::BaseState::DipExploded)
-            {
+            let b: &Building = unsafe { &*(obj as *const dyn MapStatic as *const Building) };
+            if matches!(
+                b.state,
+                crate::matrix_game::object_building::BaseState::Dip
+                    | crate::matrix_game::object_building::BaseState::DipExploded
+            ) {
                 continue;
             }
             if b.kind == BuildingType::Base {
@@ -832,11 +987,12 @@ impl MapLogic {
                 continue;
             };
             // SAFETY: filtered to ObjectType::Building above.
-            let b: &mut Building =
-                unsafe { &mut *(obj as *mut dyn MapStatic as *mut Building) };
-            if matches!(b.state, crate::matrix_game::object_building::BaseState::Dip
-                | crate::matrix_game::object_building::BaseState::DipExploded)
-            {
+            let b: &mut Building = unsafe { &mut *(obj as *mut dyn MapStatic as *mut Building) };
+            if matches!(
+                b.state,
+                crate::matrix_game::object_building::BaseState::Dip
+                    | crate::matrix_game::object_building::BaseState::DipExploded
+            ) {
                 continue;
             }
             if b.side == 0 {
@@ -846,9 +1002,10 @@ impl MapLogic {
 
             // Per-kind threshold lookup.
             let (threshold, payout): (i32, Payout) = match b.kind {
-                BuildingType::Titan => {
-                    (timings.resource_titan, Payout::Single(Resource::Titan, RESOURCES_INCOME))
-                }
+                BuildingType::Titan => (
+                    timings.resource_titan,
+                    Payout::Single(Resource::Titan, RESOURCES_INCOME),
+                ),
                 BuildingType::Electronic => (
                     timings.resource_electronics,
                     Payout::Single(Resource::Electronics, RESOURCES_INCOME),
@@ -857,9 +1014,10 @@ impl MapLogic {
                     timings.resource_energy,
                     Payout::Single(Resource::Energy, RESOURCES_INCOME),
                 ),
-                BuildingType::Plasma => {
-                    (timings.resource_plasma, Payout::Single(Resource::Plasma, RESOURCES_INCOME))
-                }
+                BuildingType::Plasma => (
+                    timings.resource_plasma,
+                    Payout::Single(Resource::Plasma, RESOURCES_INCOME),
+                ),
                 BuildingType::Base => {
                     let ra = RESOURCES_INCOME_BASE * fu / 100;
                     (timings.resource_base, Payout::All(ra))
@@ -1467,13 +1625,7 @@ mod tests {
     use crate::matrix_game::map::BuildingInstance;
     use crate::matrix_game::object_building::{Building, BuildingType};
 
-    fn spawn_building(
-        w: &mut MapLogic,
-        side: i32,
-        kind: BuildingType,
-        x: f32,
-        y: f32,
-    ) -> ObjectId {
+    fn spawn_building(w: &mut MapLogic, side: i32, kind: BuildingType, x: f32, y: f32) -> ObjectId {
         let inst = BuildingInstance {
             x,
             y,
@@ -1569,7 +1721,10 @@ mod tests {
 
         // Under threshold: nothing credited.
         w.accrue_resources(5_000);
-        assert_eq!(w.player_side.resources, [0; crate::matrix_game::config::MAX_RESOURCES]);
+        assert_eq!(
+            w.player_side.resources,
+            [0; crate::matrix_game::config::MAX_RESOURCES]
+        );
 
         // Past titan threshold only (10_000 < 15_000): +10 titan,
         // 0 elsewhere.
@@ -1588,14 +1743,12 @@ mod tests {
         );
         for r in [Resource::Electronics, Resource::Energy, Resource::Plasma] {
             assert_eq!(
-                w.player_side.resources[r as usize],
-                RESOURCES_INCOME_BASE,
+                w.player_side.resources[r as usize], RESOURCES_INCOME_BASE,
                 "base income missing for {r:?}"
             );
         }
     }
 }
-
 
 // ════════════════════════════════════════════════════════════════════════
 // Local A* pathfinding — ports `CMatrixMapLogic::FindLocalPath` and
@@ -1959,13 +2112,7 @@ pub fn optimize_path(
 /// the weight-40 `dest` stamps trip it. Like the C++ (whose Bresenham
 /// loop pre-increments past the first cell), the weight check skips
 /// the starting cell.
-fn line_of_sight(
-    map: &GameMap,
-    a: MovePt,
-    b: MovePt,
-    chassis_kind: usize,
-    weight: &[f32],
-) -> bool {
+fn line_of_sight(map: &GameMap, a: MovePt, b: MovePt, chassis_kind: usize, weight: &[f32]) -> bool {
     const BLOCK_WEIGHT: f32 = 8.0; // C++ 40 / 5
     let w = map.size_move_x;
     let dx = b.x - a.x;

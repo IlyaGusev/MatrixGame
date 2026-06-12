@@ -35,11 +35,13 @@ only the read-only field-parsing helpers are in `wstr.rs`.)
 
 | Rust file                               | Original                           |
 |-----------------------------------------|------------------------------------|
+| matrix_lib/three_g/billboard.rs         | MatrixLib/3G/src/CBillboard.cpp (queue + quad/line expansion; GPU flush in effects_renderer.rs) |
+| matrix_lib/three_g/math3d.rs            | MatrixLib/3G/src/Math3D.cpp (CTrajectory + VecToMatrixX/Y) |
 | matrix_lib/three_g/texture.rs           | MatrixLib/3G/src/Texture.cpp       |
 | matrix_lib/three_g/vector_object.rs     | MatrixLib/3G/src/VectorObject.cpp  |
 
 Not yet ported: 3g, BigIB, BigVB, Cache, CBillboard, DeviceState,
-Form, Helper, Math3D, ShadowProj, ShadowStencil.
+Form, Helper, ShadowProj, ShadowStencil. (Math3D partial — CTrajectory.)
 
 ## matrix_game/ (MatrixGame/src/)
 
@@ -47,7 +49,7 @@ Form, Helper, Math3D, ShadowProj, ShadowStencil.
 |-------------------------------|-----------------------------------|
 | matrix_game/camera.rs         | MatrixCamera.cpp                  |
 | matrix_game/common.rs         | Common.hpp                        |
-| matrix_game/config.rs         | MatrixConfig.cpp (damage tables only; gamma/keybind/sound deferred) |
+| matrix_game/config.rs         | MatrixConfig.cpp (damage/radius/cooldown/overheat tables, cannon props, difficulty; gamma/keybind/sound deferred) |
 | matrix_game/form_game.rs      | MatrixFormGame.cpp (+ MatrixGame.cpp entry glue) |
 | matrix_game/map.rs            | MatrixMap.cpp (map data + `MapRenderer` draw orchestration)|
 | matrix_game/map_group.rs      | MatrixMapGroup.cpp (BuildBottom + BuildWater — merged across groups by texture; see header) |
@@ -56,9 +58,10 @@ Form, Helper, Math3D, ShadowProj, ShadowStencil.
 | matrix_game/minimap.rs        | MatrixMinimap.cpp                 |
 | matrix_game/object.rs         | MatrixObject.cpp (OBJECT_TYPE_MAPOBJECT — decorative rendering + `MapObject` game-object side)|
 | matrix_game/object_building.rs| MatrixObjectBuilding.cpp          |
+| matrix_game/combat_tests.rs   | (test-only — weapon/damage behavior tests) |
 | matrix_game/object_robot.rs   | MatrixObjectRobot.cpp (chassis-only RNeed + per-frame instance sync) |
 | matrix_game/logic.rs          | MatrixLogic.cpp (CMatrixMapLogic: Takt driver, Place*/IsAbsenceWall helpers; also module root for Logic/ subsystems) |
-| matrix_game/map_trace.rs      | MatrixMapTrace.cpp (FindLocalPath A* + OptimizeMovePath line-of-sight cull) |
+| matrix_game/map_trace.rs      | MatrixMapTrace.cpp (CMatrixMap::Trace hitscan + FindLocalPath A* + OptimizeMovePath) |
 | matrix_game/orders.rs         | MatrixRobot.hpp SOrder/OrderType/OrderPhase + AllocPlaceForOrderOnTop pool |
 | matrix_game/particles.rs      | (stub — will split across Effects/) |
 | matrix_game/progress_bar.rs   | MatrixProgressBar.cpp (3-segment bar + LIC color, atlas-backed) |
@@ -67,7 +70,7 @@ Form, Helper, Math3D, ShadowProj, ShadowStencil.
 | matrix_game/side.rs           | MatrixSide.cpp (selection fields only — `m_ActiveObject`, `m_CurrSel`; resources/AI/stats deferred) |
 | matrix_game/sky.rs            | DrawSky in MatrixMap.cpp + skybox parts |
 | matrix_game/ter_surface.rs    | MatrixTerSurface.cpp              |
-| matrix_game/robot.rs          | MatrixRobot.cpp (CMatrixRobotAI AI state machine — spawn flow + move-out + MoveTo + GetLost) |
+| matrix_game/robot.rs          | MatrixRobot.cpp (CMatrixRobotAI — spawn flow + move-out + MoveTo + GetLost + SBotWeapon fire control / heat / Damage / ablaze-shorted DOT) |
 | matrix_game/water.rs          | MatrixWater.cpp + BuildWater in MatrixMapGroup.cpp + WaterAlpha_t3 in MatrixRenderPipeline.cpp — will split in Stage 2 part 2 |
 
 Not yet ported: MatrixConfig, MatrixCursor, MatrixDebugInfo,
@@ -83,12 +86,23 @@ MatrixVisiCalc, DevConsole, StringConstants.
 |-----------------------------------------|---------------------------------|
 | matrix_game/effects/point_light.rs      | MatrixEffectPointLight.cpp      |
 | matrix_game/effects/selection.rs        | MatrixEffectSelection.cpp (animated dot billboards; CBillboard draw-queue + BBT_SELDOT texture deferred — own pipeline + radial-alpha shader stand in) |
-| matrix_game/effects/weapon.rs           | MatrixEffectWeapon.hpp (EWeapon enum constants only; effect class deferred) |
+| matrix_game/effects/big_boom.rs         | MatrixEffectBigBoom.cpp (blast sweep + geosphere shell) |
+| matrix_game/effects/billboard_fx.rs     | MatrixEffectBillboard.cpp (TTL'd billboard-line effects) |
+| matrix_game/effects/effects_renderer.rs | (no direct peer — wgpu flush for CBillboard::SortEndDraw + the BBT table of MatrixEffect.cpp InitEffects + CVectorObject draws for bullets/debris) |
+| matrix_game/effects/explosion.rs        | MatrixEffectExplosion.cpp (all presets, sparks/intense/fire/mesh debris + FireAnim) |
+| matrix_game/effects/fire_plasma.rs      | MatrixEffectFirePlasma.cpp (bolt movement + hit + sprites) |
+| matrix_game/effects/flame.rs            | MatrixEffectFlame.cpp (puffs: damage sweep + 10-billboard chains) |
+| matrix_game/effects/konus.rs            | MatrixEffectKonus.cpp (cone + splash variants) |
+| matrix_game/effects/landscape_spot.rs   | MatrixEffectLandscapeSpot.cpp (voronka / plasma-hit / constant decals) |
+| matrix_game/effects/lightening.rs       | MatrixEffectLightening.cpp (bolt + shorted arcs) |
+| matrix_game/effects/moving_object.rs    | MatrixEffectMovingObject.cpp (gun/cannon/missile/bomb takts + trails/tracers/meshes) |
+| matrix_game/effects/smoke_and_fire.rs   | MatrixEffectSmokeAndFire.cpp (smoke + fire puff emitters) |
+| matrix_game/effects/weapon.rs           | MatrixEffectWeapon.{cpp,hpp} (EWeapon + CMatrixEffectWeapon + WeaponHit + CLaser/CVolcano/repair-beam visuals) |
 
-Not yet ported: MatrixEffect (base), BigBoom, Billboard, Dust,
-ElevatorField, Explosion, FirePlasma, Flame, Konus, LandscapeSpot,
-Lightening, MoveTo, MovingObject, Path, Repair, Selection, Shleif,
-SmokeAndFire, Weapon, Zahvat.
+Not yet ported: MatrixEffect (base class itself — its list/limits are
+the GameEffect enum + effects_takt), Dust, ElevatorField, Path,
+Zahvat. (Shleif's AddSmoke/AddFire map to standalone Smoke/Fire
+spawns; the repair beam visuals live on the weapon.)
 
 ## matrix_game/interface/ (MatrixGame/src/Interface/)
 
@@ -153,3 +167,5 @@ not embedded as raw-string constants.
 | shaders/terrain_gloss.wgsl           | matrix_game/map.rs (MapRenderer) |
 | shaders/water.wgsl                   | matrix_game/water.rs             |
 | shaders/water_inshore.wgsl           | matrix_game/water.rs             |
+| shaders/billboard.wgsl               | matrix_game/effects/effects_renderer.rs |
+| shaders/effect_mesh.wgsl             | matrix_game/effects/effects_renderer.rs |

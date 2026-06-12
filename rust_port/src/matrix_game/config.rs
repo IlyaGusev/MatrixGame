@@ -10,7 +10,7 @@
 //! BlockPar accessors on [`Storage`]. Tests can construct the structs
 //! directly without touching the filesystem.
 
-use crate::matrix_game::effects::weapon::{weap_name_to_index, WEAPON_COUNT};
+use crate::matrix_game::effects::weapon::{weap_name_to_index, weapon_for_index, WEAPON_COUNT};
 use crate::matrix_lib::base::storage::Storage;
 use crate::matrix_lib::base::wstr;
 
@@ -364,15 +364,9 @@ impl PriceTable {
                 let slot = (num - 1) as usize;
                 let prefix_upper = prefix.to_ascii_uppercase();
                 match prefix_upper.as_str() {
-                    "HEAD" if slot < ROBOT_HEAD_CNT => {
-                        out.heads[slot].resources[res_idx] = v
-                    }
-                    "ARMOR" if slot < ROBOT_ARMOR_CNT => {
-                        out.armors[slot].resources[res_idx] = v
-                    }
-                    "WEAPON" if slot < ROBOT_WEAPON_CNT => {
-                        out.weapons[slot].resources[res_idx] = v
-                    }
+                    "HEAD" if slot < ROBOT_HEAD_CNT => out.heads[slot].resources[res_idx] = v,
+                    "ARMOR" if slot < ROBOT_ARMOR_CNT => out.armors[slot].resources[res_idx] = v,
+                    "WEAPON" if slot < ROBOT_WEAPON_CNT => out.weapons[slot].resources[res_idx] = v,
                     "CHASSIS" if slot < ROBOT_CHASSIS_CNT => {
                         out.chassis[slot].resources[res_idx] = v
                     }
@@ -575,6 +569,17 @@ pub struct CannonProps {
     pub resources: [i32; MAX_RESOURCES],
     pub strength: f32,
     pub hitpoint: f32,
+    /// `max_top_angle` / `max_bottom_angle` — barrel elevation clamps,
+    /// radians (loaded as degrees, MatrixConfig.cpp:1060-1061).
+    pub max_top_angle: f32,
+    pub max_bottom_angle: f32,
+    /// `weapon` — the `EWeapon` this turret fires (WEAPON_CANNON0..3).
+    pub weapon: crate::matrix_game::effects::weapon::Weapon,
+    /// `max_da` — per-takt rotation step in radians; 0 = smooth
+    /// exponential aiming (MatrixConfig.hpp:509).
+    pub max_da: f32,
+    /// `seek_radius` — target-acquisition radius.
+    pub seek_radius: f32,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -616,6 +621,13 @@ impl TurretProps {
             // TITAN=0, ELECTRONICS=1, ENERGY=2, PLASMA=3.
             // The data file uses `Plasm` (with no trailing `a`) —
             // preserve the typo to match the shipped assets.
+            let grad2rad = |deg: f32| deg * std::f32::consts::PI / 180.0;
+            // `WeapName2Weap` on the `Weapon` key (MatrixConfig.cpp:1064).
+            let weapon = stor
+                .block_param(&rec, "Weapon")
+                .and_then(|s| weap_name_to_index(s.trim()))
+                .map(weapon_for_index)
+                .unwrap_or(crate::matrix_game::effects::weapon::WEAPON_NONE);
             out.cannons[i] = CannonProps {
                 resources: [
                     read_i("Titan"),
@@ -625,6 +637,11 @@ impl TurretProps {
                 ],
                 strength: read_f("Strength"),
                 hitpoint: read_f("Hitpoint"),
+                max_top_angle: grad2rad(read_f("MaxTopAngle")),
+                max_bottom_angle: grad2rad(read_f("MaxBottomAngle")),
+                weapon,
+                max_da: grad2rad(read_f("Rotation")),
+                seek_radius: read_f("Radius"),
             };
         }
         Some(out)
@@ -703,6 +720,276 @@ impl RobotDamages {
         } else {
             WeaponDamage::default()
         }
+    }
+}
+
+/// Shared loader for the `Weapons/Damages/<block>` tables that follow
+/// the same `damage[,mindamage[,friend_damage]]` shape (MatrixConfig.cpp
+/// :487-587). `friend_damage` falls back to `damage` when the third
+/// column is absent — true for the Cannon / Building / Flyer / Robot
+/// tables (the Object table never reads it; it keeps its own loader).
+fn load_damage_table(stor: &Storage, block: &str) -> Option<[WeaponDamage; WEAPON_COUNT]> {
+    let weapons_rec = stor.block_record("da", "Weapons")?;
+    let damages_rec = stor.block_record(&weapons_rec, "Damages")?;
+    let rec = stor.block_record(&damages_rec, block)?;
+    let keys = stor.get_buf(&rec, "0")?;
+    let values = stor.get_buf(&rec, "1")?;
+    let n = keys.arrays_count().min(values.arrays_count());
+    let mut table = [WeaponDamage::default(); WEAPON_COUNT];
+    for i in 0..n {
+        let name = keys.get_as_wstr(i);
+        let Some(idx) = weap_name_to_index(&name) else {
+            continue;
+        };
+        let val = values.get_as_wstr(i);
+        let nn = wstr::count_par(&val, ",");
+        let damage = wstr::int_par(&val, 0, ",");
+        let mindamage = if nn > 1 {
+            wstr::int_par(&val, 1, ",")
+        } else {
+            0
+        };
+        let friend_damage = if nn > 2 {
+            wstr::int_par(&val, 2, ",")
+        } else {
+            damage
+        };
+        table[idx] = WeaponDamage {
+            damage,
+            mindamage,
+            friend_damage,
+        };
+    }
+    Some(table)
+}
+
+/// Port of `g_Config.m_CannonDamages[]` (MatrixConfig.cpp:487-504) —
+/// damage received by turrets, indexed by `weap_to_index`.
+#[derive(Debug, Clone, Copy)]
+pub struct CannonDamages {
+    pub table: [WeaponDamage; WEAPON_COUNT],
+}
+
+impl Default for CannonDamages {
+    fn default() -> Self {
+        Self {
+            table: [WeaponDamage::default(); WEAPON_COUNT],
+        }
+    }
+}
+
+impl CannonDamages {
+    pub fn from_matrix_data(stor: &Storage) -> Option<Self> {
+        Some(Self {
+            table: load_damage_table(stor, "Cannon")?,
+        })
+    }
+
+    pub fn get(&self, weap: crate::matrix_game::effects::weapon::Weapon) -> Option<WeaponDamage> {
+        let idx = crate::matrix_game::effects::weapon::weap_to_index(weap)?;
+        Some(self.table[idx])
+    }
+}
+
+/// Port of `g_Config.m_FlyerDamages[]` (MatrixConfig.cpp:538-566).
+/// Flyers themselves aren't ported yet, but the table is loaded so the
+/// damage subsystem is complete.
+#[derive(Debug, Clone, Copy)]
+pub struct FlyerDamages {
+    pub table: [WeaponDamage; WEAPON_COUNT],
+}
+
+impl Default for FlyerDamages {
+    fn default() -> Self {
+        Self {
+            table: [WeaponDamage::default(); WEAPON_COUNT],
+        }
+    }
+}
+
+impl FlyerDamages {
+    pub fn from_matrix_data(stor: &Storage) -> Option<Self> {
+        Some(Self {
+            table: load_damage_table(stor, "Flyer")?,
+        })
+    }
+
+    pub fn get(&self, weap: crate::matrix_game::effects::weapon::Weapon) -> Option<WeaponDamage> {
+        let idx = crate::matrix_game::effects::weapon::weap_to_index(weap)?;
+        Some(self.table[idx])
+    }
+}
+
+/// Port of `g_Config.m_WeaponRadius[]` (MatrixConfig.cpp:609-623) —
+/// per-weapon range, loaded from `Weapons/Radius`. This is the
+/// `m_WeaponDist` a `CMatrixEffectWeapon` is born with.
+#[derive(Debug, Clone, Copy)]
+pub struct WeaponRadius {
+    pub table: [f32; WEAPON_COUNT],
+}
+
+impl Default for WeaponRadius {
+    fn default() -> Self {
+        Self {
+            table: [0.0; WEAPON_COUNT],
+        }
+    }
+}
+
+impl WeaponRadius {
+    pub fn from_matrix_data(stor: &Storage) -> Option<Self> {
+        let weapons_rec = stor.block_record("da", "Weapons")?;
+        let radius_rec = stor.block_record(&weapons_rec, "Radius")?;
+        let keys = stor.get_buf(&radius_rec, "0")?;
+        let values = stor.get_buf(&radius_rec, "1")?;
+        let n = keys.arrays_count().min(values.arrays_count());
+        let mut out = Self::default();
+        for i in 0..n {
+            let name = keys.get_as_wstr(i);
+            let Some(idx) = weap_name_to_index(&name) else {
+                continue;
+            };
+            let val = values.get_as_wstr(i);
+            out.table[idx] = val.trim().parse::<f32>().unwrap_or(0.0);
+        }
+        Some(out)
+    }
+
+    /// `g_Config.m_WeaponRadius[Weap2Index(w)]` — 0.0 for weapons with
+    /// no table slot.
+    pub fn get(&self, weap: crate::matrix_game::effects::weapon::Weapon) -> f32 {
+        crate::matrix_game::effects::weapon::weap_to_index(weap)
+            .map(|i| self.table[i])
+            .unwrap_or(0.0)
+    }
+}
+
+/// One weapon class's overheat numbers out of `g_Config.m_Overheat[]`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OverheatParams {
+    /// `WEAPON_*_HEAT` — heat added per shot (`SBotWeapon::m_HeatMod`).
+    pub heat_mod: i32,
+    /// `WCP_*` — cooling period in ms (`m_CoolDownPeriod` threshold).
+    pub cool_period: i32,
+    /// `WEAPON_*_COOL` — heat removed per elapsed period
+    /// (`SBotWeapon::m_CoolDownMod`).
+    pub cool_mod: i32,
+}
+
+/// Port of `g_Config.m_Overheat[OVERHEAT_LAST]` (MatrixConfig.hpp:637,
+/// loaded at MatrixConfig.cpp:666-706). Only the 8 robot weapon classes
+/// have entries; BIGBOOM and REPAIR get hardcoded 10/10 heat/cool mods
+/// in `RobotWeaponInit` and no cooling period.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Overheat {
+    pub volcano: OverheatParams,
+    pub plasma: OverheatParams,
+    pub laser: OverheatParams,
+    pub homing_missile: OverheatParams,
+    pub flamethrower: OverheatParams,
+    pub bomb: OverheatParams,
+    pub gun: OverheatParams,
+    pub lightening: OverheatParams,
+}
+
+impl Overheat {
+    pub fn from_matrix_data(stor: &Storage) -> Option<Self> {
+        let weapons_rec = stor.block_record("da", "Weapons")?;
+        let rec = stor.block_record(&weapons_rec, "Overheat")?;
+        let read = |k: &str| -> i32 {
+            stor.block_param(&rec, k)
+                .and_then(|s| s.trim().parse::<i32>().ok())
+                .unwrap_or(0)
+        };
+        let load = |name: &str| -> OverheatParams {
+            OverheatParams {
+                heat_mod: read(&format!("WEAPON_{name}_HEAT")),
+                cool_period: read(&format!("WCP_{name}")),
+                cool_mod: read(&format!("WEAPON_{name}_COOL")),
+            }
+        };
+        Some(Self {
+            volcano: load("VOLCANO"),
+            plasma: load("PLASMA"),
+            laser: load("LASER"),
+            homing_missile: load("HOMING_MISSILE"),
+            flamethrower: load("FLAMETHROWER"),
+            bomb: load("BOMB"),
+            gun: load("GUN"),
+            lightening: load("LIGHTENING"),
+        })
+    }
+
+    /// Entry for a weapon discriminant — covers exactly the classes the
+    /// robot fire-control switch reads (MatrixRobot.cpp:1510-1535).
+    /// `None` for BIGBOOM / REPAIR / cannon weapons.
+    pub fn for_weapon(
+        &self,
+        weap: crate::matrix_game::effects::weapon::Weapon,
+    ) -> Option<OverheatParams> {
+        use crate::matrix_game::effects::weapon as w;
+        Some(match weap {
+            w::WEAPON_VOLCANO => self.volcano,
+            w::WEAPON_PLASMA => self.plasma,
+            w::WEAPON_LASER => self.laser,
+            w::WEAPON_HOMING_MISSILE => self.homing_missile,
+            w::WEAPON_FLAMETHROWER => self.flamethrower,
+            w::WEAPON_BOMB => self.bomb,
+            w::WEAPON_GUN => self.gun,
+            w::WEAPON_LIGHTENING => self.lightening,
+            _ => return None,
+        })
+    }
+}
+
+/// Port of `SDifficulty` (MatrixMap.hpp:182-187) + the loader in
+/// `CMatrixMap::CMatrixMap` (MatrixMap.cpp:116-145): defaults are 1.0;
+/// `Replaces/_difficulty` names a key in the `Difficulty` block whose
+/// value is `"<dmg>,<maint>,<ff>"` percentages applied as
+/// `1.0 + v/100`, clamped to ≥ 0.01.
+#[derive(Debug, Clone, Copy)]
+pub struct Difficulty {
+    pub k_damage_enemy_to_player: f32,
+    pub k_time_before_maintenance: f32,
+    pub k_friendly_fire: f32,
+}
+
+impl Default for Difficulty {
+    fn default() -> Self {
+        Self {
+            k_damage_enemy_to_player: 1.0,
+            k_time_before_maintenance: 1.0,
+            k_friendly_fire: 1.0,
+        }
+    }
+}
+
+impl Difficulty {
+    pub fn from_matrix_data(stor: &Storage) -> Self {
+        let mut out = Self::default();
+        let Some(repl_rec) = stor.block_record("da", "Replaces") else {
+            return out;
+        };
+        let Some(level) = stor.block_param(&repl_rec, "_difficulty") else {
+            return out;
+        };
+        if level.is_empty() {
+            return out;
+        }
+        let Some(dif_rec) = stor.block_record("da", "Difficulty") else {
+            return out;
+        };
+        let Some(t2) = stor.block_param(&dif_rec, &level) else {
+            return out;
+        };
+        if t2.is_empty() {
+            return out;
+        }
+        let par = |i: usize| -> f32 { 1.0 + wstr::double_par(&t2, i, ",") as f32 / 100.0 };
+        out.k_damage_enemy_to_player = par(0).max(0.01);
+        out.k_time_before_maintenance = par(1).max(0.01);
+        out.k_friendly_fire = par(2).max(0.01);
+        out
     }
 }
 
@@ -899,9 +1186,16 @@ pub struct GlobalConfig {
     pub timings: Timings,
     pub turrets: TurretProps,
     pub robot_damages: RobotDamages,
+    pub cannon_damages: CannonDamages,
+    pub flyer_damages: FlyerDamages,
+    pub weapon_radius: WeaponRadius,
     pub weapon_cooldown: WeaponCooldown,
     pub weapon_strength_ai: WeaponStrengthAI,
+    pub overheat: Overheat,
     pub head_chars: HeadCharsTable,
+    /// Per-map difficulty coefficients — `g_MatrixMap->m_Difficulty` in
+    /// the C++; kept here because it loads from the same robots.dat.
+    pub difficulty: Difficulty,
 }
 
 pub fn global() -> GlobalConfig {

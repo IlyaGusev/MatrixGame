@@ -5,6 +5,8 @@
 //! project root for the full mapping.
 
 pub mod camera;
+#[cfg(test)]
+mod combat_tests;
 pub mod common;
 pub mod config;
 pub mod effects;

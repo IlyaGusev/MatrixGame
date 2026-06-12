@@ -271,6 +271,87 @@ pub struct GameMap {
     pub group_bounds: Vec<GroupBounds>,
 }
 
+impl GameMap {
+    /// Test-only: a flat all-land map of `size_x × size_y` cells at
+    /// height `z`. Enough structure for `get_z` / `trace` / move-cell
+    /// queries; everything render-related is defaulted.
+    #[cfg(test)]
+    pub fn test_flat(size_x: usize, size_y: usize, z: f32) -> Self {
+        use crate::matrix_game::common::{CELLFLAG_FLAT, CELLFLAG_LAND};
+        let points = vec![
+            CompilePoint {
+                move_idx: 0,
+                z,
+                b: 128,
+                g: 128,
+                r: 128,
+                flags: 0,
+            };
+            (size_x + 1) * (size_y + 1)
+        ];
+        let normals = vec![
+            PointNormal {
+                x: 0.0,
+                y: 0.0,
+                z: 1.0,
+            };
+            (size_x + 1) * (size_y + 1)
+        ];
+        let units = vec![
+            MapUnit {
+                flags: CELLFLAG_LAND | CELLFLAG_FLAT,
+                a1: z,
+                b1: 0.0,
+                c1: 0.0,
+                a2: 0.0,
+                b2: 0.0,
+                c2: 0.0,
+            };
+            size_x * size_y
+        ];
+        Self {
+            size_x,
+            size_y,
+            camera_angle: 0.0,
+            camera_pos: None,
+            tex_union_dim: 0,
+            water_color: 0,
+            sky_color: 0,
+            sky_name: String::new(),
+            sky_angle: 0.0,
+            water_name: String::new(),
+            water_normal_len: 1.0,
+            light_main_color: 0,
+            light_main_color_obj: 0,
+            light_main_dir: [0.0, 0.0, -1.0],
+            ambient_color_obj: 0,
+            ambient_color: 0,
+            shadow_color: 0,
+            terrain2object_influence: 0.0,
+            terrain2object_target_color: 0,
+            inshorewave_color: 0,
+            inshore_prespawns: Vec::new(),
+            macro_texture_path: None,
+            macro_texture_size: 0,
+            points,
+            normals,
+            units,
+            objects: Vec::new(),
+            buildings: Vec::new(),
+            cannons: Vec::new(),
+            robots: Vec::new(),
+            group_max_z_land: Vec::new(),
+            group_w: 0,
+            group_h: 0,
+            move_cells: vec![MoveCell::default(); size_x * 2 * size_y * 2],
+            size_move_x: size_x * 2,
+            size_move_y: size_y * 2,
+            min_z: z,
+            group_bounds: Vec::new(),
+        }
+    }
+}
+
 /// Ports CMatrixMapGroup's bounding-Z pair — used by the camera frustum
 /// visibility check to decide whether a group's 3D footprint intersects the
 /// view frustum. For empty / all-water groups the values are `(0, 0)`.
@@ -371,7 +452,7 @@ pub struct CannonInstance {
     pub x: f32,
     pub y: f32,
     pub angle: f32,
-    pub kind: u8,  // `m_Num` — cannon variant (1..=4)
+    pub kind: u8, // `m_Num` — cannon variant (1..=4)
     pub side: u8,
     pub add_h: f32,
     /// 0 = standalone, 1 = factory cannon (mounted), 2 = empty slot
@@ -491,9 +572,8 @@ impl GameMap {
         // assigned when the property is present (MatrixMapPrepare.cpp:1204).
         // Fall back to the alpha-only black that matches the previous
         // hardcoded `(0,0,0,0.45)` shader constant.
-        let shadow_color =
-            find_property_int(prop_names, prop_values, "ShadowColor").unwrap_or(0x73000000u32 as i32)
-                as u32;
+        let shadow_color = find_property_int(prop_names, prop_values, "ShadowColor")
+            .unwrap_or(0x73000000u32 as i32) as u32;
         let mut terrain2object_influence =
             find_property_float(prop_names, prop_values, "Influence").unwrap_or(0.0);
         let inshorewave_color = find_property_int(prop_names, prop_values, "InshorewaveColor")
@@ -827,6 +907,13 @@ impl GameMap {
             Some(c) => !c.is_impassable_for(chassis_kind, size),
             None => false,
         }
+    }
+
+    /// World point lies on a map cell (`UnitGetTest != NULL`).
+    pub fn contains_point(&self, wx: f32, wy: f32) -> bool {
+        let x = (wx / GLOBAL_SCALE).floor() as i32;
+        let y = (wy / GLOBAL_SCALE).floor() as i32;
+        x >= 0 && y >= 0 && x < self.size_x as i32 && y < self.size_y as i32
     }
 
     /// Ports CMatrixMap::GetZ for terrain/water boundary tests.
@@ -1679,10 +1766,7 @@ fn load_buildings(
 /// return the full record list. Mutates `buildings` to record per-base
 /// turret-slot tables and per-base `turrets_have` for pre-mounted
 /// factory cannons.
-fn load_cannons(
-    stor: &Storage,
-    buildings: &mut [BuildingInstance],
-) -> Vec<CannonInstance> {
+fn load_cannons(stor: &Storage, buildings: &mut [BuildingInstance]) -> Vec<CannonInstance> {
     let Some(cxb) = stor.get_buf("cannons", "X") else {
         return Vec::new();
     };
@@ -3401,18 +3485,52 @@ impl Sky {
         let water_top = bot_ndc.clamp(-1.0, 1.0);
 
         let verts = [
-            GradientVertex { position: [-1.0, top_ndc], color: top_color },
-            GradientVertex { position: [1.0, top_ndc],  color: top_color },
-            GradientVertex { position: [-1.0, mid_ndc], color: sky_opaque },
-            GradientVertex { position: [1.0, mid_ndc],  color: sky_opaque },
-            GradientVertex { position: [-1.0, bot_ndc], color: sky_opaque },
-            GradientVertex { position: [1.0, bot_ndc],  color: sky_opaque },
-            GradientVertex { position: [-1.0, water_top], color: water_opaque },
-            GradientVertex { position: [1.0, water_top],  color: water_opaque },
-            GradientVertex { position: [-1.0, -1.0], color: water_opaque },
-            GradientVertex { position: [1.0, -1.0],  color: water_opaque },
+            GradientVertex {
+                position: [-1.0, top_ndc],
+                color: top_color,
+            },
+            GradientVertex {
+                position: [1.0, top_ndc],
+                color: top_color,
+            },
+            GradientVertex {
+                position: [-1.0, mid_ndc],
+                color: sky_opaque,
+            },
+            GradientVertex {
+                position: [1.0, mid_ndc],
+                color: sky_opaque,
+            },
+            GradientVertex {
+                position: [-1.0, bot_ndc],
+                color: sky_opaque,
+            },
+            GradientVertex {
+                position: [1.0, bot_ndc],
+                color: sky_opaque,
+            },
+            GradientVertex {
+                position: [-1.0, water_top],
+                color: water_opaque,
+            },
+            GradientVertex {
+                position: [1.0, water_top],
+                color: water_opaque,
+            },
+            GradientVertex {
+                position: [-1.0, -1.0],
+                color: water_opaque,
+            },
+            GradientVertex {
+                position: [1.0, -1.0],
+                color: water_opaque,
+            },
         ];
-        queue.write_buffer(&self.gradient_vertex_buffer, 0, bytemuck::cast_slice(&verts));
+        queue.write_buffer(
+            &self.gradient_vertex_buffer,
+            0,
+            bytemuck::cast_slice(&verts),
+        );
 
         pass.set_pipeline(&self.gradient_pipeline);
         pass.set_vertex_buffer(0, self.gradient_vertex_buffer.slice(..));
@@ -3464,8 +3582,16 @@ fn build_gradient_pipeline(
                 array_stride: std::mem::size_of::<GradientVertex>() as u64,
                 step_mode: wgpu::VertexStepMode::Vertex,
                 attributes: &[
-                    wgpu::VertexAttribute { offset: 0, shader_location: 0, format: wgpu::VertexFormat::Float32x2 },
-                    wgpu::VertexAttribute { offset: 8, shader_location: 1, format: wgpu::VertexFormat::Float32x4 },
+                    wgpu::VertexAttribute {
+                        offset: 0,
+                        shader_location: 0,
+                        format: wgpu::VertexFormat::Float32x2,
+                    },
+                    wgpu::VertexAttribute {
+                        offset: 8,
+                        shader_location: 1,
+                        format: wgpu::VertexFormat::Float32x4,
+                    },
                 ],
             }],
             compilation_options: Default::default(),
@@ -3586,11 +3712,31 @@ fn load_skybox(
                 array_stride: std::mem::size_of::<BoxVertex>() as u64,
                 step_mode: wgpu::VertexStepMode::Vertex,
                 attributes: &[
-                    wgpu::VertexAttribute { offset: 0, shader_location: 0, format: wgpu::VertexFormat::Float32x2 },
-                    wgpu::VertexAttribute { offset: 8, shader_location: 1, format: wgpu::VertexFormat::Float32 },
-                    wgpu::VertexAttribute { offset: 12, shader_location: 2, format: wgpu::VertexFormat::Float32 },
-                    wgpu::VertexAttribute { offset: 16, shader_location: 3, format: wgpu::VertexFormat::Float32 },
-                    wgpu::VertexAttribute { offset: 20, shader_location: 4, format: wgpu::VertexFormat::Float32 },
+                    wgpu::VertexAttribute {
+                        offset: 0,
+                        shader_location: 0,
+                        format: wgpu::VertexFormat::Float32x2,
+                    },
+                    wgpu::VertexAttribute {
+                        offset: 8,
+                        shader_location: 1,
+                        format: wgpu::VertexFormat::Float32,
+                    },
+                    wgpu::VertexAttribute {
+                        offset: 12,
+                        shader_location: 2,
+                        format: wgpu::VertexFormat::Float32,
+                    },
+                    wgpu::VertexAttribute {
+                        offset: 16,
+                        shader_location: 3,
+                        format: wgpu::VertexFormat::Float32,
+                    },
+                    wgpu::VertexAttribute {
+                        offset: 20,
+                        shader_location: 4,
+                        format: wgpu::VertexFormat::Float32,
+                    },
                 ],
             }],
             compilation_options: Default::default(),
@@ -3641,9 +3787,18 @@ fn load_skybox(
         label: Some("Skybox BG"),
         layout: &bgl,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: uniform_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&texture_view) },
-            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&sampler) },
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(&texture_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Sampler(&sampler),
+            },
         ],
     });
 
@@ -3749,12 +3904,40 @@ fn push_face(
     v0: f32,
     v1: f32,
 ) {
-    let tl = BoxVertex { xy: xy_tl, bottom_w: 0.0, u: u_left,  v0, v1 };
-    let tr = BoxVertex { xy: xy_tr, bottom_w: 0.0, u: u_right, v0, v1 };
-    let bl = BoxVertex { xy: xy_bl, bottom_w: 1.0, u: u_left,  v0, v1 };
-    let br = BoxVertex { xy: xy_br, bottom_w: 1.0, u: u_right, v0, v1 };
-    out.push(tl); out.push(bl); out.push(tr);
-    out.push(tr); out.push(bl); out.push(br);
+    let tl = BoxVertex {
+        xy: xy_tl,
+        bottom_w: 0.0,
+        u: u_left,
+        v0,
+        v1,
+    };
+    let tr = BoxVertex {
+        xy: xy_tr,
+        bottom_w: 0.0,
+        u: u_right,
+        v0,
+        v1,
+    };
+    let bl = BoxVertex {
+        xy: xy_bl,
+        bottom_w: 1.0,
+        u: u_left,
+        v0,
+        v1,
+    };
+    let br = BoxVertex {
+        xy: xy_br,
+        bottom_w: 1.0,
+        u: u_right,
+        v0,
+        v1,
+    };
+    out.push(tl);
+    out.push(bl);
+    out.push(tr);
+    out.push(tr);
+    out.push(bl);
+    out.push(br);
 }
 
 fn compute_cut_dn(eye_z: f32) -> f32 {
@@ -3898,9 +4081,8 @@ static GLOBAL_WEAPON_MATRICES: std::sync::OnceLock<
 > = std::sync::OnceLock::new();
 
 fn weapon_matrices_slot() -> &'static std::sync::RwLock<[WeaponMatrix; ROBOT_ARMOR_CNT_LOCAL]> {
-    GLOBAL_WEAPON_MATRICES.get_or_init(|| {
-        std::sync::RwLock::new([WeaponMatrix::default(); ROBOT_ARMOR_CNT_LOCAL])
-    })
+    GLOBAL_WEAPON_MATRICES
+        .get_or_init(|| std::sync::RwLock::new([WeaponMatrix::default(); ROBOT_ARMOR_CNT_LOCAL]))
 }
 
 /// Faithful port of `CMatrixMap::RobotPreload`'s armor-VO weapon-slot
@@ -3948,9 +4130,7 @@ pub fn weapon_matrix_from_vo(
             };
             if first_kind_token {
                 first_kind_token = false;
-                if kind == RobotUnitKind::WEAPON_BOMB.0
-                    || kind == RobotUnitKind::WEAPON_MORTAR.0
-                {
+                if kind == RobotUnitKind::WEAPON_BOMB.0 || kind == RobotUnitKind::WEAPON_MORTAR.0 {
                     out.extra += 1;
                 } else {
                     out.common += 1;
@@ -4017,7 +4197,11 @@ pub fn side_color_rgb(side: i32) -> [f32; 3] {
         4 => [0, 150, 0],
         _ => [128, 128, 128],
     };
-    [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0]
+    [
+        c[0] as f32 / 255.0,
+        c[1] as f32 / 255.0,
+        c[2] as f32 / 255.0,
+    ]
 }
 
 /// Port of `CMatrixMap::GetSideColorMM` (MatrixMap.cpp:1015,
@@ -4030,5 +4214,9 @@ pub fn side_color_minimap_rgb(side: i32) -> [f32; 3] {
         4 => [0, 255, 0],
         _ => [128, 128, 128],
     };
-    [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0]
+    [
+        c[0] as f32 / 255.0,
+        c[1] as f32 / 255.0,
+        c[2] as f32 / 255.0,
+    ]
 }

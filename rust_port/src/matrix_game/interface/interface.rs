@@ -112,6 +112,9 @@ pub struct MainVisibilityCtx {
     /// Constructor panel is open — show the chassis/armor/head/weapon
     /// buttons + price readouts.
     pub constructor_active: bool,
+    /// An order from the robot panel is armed and awaiting its map
+    /// click (`ORDERING_MODE`) — show `ocan` instead of the order set.
+    pub ordering: bool,
     /// Turret-build mode active — show turret1..4 kind picker.
     pub turret_build_active: bool,
     /// True once the player has clicked one of `tur1..tur4` and the
@@ -546,6 +549,21 @@ impl CInterface {
             }
         }
 
+        // Step 4.7 — robot order buttons (CInterface.cpp:1637-1700):
+        // visible while a robot group is selected and no order is
+        // being aimed; in ordering mode only the cancel button shows
+        // (CInterface.cpp:1696-1699). Patrol / capture / bomb wait on
+        // their subsystems, so only the working set is exposed.
+        if ctx.curr_sel == CurrSel::RobotsSelected && !ctx.turret_build_active {
+            for e in &mut self.elements {
+                match e.name.as_str() {
+                    "ost" | "ogo" | "ofi" if !ctx.ordering => e.set_visible(true),
+                    "ocan" | "zagl1" if ctx.ordering => e.set_visible(true),
+                    _ => {}
+                }
+            }
+        }
+
         // Step 5 — constructor sub-panel visibility. When the player
         // opens the robot builder (`buro`), the Base panel's component
         // buttons become visible. Ports the `if (m_Active)` branches
@@ -975,12 +993,7 @@ impl CInterface {
     /// Refresh the dynamic captions on the `Main` panel for a selected
     /// robot. Port of CInterface.cpp:1369-1404 — sets the `name` static
     /// to `cur_r->m_Name` and the `lives` static to `"<hp>/<max>"`.
-    pub fn apply_main_robot_text(
-        &mut self,
-        robot_name: &str,
-        hp: i32,
-        max_hp: i32,
-    ) {
+    pub fn apply_main_robot_text(&mut self, robot_name: &str, hp: i32, max_hp: i32) {
         if self.name != "Main" {
             return;
         }
@@ -1474,8 +1487,16 @@ impl CInterface {
         // these are kept here just to silence the parameter-unused
         // warning when the price helpers were inlined.
         let _ = (
-            summ_titan, summ_elec, summ_ener, summ_plas, unit_titan, unit_elec, unit_ener,
-            unit_plas, summ_price, focused_price,
+            summ_titan,
+            summ_elec,
+            summ_ener,
+            summ_plas,
+            unit_titan,
+            unit_elec,
+            unit_ener,
+            unit_plas,
+            summ_price,
+            focused_price,
         );
     }
 
@@ -1658,9 +1679,7 @@ impl CInterface {
         // ── Summary price row (CInterface.cpp:3220-3297). Anchor
         // shifts left when fewer resources are present so the row
         // stays roughly centred under the build-button.
-        let summ_count = (0..4)
-            .filter(|i| summ_price.resources[*i] != 0)
-            .count();
+        let summ_count = (0..4).filter(|i| summ_price.resources[*i] != 0).count();
         let mut x = match summ_count {
             3 => 235.0,
             2 => 250.0,
@@ -2065,9 +2084,7 @@ fn load_element(stor: &Storage, rec: &str, kind: ElementKind) -> Option<IFaceEle
     // `pricel` / `weightl` / `chasl` that the C++ uses to print
     // localised "общая стоимость:" / "корпус:" headers) must stay so
     // the text pass can render them.
-    if images.iter().all(|i| i.is_none())
-        && stor.block_record(rec, "Labels").is_none()
-    {
+    if images.iter().all(|i| i.is_none()) && stor.block_record(rec, "Labels").is_none() {
         return None;
     }
 
@@ -2264,9 +2281,7 @@ fn attach_labels(stor: &Storage, panel_rec: &str, panel_name: &str, elements: &m
             attached += 1;
         }
     }
-    log::debug!(
-        "iface labels: panel={panel_name} attached={attached} label rows"
-    );
+    log::debug!("iface labels: panel={panel_name} attached={attached} label rows");
 }
 
 /// Decode the C++ aRGB packed `Color` param. Format: `A,R,G,B` ints

@@ -128,11 +128,17 @@ impl HintReplacer {
             .and_then(|all| storage.block_record(&all, PAR_REPLACE));
         for rec_opt in [top.as_deref(), nested.as_deref()] {
             let Some(rec) = rec_opt else { continue };
-            let Some(keys) = storage.get_buf(rec, "0") else { continue };
-            let Some(vals) = storage.get_buf(rec, "1") else { continue };
+            let Some(keys) = storage.get_buf(rec, "0") else {
+                continue;
+            };
+            let Some(vals) = storage.get_buf(rec, "1") else {
+                continue;
+            };
             let n = keys.arrays_count().min(vals.arrays_count());
             for i in 0..n {
-                values.entry(keys.get_as_wstr(i)).or_insert(vals.get_as_wstr(i));
+                values
+                    .entry(keys.get_as_wstr(i))
+                    .or_insert(vals.get_as_wstr(i));
             }
         }
         let mut turret_labels: [[String; 2]; 4] = Default::default();
@@ -293,15 +299,23 @@ impl HintChromeLibrary {
         // Enumerate child records — each integer-named child is one
         // border-id (usually just `0`), `Bitmaps` holds the alias
         // table.
-        let Some(names) = storage.get_buf(&hints_rec, "2") else { return out };
-        let Some(recs) = storage.get_buf(&hints_rec, "3") else { return out };
+        let Some(names) = storage.get_buf(&hints_rec, "2") else {
+            return out;
+        };
+        let Some(recs) = storage.get_buf(&hints_rec, "3") else {
+            return out;
+        };
         let n = names.arrays_count().min(recs.arrays_count());
         for i in 0..n {
             let name = names.get_as_wstr(i);
             let rec = recs.get_as_wstr(i);
             if name == "Bitmaps" {
-                let Some(k) = storage.get_buf(&rec, "0") else { continue };
-                let Some(v) = storage.get_buf(&rec, "1") else { continue };
+                let Some(k) = storage.get_buf(&rec, "0") else {
+                    continue;
+                };
+                let Some(v) = storage.get_buf(&rec, "1") else {
+                    continue;
+                };
                 for j in 0..k.arrays_count().min(v.arrays_count()) {
                     out.bitmaps.insert(
                         k.get_as_wstr(j),
@@ -330,7 +344,10 @@ fn parse_border(stor: &Storage, rec: &str) -> ChromeBorder {
         let Some(raw) = stor.block_param(rec, name) else {
             return ChromeSlice::default();
         };
-        let parts: Vec<i32> = raw.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+        let parts: Vec<i32> = raw
+            .split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect();
         ChromeSlice {
             tex_x: parts.first().copied().unwrap_or(0),
             tex_y: parts.get(1).copied().unwrap_or(0),
@@ -457,46 +474,45 @@ impl Hint {
                 screen_h: slice.h as f32 * scale,
             });
         };
-        let push_tile =
-            |out: &mut Vec<SliceDraw>,
-             dst_x: f32,
-             dst_y: f32,
-             dst_w: f32,
-             dst_h: f32,
-             slice: &ChromeSlice| {
-                if slice.w <= 0 || slice.h <= 0 || dst_w <= 0.0 || dst_h <= 0.0 {
-                    return;
+        let push_tile = |out: &mut Vec<SliceDraw>,
+                         dst_x: f32,
+                         dst_y: f32,
+                         dst_w: f32,
+                         dst_h: f32,
+                         slice: &ChromeSlice| {
+            if slice.w <= 0 || slice.h <= 0 || dst_w <= 0.0 || dst_h <= 0.0 {
+                return;
+            }
+            let tile_w = slice.w as f32 * scale;
+            let tile_h = slice.h as f32 * scale;
+            if tile_w <= 0.0 || tile_h <= 0.0 {
+                return;
+            }
+            let mut y = dst_y;
+            let y_end = dst_y + dst_h;
+            while y < y_end - 0.01 {
+                let row_h = tile_h.min(y_end - y);
+                let sh_src = ((row_h / scale).round() as i32).max(1).min(slice.h);
+                let mut x = dst_x;
+                let x_end = dst_x + dst_w;
+                while x < x_end - 0.01 {
+                    let col_w = tile_w.min(x_end - x);
+                    let sw_src = ((col_w / scale).round() as i32).max(1).min(slice.w);
+                    out.push(SliceDraw {
+                        tex_x: slice.tex_x,
+                        tex_y: slice.tex_y,
+                        tex_w: sw_src,
+                        tex_h: sh_src,
+                        screen_x: x,
+                        screen_y: y,
+                        screen_w: col_w,
+                        screen_h: row_h,
+                    });
+                    x += tile_w;
                 }
-                let tile_w = slice.w as f32 * scale;
-                let tile_h = slice.h as f32 * scale;
-                if tile_w <= 0.0 || tile_h <= 0.0 {
-                    return;
-                }
-                let mut y = dst_y;
-                let y_end = dst_y + dst_h;
-                while y < y_end - 0.01 {
-                    let row_h = tile_h.min(y_end - y);
-                    let sh_src = ((row_h / scale).round() as i32).max(1).min(slice.h);
-                    let mut x = dst_x;
-                    let x_end = dst_x + dst_w;
-                    while x < x_end - 0.01 {
-                        let col_w = tile_w.min(x_end - x);
-                        let sw_src = ((col_w / scale).round() as i32).max(1).min(slice.w);
-                        out.push(SliceDraw {
-                            tex_x: slice.tex_x,
-                            tex_y: slice.tex_y,
-                            tex_w: sw_src,
-                            tex_h: sh_src,
-                            screen_x: x,
-                            screen_y: y,
-                            screen_w: col_w,
-                            screen_h: row_h,
-                        });
-                        x += tile_w;
-                    }
-                    y += tile_h;
-                }
-            };
+                y += tile_h;
+            }
+        };
 
         // Corners (MatrixHint.cpp:326-348 — four `bmpf.Copy` calls).
         let lt = &s[SLICE_LT];
@@ -553,7 +569,10 @@ impl Hint {
     /// Source atlas path for this hint's border chrome. Returns
     /// `None` if the border wasn't loaded.
     pub fn border_source_path<'a>(&self, chrome: &'a HintChromeLibrary) -> Option<&'a str> {
-        chrome.borders.get(&self.border_id).map(|b| b.source_path.as_str())
+        chrome
+            .borders
+            .get(&self.border_id)
+            .map(|b| b.source_path.as_str())
     }
 }
 
@@ -572,17 +591,30 @@ enum Hem {
     /// `HEM_CENTER` — emit centered; newline after.
     Center,
     /// `HEM_COORD` — absolute coord; next Bitmap uses stored coord.
-    Coord { x: i32, y: i32 },
+    Coord {
+        x: i32,
+        y: i32,
+    },
     /// `HEM_DOWN` — cy += N, no emit.
-    Down { dy: i32 },
+    Down {
+        dy: i32,
+    },
     /// `HEM_RIGHT` — cx += N, no emit.
-    Right { dx: i32 },
+    Right {
+        dx: i32,
+    },
     /// `HEM_TAB_*` — place at absolute X = n (w/o bumping cx start).
-    Tab { x: i32 },
+    Tab {
+        x: i32,
+    },
     /// `HEM_CENTER_RIGHT_*` / `HEM_CENTER_LEFT_*` — sentinels resolved
     /// in Pass 2 using total width.
-    CenterRight { n: i32 },
-    CenterLeft { n: i32 },
+    CenterRight {
+        n: i32,
+    },
+    CenterLeft {
+        n: i32,
+    },
 }
 
 /// Parse one template into a laid-out `Hint`. Ports the two-pass
@@ -605,7 +637,10 @@ pub fn build_hint(
         return None;
     }
     // First field is the border id (MatrixHint.cpp:579). Default 0.
-    let border_id: i32 = parts_iter.first().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+    let border_id: i32 = parts_iter
+        .first()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
 
     // Layout state (mirrors MatrixHint.cpp:580-591).
     let mut font = "Font.2Normal".to_string();
@@ -668,8 +703,10 @@ pub fn build_hint(
             h_height = rest.trim().parse().unwrap_or(0);
             continue;
         }
-        if directive.starts_with("_ALIGN:") || directive.starts_with("_SOUNDIN:")
-            || directive.starts_with("_SOUNDOUT:") || directive.starts_with("_BORDER:")
+        if directive.starts_with("_ALIGN:")
+            || directive.starts_with("_SOUNDIN:")
+            || directive.starts_with("_SOUNDOUT:")
+            || directive.starts_with("_BORDER:")
         {
             continue; // scalar-ish; we don't use them for text hints.
         }
@@ -705,7 +742,16 @@ pub fn build_hint(
         // 0×0 part and discard the resulting coordinate.
         if let Some(rest) = directive.strip_prefix("_MOD:") {
             let hem = parse_mod(rest);
-            let _ = pass1_position(hem, &mut cx, &mut cy, &mut cw, &mut ch, 0, 0, &mut new_coord);
+            let _ = pass1_position(
+                hem,
+                &mut cx,
+                &mut cy,
+                &mut cw,
+                &mut ch,
+                0,
+                0,
+                &mut new_coord,
+            );
             continue;
         }
         if let Some(rest) = directive.strip_prefix("_TEXTP:") {
@@ -990,8 +1036,22 @@ fn resolve_sentinel(part: HintPart, hem: Hem, cw: i32, ots_left: i32, ots_top: i
     match part {
         HintPart::Text {
             text, font, color, ..
-        } => HintPart::Text { x, y, w: w0, h: h0, text, font, color },
-        HintPart::Bitmap { name, .. } => HintPart::Bitmap { x, y, w: w0, h: h0, name },
+        } => HintPart::Text {
+            x,
+            y,
+            w: w0,
+            h: h0,
+            text,
+            font,
+            color,
+        },
+        HintPart::Bitmap { name, .. } => HintPart::Bitmap {
+            x,
+            y,
+            w: w0,
+            h: h0,
+            name,
+        },
     }
 }
 
@@ -1002,9 +1062,15 @@ fn parse_mod(spec: &str) -> Hem {
     match tag {
         "C" => Hem::Center,
         "L" => Hem::LastOnLine,
-        "CR" => Hem::CenterRight { n: arg.unwrap_or(0) },
-        "CL" => Hem::CenterLeft { n: arg.unwrap_or(0) },
-        "T" => Hem::Tab { x: arg.unwrap_or(0) },
+        "CR" => Hem::CenterRight {
+            n: arg.unwrap_or(0),
+        },
+        "CL" => Hem::CenterLeft {
+            n: arg.unwrap_or(0),
+        },
+        "T" => Hem::Tab {
+            x: arg.unwrap_or(0),
+        },
         "B" | "" | "COPY" => Hem::Bitmap,
         _ => Hem::Bitmap,
     }
@@ -1015,11 +1081,7 @@ fn parse_mod(spec: &str) -> Hem {
 /// to `m_RangersText` which knows to skip tags when measuring; we
 /// re-parse here so width accounting (wrap budgets, bitmap-after-text
 /// placement) doesn't count tag bytes.
-pub(super) fn measure_rich(
-    atlas: &mut super::text::GlyphAtlas,
-    font: &str,
-    text: &str,
-) -> u32 {
+pub(super) fn measure_rich(atlas: &mut super::text::GlyphAtlas, font: &str, text: &str) -> u32 {
     super::text::parse_rich_text(text)
         .iter()
         .map(|run| atlas.measure(font, &run.text))
@@ -1469,9 +1531,10 @@ mod tests {
         let bitmaps = HashMap::new();
         let repl = HintReplacer::default();
         let mut atlas = crate::matrix_game::interface::text::GlyphAtlas::new();
-        let (parts, ..) =
-            build_hint(template, &border, &bitmaps, &repl, &mut atlas, |_| Some((10, 10)))
-                .unwrap();
+        let (parts, ..) = build_hint(template, &border, &bitmaps, &repl, &mut atlas, |_| {
+            Some((10, 10))
+        })
+        .unwrap();
         parts
     }
 

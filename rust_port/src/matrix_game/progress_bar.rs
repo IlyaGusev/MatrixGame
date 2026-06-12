@@ -94,9 +94,26 @@ pub struct ProgressBarRenderer {
     /// across frames for cheap reuse.
     bars: Vec<BarBuffers>,
     pending: Vec<ProgressBar>,
+    /// World-anchored bars (floating HP bars over objects). Projected
+    /// to the screen inside `upload` with the camera the frame
+    /// actually renders with, so they can't lag the world pass.
+    pending_world: Vec<WorldBar>,
     /// Texture-h in pixels. Set when the atlas is loaded; half of
     /// the V strip = bar visual height, quarter = segment width.
     atlas_h: f32,
+}
+
+/// A floating bar anchored at a world position. `x_off`/`y_off`/
+/// `width`/`height` are screen pixels (caller pre-applies UI scale);
+/// the anchor is projected at upload time.
+#[derive(Debug, Clone, Copy)]
+pub struct WorldBar {
+    pub anchor: glam::Vec3,
+    pub x_off: f32,
+    pub y_off: f32,
+    pub width: f32,
+    pub height: f32,
+    pub fill: f32,
 }
 
 impl ProgressBarRenderer {
@@ -204,6 +221,7 @@ impl ProgressBarRenderer {
             atlas_ready: false,
             bars: Vec::new(),
             pending: Vec::new(),
+            pending_world: Vec::new(),
             atlas_h: 0.0,
         }
     }
@@ -267,8 +285,13 @@ impl ProgressBarRenderer {
         self.pending.push(bar);
     }
 
+    pub fn push_world(&mut self, bar: WorldBar) {
+        self.pending_world.push(bar);
+    }
+
     pub fn clear(&mut self) {
         self.pending.clear();
+        self.pending_world.clear();
     }
 
     /// Bar height in design-space pixels — the C++ reads
@@ -288,7 +311,21 @@ impl ProgressBarRenderer {
         queue: &wgpu::Queue,
         screen_w: f32,
         screen_h: f32,
+        camera: Option<&crate::matrix_game::camera::Camera>,
     ) {
+        // Resolve world-anchored bars with the render-time camera.
+        let world = std::mem::take(&mut self.pending_world);
+        if let Some(cam) = camera {
+            for wb in world {
+                let Some(p) = cam.project_to_screen(wb.anchor, screen_w, screen_h) else {
+                    continue;
+                };
+                self.pending.push(ProgressBar {
+                    rect: [p.x + wb.x_off, p.y + wb.y_off, wb.width, wb.height],
+                    fill: wb.fill,
+                });
+            }
+        }
         if !self.atlas_ready {
             return;
         }

@@ -107,7 +107,10 @@ impl SlotMarkerRenderer {
             log::warn!("slot_marker: missing texture {tex_path} in bundle");
             return None;
         };
-        log::debug!("slot_marker: loaded {} bytes for {tex_path}", tex_bytes.len());
+        log::debug!(
+            "slot_marker: loaded {} bytes for {tex_path}",
+            tex_bytes.len()
+        );
         let Some(rgba) = decode_texture_bytes(&tex_bytes) else {
             log::warn!("slot_marker: decode failed for {tex_path}");
             return None;
@@ -256,10 +259,16 @@ impl SlotMarkerRenderer {
         });
 
         let quad_verts = [
-            QuadVertex { corner: [-1.0, -1.0] },
-            QuadVertex { corner: [1.0, -1.0] },
+            QuadVertex {
+                corner: [-1.0, -1.0],
+            },
+            QuadVertex {
+                corner: [1.0, -1.0],
+            },
             QuadVertex { corner: [1.0, 1.0] },
-            QuadVertex { corner: [-1.0, 1.0] },
+            QuadVertex {
+                corner: [-1.0, 1.0],
+            },
         ];
         let quad_vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("SlotMarker Quad VB"),

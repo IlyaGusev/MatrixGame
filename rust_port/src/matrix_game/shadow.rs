@@ -464,10 +464,7 @@ impl ShadowSystem {
                 let i01 = (y + 1) * nx + x;
                 let i11 = (y + 1) * nx + (x + 1);
 
-                if grid[i00].outside
-                    && grid[i10].outside
-                    && grid[i01].outside
-                    && grid[i11].outside
+                if grid[i00].outside && grid[i10].outside && grid[i01].outside && grid[i11].outside
                 {
                     continue;
                 }
@@ -489,11 +486,7 @@ impl ShadowSystem {
                     let p = &grid[gi];
                     let v_idx = shadow_verts.len() as u32;
                     shadow_verts.push(ShadowVertex {
-                        position: [
-                            p.p.x - map_center[0],
-                            p.p.y - map_center[1],
-                            p.p.z,
-                        ],
+                        position: [p.p.x - map_center[0], p.p.y - map_center[1], p.p.z],
                         uv: p.uv,
                     });
                     vmap[gi] = v_idx as i32;

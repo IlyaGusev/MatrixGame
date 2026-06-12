@@ -230,7 +230,11 @@ impl IFaceElement {
     pub fn current_labels(&self) -> impl Iterator<Item = &ElementLabel> {
         let cur = self.cur_state;
         let any_for_cur = self.labels.iter().any(|l| l.state == cur);
-        let target = if any_for_cur { cur } else { ElementState::Normal };
+        let target = if any_for_cur {
+            cur
+        } else {
+            ElementState::Normal
+        };
         self.labels.iter().filter(move |l| l.state == target)
     }
 

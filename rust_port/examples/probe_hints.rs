@@ -30,7 +30,19 @@ fn main() {
     if let Some(all) = stor.block_record("da", "AllLabels") {
         if let Some(rr) = stor.block_record(&all, "Replaces") {
             if let (Some(keys), Some(vals)) = (stor.get_buf(&rr, "0"), stor.get_buf(&rr, "1")) {
-                for target in ["titan_hint", "electronics_hint", "energy_hint", "plasma_hint", "robots_hint", "bt_name_hint", "bt_params_hint", "bt_res1_hint", "bt_res2_hint", "bt_res3_hint", "bt_res4_hint"] {
+                for target in [
+                    "titan_hint",
+                    "electronics_hint",
+                    "energy_hint",
+                    "plasma_hint",
+                    "robots_hint",
+                    "bt_name_hint",
+                    "bt_params_hint",
+                    "bt_res1_hint",
+                    "bt_res2_hint",
+                    "bt_res3_hint",
+                    "bt_res4_hint",
+                ] {
                     for i in 0..keys.arrays_count() {
                         if keys.get_as_wstr(i) == target {
                             let v = vals.get_as_wstr(i);
@@ -48,12 +60,17 @@ fn main() {
     if let Some(t_rec) = stor.block_record("da", "Templates") {
         if let Some(keys) = stor.get_buf(&t_rec, "0") {
             let vals = stor.get_buf(&t_rec, "1");
-            for target in ["Titan", "Electronics", "Energy", "Plasma", "Robots", "HistoryNext"] {
+            for target in [
+                "Titan",
+                "Electronics",
+                "Energy",
+                "Plasma",
+                "Robots",
+                "HistoryNext",
+            ] {
                 for i in 0..keys.arrays_count() {
                     if keys.get_as_wstr(i) == target {
-                        let v = vals
-                            .map(|vb| vb.get_as_wstr(i))
-                            .unwrap_or_default();
+                        let v = vals.map(|vb| vb.get_as_wstr(i)).unwrap_or_default();
                         println!("Template '{target}' = {v}");
                     }
                 }
@@ -92,7 +109,10 @@ fn main() {
                 let ks = k.get_as_wstr(i);
                 let vs = v.get_as_wstr(i);
                 let preview: String = vs.chars().take(90).collect();
-                println!("  [{i}] {ks} = {preview}{}", if vs.len() > 90 { " …" } else { "" });
+                println!(
+                    "  [{i}] {ks} = {preview}{}",
+                    if vs.len() > 90 { " …" } else { "" }
+                );
             }
         }
     }
@@ -112,8 +132,12 @@ fn main() {
         for i in 0..n {
             let panel_name = names.get_as_wstr(i);
             let panel_rec = recs.get_as_wstr(i);
-            let Some(enames) = stor.get_buf(&panel_rec, "2") else { continue };
-            let Some(erecs) = stor.get_buf(&panel_rec, "3") else { continue };
+            let Some(enames) = stor.get_buf(&panel_rec, "2") else {
+                continue;
+            };
+            let Some(erecs) = stor.get_buf(&panel_rec, "3") else {
+                continue;
+            };
             let en = enames.arrays_count().min(erecs.arrays_count());
             let mut found: Vec<(String, String)> = Vec::new();
             for ei in 0..en {

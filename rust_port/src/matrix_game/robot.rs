@@ -8,6 +8,7 @@
 //! selection queries do the right thing. AI and combat land with
 //! their owning subsystems.
 
+use crate::matrix_game::logic::Rnd;
 use crate::matrix_game::logic::{self, ROBOT_MOVECELLS_PER_SIZE};
 use crate::matrix_game::map::GameMap;
 use crate::matrix_game::map_static::{
@@ -15,7 +16,6 @@ use crate::matrix_game::map_static::{
 };
 use crate::matrix_game::map_trace::{self, MovePath, ROBOT_FOOTPRINT_HALF};
 use crate::matrix_game::object_cannon::{Cannon, CannonState};
-use crate::matrix_game::logic::Rnd;
 
 /// Port of `ERobotState` (MatrixRobot.hpp). Full enum is 20+
 /// states (DIP, MOVE, PATROL, ATTACK, CARRYING, CAPTURING,
@@ -34,6 +34,10 @@ pub enum RobotState {
     /// closed, the robot hands off to normal idle AI
     /// (MatrixRobot.cpp:801).
     Idle,
+    /// `ROBOT_DIP` — destroyed; the wreck decays for `dip_ttl` ms
+    /// (the unit-scatter death animation isn't ported) and then
+    /// despawns.
+    Dip,
 }
 
 /// Port of `ERobotUnitKind` — chassis rows (MatrixRobot.hpp). Only
@@ -233,6 +237,118 @@ pub struct Robot {
     /// AI, and the building progress UI access the per-component
     /// metadata without round-tripping through `g_Config`.
     pub config: crate::matrix_game::interface::constructor::RobotConfig,
+
+    // ── Combat state (MatrixRobot.hpp) ───────────────────────────────
+    /// Own arena id — set right after spawn (same pattern as
+    /// `Building::self_id`); the weapons need it as handler target.
+    pub self_id: Option<ObjectId>,
+    /// `m_Weapons[]` + `m_WeaponsCnt` — created by
+    /// [`Robot::robot_weapon_init`] on the first live takt.
+    pub weapons: Vec<BotWeapon>,
+    /// `m_WeaponDir` — world-space point the weapons aim at (set by
+    /// the ROT_FIRE order processing, MatrixRobot.cpp:1152-1175).
+    pub weapon_dir: glam::Vec3,
+    /// `m_LastDelayDamageSide` + `m_NextTimeAblaze` /
+    /// `m_NextTimeShorted` — DOT bookkeeping.
+    pub last_delay_damage_side: i32,
+    pub next_time_ablaze: i64,
+    pub next_time_shorted: i64,
+    /// `m_BombProtect` / `m_LightProtect` — head armor coefficients in
+    /// `[0, 1]` (MatrixRobot.cpp:4281-4285).
+    pub bomb_protect: f32,
+    pub light_protect: f32,
+    /// `GetEnv()->m_LastHit*` timestamps `HitTo` maintains — kept for
+    /// the AI port even though the env itself isn't here yet.
+    pub last_hit_enemy_ms: i64,
+    pub last_hit_friendly_ms: i64,
+    pub last_hit_target_ms: i64,
+    /// `ROBOT_MUST_DIE` flag — set by [`Robot::big_boom`]; the next
+    /// logic takt routes it into `Damage(WEAPON_INSTANT_DEATH)`.
+    pub must_die: bool,
+    /// `m_ShowHitpointTime` — floating HP-bar visibility timer.
+    pub show_hitpoint_time: i32,
+    /// Wreck decay timer for the `Dip` state.
+    pub dip_ttl: i32,
+    /// DIP wreck pieces (`m_Unit[]` in death mode) — flying chunks
+    /// with smoke trails that damage what they land on
+    /// (MatrixRobot.cpp:178-283).
+    pub dip_units: Vec<DipUnit>,
+    /// Per-pylon weapon muzzle transforms, written back by the robot
+    /// renderer each frame from the real part chain — the
+    /// `m_Graph->GetMatrixById(1) * m_Unit.m_Matrix` lookup the C++
+    /// fire control does (MatrixRobot.cpp:1390-1394). `pos` is the
+    /// barrel-tip bone in world space, `dir` the barrel's Y axis.
+    pub weapon_mounts: [Option<WeaponMount>; 5],
+    /// Assembled-part world positions (renderer write-back, see
+    /// [`DipPartSnapshot`]).
+    pub part_snapshot: DipPartSnapshot,
+}
+
+/// One weapon's world-space muzzle (see `weapon_mounts`).
+#[derive(Debug, Clone, Copy)]
+pub struct WeaponMount {
+    pub pos: glam::Vec3,
+    pub dir: glam::Vec3,
+}
+
+/// One scattering wreck piece — the robot's own part mesh flying with
+/// a tumble (`m_Unit[]` in ROBOT_DIP mode). The robot renderer draws
+/// it via `part` + the spin/pos fields; the hull (MRT_ARMOR) gets no
+/// unit at all — the C++ zeroes its TTL so it's never drawn
+/// (MatrixRobot.cpp:2088-2093, MatrixObjectRobot.cpp:1049).
+pub struct DipUnit {
+    pub pos: glam::Vec3,
+    pub velocity: glam::Vec3,
+    pub ttl: f32,
+    pub dp: f32,
+    pub dy: f32,
+    pub dr: f32,
+    pub part: DipPart,
+    pub invert: bool,
+    /// Base Z-rotation. Non-zero only for the stay-in-place chassis,
+    /// whose C++ unit matrix is never recomputed and so keeps the
+    /// robot's death orientation; flying pieces snap to the pure
+    /// YawPitchRoll spin (DIPTakt only updates moving units).
+    pub yaw: f32,
+    /// Spin-clock freeze stamp — set when the piece lands (zero
+    /// velocity skips the C++ matrix update, freezing orientation).
+    pub freeze_t: Option<f32>,
+    pub smoke: crate::matrix_game::effects::smoke_and_fire::Smoke,
+}
+
+/// Which of the robot's parts a [`DipUnit`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DipPart {
+    Chassis,
+    Head,
+    /// Pylon index into `config.weapon`.
+    Weapon(usize),
+}
+
+/// World positions (+ weapon invert flags) of the assembled parts,
+/// written back by the renderer each frame — the real part chain only
+/// exists render-side. `init_dip_scatter` seeds each wreck piece at
+/// its part's position like the C++ (`m_Unit[i].m_Matrix._41-43`).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DipPartSnapshot {
+    pub chassis: Option<glam::Vec3>,
+    pub head: Option<glam::Vec3>,
+    pub weapons: [Option<(glam::Vec3, bool)>; 5],
+}
+
+/// Port of `SBotWeapon` (MatrixRobot.hpp:50-121) — one mounted weapon
+/// with its heat bookkeeping. The effect itself lives in the
+/// `Objects::weapons` slab.
+pub struct BotWeapon {
+    pub weapon: crate::matrix_game::effects::weapon::WeaponId,
+    /// Index into `config.weapon` (which pylon this is).
+    pub unit: usize,
+    pub heat: i32,
+    pub heat_period: i32,
+    pub heat_mod: i32,
+    pub cool_down_period: i32,
+    pub cool_down_mod: i32,
+    pub on: bool,
 }
 
 /// Port of `EAnimation` (MatrixObjectRobot.hpp:32-47).
@@ -308,6 +424,23 @@ impl Robot {
             name: String::new(),
             team: 0,
             config: crate::matrix_game::interface::constructor::RobotConfig::new(),
+            self_id: None,
+            weapons: Vec::new(),
+            weapon_dir: glam::Vec3::ZERO,
+            last_delay_damage_side: 0,
+            next_time_ablaze: 0,
+            next_time_shorted: 0,
+            bomb_protect: 0.0,
+            light_protect: 0.0,
+            last_hit_enemy_ms: 0,
+            last_hit_friendly_ms: 0,
+            last_hit_target_ms: 0,
+            must_die: false,
+            show_hitpoint_time: 0,
+            dip_ttl: 0,
+            dip_units: Vec::new(),
+            weapon_mounts: [None; 5],
+            part_snapshot: DipPartSnapshot::default(),
         }
     }
 
@@ -1661,7 +1794,39 @@ impl MapStatic for Robot {
         self.rchange = 0;
     }
 
-    fn takt(&mut self, _cms: i32, _rng: &mut Rnd, _objs: &mut Objects) {}
+    fn takt(&mut self, cms: i32, _rng: &mut Rnd, _objs: &mut Objects) {
+        // HP-bar timer decay (`RobotTakt`, MatrixRobot.cpp:313-317).
+        if self.show_hitpoint_time > 0 {
+            self.show_hitpoint_time = (self.show_hitpoint_time - cms).max(0);
+        }
+    }
+
+    fn show_hitpoint(&mut self) {
+        self.show_hitpoint_time = crate::matrix_game::common::HITPOINT_SHOW_TIME_MS;
+    }
+
+    /// `CMatrixRobot::BeforeDraw` PB block (MatrixObjectRobot.cpp:
+    /// 1007-1017): anchor 20 above the robot origin, bar lifted by the
+    /// radius, PB_ROBOT_WIDTH=70 centered.
+    fn hitpoint_bar(
+        &self,
+        _map: &crate::matrix_game::map::GameMap,
+    ) -> Option<crate::matrix_game::map_static::HpBar> {
+        if self.show_hitpoint_time <= 0 || self.hit_point <= 0.0 || self.state == RobotState::Dip
+        {
+            return None;
+        }
+        Some(crate::matrix_game::map_static::HpBar {
+            anchor: glam::Vec3::new(self.pos_x, self.pos_y, self.pos_z + 20.0),
+            width: 70.0,
+            fill: (self.hit_point / self.hit_point_max.max(1.0)).clamp(0.0, 1.0),
+            x_off: -35.0,
+            // C++ lifts by GetRadius() — the mesh-AABB half-diagonal
+            // (~18 for a typical build), not our hand-tuned 6-unit
+            // trace sphere.
+            y_off: -18.0,
+        })
+    }
 
     /// Minimal port of `CMatrixRobotAI::LogicTakt` covering only the
     /// spawn-animation branch (MatrixRobot.cpp:774-824). Reads the
@@ -1679,7 +1844,56 @@ impl MapStatic for Robot {
         };
         let elapsed_ms = crate::matrix_game::map::current_elapsed_ms();
 
+        // ROBOT_DIP — `DIPTakt` (MatrixRobot.cpp:178-283): pieces fly
+        // with gravity, bounce nothing, splash into water, damage
+        // objects they strike (WEAPON_DEBRIS) and pop a small boom at
+        // end of life. The robot frees itself when all pieces are gone.
+        if self.state == RobotState::Dip {
+            self.dip_takt(cms, map, rng, objs);
+            self.dip_ttl -= cms;
+            if self.dip_units.is_empty() || self.dip_ttl <= -10_000 {
+                if let Some(id) = self.self_id {
+                    objs.remove_deferred(id);
+                }
+            }
+            return;
+        }
+
+        // Weapons mount on the first live takt (`RobotWeaponInit` runs
+        // at construction in the C++; the arena id isn't known until
+        // after spawn here).
+        self.robot_weapon_init(objs);
+
+        // MUST_DIE flag — set by BigBoom (MatrixRobot.cpp:4774).
+        if self.must_die {
+            if let Some(id) = self.self_id {
+                let pos = self.core.geo_center;
+                if self.damage(
+                    crate::matrix_game::effects::weapon::WEAPON_INSTANT_DEATH,
+                    pos,
+                    glam::Vec3::Z,
+                    0,
+                    None,
+                    id,
+                    objs,
+                ) {
+                    return;
+                }
+            }
+        }
+
+        // Ablaze / shorted periodic self-damage (MatrixRobot.cpp:416-507).
+        if self.dot_takt(objs) {
+            return;
+        }
+        // A shorted robot is paralyzed — no orders, movement or
+        // weapons until the TTL clears (MatrixRobot.cpp:717).
+        if self.object_state & OBJECT_STATE_SHORTED != 0 {
+            return;
+        }
+
         match self.state {
+            RobotState::Dip => unreachable!(),
             RobotState::InSpawn => {
                 // Reach into the base; downcast-via-raw-pointer is
                 // safe because the arena slot holds a concrete Building
@@ -1797,13 +2011,21 @@ impl MapStatic for Robot {
                 }
             }
             RobotState::Idle => {
+                // ROT_FIRE / ROT_STOP_FIRE first — a FIRE order on top
+                // `break`s the C++ order loop, holding position
+                // (MatrixRobot.cpp:1143-1205).
+                let firing = self.dispatch_fire_order(objs);
+
                 // Dispatch the top-of-pool order. For now only
                 // ROT_MOVE_TO (and implicitly its GetingLost-phase
                 // variant) is handled — the rest land with combat
                 // / capture. Mirrors the while-loop around
                 // MatrixRobot.cpp:1012.
                 let top_ty = self.orders.top().map(|o| o.ty);
-                if matches!(top_ty, Some(OrderType::MoveTo)) {
+                if firing {
+                    self.velocity = glam::Vec2::ZERO;
+                    self.speed = 0.0;
+                } else if matches!(top_ty, Some(OrderType::MoveTo)) {
                     let o = *self.orders.top().unwrap();
                     self.des_x = o.p1 as i32;
                     self.des_y = o.p2 as i32;
@@ -1852,16 +2074,41 @@ impl MapStatic for Robot {
             }
         }
 
+        // Fire-control + heat (MatrixRobot.cpp:1364-1542) — runs after
+        // order processing, before the animation tail.
+        if self.state == RobotState::Idle {
+            self.weapons_logic_takt(cms, map, objs, rng);
+            // Hitscan weapons fired above land synchronously in the C++
+            // (`FireHandler` → `HitTo`), but our box is checked out, so
+            // the dispatch queued the notices instead — apply them now.
+            if let (false, Some(me)) = (objs.pending_hit_notices.is_empty(), self.self_id) {
+                let mut i = 0;
+                while i < objs.pending_hit_notices.len() {
+                    if objs.pending_hit_notices[i].0 == me {
+                        let (_, hit, pos) = objs.pending_hit_notices.swap_remove(i);
+                        self.hit_to(hit, pos);
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+        }
+
         // Hull tracking — port of the no-enemy fall-through at
         // MatrixRobot.cpp:945-951:
         //
         //   RotateHull(D3DXVECTOR3(m_PosX + m_Forward.x, m_PosY + m_Forward.y, 0));
         //
-        // Without enemy/AI vision logic ported, the hull always tracks
-        // chassis forward so it follows the chassis as it rotates.
-        // Combat/arcade hull-aim lands when those subsystems do.
+        // While a FIRE order is active the hull turns to the aim point
+        // (the enemy-tracking branch at :940); otherwise it follows
+        // chassis forward.
         let here = glam::Vec2::new(self.pos_x, self.pos_y);
-        self.rotate_hull(here + self.forward, cms);
+        let hull_target = if self.orders.top().map(|o| o.ty) == Some(OrderType::Fire) {
+            glam::Vec2::new(self.weapon_dir.x, self.weapon_dir.y)
+        } else {
+            here + self.forward
+        };
+        self.rotate_hull(hull_target, cms);
     }
 
     fn side(&self) -> i32 {
@@ -1869,6 +2116,261 @@ impl MapStatic for Robot {
     }
     fn need_repair(&self) -> bool {
         self.hit_point < self.hit_point_max
+    }
+
+    fn is_live(&self) -> bool {
+        self.state != RobotState::Dip
+    }
+
+    /// Port of `CMatrixRobotAI::Damage` (MatrixRobot.cpp:1827-2118).
+    /// Not ported (visual / unported-subsystem hooks): hit sounds,
+    /// explosion + crater effects, progress-bar + minimap flashes, the
+    /// war camera, env target-switching on cannon hits, and the DIP
+    /// unit-scatter animation.
+    fn damage(
+        &mut self,
+        weap: crate::matrix_game::effects::weapon::Weapon,
+        _pos: glam::Vec3,
+        _dir: glam::Vec3,
+        attacker_side: i32,
+        _attacker: Option<ObjectId>,
+        self_id: ObjectId,
+        objs: &mut Objects,
+    ) -> bool {
+        use crate::matrix_game::common::PLAYER_SIDE;
+        use crate::matrix_game::effects::weapon::{weap_to_index, WEAPON_INSTANT_DEATH};
+
+        if self.state == RobotState::Dip {
+            return true;
+        }
+
+        let cfg = crate::matrix_game::config::global();
+        let now = crate::matrix_game::map::current_elapsed_ms();
+
+        let instant = weap == WEAPON_INSTANT_DEATH;
+        if !instant {
+            let friendly_fire = attacker_side != 0 && attacker_side == self.side;
+            let mut damagek = if friendly_fire || self.side != PLAYER_SIDE {
+                1.0
+            } else {
+                cfg.difficulty.k_damage_enemy_to_player
+            };
+            if friendly_fire && self.side == PLAYER_SIDE {
+                damagek *= cfg.difficulty.k_friendly_fire;
+            }
+
+            let idx = weap_to_index(weap);
+            let dmg = idx.map(|i| cfg.robot_damages.table[i]).unwrap_or_default();
+
+            if weap == WEAPON_REPAIR {
+                self.hit_point += if friendly_fire {
+                    dmg.friend_damage as f32
+                } else {
+                    dmg.damage as f32
+                };
+                if self.hit_point > self.hit_point_max {
+                    self.hit_point = self.hit_point_max;
+                }
+                return false;
+            }
+
+            // (Cannon-attacker enemy-list / target-switch block at
+            // :1870-1878 needs SMatrixRobotAIEnv — lands with the AI.)
+
+            if self.hit_point > dmg.mindamage as f32 {
+                let mut damage = damagek
+                    * if friendly_fire {
+                        dmg.friend_damage as f32
+                    } else {
+                        dmg.damage as f32
+                    };
+                if weap == WEAPON_BIGBOOM {
+                    damage -= damage * self.bomb_protect;
+                }
+                self.hit_point -= damage;
+            }
+
+            if weap == WEAPON_FLAMETHROWER {
+                self.object_state |= OBJECT_STATE_ABLAZE;
+                self.last_delay_damage_side = attacker_side;
+                self.ablaze_ttl = (self.ablaze_ttl + 300).min(5000);
+                self.next_time_ablaze = now;
+            } else if weap == WEAPON_LIGHTENING {
+                self.low_level_stop_fire(objs);
+                self.object_state |= OBJECT_STATE_SHORTED;
+                self.last_delay_damage_side = attacker_side;
+                let mut ttl = self.shorted_ttl + 500 - (500.0 * self.light_protect) as i32;
+                let maxl = 3000 - (3000.0 * self.light_protect) as i32;
+                if ttl > maxl {
+                    ttl = maxl;
+                }
+                self.shorted_ttl = ttl;
+                self.next_time_shorted = now;
+            } else {
+                self.last_delay_damage_side = 0;
+            }
+
+            if self.hit_point > 50.0
+                && !matches!(
+                    weap,
+                    crate::matrix_game::effects::weapon::WEAPON_ABLAZE
+                        | crate::matrix_game::effects::weapon::WEAPON_SHORTED
+                        | WEAPON_LIGHTENING
+                        | WEAPON_FLAMETHROWER
+                )
+            {
+                // Impact flash (MatrixRobot.cpp:1937-1941).
+                objs.pending_explosions
+                    .push(crate::matrix_game::map_static::ExplosionSpawn {
+                        pos: _pos,
+                        props: &crate::matrix_game::effects::explosion::EXPLOSION_ROBOT_HIT,
+                        fire: false,
+                    });
+            }
+            if self.hit_point > 0.0 {
+                return false;
+            }
+            if attacker_side != 0 && !friendly_fire {
+                objs.inc_side_stat(attacker_side, |s| s.robot_kill += 1);
+            }
+        }
+
+        // inst_death (MatrixRobot.cpp:1951-2116).
+        //
+        // Self-destruct bomb: enemy robots blow up when going down if
+        // the blast favors them (danger > 0); the player's own robots
+        // never auto-trigger (the C++ comments the call out).
+        if self.side != PLAYER_SIDE {
+            let boom = self.weapons.iter().find(|bw| {
+                objs.weapons
+                    .get(bw.weapon)
+                    .map(|w| w.weapon_type() == WEAPON_BIGBOOM)
+                    .unwrap_or(false)
+            });
+            if let Some(bw) = boom {
+                let wdist = objs
+                    .weapons
+                    .get(bw.weapon)
+                    .map(|w| w.weapon_dist())
+                    .unwrap_or(0.0);
+                let mut danger = 0.0f32;
+                let here = glam::Vec2::new(self.pos_x, self.pos_y);
+                for oid in objs.iter_live().collect::<Vec<_>>() {
+                    if Some(oid) == self.self_id {
+                        continue;
+                    }
+                    let Some(o) = objs.get(oid) else { continue };
+                    if !o.is_live() {
+                        continue;
+                    }
+                    match o.core().obj_type {
+                        ObjectType::RobotAi => {
+                            let r: &Robot =
+                                unsafe { &*(o as *const dyn MapStatic as *const Robot) };
+                            let d2 = (glam::Vec2::new(r.pos_x, r.pos_y) - here).length_squared();
+                            if d2 < wdist * wdist {
+                                let s = r.calc_strength(objs);
+                                if r.side == self.side {
+                                    danger -= s;
+                                } else {
+                                    danger += s;
+                                }
+                            }
+                        }
+                        ObjectType::Cannon => {
+                            let c: &Cannon =
+                                unsafe { &*(o as *const dyn MapStatic as *const Cannon) };
+                            if c.state == CannonState::UnderConstruction {
+                                continue;
+                            }
+                            let d2 = (c.pos - here).length_squared();
+                            if d2 < wdist * wdist {
+                                let s = c.get_strength();
+                                if c.side == self.side {
+                                    danger -= s;
+                                } else {
+                                    danger += s;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if danger > 0.0 {
+                    let bw_weapon = bw.weapon;
+                    if let Some(map) = crate::matrix_game::map::current_map() {
+                        // Inline `BigBoom(nC)` without the MustDie tail
+                        // — death continues right below.
+                        let geo = self.core.geo_center;
+                        let vel = glam::Vec3::new(self.velocity.x, self.velocity.y, 0.0)
+                            / crate::matrix_game::logic::LOGIC_TAKT_PERIOD_MS as f32;
+                        if let Some(we) = objs.weapons.get_mut(bw_weapon) {
+                            we.modify(geo, glam::Vec3::new(self.pos_x, self.pos_y, 0.0), vel);
+                            we.fire_begin(vel, Some(self_id));
+                        }
+                        // Use a throwaway RNG stream — the C++ Takt(1)
+                        // path doesn't draw from the world RNG.
+                        let mut rng = crate::matrix_game::logic::Rnd::new(1);
+                        weapon_takt(objs, bw_weapon, 1.0, map, &mut rng);
+                    }
+                }
+            }
+        }
+        self.must_die = false; // ResetMustDie
+
+        // Close the spawning base if we died on the pad.
+        if matches!(self.state, RobotState::InSpawn | RobotState::BaseMoveOut) {
+            if let Some(base_id) = self.base {
+                if let Some(obj_mut) = objs.get_mut(base_id) {
+                    if matches!(obj_mut.core().obj_type, ObjectType::Building) {
+                        let b: &mut crate::matrix_game::object_building::Building = unsafe {
+                            &mut *(obj_mut as *mut dyn MapStatic
+                                as *mut crate::matrix_game::object_building::Building)
+                        };
+                        b.object_state_clear(
+                            crate::matrix_game::map_static::OBJECT_STATE_BUILDING_SPAWNBOT,
+                        );
+                        b.close();
+                    }
+                }
+            }
+        }
+
+        // Death visuals (MatrixRobot.cpp:2000-2007): the big boom +
+        // the crater under the wreck.
+        let geo = self.core.geo_center;
+        objs.pending_explosions
+            .push(crate::matrix_game::map_static::ExplosionSpawn {
+                pos: geo,
+                props: &crate::matrix_game::effects::explosion::EXPLOSION_ROBOT_BOOM,
+                fire: true,
+            });
+        // Visual randomness only — seeded off position/time so the
+        // world RNG stream is untouched (the C++ uses libc rand()).
+        let mut vrng = crate::matrix_game::logic::Rnd::new(
+            ((now as i32) ^ (self.pos_x as i32) << 8 ^ (self.pos_y as i32)).max(1),
+        );
+        objs.pending_spots
+            .push(crate::matrix_game::effects::landscape_spot::SpotSpawn {
+                pos: glam::Vec2::new(geo.x, geo.y),
+                angle: crate::matrix_game::effects::smoke_and_fire::fsrnd(
+                    &mut vrng,
+                    std::f32::consts::PI,
+                ),
+                scale: 4.0 + crate::matrix_game::effects::smoke_and_fire::frnd(&mut vrng, 2.0),
+                kind: crate::matrix_game::effects::landscape_spot::SpotKind::Voronka,
+            });
+        let on_water = self.object_state & crate::matrix_game::map_static::ROBOT_FLAG_ONWATER != 0;
+
+        self.state = RobotState::Dip;
+        self.dip_ttl = 5000; // FRND(3000)+2000 unit TTL ceiling
+        self.speed = 0.0;
+        self.velocity = glam::Vec2::ZERO;
+        self.init_dip_scatter(&mut vrng, on_water);
+        for bw in self.weapons.drain(..) {
+            objs.weapons.release(bw.weapon);
+        }
+        true
     }
 }
 
@@ -2064,5 +2566,766 @@ mod orders_tests {
         ol.remove_type(OrderType::MoveTo);
         assert_eq!(ol.len(), 1);
         assert_eq!(ol.top().unwrap().ty, OrderType::Fire);
+    }
+}
+
+// ── Combat: weapons + damage (CMatrixRobotAI combat subset) ─────────────
+
+use crate::matrix_game::effects::weapon::{
+    weapon_takt, WeaponEffect, WeaponHandler, WEAPON_BIGBOOM, WEAPON_BOMB, WEAPON_FLAMETHROWER,
+    WEAPON_GUN, WEAPON_HOMING_MISSILE, WEAPON_LASER, WEAPON_LIGHTENING, WEAPON_MAX_HEAT,
+    WEAPON_PLASMA, WEAPON_REPAIR, WEAPON_VOLCANO,
+};
+use crate::matrix_game::map_static::{OBJECT_STATE_ABLAZE, OBJECT_STATE_SHORTED};
+
+/// `BARREL_TO_SHOT_ANGLE` (MatrixRobot.hpp:31) — 15°.
+pub const BARREL_TO_SHOT_ANGLE: f32 = 15.0 * std::f32::consts::PI / 180.0;
+
+impl Robot {
+    /// Port of `CMatrixRobotAI::RobotWeaponInit` (MatrixRobot.cpp:
+    /// 4052-4142) + the head-modifier application from `CalcRobotMass`
+    /// (MatrixRobot.cpp:4248-4305): create one weapon effect per
+    /// mounted weapon unit, seed heat/cool mods from `m_Overheat`, and
+    /// apply the head's COOL_DOWN / FIRE_DISTANCE / OVERHEAT /
+    /// LIGHT_PROTECT / BOMB_PROTECT percentages.
+    pub fn robot_weapon_init(&mut self, objs: &mut Objects) {
+        let Some(self_id) = self.self_id else { return };
+        if !self.weapons.is_empty() {
+            return;
+        }
+        let cfg = crate::matrix_game::config::global();
+
+        // Head modifiers (CalcRobotMass).
+        let (mut cool_down, mut fire_dist, mut overheat) = (0.0f32, 0.0f32, 0.0f32);
+        if !self.config.head.kind.is_empty() {
+            let h = self.config.head.kind.as_index();
+            let hc = &cfg.head_chars;
+            cool_down = (hc.cool_down[h.min(3)] / 100.0).max(-1.0);
+            fire_dist = (hc.fire_distance[h.min(3)] / 100.0).max(-1.0);
+            overheat = (hc.overheat[h.min(3)] / 100.0).max(-1.0);
+            self.light_protect = (hc.light_protect[h.min(3)] / 100.0).clamp(0.0, 1.0);
+            self.bomb_protect = (hc.bomb_protect[h.min(3)] / 100.0).clamp(0.0, 1.0);
+        }
+
+        for (i, w) in self.config.weapon.iter().enumerate() {
+            if w.kind.is_empty() {
+                continue;
+            }
+            // RUK_WEAPON_* → (EWeapon, heat entry). The C++ wires
+            // RUK_WEAPON_ELECTRIC with a NULL handler (MatrixRobot.cpp
+            // :4118) — preserved.
+            let (wtype, oh, handler) = match w.kind.0 {
+                1 => (
+                    WEAPON_VOLCANO,
+                    cfg.overheat.volcano,
+                    WeaponHandler::Robot(self_id),
+                ),
+                2 => (WEAPON_GUN, cfg.overheat.gun, WeaponHandler::Robot(self_id)),
+                3 => (
+                    WEAPON_HOMING_MISSILE,
+                    cfg.overheat.homing_missile,
+                    WeaponHandler::Robot(self_id),
+                ),
+                4 => (
+                    WEAPON_FLAMETHROWER,
+                    cfg.overheat.flamethrower,
+                    WeaponHandler::Robot(self_id),
+                ),
+                5 => (
+                    WEAPON_BOMB,
+                    cfg.overheat.bomb,
+                    WeaponHandler::Robot(self_id),
+                ),
+                6 => (
+                    WEAPON_LASER,
+                    cfg.overheat.laser,
+                    WeaponHandler::Robot(self_id),
+                ),
+                7 => (
+                    WEAPON_BIGBOOM,
+                    crate::matrix_game::config::OverheatParams {
+                        heat_mod: 10,
+                        cool_period: 0,
+                        cool_mod: 10,
+                    },
+                    WeaponHandler::Robot(self_id),
+                ),
+                8 => (
+                    WEAPON_PLASMA,
+                    cfg.overheat.plasma,
+                    WeaponHandler::Robot(self_id),
+                ),
+                9 => (
+                    WEAPON_LIGHTENING,
+                    cfg.overheat.lightening,
+                    WeaponHandler::None,
+                ),
+                10 => (
+                    WEAPON_REPAIR,
+                    crate::matrix_game::config::OverheatParams {
+                        heat_mod: 10,
+                        cool_period: 0,
+                        cool_mod: 10,
+                    },
+                    WeaponHandler::Robot(self_id),
+                ),
+                _ => continue,
+            };
+            let mut we = WeaponEffect::new(wtype, 0, handler);
+            we.set_owner(self_id, self.side);
+            // Head bonuses (MatrixRobot.cpp:4299-4302).
+            we.modify_cool_down(cool_down);
+            we.modify_dist(fire_dist);
+            let mut heat_mod = oh.heat_mod;
+            heat_mod += (heat_mod as f32 * overheat) as i32;
+            let id = objs.weapons.create(we);
+            self.weapons.push(BotWeapon {
+                weapon: id,
+                unit: i,
+                heat: 0,
+                heat_period: 0,
+                heat_mod,
+                cool_down_period: 0,
+                cool_down_mod: oh.cool_mod,
+                on: true,
+            });
+        }
+    }
+
+    /// Port of `CMatrixRobotAI::Fire` (MatrixRobot.cpp:4734-4742).
+    pub fn fire(&mut self, fire_pos: glam::Vec3, ftype: i32) {
+        self.orders.remove_type(OrderType::Fire);
+        self.orders.push_top(Order::set(
+            OrderType::Fire,
+            fire_pos.x,
+            fire_pos.y,
+            fire_pos.z,
+            ftype,
+        ));
+    }
+
+    /// Port of `CMatrixRobotAI::StopFire` (MatrixRobot.cpp:4744-4752):
+    /// converts pending FIRE orders into STOP_FIRE in place.
+    pub fn stop_fire(&mut self) {
+        for o in self.orders.iter_mut() {
+            if o.ty == OrderType::Fire {
+                *o = Order::set(OrderType::StopFire, 0.0, 0.0, 0.0, 0);
+            }
+        }
+    }
+
+    /// Port of `LowLevelStopFire` (MatrixRobot.cpp:5044-5052).
+    pub fn low_level_stop_fire(&mut self, objs: &mut Objects) {
+        for bw in &self.weapons {
+            if let Some(we) = objs.weapons.get_mut(bw.weapon) {
+                we.fire_end();
+            }
+        }
+    }
+
+    /// Port of `CMatrixRobotAI::HitTo` (MatrixRobot.cpp:4025-4050) —
+    /// the FIRE_END_HANDLER target. The env target-switching half
+    /// needs `SMatrixRobotAIEnv` (not ported); the hit timestamps are
+    /// the part current systems read.
+    pub fn hit_to(&mut self, hit: Option<(i32, ObjectType)>, _pos: glam::Vec3) {
+        let now = crate::matrix_game::map::current_elapsed_ms();
+        match hit {
+            Some((_, ObjectType::Building)) => {}
+            Some((side, _)) if side != self.side => self.last_hit_enemy_ms = now,
+            Some(_) => self.last_hit_friendly_ms = now,
+            None => {}
+        }
+    }
+
+    /// Port of `CMatrixRobotAI::BigBoom` (MatrixRobot.cpp:4755-4774):
+    /// trigger the self-destruct bomb then flag MUST_DIE.
+    pub fn big_boom(&mut self, map: &GameMap, objs: &mut Objects, rng: &mut Rnd) {
+        let geo = self.core.geo_center;
+        let vel = glam::Vec3::new(self.velocity.x, self.velocity.y, 0.0)
+            / crate::matrix_game::logic::LOGIC_TAKT_PERIOD_MS as f32;
+        for bw in &self.weapons {
+            let is_boom = objs
+                .weapons
+                .get(bw.weapon)
+                .map(|w| w.weapon_type() == WEAPON_BIGBOOM)
+                .unwrap_or(false);
+            if !is_boom {
+                continue;
+            }
+            if let Some(we) = objs.weapons.get_mut(bw.weapon) {
+                we.modify(geo, glam::Vec3::new(self.pos_x, self.pos_y, 0.0), vel);
+                we.fire_begin(vel, self.self_id);
+            }
+            weapon_takt(objs, bw.weapon, 1.0, map, rng);
+            break;
+        }
+        self.must_die = true;
+    }
+
+    /// Port of `CalcStrength` (MatrixRobot.cpp:5311-5330).
+    pub fn calc_strength(&self, objs: &Objects) -> f32 {
+        let cfg = crate::matrix_game::config::global();
+        let mut s = 0.0f32;
+        for bw in &self.weapons {
+            let Some(we) = objs.weapons.get(bw.weapon) else {
+                continue;
+            };
+            use crate::matrix_game::config::RobotUnitKind as K;
+            let kind = match we.weapon_type() {
+                WEAPON_PLASMA => K::WEAPON_PLASMA,
+                WEAPON_VOLCANO => K::WEAPON_MACHINEGUN,
+                WEAPON_HOMING_MISSILE => K::WEAPON_MISSILE,
+                WEAPON_BOMB => K::WEAPON_MORTAR,
+                WEAPON_FLAMETHROWER => K::WEAPON_FLAMETHROWER,
+                WEAPON_BIGBOOM => K::WEAPON_BOMB,
+                WEAPON_LIGHTENING => K::WEAPON_ELECTRIC,
+                WEAPON_LASER => K::WEAPON_LASER,
+                WEAPON_GUN => K::WEAPON_CANNON,
+                _ => continue,
+            };
+            s += cfg.weapon_strength_ai.for_kind(kind);
+        }
+        s * (0.4 + 0.6 * (self.hit_point / self.hit_point_max.max(1.0)))
+    }
+
+    /// `SetWeaponToArcadedCoeff` / `SetWeaponToDefaultCoeff`
+    /// (MatrixRobot.cpp:5396-5409).
+    pub fn set_weapons_arcade_coeff(&self, objs: &mut Objects, arcade: bool) {
+        for bw in &self.weapons {
+            if let Some(we) = objs.weapons.get_mut(bw.weapon) {
+                if arcade {
+                    we.set_arcade_coefficient();
+                } else {
+                    we.set_default_coefficient();
+                }
+            }
+        }
+    }
+
+    /// Fire-control block of `LogicTakt` (MatrixRobot.cpp:1364-1495) +
+    /// the cool-down block (:1497-1542).
+    fn weapons_logic_takt(&mut self, ms: i32, map: &GameMap, objs: &mut Objects, rng: &mut Rnd) {
+        let arcaded = objs.arcaded_object.is_some() && objs.arcaded_object == self.self_id;
+        let vel3 = glam::Vec3::new(self.velocity.x, self.velocity.y, 0.0)
+            / crate::matrix_game::logic::LOGIC_TAKT_PERIOD_MS as f32;
+        let geo = self.core.geo_center;
+
+        for i in 0..self.weapons.len() {
+            let (wid, on, heat, heat_mod) = {
+                let bw = &self.weapons[i];
+                (bw.weapon, bw.on, bw.heat, bw.heat_mod)
+            };
+            if objs.weapons.get(wid).is_none() || !(on || arcaded) {
+                continue;
+            }
+            let wtype = objs.weapons.get(wid).map(|w| w.weapon_type()).unwrap();
+
+            // Real muzzle from the renderer's part chain when
+            // available; geo-center fallback before the first frame.
+            let mount = self
+                .weapons
+                .get(i)
+                .and_then(|b| self.weapon_mounts.get(b.unit))
+                .copied()
+                .flatten();
+            let (v_pos, barrel2) = match mount {
+                Some(m) => (m.pos, glam::Vec2::new(m.dir.x, m.dir.y)),
+                None => (self.core.geo_center, self.hull_forward),
+            };
+
+            // Heat budget check (MatrixRobot.cpp:1373-1384).
+            let modk = if wtype == WEAPON_HOMING_MISSILE || wtype == WEAPON_BOMB {
+                1
+            } else {
+                2
+            };
+            if heat + heat_mod * modk > WEAPON_MAX_HEAT {
+                if let Some(we) = objs.weapons.get_mut(wid) {
+                    we.fire_end();
+                }
+                continue;
+            }
+
+            let fire_dist = objs
+                .weapons
+                .get(wid)
+                .map(|w| w.weapon_dist())
+                .unwrap_or(0.0);
+            let v_dir = (self.weapon_dir - v_pos).normalize_or_zero();
+
+            // Range check — AI robots only (:1403-1408).
+            if !arcaded && (geo - self.weapon_dir).length_squared() > fire_dist * fire_dist {
+                if let Some(we) = objs.weapons.get_mut(wid) {
+                    we.fire_end();
+                }
+                continue;
+            }
+
+            match wtype {
+                WEAPON_BOMB => {
+                    // (:1413-1431) — bomb aims at m_WeaponDir itself.
+                    if let Some(we) = objs.weapons.get_mut(wid) {
+                        we.modify(
+                            v_pos,
+                            glam::Vec3::new(barrel2.x, barrel2.y, 0.0),
+                            self.weapon_dir,
+                        );
+                    }
+                    weapon_takt(objs, wid, ms as f32, map, rng);
+                    if objs
+                        .weapons
+                        .get_mut(wid)
+                        .map(|w| w.is_fire_was())
+                        .unwrap_or(false)
+                    {
+                        let bw = &mut self.weapons[i];
+                        bw.heat = (bw.heat + bw.heat_mod).min(WEAPON_MAX_HEAT);
+                    }
+                    continue;
+                }
+                WEAPON_BIGBOOM => continue, // (:1433) — fired only on death
+                WEAPON_HOMING_MISSILE => {
+                    // (:1437-1450).
+                    if let Some(we) = objs.weapons.get_mut(wid) {
+                        we.modify(v_pos, v_dir, vel3);
+                    }
+                    weapon_takt(objs, wid, ms as f32, map, rng);
+                    if objs
+                        .weapons
+                        .get_mut(wid)
+                        .map(|w| w.is_fire_was())
+                        .unwrap_or(false)
+                    {
+                        let bw = &mut self.weapons[i];
+                        bw.heat = (bw.heat + bw.heat_mod).min(WEAPON_MAX_HEAT);
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+
+            if let Some(we) = objs.weapons.get_mut(wid) {
+                we.modify(v_pos, v_dir, vel3);
+            }
+
+            // Barrel-angle gate (:1465-1475) — 2D angle between the
+            // barrel direction and the target direction.
+            let dir1 = barrel2.normalize_or_zero();
+            let dir2 = glam::Vec2::new(v_dir.x, v_dir.y).normalize_or_zero();
+            let angle = dir1.dot(dir2).clamp(-1.0, 1.0).acos();
+            if angle > BARREL_TO_SHOT_ANGLE && wtype != WEAPON_REPAIR {
+                if let Some(we) = objs.weapons.get_mut(wid) {
+                    we.fire_end();
+                }
+                continue;
+            }
+
+            weapon_takt(objs, wid, ms as f32, map, rng);
+            if objs
+                .weapons
+                .get_mut(wid)
+                .map(|w| w.is_fire_was())
+                .unwrap_or(false)
+            {
+                let bw = &mut self.weapons[i];
+                bw.heat = (bw.heat + bw.heat_mod).min(WEAPON_MAX_HEAT);
+            }
+        }
+
+        // Cool-down (MatrixRobot.cpp:1497-1542).
+        let cfg = crate::matrix_game::config::global();
+        for bw in &mut self.weapons {
+            let Some(we) = objs.weapons.get(bw.weapon) else {
+                continue;
+            };
+            let wtype = we.weapon_type();
+            if wtype == WEAPON_BIGBOOM {
+                continue;
+            }
+            if bw.heat > 0 {
+                bw.cool_down_period += ms;
+            } else {
+                bw.cool_down_period = 0;
+            }
+            bw.heat_period = 0;
+            let period = cfg
+                .overheat
+                .for_weapon(wtype)
+                .map(|o| o.cool_period)
+                .unwrap_or(0);
+            while bw.heat > 0 && bw.cool_down_period >= period {
+                bw.heat = (bw.heat - bw.cool_down_mod).max(0);
+                bw.cool_down_period -= period;
+                if bw.cool_down_mod <= 0 {
+                    break; // zero cool rate would never converge
+                }
+            }
+        }
+    }
+
+    /// Ablaze / shorted DOT loops at the head of `LogicTakt`
+    /// (MatrixRobot.cpp:416-507). Fire/lightning visuals are skipped;
+    /// the periodic self-damage is the mechanic. Returns true when the
+    /// robot died mid-loop.
+    fn dot_takt(&mut self, objs: &mut Objects) -> bool {
+        let now = crate::matrix_game::map::current_elapsed_ms();
+        let Some(self_id) = self.self_id else {
+            return false;
+        };
+        if self.object_state & OBJECT_STATE_ABLAZE != 0 {
+            while now > self.next_time_ablaze {
+                self.next_time_ablaze += 90; // OBJECT_ROBOT_ABLAZE_PERIOD_EFFECT
+                let pos = self.core.geo_center;
+                let side = self.last_delay_damage_side;
+                // Flame tongue at a random surface point — the
+                // shleif AddFire at MatrixRobot.cpp:444-449.
+                {
+                    use crate::matrix_game::effects::smoke_and_fire::{fsrnd, Fire};
+                    let mut vrng = crate::matrix_game::logic::Rnd::new(
+                        ((now as i32) ^ ((pos.x + pos.y) as i32)).max(1),
+                    );
+                    let r = self.core.radius;
+                    let fp = pos
+                        + glam::Vec3::new(
+                            fsrnd(&mut vrng, r),
+                            fsrnd(&mut vrng, r),
+                            fsrnd(&mut vrng, r) * 0.5,
+                        );
+                    objs.pending_effects
+                        .push(crate::matrix_game::effects::GameEffect::Fire(Fire::new(
+                            fp,
+                            100.0,
+                            1500.0,
+                            30.0,
+                            2.5,
+                            false,
+                            1.0 / 35.0,
+                        )));
+                }
+                for _ in (0..90).step_by(10) {
+                    // OBJECT_ROBOT_ABLAZE_PERIOD
+                    if self.damage(
+                        crate::matrix_game::effects::weapon::WEAPON_ABLAZE,
+                        pos,
+                        glam::Vec3::Z,
+                        side,
+                        None,
+                        self_id,
+                        objs,
+                    ) {
+                        return true;
+                    }
+                    if self.state == RobotState::Dip {
+                        return true;
+                    }
+                }
+            }
+        }
+        if self.object_state & OBJECT_STATE_SHORTED != 0 {
+            while now > self.next_time_shorted {
+                self.next_time_shorted += 50; // OBJECT_SHORTED_PERIOD
+                let pos = self.core.geo_center;
+                let side = self.last_delay_damage_side;
+                // Arc between two random surface points
+                // (MatrixRobot.cpp:478-501).
+                {
+                    use crate::matrix_game::effects::lightening::Lightening;
+                    use crate::matrix_game::effects::smoke_and_fire::{frnd, fsrnd};
+                    let mut vrng = crate::matrix_game::logic::Rnd::new(
+                        ((now as i32) ^ ((pos.x * 3.0 + pos.y) as i32)).max(1),
+                    );
+                    let r = self.core.radius;
+                    let rndp = |vr: &mut crate::matrix_game::logic::Rnd| {
+                        pos + glam::Vec3::new(fsrnd(vr, r), fsrnd(vr, r), fsrnd(vr, r))
+                    };
+                    let d1 = rndp(&mut vrng);
+                    let d2 = rndp(&mut vrng);
+                    objs.pending_effects
+                        .push(crate::matrix_game::effects::GameEffect::Lightening(
+                            Lightening::new_shorted(
+                                d1,
+                                d2,
+                                frnd(&mut vrng, 400.0) + 100.0,
+                                0xFFFF_FFFF,
+                            ),
+                        ));
+                }
+                if self.damage(
+                    crate::matrix_game::effects::weapon::WEAPON_SHORTED,
+                    pos,
+                    glam::Vec3::Z,
+                    side,
+                    None,
+                    self_id,
+                    objs,
+                ) {
+                    return true;
+                }
+                if self.state == RobotState::Dip {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// `DIPTakt` wreck physics (MatrixRobot.cpp:178-283).
+    fn dip_takt(&mut self, cms: i32, map: &GameMap, rng: &mut Rnd, objs: &mut Objects) {
+        use crate::matrix_game::common::{TRACE_ALL, WATER_LEVEL};
+        use crate::matrix_game::effects::konus::Konus;
+        use crate::matrix_game::effects::smoke_and_fire::fsrnd;
+        use crate::matrix_game::effects::GameEffect;
+        use crate::matrix_game::map_trace::{trace, TraceStop};
+
+        let ms = cms as f32;
+        let self_id = self.self_id;
+        let mut i = 0;
+        while i < self.dip_units.len() {
+            let u = &mut self.dip_units[i];
+            u.ttl -= ms;
+            u.smoke.takt(ms, rng);
+            if u.ttl <= 0.0 {
+                // End of life — small boom 10 above (:190-208).
+                let mut pos = u.pos;
+                pos.z += 10.0;
+                objs.pending_explosions
+                    .push(crate::matrix_game::map_static::ExplosionSpawn {
+                        pos,
+                        props: &crate::matrix_game::effects::explosion::EXPLOSION_ROBOT_BOOM_SMALL,
+                        fire: true,
+                    });
+                let mut u = self.dip_units.swap_remove(i);
+                u.smoke.set_ttl(1000.0);
+                // Hand the dying smoke emitter to the world so it
+                // finishes fading.
+                objs.pending_effects.push(GameEffect::Smoke(u.smoke));
+                continue;
+            }
+            if u.velocity != glam::Vec3::ZERO {
+                let oldpos = u.pos;
+                u.velocity.z -= 0.0002 * ms; // gravity (:215)
+                u.pos += u.velocity * ms;
+                let (o, hitpos) = trace(map, objs, oldpos, u.pos, TRACE_ALL, self_id);
+                match o {
+                    TraceStop::Water => {
+                        if map.get_z(hitpos.x, hitpos.y) < WATER_LEVEL {
+                            // Sinks silently: splash, no end-of-life
+                            // boom (the C++ zeroes the TTL, and
+                            // TTL<=0 units are skipped — :224-236).
+                            objs.pending_effects.push(GameEffect::Konus(Konus::new_splash(
+                                hitpos,
+                                glam::Vec3::Z,
+                                10.0,
+                                5.0,
+                                fsrnd(rng, std::f32::consts::PI),
+                                1000.0,
+                                true,
+                                crate::matrix_lib::three_g::billboard::TexRef::Path(
+                                    crate::matrix_game::effects::effects_renderer::TEXTURE_PATH_SPLASH,
+                                ),
+                            )));
+                            let mut u = self.dip_units.swap_remove(i);
+                            u.smoke.set_ttl(1000.0);
+                            objs.pending_effects.push(GameEffect::Smoke(u.smoke));
+                            continue;
+                        }
+                    }
+                    TraceStop::Landscape => {
+                        u.velocity = glam::Vec3::ZERO;
+                        u.pos = hitpos;
+                        u.freeze_t =
+                            Some(crate::matrix_game::map::current_elapsed_ms() as f32);
+                        // Landing off-map kills the piece silently
+                        // (`UnitGetTest == NULL || m_Base` — :243-247;
+                        // the base-cell footprint isn't tracked here).
+                        if !map.contains_point(hitpos.x, hitpos.y) {
+                            let mut u = self.dip_units.swap_remove(i);
+                            u.smoke.set_ttl(1000.0);
+                            objs.pending_effects.push(GameEffect::Smoke(u.smoke));
+                            continue;
+                        }
+                    }
+                    TraceStop::Object(hit_id) => {
+                        let v = u.velocity;
+                        u.pos = hitpos;
+                        u.ttl = 1.0;
+                        objs.apply_damage(
+                            hit_id,
+                            crate::matrix_game::effects::weapon::WEAPON_DEBRIS,
+                            hitpos,
+                            v,
+                            0,
+                            None,
+                        );
+                    }
+                    TraceStop::None => {}
+                }
+            }
+            let pos = self.dip_units[i].pos;
+            self.dip_units[i].smoke.set_pos(pos);
+            i += 1;
+        }
+    }
+
+    /// Death scatter init — the unit TTL/velocity/spin seeding of the
+    /// robot Damage death flow (MatrixRobot.cpp:2040-2110). Each piece
+    /// is one of the robot's real parts starting at its assembled
+    /// position (renderer snapshot); the hull gets no piece (the C++
+    /// zeroes MRT_ARMOR's TTL so it never flies or draws). `onair`
+    /// (death above the ground by more than the radius) launches every
+    /// piece, chassis included, with random velocities.
+    fn init_dip_scatter(&mut self, rng: &mut Rnd, on_water: bool) {
+        use crate::matrix_game::effects::smoke_and_fire::{frnd, fsrnd, Smoke};
+        let geo = self.core.geo_center;
+        let snap = self.part_snapshot;
+        let chassis_pos = snap.chassis.unwrap_or(geo);
+
+        let onair = crate::matrix_game::map::current_map()
+            .map(|m| m.get_z(chassis_pos.x, chassis_pos.y) + self.core.radius < chassis_pos.z)
+            .unwrap_or(false);
+        let mut cstay = frnd(rng, 1.0) < 0.5;
+        if on_water {
+            cstay = false;
+        }
+
+        let mut push = |pos: glam::Vec3,
+                        part: DipPart,
+                        invert: bool,
+                        v: glam::Vec3,
+                        spins: (f32, f32, f32),
+                        yaw: f32,
+                        rng: &mut Rnd| {
+            let ttl = frnd(rng, 3000.0) + 2000.0;
+            self.dip_units.push(DipUnit {
+                pos,
+                velocity: v,
+                ttl,
+                dp: spins.0,
+                dy: spins.1,
+                dr: spins.2,
+                part,
+                invert,
+                yaw,
+                freeze_t: None,
+                smoke: Smoke::new(
+                    pos,
+                    ttl + 100_000.0,
+                    1600.0,
+                    80.0,
+                    0xCF30_3030,
+                    false,
+                    1.0 / 30.0,
+                ),
+            });
+        };
+
+        // Unit 0 — chassis (:2061-2080). When it stays put its unit
+        // matrix is never recomputed, keeping the death orientation.
+        let stay = cstay && !onair;
+        let chassis_yaw = if stay {
+            let f = self.forward.normalize_or_zero();
+            (-f.x).atan2(f.y)
+        } else {
+            0.0
+        };
+        let (v, spins) = if stay {
+            (glam::Vec3::ZERO, (0.0, 0.0, 0.0))
+        } else {
+            let spins = (fsrnd(rng, 0.0005), fsrnd(rng, 0.0005), fsrnd(rng, 0.0005));
+            let v = if onair {
+                glam::Vec3::new(fsrnd(rng, 0.08), fsrnd(rng, 0.08), fsrnd(rng, 0.1))
+            } else {
+                glam::Vec3::new(0.0, 0.0, 0.1)
+            };
+            (v, spins)
+        };
+        push(chassis_pos, DipPart::Chassis, false, v, spins, chassis_yaw, rng);
+
+        // Head + weapons (:2086-2110); armor skipped.
+        let mut parts: Vec<(glam::Vec3, DipPart, bool)> = Vec::new();
+        if !self.config.head.kind.is_empty() {
+            parts.push((snap.head.unwrap_or(geo), DipPart::Head, false));
+        }
+        for (p, w) in self.config.weapon.iter().enumerate() {
+            if w.kind.is_empty() {
+                continue;
+            }
+            let (pos, inv) = snap.weapons[p.min(4)].unwrap_or((geo, false));
+            parts.push((pos, DipPart::Weapon(p), inv));
+        }
+        for (pos, part, inv) in parts {
+            let spins = (fsrnd(rng, 0.005), fsrnd(rng, 0.005), fsrnd(rng, 0.005));
+            let v = if onair {
+                glam::Vec3::new(fsrnd(rng, 0.08), fsrnd(rng, 0.08), fsrnd(rng, 0.1))
+            } else {
+                glam::Vec3::new(fsrnd(rng, 0.08), fsrnd(rng, 0.08), 0.1)
+            };
+            push(pos, part, inv, v, spins, 0.0, rng);
+        }
+    }
+
+    /// Wreck smoke trails into the billboard queue. The pieces
+    /// themselves are the robot's part meshes, drawn by the robot
+    /// renderer's DIP path.
+    pub fn draw_dip(&self, q: &mut crate::matrix_lib::three_g::billboard::BillboardQueue) {
+        for u in &self.dip_units {
+            u.smoke.draw(q);
+        }
+    }
+
+    /// ROT_FIRE / ROT_STOP_FIRE order processing (MatrixRobot.cpp:
+    /// 1143-1205). Returns true when an order consumed the dispatch
+    /// slot this takt.
+    fn dispatch_fire_order(&mut self, objs: &mut Objects) -> bool {
+        let Some(top) = self.orders.top().copied() else {
+            return false;
+        };
+        match top.ty {
+            OrderType::Fire => {
+                // Arcade robots aim at the cursor trace; that path
+                // lands with arcade mode. AI/commanded path: aim at
+                // the order's params.
+                self.weapon_dir = glam::Vec3::new(top.p1, top.p2, top.p3);
+                let ftype = top.p4;
+                let vel = glam::Vec3::new(self.velocity.x, self.velocity.y, 0.0)
+                    / crate::matrix_game::logic::LOGIC_TAKT_PERIOD_MS as f32;
+                let skip = self.self_id;
+                for bw in &self.weapons {
+                    let Some(we) = objs.weapons.get_mut(bw.weapon) else {
+                        continue;
+                    };
+                    match we.weapon_type() {
+                        WEAPON_REPAIR => {
+                            if ftype == 2 {
+                                we.fire_begin(vel, skip);
+                            } else {
+                                we.fire_end();
+                            }
+                        }
+                        WEAPON_BOMB => {
+                            if ftype == 0 {
+                                we.fire_begin(glam::Vec3::new(top.p1, top.p2, top.p3), skip);
+                            } else {
+                                we.fire_end();
+                            }
+                        }
+                        _ => {
+                            if ftype == 0 {
+                                we.fire_begin(vel, skip);
+                            } else {
+                                we.fire_end();
+                            }
+                        }
+                    }
+                }
+                true // `break` — FIRE stays on top until STOP_FIRE
+            }
+            OrderType::StopFire => {
+                self.low_level_stop_fire(objs);
+                self.orders.pop_top();
+                false // `continue` — let the next order dispatch
+            }
+            _ => false,
+        }
     }
 }

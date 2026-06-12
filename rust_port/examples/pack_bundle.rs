@@ -141,6 +141,58 @@ fn main() {
     // StringConstants.hpp:114, used by SPOT_TURRET landscape decals
     // (MatrixObjectBuilding.cpp:1640). Ships as DDS.
     extra_paths.push("Matrix/Textures/LandSpots/spot_turr2".to_string());
+    // Weapon / damage effect assets: the BBT billboard table (sortable
+    // atlas + every intense texture from `da/Billboards/Textures`),
+    // landscape spot decals, standalone effect textures, projectile
+    // meshes and the debris catalog.
+    if let Some(dat_s) = dat_stor.as_ref() {
+        if let Some(bb_rec) = dat_s.block_record("da", "Billboards") {
+            if let Some(ts) = dat_s.block_param(&bb_rec, "TexSort") {
+                extra_paths.push(ts);
+            }
+            if let Some(tex_rec) = dat_s.block_record(&bb_rec, "Textures") {
+                if let (Some(_k), Some(v)) =
+                    (dat_s.get_buf(&tex_rec, "0"), dat_s.get_buf(&tex_rec, "1"))
+                {
+                    for i in 0..v.arrays_count() {
+                        let val = v.get_as_wstr(i);
+                        let parts: Vec<&str> = val.split(',').collect();
+                        if parts.first().map(|s| s.trim()) == Some("1") {
+                            if let Some(path) = parts.get(1) {
+                                extra_paths.push(path.trim().to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(models_rec) = dat_s.block_record("da", "Models") {
+            if let Some(deb_rec) = dat_s.block_record(&models_rec, "Debris") {
+                if let (Some(_k), Some(v)) =
+                    (dat_s.get_buf(&deb_rec, "0"), dat_s.get_buf(&deb_rec, "1"))
+                {
+                    for i in 0..v.arrays_count() {
+                        extra_paths.push(v.get_as_wstr(i));
+                    }
+                }
+            }
+        }
+    }
+    for p in [
+        "Matrix/Textures/LandSpots/varonka",
+        "Matrix/Textures/LandSpots/spot_hit",
+        "Matrix/Textures/LandSpots/spot",
+        "Matrix/Textures/Effects/gun_fire",
+        "Matrix/Textures/Effects/splash",
+        "Matrix/Textures/Effects/bigboom",
+        "Matrix/Textures/Effects/gun_bullets1",
+        "Matrix/Textures/Effects/gun_bullets2",
+        "Matrix/Bullets/roket.vo",
+        "Matrix/Bullets/mina.vo",
+        "Matrix/Bullets/bullet.vo",
+    ] {
+        extra_paths.push(p.to_string());
+    }
     // Hint chrome + inline resource icons — referenced by
     // `CMatrixHint::PreloadBitmaps` (MatrixHint.cpp:441-459). Sources
     // come from `da/Hints/0/Source` (border0) and every alias under
@@ -193,6 +245,54 @@ fn main() {
                 tex_count += 1;
                 println!("  extra {} -> {}", extra, candidate);
                 break;
+            }
+        }
+    }
+
+    // Textures referenced by the effect meshes (bullets + debris VOs)
+    // — packed under their extensionless resolved names so the WASM
+    // bundle reader (exact-key lookup) finds them.
+    {
+        let mut fx_vo_paths: Vec<String> = vec![
+            "Matrix/Bullets/roket.vo".to_string(),
+            "Matrix/Bullets/mina.vo".to_string(),
+            "Matrix/Bullets/bullet.vo".to_string(),
+        ];
+        if let Some(dat_s) = dat_stor.as_ref() {
+            if let Some(models_rec) = dat_s.block_record("da", "Models") {
+                if let Some(deb_rec) = dat_s.block_record(&models_rec, "Debris") {
+                    if let Some(v) = dat_s.get_buf(&deb_rec, "1") {
+                        for i in 0..v.arrays_count() {
+                            fx_vo_paths.push(v.get_as_wstr(i));
+                        }
+                    }
+                }
+            }
+        }
+        for vo_path in fx_vo_paths {
+            let Ok(vo_bytes) = pkg.read_file(&vo_path) else {
+                eprintln!("  MISS fx vo: {}", vo_path);
+                continue;
+            };
+            let Ok(vo) = vector_object::parse_vo(&vo_bytes) else {
+                continue;
+            };
+            for surf in &vo.surfaces {
+                let Some(spec) = surf.texture_ref.as_deref() else {
+                    continue;
+                };
+                if let Some(t) =
+                    matrixgame_rs::matrix_lib::three_g::texture::resolve_texture_name(spec, None)
+                {
+                    let key = t.replace('\\', "/");
+                    let up = key.to_uppercase();
+                    for cand in [up.clone(), format!("{}.DDS", up), format!("{}.PNG", up)] {
+                        if let Ok(data) = pkg.read_file(&cand) {
+                            bundle.add(&key, data);
+                            break;
+                        }
+                    }
+                }
             }
         }
     }
