@@ -158,6 +158,17 @@ pub enum PreOrder {
     Fire,
     /// `PREORDER_MOVE`.
     Move,
+    /// `PREORDER_CAPTURE` — needs a live enemy building under the
+    /// cursor; an invalid click keeps the order armed
+    /// (MatrixSide.cpp:715-721).
+    Capture,
+    /// `PREORDER_PATROL` (MatrixSide.cpp:723-726).
+    Patrol,
+    /// `PREORDER_BOMB` (MatrixSide.cpp:727-737).
+    Bomb,
+    /// `PREORDER_REPAIR` — needs a live own-side object
+    /// (MatrixSide.cpp:738-745).
+    Repair,
 }
 
 pub struct IFaceList {
@@ -504,6 +515,18 @@ impl IFaceList {
         bitmap_sizer: &dyn Fn(&str) -> Option<(i32, i32)>,
     ) {
         let scale = (screen_h / DESIGN_H).max(0.1);
+        // CAnimation frame advance (CInterface::LogicTakt →
+        // m_Animation->LogicTakt, CAnimation.cpp:41-53).
+        let cms = dt_ms.round() as i32;
+        if cms > 0 {
+            for p in self.panels.iter_mut() {
+                for e in p.elements.iter_mut() {
+                    if let Some(a) = e.animation.as_mut() {
+                        a.logic_takt(cms);
+                    }
+                }
+            }
+        }
         let main_origin = self
             .panel("Main")
             .map(|p| p.resolved_pos(screen_w, screen_h, scale))

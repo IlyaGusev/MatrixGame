@@ -722,6 +722,7 @@ impl CInterface {
                 hint_template: String::new(),
                 hint_offset_x: 0,
                 hint_offset_y: 0,
+                animation: None,
             });
         }
 
@@ -791,6 +792,7 @@ impl CInterface {
                     hint_template: String::new(),
                     hint_offset_x: 0,
                     hint_offset_y: 0,
+                animation: None,
                 });
             }
         }
@@ -883,6 +885,7 @@ impl CInterface {
                             hint_template: String::new(),
                             hint_offset_x: 0,
                             hint_offset_y: 0,
+                animation: None,
                         });
                     }
                 }
@@ -937,6 +940,7 @@ impl CInterface {
                         hint_template: String::new(),
                         hint_offset_x: 0,
                         hint_offset_y: 0,
+                animation: None,
                     });
                 }
 
@@ -984,6 +988,7 @@ impl CInterface {
                         hint_template: String::new(),
                         hint_offset_x: 0,
                         hint_offset_y: 0,
+                animation: None,
                     });
                 }
             }
@@ -1673,6 +1678,7 @@ impl CInterface {
                 hint_template: String::new(),
                 hint_offset_x: 0,
                 hint_offset_y: 0,
+                animation: None,
             });
         };
 
@@ -1737,6 +1743,7 @@ impl CInterface {
                         hint_template: String::new(),
                         hint_offset_x: 0,
                         hint_offset_y: 0,
+                animation: None,
                     });
                 }
             }
@@ -2094,6 +2101,49 @@ fn load_element(stor: &Storage, rec: &str, kind: ElementKind) -> Option<IFaceEle
     let (hint_template, hint_offset_x, hint_offset_y) =
         parse_hint_param(stor, rec).unwrap_or_default();
 
+    // Animation block (CInterface.cpp:480-517):
+    // `Animation/Frames = cnt,period,w,h, x0,y0, x1,y1, ...` — frame
+    // atlas rects in the same texture as sNormal.
+    let animation = (|| {
+        let anim_rec = stor.block_record(rec, "Animation")?;
+        let par = stor.block_param(&anim_rec, "Frames")?;
+        let nums: Vec<i32> = par
+            .split(',')
+            .map(|s| s.trim().parse::<i32>().unwrap_or(0))
+            .collect();
+        if nums.len() < 6 {
+            return None;
+        }
+        let frames_cnt = nums[0].max(0) as usize;
+        let period = nums[1].max(1);
+        let (w, h) = (nums[2] as f32, nums[3] as f32);
+        let normal = images[crate::matrix_game::interface::iface_element::ElementState::Normal
+            as usize]
+            .as_ref()?;
+        let mut frames = Vec::with_capacity(frames_cnt);
+        for i in 0..frames_cnt {
+            let xi = *nums.get(4 + i * 2)? as f32;
+            let yi = *nums.get(4 + i * 2 + 1)? as f32;
+            frames.push(crate::matrix_game::interface::iface_element::StateImage {
+                x: xi,
+                y: yi,
+                w,
+                h,
+                tex_w: normal.tex_w,
+                tex_h: normal.tex_h,
+                tex_path: normal.tex_path.clone(),
+            });
+        }
+        Some(
+            crate::matrix_game::interface::iface_element::ElementAnimation {
+                frames,
+                period,
+                current: 0,
+                time_pass: 0,
+            },
+        )
+    })();
+
     Some(IFaceElement {
         name,
         kind,
@@ -2116,6 +2166,7 @@ fn load_element(stor: &Storage, rec: &str, kind: ElementKind) -> Option<IFaceEle
         hint_template,
         hint_offset_x,
         hint_offset_y,
+        animation,
     })
 }
 

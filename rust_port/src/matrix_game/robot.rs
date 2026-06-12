@@ -13,6 +13,7 @@ use crate::matrix_game::logic::{self, ROBOT_MOVECELLS_PER_SIZE};
 use crate::matrix_game::map::GameMap;
 use crate::matrix_game::map_static::{
     MapStatic, ObjectCore, ObjectId, ObjectType, Objects, MR_ALL, MR_MATRIX,
+    ROBOT_FLAG_COLLISION, ROBOT_FLAG_DISABLE_MANUAL,
 };
 use crate::matrix_game::map_trace::{self, MovePath, ROBOT_FOOTPRINT_HALF};
 use crate::matrix_game::object_cannon::{Cannon, CannonState};
@@ -34,6 +35,16 @@ pub enum RobotState {
     /// closed, the robot hands off to normal idle AI
     /// (MatrixRobot.cpp:801).
     Idle,
+    /// `ROBOT_BASE_CAPTURE` — riding the base platform down while
+    /// capturing it (MatrixRobot.cpp:1300). The order loop still
+    /// runs in this state (MatrixRobot.cpp:830).
+    BaseCapture,
+    /// `ROBOT_CARRYING` — dangling under a transport flyer
+    /// (MatrixRobot.cpp:612-716).
+    Carrying,
+    /// `ROBOT_FALLING` — released by the flyer, gravity until ground
+    /// contact (MatrixRobot.cpp:570-607).
+    Falling,
     /// `ROBOT_DIP` — destroyed; the wreck decays for `dip_ttl` ms
     /// (the unit-scatter death animation isn't ported) and then
     /// despawns.
@@ -138,6 +149,18 @@ pub struct Robot {
     /// ROT_MOVE_TO has no path yet, and consumed by `move_by_move_path`
     /// (MatrixRobot.cpp:1708-1764).
     pub move_path: MovePath,
+    /// Port of `m_ZoneCur` (MatrixRobot.hpp:258) — zone the robot
+    /// currently stands in, updated by `zone_cur_find`.
+    pub zone_cur: i32,
+    /// Port of `m_ZoneDes` (MatrixRobot.hpp) — zone of the MOVE_TO
+    /// destination, found via `ZoneFindNear`.
+    pub zone_des: i32,
+    /// Port of `m_ZonePath` + `m_ZonePathCnt` (MatrixRobot.hpp:260) —
+    /// the zone-level route from `FindPathInZone`.
+    pub zone_path: Vec<i32>,
+    /// Port of `m_ZonePathNext` (MatrixRobot.hpp:261) — index of the
+    /// next zone to enter; -1 when no zone route is active.
+    pub zone_path_next: i32,
     /// Port of `m_DesX`/`m_DesY` (MatrixRobot.hpp:257). Move-cell
     /// coords of the currently-pending MOVE_TO destination.
     pub des_x: i32,
@@ -186,19 +209,20 @@ pub struct Robot {
     /// collision was detected; clamped by the CollisionCallback when
     /// one is.
     pub col_speed: f32,
-    /// Port of `SMatrixRobotAIEnv::m_PlaceAdd`
-    /// (MatrixRobot.hpp env struct). Set by `PGSetPlace` when the
-    /// group-formation spiral search finds a free cell that doesn't
-    /// map to a road-network `m_Place` entry — a direct move-cell
-    /// upper-left corner the robot is heading for. The corresponding
-    /// `m_Place` (road-network index) isn't ported since the road
-    /// network itself isn't, so `m_Place >= 0` always resolves to
-    /// `-1` here and we always fall back to `place_add`.
-    ///
-    /// Read by `PGAssignPlacePlayer` to avoid walking every group
-    /// member onto the same destination, and by the move-to ping
-    /// spawner to draw one ping per assigned cell.
-    pub place_add: Option<(i32, i32)>,
+    /// Port of `m_Environment` (CInfo, Logic/MatrixEnvironment.h) —
+    /// the robot's sensing state: enemy list, combat target, assigned
+    /// road-network place (`env.place`) and player-assigned fallback
+    /// cell (`env.place_add`).
+    pub env: crate::matrix_game::logic::environment::Info,
+    /// Port of `m_GroupLogic` (MatrixRobot.hpp:349-350) — index into
+    /// the side's `player_groups` array; -1 = none.
+    pub group_logic: i32,
+    /// Snapshot of `side->m_PlayerGroup[m_GroupLogic].m_RoadPath` —
+    /// the C++ reads the side's route live inside `ZonePathCalc`
+    /// (MatrixRobot.cpp:1587-1588); the arena split makes that
+    /// borrow impossible, so the PG layer hands each group member an
+    /// `Arc` of the route whenever it changes.
+    pub group_road_path: Option<std::sync::Arc<crate::matrix_game::road_network::RoadRoute>>,
 
     /// `m_CollAvoid` (MatrixRobot.hpp — per-instance). Unit vector the
     /// WallAvoid hint pushes Seek to steer along when hugging a wall.
@@ -253,10 +277,39 @@ pub struct Robot {
     pub last_delay_damage_side: i32,
     pub next_time_ablaze: i64,
     pub next_time_shorted: i64,
-    /// `m_BombProtect` / `m_LightProtect` — head armor coefficients in
-    /// `[0, 1]` (MatrixRobot.cpp:4281-4285).
+    /// `m_BombProtect` / `m_LightProtect` / `m_AimProtect` — head
+    /// armor coefficients in `[0, 1]` (MatrixRobot.cpp:4281-4288).
     pub bomb_protect: f32,
     pub light_protect: f32,
+    pub aim_protect: f32,
+    /// `m_MaxFireDist` / `m_MinFireDist` / `m_RepairDist` — weapon
+    /// reach extremes computed by `CalcRobotMass`
+    /// (MatrixRobot.cpp:4294-4330); BIGBOOM excluded, REPAIR feeds
+    /// only `repair_dist`.
+    pub max_fire_dist: f32,
+    pub min_fire_dist: f32,
+    pub repair_dist: f32,
+    /// `m_HaveRepair` (MatrixRobot.hpp:295): 0 = none, 1 = has a
+    /// repairer, 2 = ALL weapons are repairers (bomb not counted).
+    pub have_repair: i32,
+    /// `m_Strength` (MatrixRobot.hpp:361) — cached by `GatherInfo`'s
+    /// `CalcStrength` call each env refresh.
+    pub strength: f32,
+    /// `m_MiniMapFlashTime` (MatrixRobot.hpp) — under-attack blink
+    /// countdown the minimap reads; set to FLASH_PERIOD (1000ms) on
+    /// non-friendly damage.
+    pub mini_map_flash_time: i32,
+    /// `m_TimeWithBase` (MatrixRobot.cpp:361-371) — spawn watchdog:
+    /// a robot attached to a base for >10s closes the base and dies.
+    pub time_with_base: i32,
+    /// `m_KeelWaterCount` / `m_ChassisData.m_DustCount`
+    /// (MatrixObjectRobot.cpp:911-948) — fractional spawn accumulators.
+    pub keelwater_count: f32,
+    pub dust_count: f32,
+    /// `m_CargoFlyer` — the transport carrying us (ROBOT_CARRYING).
+    pub cargo_flyer: Option<ObjectId>,
+    /// `m_FallingSpeed` (MatrixRobot.cpp:570-607).
+    pub falling_speed: f32,
     /// `GetEnv()->m_LastHit*` timestamps `HitTo` maintains — kept for
     /// the AI port even though the env itself isn't here yet.
     pub last_hit_enemy_ms: i64,
@@ -265,6 +318,14 @@ pub struct Robot {
     /// `ROBOT_MUST_DIE` flag — set by [`Robot::big_boom`]; the next
     /// logic takt routes it into `Damage(WEAPON_INSTANT_DEATH)`.
     pub must_die: bool,
+    /// Set when completing a base capture consumed this robot
+    /// (`StaticDelete(this)` at MatrixRobot.cpp:1317) — the takt must
+    /// bail immediately.
+    pub consumed_by_capture: bool,
+    /// Port of `m_CaptureCandidates[MAX_CAPTURE_CANDIDATES]` +
+    /// `m_CaptureCandidatesCnt` (MatrixRobot.hpp:252-253). Each entry
+    /// is `(building, time-before-capture ms)`.
+    pub capture_candidates: Vec<(ObjectId, i32)>,
     /// `m_ShowHitpointTime` — floating HP-bar visibility timer.
     pub show_hitpoint_time: i32,
     /// Wreck decay timer for the `Dip` state.
@@ -397,6 +458,10 @@ impl Robot {
             forward: glam::Vec2::new(0.0, -1.0),
             orders: OrderList::new(),
             move_path: MovePath::default(),
+            zone_cur: -1,
+            zone_des: -1,
+            zone_path: Vec::new(),
+            zone_path_next: -1,
             des_x: 0,
             des_y: 0,
             map_x: 0,
@@ -415,7 +480,9 @@ impl Robot {
             group_speed: 0.0,
             col_speed: 100.0,
             coll_avoid: glam::Vec2::ZERO,
-            place_add: None,
+            env: crate::matrix_game::logic::environment::Info::new(),
+            group_logic: -1,
+            group_road_path: None,
             animation: Animation::Off,
             chassis_anim: Default::default(),
             armor_anim: Default::default(),
@@ -432,10 +499,24 @@ impl Robot {
             next_time_shorted: 0,
             bomb_protect: 0.0,
             light_protect: 0.0,
+            aim_protect: 0.0,
+            max_fire_dist: 0.0,
+            min_fire_dist: 0.0,
+            repair_dist: 0.0,
+            have_repair: 0,
+            strength: 0.0,
+            mini_map_flash_time: 0,
+            time_with_base: 0,
+            keelwater_count: 0.0,
+            dust_count: 0.0,
+            cargo_flyer: None,
+            falling_speed: 0.0,
             last_hit_enemy_ms: 0,
             last_hit_friendly_ms: 0,
             last_hit_target_ms: 0,
             must_die: false,
+            consumed_by_capture: false,
+            capture_candidates: Vec::new(),
             show_hitpoint_time: 0,
             dip_ttl: 0,
             dip_units: Vec::new(),
@@ -601,9 +682,380 @@ impl Robot {
         self.orders.remove_type(OrderType::StopMove);
         self.orders
             .push_top(Order::set(OrderType::MoveTo, mx as f32, my as f32, 0.0, 0));
+        self.zone_des = -1;
+        self.zone_path.clear();
+        self.zone_path_next = -1;
+        self.move_path.clear();
         self.des_x = mx;
         self.des_y = my;
+    }
+
+    /// Port of `CMatrixRobotAI::MoveToBack` (MatrixRobot.cpp:4658-4684).
+    pub fn move_to_back(&mut self, mx: i32, my: i32) {
+        self.orders.remove_type(OrderType::MoveTo);
+        self.orders.remove_type(OrderType::MoveToBack);
+        self.orders.remove_type(OrderType::StopMove);
+        self.orders.push_top(Order::set(
+            OrderType::MoveToBack,
+            mx as f32,
+            my as f32,
+            0.0,
+            0,
+        ));
+        self.zone_des = -1;
+        self.zone_path.clear();
+        self.zone_path_next = -1;
         self.move_path.clear();
+        self.des_x = mx;
+        self.des_y = my;
+    }
+
+    /// Port of `CMatrixRobotAI::MoveReturn` (MatrixRobot.cpp:4687-4699):
+    /// an existing MOVE_RETURN turns into a MOVE_TO at the new coords;
+    /// otherwise a fresh MOVE_RETURN lands on top.
+    pub fn move_return(&mut self, mx: i32, my: i32) {
+        for o in self.orders.iter_mut() {
+            if o.ty == OrderType::MoveReturn {
+                *o = Order::set(OrderType::MoveTo, mx as f32, my as f32, 0.0, 0);
+                return;
+            }
+        }
+        self.orders.push_top(Order::set(
+            OrderType::MoveReturn,
+            mx as f32,
+            my as f32,
+            0.0,
+            0,
+        ));
+    }
+
+    /// Port of `CMatrixRobotAI::MoveToHigh` (MatrixRobot.cpp:4701-4713).
+    pub fn move_to_high(&mut self, mx: i32, my: i32) {
+        self.stop_capture();
+        self.orders.remove_type(OrderType::MoveReturn);
+        self.move_to(mx, my);
+    }
+
+    /// Port of `CMatrixRobotAI::StopCapture` (MatrixRobot.cpp:4810-4834):
+    /// converts CAPTURE_FACTORY orders into STOP_CAPTURE (keeping the
+    /// target) and capture-phase MOVE_TOs into STOP_MOVE.
+    pub fn stop_capture(&mut self) {
+        for o in self.orders.iter_mut() {
+            if o.ty == OrderType::CaptureFactory {
+                let target = o.target;
+                *o = Order::set_static(OrderType::StopCapture, target);
+            } else if o.ty == OrderType::MoveTo && o.phase == OrderPhase::CaptureMoving {
+                *o = Order::set(OrderType::StopMove, 0.0, 0.0, 0.0, 0);
+            }
+        }
+    }
+
+    /// Port of `CMatrixRobotAI::CaptureFactory` (MatrixRobot.cpp:4786-
+    /// 4796).
+    pub fn capture_factory(&mut self, factory: ObjectId) {
+        self.orders.remove_type(OrderType::CaptureFactory);
+        self.orders
+            .push_top(Order::set_static(OrderType::CaptureFactory, Some(factory)));
+    }
+
+    /// Port of `CMatrixRobotAI::GetCaptureFactory` (MatrixRobot.cpp:
+    /// 4798-4808).
+    /// Port of `SelectByGroup` (MatrixRobot.cpp:5240-5253) — the flag
+    /// half; the selection-ring effect is owned by the selection
+    /// renderer which keys off `is_selected`.
+    pub fn select_by_group(&mut self) {
+        self.object_state |= crate::matrix_game::map_static::ROBOT_FLAG_SGROUP;
+    }
+
+    /// Port of `UnSelect` (MatrixRobot.cpp:5270-5276).
+    pub fn unselect(&mut self) {
+        self.object_state &= !(crate::matrix_game::map_static::ROBOT_FLAG_SGROUP
+            | crate::matrix_game::map_static::ROBOT_FLAG_SARCADE);
+    }
+
+    /// Port of `IsSelected` (MatrixRobot.cpp:5303-5310).
+    pub fn is_selected(&self) -> bool {
+        self.object_state
+            & (crate::matrix_game::map_static::ROBOT_FLAG_SGROUP
+                | crate::matrix_game::map_static::ROBOT_FLAG_SARCADE)
+            != 0
+    }
+
+    /// `Carry(flyer, quick_connect)` attach half
+    /// (MatrixObjectRobot.cpp:1290-1356).
+    pub fn carry_attach(&mut self, flyer: ObjectId) {
+        self.cargo_flyer = Some(flyer);
+        self.state = RobotState::Carrying;
+        self.falling_speed = 0.0;
+    }
+
+    /// The ROBOT_CARRYING physics (MatrixRobot.cpp:612-716): chase the
+    /// flyer hook with a sprung lag, dangle-sway the up vector, keep
+    /// the elevator field anchored. The C++ also pushes out of nearby
+    /// objects via FindObjects/CollisionRobots — robots in transit are
+    /// airborne for a couple of seconds, so that nudge is skipped.
+    fn carrying_takt(
+        &mut self,
+        cms: i32,
+        map: &crate::matrix_game::map::GameMap,
+        objs: &mut Objects,
+    ) {
+        const CARRYING_DISTANCE: f32 = 20.0; // MatrixObjectRobot.hpp:63
+        const CARRYING_SPEED: f64 = 0.996; // MatrixObjectRobot.hpp:64
+
+        let Some(fid) = self.cargo_flyer else {
+            self.state = RobotState::Idle;
+            return;
+        };
+        let Some((fpos, fangle, elevator_active)) =
+            crate::matrix_game::logic::flyer_ref(objs, fid).map(|f| {
+                (
+                    f.pos,
+                    f.angle,
+                    f.carry
+                        .elevator
+                        .as_ref()
+                        .map(|e| e.activated)
+                        .unwrap_or(false),
+                )
+            })
+        else {
+            self.carry_release();
+            return;
+        };
+        let ms = cms as f32;
+        let mul = (1.0 - CARRYING_SPEED.powf(ms as f64)) as f32;
+
+        // Mass-factor reel-in once the field is up (MatrixRobot.cpp:618-625).
+        let mass_factor = {
+            let f = crate::matrix_game::logic::flyer_mut(objs, fid).unwrap();
+            if elevator_active {
+                f.carry.robot_mass_factor = (f.carry.robot_mass_factor + 0.0005 * ms).min(1.0);
+            }
+            f.carry.robot_mass_factor
+        };
+
+        self.falling_speed = (self.falling_speed - ms * 0.013).max(0.0);
+
+        let geo = self.core.geo_center;
+        let delta = fpos - glam::Vec3::new(0.0, 0.0, CARRYING_DISTANCE) - geo;
+        let mut mv = delta * mul * mass_factor;
+        mv.z -= self.falling_speed * ms * 0.013;
+        self.pos_x += mv.x;
+        self.pos_y += mv.y;
+        self.pos_z += mv.z;
+        let cz = map.get_z(self.pos_x, self.pos_y);
+        if self.pos_z < cz {
+            self.pos_z = cz;
+        }
+        self.core.geo_center = glam::Vec3::new(self.pos_x, self.pos_y, self.pos_z + 3.0);
+
+        // Sway + heading follow (MatrixRobot.cpp:651-668).
+        {
+            let f = crate::matrix_game::logic::flyer_mut(objs, fid).unwrap();
+            f.carry.robot_up.x += mv.x * 0.03 + f.carry.robot_up_back.x * mul;
+            f.carry.robot_up.y += mv.y * 0.03 + f.carry.robot_up_back.y * mul;
+            let l = glam::Vec2::new(f.carry.robot_up.x, f.carry.robot_up.y).length();
+            if l > 1.0 {
+                f.carry.robot_up.x /= l;
+                f.carry.robot_up.y /= l;
+            }
+            f.carry.robot_up_back.x -= f.carry.robot_up.x * 0.08;
+            f.carry.robot_up_back.y -= f.carry.robot_up.y * 0.08;
+            f.carry.robot_up_back.z = 0.0;
+            let mul2 = 0.999f64.powf(ms as f64) as f32;
+            f.carry.robot_up.x *= mul2;
+            f.carry.robot_up.y *= mul2;
+            let l = glam::Vec2::new(f.carry.robot_up_back.x, f.carry.robot_up_back.y).length();
+            if l > 0.4 {
+                f.carry.robot_up_back.x *= 0.4 / l;
+                f.carry.robot_up_back.y *= 0.4 / l;
+            }
+            let da = mul
+                * mul
+                * crate::matrix_game::flyer::angle_dist(fangle, f.carry.robot_angle);
+            f.carry.robot_angle -= da;
+            let (s, c) = f.carry.robot_angle.sin_cos();
+            let rf = f.carry.robot_forward;
+            self.forward = glam::Vec2::new(c * rf.x + s * rf.y, -s * rf.x + c * rf.y);
+
+            // Elevator field create / re-anchor (MatrixRobot.cpp:705-713).
+            let radius = self.core.radius.max(10.0);
+            let fwd3 = glam::Vec3::new(self.forward.x, self.forward.y, 0.0);
+            match f.carry.elevator.as_mut() {
+                None => {
+                    f.carry.elevator = Some(
+                        crate::matrix_game::effects::elevator_field::ElevatorField::new(
+                            fpos,
+                            self.core.geo_center,
+                            radius,
+                            fwd3,
+                        ),
+                    );
+                }
+                Some(e) => {
+                    e.update_data(
+                        fpos,
+                        glam::Vec3::new(self.pos_x, self.pos_y, self.pos_z),
+                        radius,
+                        fwd3,
+                    );
+                }
+            }
+        }
+    }
+
+    /// `Carry(NULL)` — release into free fall
+    /// (MatrixObjectRobot.cpp:1322-1330).
+    pub fn carry_release(&mut self) {
+        self.cargo_flyer = None;
+        self.state = RobotState::Falling;
+        self.velocity = glam::Vec2::ZERO;
+        self.falling_speed = 0.0;
+    }
+
+    /// `m_GroupSpeed = GetMaxSpeed()` (MatrixSide.cpp:2359) — the
+    /// CalcMaxSpeed reset.
+    pub fn reset_group_speed(&mut self) {
+        self.group_speed = chassis_max_speed(self.chassis);
+    }
+
+    /// `m_GroupSpeed *= k` (MatrixSide.cpp:2444).
+    pub fn scale_group_speed(&mut self, k: f32) {
+        self.group_speed *= k;
+    }
+
+    /// Port of `IsAutomaticMode` (MatrixRobot.hpp:380-383).
+    pub fn is_automatic_mode(&self) -> bool {
+        matches!(
+            self.state,
+            RobotState::InSpawn | RobotState::BaseMoveOut | RobotState::BaseCapture
+        )
+    }
+
+    /// Port of `CanBreakOrder` (MatrixRobot.hpp:385-406). The
+    /// MMFLAG_FULLAUTO demo flag and the arcaded-object (FPS mode)
+    /// branch are out of scope: non-player capturing robots never
+    /// break, player robots only obey the automatic-mode gate.
+    pub fn can_break_order(&self) -> bool {
+        if self.side != crate::matrix_game::common::PLAYER_SIDE
+            && self.get_capture_factory().is_some()
+        {
+            return false; // DO NOT BREAK CAPTURING!!! NEVER!!! (C++ comment)
+        }
+        !self.is_automatic_mode()
+    }
+
+    /// Port of `IsDisableManual` (MatrixRobot.hpp:357).
+    pub fn is_disable_manual(&self) -> bool {
+        (self.object_state & crate::matrix_game::map_static::ROBOT_FLAG_DISABLE_MANUAL) != 0
+    }
+
+    /// Port of `HaveBomb` (MatrixRobot.cpp:4617-4623).
+    pub fn have_bomb(&self, objs: &Objects) -> bool {
+        self.weapons.iter().any(|bw| {
+            objs.weapons
+                .get(bw.weapon)
+                .map(|we| we.weapon_type() == WEAPON_BIGBOOM)
+                .unwrap_or(false)
+        })
+    }
+
+    pub fn get_capture_factory(&self) -> Option<ObjectId> {
+        self.orders
+            .iter()
+            .find(|o| o.ty == OrderType::CaptureFactory)
+            .and_then(|o| o.target)
+    }
+
+    /// Port of `CMatrixRobotAI::AddCaptureCandidate` (MatrixRobot.cpp:
+    /// 4893-4911).
+    pub fn add_capture_candidate(&mut self, b: ObjectId, rng: &mut Rnd) {
+        const MAX_CAPTURE_CANDIDATES: usize = 4; // MatrixRobot.hpp:48
+        if self.orders.has(OrderType::CaptureFactory) {
+            return;
+        }
+        self.object_state |= crate::matrix_game::map_static::ROBOT_CAPTURE_INFORMED;
+        if self.capture_candidates.len() >= MAX_CAPTURE_CANDIDATES {
+            return;
+        }
+        if self.capture_candidates.iter().any(|(id, _)| *id == b) {
+            return;
+        }
+        self.capture_candidates.push((b, rng.range(100, 5000)));
+    }
+
+    /// Port of `CMatrixRobotAI::RemoveCaptureCandidate` (MatrixRobot.cpp:
+    /// 4913-4925) — swap-remove like the C++.
+    pub fn remove_capture_candidate(&mut self, b: ObjectId) {
+        if let Some(i) = self.capture_candidates.iter().position(|(id, _)| *id == b) {
+            self.capture_candidates.swap_remove(i);
+        }
+    }
+
+    /// Port of `CMatrixRobotAI::ClearCaptureCandidates` (MatrixRobot.cpp:
+    /// 4883-4891).
+    pub fn clear_capture_candidates(&mut self) {
+        self.capture_candidates.clear();
+    }
+
+    /// Port of `CMatrixRobotAI::TaktCaptureCandidate` (MatrixRobot.cpp:
+    /// 4836-4881): tick down each candidate's fuse; once expired, pick
+    /// the best target (fewest turrets; neutral breaks ties) and issue
+    /// the CAPTURE_FACTORY order.
+    pub fn takt_capture_candidate(&mut self, ms: i32, objs: &Objects, rng: &mut Rnd) {
+        use crate::matrix_game::object_building::Building;
+        let _ = rng;
+
+        let mut bc: Option<(ObjectId, i32, i32)> = None; // (id, turrets_have, side)
+        let mut i = 0;
+        while i < self.capture_candidates.len() {
+            self.capture_candidates[i].1 -= ms;
+            if self.capture_candidates[i].1 < 0 {
+                let bid = self.capture_candidates[i].0;
+                let info = objs.get(bid).and_then(|o| {
+                    if matches!(o.core().obj_type, ObjectType::Building) {
+                        let b: &Building =
+                            unsafe { &*(o as *const dyn MapStatic as *const Building) };
+                        Some((b.side, b.turrets_have, b.capturer.is_none()))
+                    } else {
+                        None
+                    }
+                });
+                match info {
+                    Some((side, turrets, free)) if side != self.side => {
+                        if free {
+                            bc = match bc {
+                                Some((cid, cturrets, cside)) => {
+                                    if cturrets > turrets {
+                                        Some((bid, turrets, side))
+                                    } else if cturrets == turrets && side == 0 {
+                                        // Neutral buildings win ties
+                                        // (MatrixRobot.cpp:4858).
+                                        Some((bid, turrets, side))
+                                    } else {
+                                        Some((cid, cturrets, cside))
+                                    }
+                                }
+                                None => Some((bid, turrets, side)),
+                            };
+                        }
+                    }
+                    _ => {
+                        // Dead or already ours — drop the candidate
+                        // (swap-remove, :4868-4870).
+                        self.capture_candidates.swap_remove(i);
+                        continue;
+                    }
+                }
+            }
+            i += 1;
+        }
+
+        if let Some((bid, _, _)) = bc {
+            self.capture_factory(bid);
+            self.clear_capture_candidates();
+        }
     }
 
     /// Port of `CMatrixRobotAI::StopMoving` (inline helper used from
@@ -694,12 +1146,29 @@ impl Robot {
         (false, angle1)
     }
 
+    /// Port of `CMatrixRobotAI::StopMoving` (MatrixRobot.cpp:4715-
+    /// 4732): converts MOVE_TO / MOVE_TO_BACK orders to STOP_MOVE in
+    /// place (the STOP_MOVE dispatch case then runs `LowLevelStop` and
+    /// pops it) and clears the zone / move path state. Note the C++
+    /// does NOT zero velocity here — `LowLevelStop` is commented out
+    /// at :4731.
     pub fn stop_moving(&mut self) {
-        self.orders.remove_type(OrderType::MoveTo);
-        self.orders.remove_type(OrderType::MoveToBack);
+        for o in self.orders.iter_mut() {
+            if o.ty == OrderType::MoveTo || o.ty == OrderType::MoveToBack {
+                *o = Order::set(OrderType::StopMove, 0.0, 0.0, 0.0, 0);
+            }
+        }
+        self.zone_des = -1;
+        self.zone_path.clear();
+        self.zone_path_next = -1;
         self.move_path.clear();
-        self.velocity = glam::Vec2::ZERO;
+    }
+
+    /// Port of `CMatrixRobotAI::LowLevelStop` (MatrixRobot.cpp:2657-
+    /// 2662) — kill all motion immediately.
+    pub fn low_level_stop(&mut self) {
         self.speed = 0.0;
+        self.velocity = glam::Vec2::ZERO;
     }
 
     /// Port of `CMatrixRobotAI::RotateHull(dest)` (MatrixRobot.cpp:
@@ -788,7 +1257,6 @@ impl Robot {
             ROBOT_MOVECELLS_PER_SIZE,
             mx,
             my,
-            4,
             None,
         ) else {
             return;
@@ -825,126 +1293,604 @@ impl Robot {
     /// 1112 — minus the arcade / capture-chain branches. If there's
     /// no active move-path, computes one via A*; if there is, hands
     /// off to `move_by_move_path`.
-    fn dispatch_move_to(&mut self, cms: i32, map: &GameMap, objs: &Objects, elapsed_ms: i64) {
-        self.map_pos_calc(map);
-
-        // Recompute path if stale / empty.
-        if !self.move_path.is_active() {
-            let chassis = self.chassis.kind_index();
-            let start = match logic::place_find_near(
-                map,
-                objs,
-                chassis,
-                ROBOT_MOVECELLS_PER_SIZE,
-                self.map_x,
-                self.map_y,
-                4,
-                None,
-            ) {
-                Some((x, y)) => map_trace::MovePt::new(x, y),
-                None => {
-                    self.stop_moving();
-                    return;
-                }
-            };
-            let goal = match logic::place_find_near(
-                map,
-                objs,
-                chassis,
-                ROBOT_MOVECELLS_PER_SIZE,
-                self.des_x,
-                self.des_y,
-                4,
-                None,
-            ) {
-                Some((x, y)) => map_trace::MovePt::new(x, y),
-                None => {
-                    self.stop_moving();
-                    return;
-                }
-            };
-            // Port of the `other_des` / `other_path_list` collection
-            // at MatrixRobot.cpp:1613-1645. Each other live robot /
-            // cannon contributes a `(pos, dest)` pair that raises the
-            // per-cell A* weight inside a footprint window — routing
-            // _prefers_ detours but doesn't hard-block them, matching
-            // the C++ weight-30/200 scheme at MatrixLogic.cpp:1285,1297.
-            let mut blockers: Vec<map_trace::Blocker> = Vec::new();
-            for id in objs.iter_live() {
-                let Some(other_obj) = objs.get(id) else {
-                    continue;
-                };
-                match other_obj.core().obj_type {
-                    ObjectType::RobotAi => {
-                        let other: &Robot =
-                            unsafe { &*(other_obj as *const dyn MapStatic as *const Robot) };
-                        let (omx, omy) = map.world_to_move(other.pos_x, other.pos_y);
-                        let pos = map_trace::MovePt::new(
-                            omx - ROBOT_FOOTPRINT_HALF,
-                            omy - ROBOT_FOOTPRINT_HALF,
-                        );
-                        // C++ :1626-1645: if MoveTo exists, blocker =
-                        // (current_pos, move_to_dest); otherwise blocker =
-                        // (none, current_pos) — robot is stationary at its
-                        // "destination". MoveReturn folds the same way.
-                        if let Some((dx, dy)) = other.move_to_coords() {
-                            blockers.push(map_trace::Blocker {
-                                pos: Some(pos),
-                                dest: map_trace::MovePt::new(dx, dy),
-                            });
-                        } else if let Some((dx, dy)) = other.return_coords() {
-                            blockers.push(map_trace::Blocker {
-                                pos: Some(pos),
-                                dest: map_trace::MovePt::new(dx, dy),
-                            });
-                        } else {
-                            blockers.push(map_trace::Blocker {
-                                pos: None,
-                                dest: pos,
-                            });
-                        }
-                    }
-                    ObjectType::Cannon => {
-                        // C++ :1646-1652: every live cannon is a stationary
-                        // weight-200 destination blocker at
-                        // Float2Int(pos / GLOBAL_SCALE_MOVE) - size/2.
-                        let cannon: &Cannon =
-                            unsafe { &*(other_obj as *const dyn MapStatic as *const Cannon) };
-                        if matches!(
-                            cannon.state,
-                            CannonState::Dip | CannonState::UnderConstruction
-                        ) {
-                            continue; // IsLiveCannon (MatrixMapStatic.hpp:228)
-                        }
-                        use crate::matrix_game::common::float2int;
-                        let cx = float2int(cannon.pos.x / GameMap::GLOBAL_SCALE_MOVE)
-                            - ROBOT_FOOTPRINT_HALF;
-                        let cy = float2int(cannon.pos.y / GameMap::GLOBAL_SCALE_MOVE)
-                            - ROBOT_FOOTPRINT_HALF;
-                        blockers.push(map_trace::Blocker {
-                            pos: None,
-                            dest: map_trace::MovePt::new(cx, cy),
-                        });
-                    }
-                    _ => {}
-                }
+    /// Port of `CMatrixRobotAI::ZoneCurFind` (MatrixRobot.cpp:1552-
+    /// 1576) — adopt the zone of the cell we stand on when valid.
+    fn zone_cur_find(&mut self, map: &GameMap) {
+        if let Some(c) = map.move_cell(self.map_x, self.map_y) {
+            if c.zone >= 0 {
+                self.zone_cur = c.zone;
             }
+        }
+    }
 
-            let raw = map_trace::find_path(map, start, goal, chassis, &blockers);
-            let Some(raw) = raw else {
-                self.stop_moving();
-                return;
-            };
-            let opt = map_trace::optimize_path(map, &raw, chassis, &blockers);
-            self.move_path.total_len = map_trace::path_total_length(&opt);
-            self.move_path.followed_len = 0.0;
-            self.move_path.pts = opt;
-            self.move_path.cur = 0;
-            self.move_test_pos = glam::Vec2::new(self.pos_x, self.pos_y);
-            self.move_test_change_ms = elapsed_ms;
+    /// Port of `CMatrixRobotAI::ZonePathCalc` (MatrixRobot.cpp:1578-
+    /// 1605). The player-group / team `m_RoadPath` route constraint
+    /// lands with the player-group order layer; ungrouped robots pass
+    /// no route — same as the C++ `else` branch at :1594.
+    fn zone_path_calc(&mut self, map: &GameMap) {
+        if self.zone_cur < 0 {
+            return;
+        }
+        // Player-group road route, when the PG layer assigned one
+        // (MatrixRobot.cpp:1587-1588).
+        let route = self
+            .group_road_path
+            .as_deref()
+            .filter(|r| r.list_cnt > 0)
+            .map(|r| (r, 0usize));
+        self.zone_path = logic::find_path_in_zone(
+            map,
+            self.chassis.kind_index(),
+            self.zone_cur,
+            self.zone_des,
+            route,
+        );
+        if !self.zone_path.is_empty() {
+            debug_assert!(self.zone_path.len() >= 2);
+            self.zone_path_next = 1;
+        } else {
+            self.zone_path_next = -1;
+        }
+    }
+
+    /// Port of `CMatrixRobotAI::ZoneMoveCalc` (MatrixRobot.cpp:1607-
+    /// 1689): collect every other live robot's / cannon's claimed
+    /// cells as path weights, run `FindLocalPath` through the active
+    /// zone window, then `OptimizeMovePath` over the same weight
+    /// stamps.
+    fn zone_move_calc(&mut self, map: &GameMap, objs: &Objects, elapsed_ms: i64) {
+        if self.zone_cur < 0 {
+            return;
         }
 
-        self.move_by_move_path(cms, map, objs, elapsed_ms);
+        self.move_test_change_ms = elapsed_ms;
+
+        let mut others: Vec<map_trace::Blocker> = Vec::new();
+        for id in objs.iter_live() {
+            if self.self_id == Some(id) {
+                continue;
+            }
+            let Some(other_obj) = objs.get(id) else {
+                continue;
+            };
+            match other_obj.core().obj_type {
+                ObjectType::RobotAi => {
+                    let other: &Robot =
+                        unsafe { &*(other_obj as *const dyn MapStatic as *const Robot) };
+                    if !other.is_live() {
+                        continue;
+                    }
+                    // C++ :1626-1645: a moving robot blocks where it
+                    // stands (current remaining waypoint, weight 30)
+                    // and where it's heading (m_DesX/Y, weight 200);
+                    // a standing robot only blocks its map cell.
+                    if other.move_to_coords().is_some() {
+                        let pos = other
+                            .move_path
+                            .pts
+                            .get(other.move_path.cur)
+                            .copied()
+                            .map(Some)
+                            .unwrap_or(None);
+                        others.push(map_trace::Blocker {
+                            pos,
+                            dest: map_trace::MovePt::new(other.des_x, other.des_y),
+                            size: ROBOT_MOVECELLS_PER_SIZE,
+                        });
+                    } else {
+                        others.push(map_trace::Blocker {
+                            pos: None,
+                            dest: map_trace::MovePt::new(other.map_x, other.map_y),
+                            size: ROBOT_MOVECELLS_PER_SIZE,
+                        });
+                    }
+                }
+                ObjectType::Cannon => {
+                    // C++ :1646-1652 — every live cannon is a
+                    // stationary weight-200 blocker.
+                    let cannon: &Cannon =
+                        unsafe { &*(other_obj as *const dyn MapStatic as *const Cannon) };
+                    if matches!(
+                        cannon.state,
+                        CannonState::Dip | CannonState::UnderConstruction
+                    ) {
+                        continue; // IsLiveCannon (MatrixMapStatic.hpp:228)
+                    }
+                    use crate::matrix_game::common::float2int;
+                    let cx = float2int(cannon.pos.x / GameMap::GLOBAL_SCALE_MOVE)
+                        - ROBOT_FOOTPRINT_HALF;
+                    let cy = float2int(cannon.pos.y / GameMap::GLOBAL_SCALE_MOVE)
+                        - ROBOT_FOOTPRINT_HALF;
+                    others.push(map_trace::Blocker {
+                        pos: None,
+                        dest: map_trace::MovePt::new(cx, cy),
+                        size: ROBOT_MOVECELLS_PER_SIZE,
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        // Zone window — `m_ZonePath + m_ZonePathNext - 1` when a zone
+        // route is active, else just the current zone (:1657-1665).
+        let window: Vec<i32> = if self.zone_path_next >= 0 {
+            let from = (self.zone_path_next - 1).max(0) as usize;
+            self.zone_path[from..].to_vec()
+        } else {
+            vec![self.zone_cur]
+        };
+
+        let chassis = self.chassis.kind_index();
+        let zone_rect_of = |z: i32| logic::zone_move_rect(map, z);
+        let result = logic::find_local_path(
+            map,
+            chassis,
+            ROBOT_MOVECELLS_PER_SIZE,
+            self.map_x,
+            self.map_y,
+            &window,
+            &zone_rect_of,
+            self.des_x,
+            self.des_y,
+            &others,
+        );
+        let mut path = result.path;
+        logic::optimize_move_path(
+            map,
+            chassis,
+            ROBOT_MOVECELLS_PER_SIZE,
+            &mut path,
+            &result.weight,
+        );
+
+        // :1681-1688 — reset the cursor and the dist bookkeeping.
+        self.move_path.total_len = map_trace::path_total_length(&path);
+        self.move_path.followed_len = 0.0;
+        self.move_path.pts = path;
+        self.move_path.cur = 0;
+    }
+
+    /// Port of the order-dispatch loop at MatrixRobot.cpp:1011-1342:
+    /// `while (cnt < m_OrdersInPool) { switch(m_OrdersList[0]) {...}
+    /// ProcessOrdersList(); cnt++; }`. Each iteration dispatches the
+    /// top order then rotates it to the back; `continue` paths pop
+    /// the top instead. The arcade branches are out of scope.
+    fn process_orders_list(
+        &mut self,
+        cms: i32,
+        map: &GameMap,
+        rng: &mut Rnd,
+        objs: &mut Objects,
+        elapsed_ms: i64,
+    ) {
+        use crate::matrix_game::object_building::Building;
+
+        let mut cnt = 0isize;
+        while cnt < self.orders.len() as isize {
+            let top = *self.orders.top().unwrap();
+            match top.ty {
+                OrderType::MoveTo | OrderType::MoveToBack => {
+                    // :1041-1048 — frozen while a base-capture order
+                    // is IN_POSITION (the base platform is carrying
+                    // us).
+                    let mut frozen = false;
+                    for o in self.orders.iter() {
+                        if o.ty == OrderType::CaptureFactory
+                            && o.phase == OrderPhase::CaptureInPosition
+                        {
+                            if let Some(fid) = o.target {
+                                if let Some(b) = objs.get(fid) {
+                                    if matches!(b.core().obj_type, ObjectType::Building) {
+                                        let b: &Building = unsafe {
+                                            &*(b as *const dyn MapStatic as *const Building)
+                                        };
+                                        if b.is_base() {
+                                            frozen = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if !frozen {
+                        self.dispatch_move_to(cms, map, &*objs, elapsed_ms);
+                    }
+                }
+                OrderType::MoveReturn => {
+                    // :1113-1125.
+                    if !self.orders.has(OrderType::MoveTo) {
+                        let (mx, my) = (top.p1 as i32, top.p2 as i32);
+                        if logic::place_is_empty(
+                            map,
+                            objs,
+                            self.chassis.kind_index(),
+                            ROBOT_MOVECELLS_PER_SIZE,
+                            mx,
+                            my,
+                            self.self_id,
+                        ) {
+                            self.orders.pop_top();
+                            self.move_to(mx, my);
+                            continue;
+                        }
+                    }
+                }
+                OrderType::StopMove => {
+                    // :1126-1141.
+                    self.low_level_stop();
+                    self.orders.pop_top();
+                    self.object_state |= ROBOT_FLAG_COLLISION;
+                    self.rchange |= MR_MATRIX;
+                    continue;
+                }
+                OrderType::Fire => {
+                    // :1143-1195 — aim at the order params and toggle
+                    // weapon groups by fire type.
+                    self.dispatch_fire_order(objs);
+                }
+                OrderType::StopFire => {
+                    // :1197-1201.
+                    self.low_level_stop_fire(objs);
+                    self.orders.pop_top();
+                    continue;
+                }
+                OrderType::CaptureFactory => {
+                    // :1203-1329.
+                    let was_empty_phase = top.phase == OrderPhase::Empty;
+                    if self.dispatch_capture_factory(cms, map, rng, objs, top) {
+                        // CAPTURING completed on a base — the robot is
+                        // consumed (StaticDelete at :1317).
+                        return;
+                    }
+                    // `cnt--` at :1238 — the Empty-phase setup pushed a
+                    // MOVE_TO order; the compensation lets it dispatch
+                    // within this same takt.
+                    if was_empty_phase
+                        && self
+                            .orders
+                            .top()
+                            .map(|o| o.ty == OrderType::MoveTo)
+                            .unwrap_or(false)
+                    {
+                        cnt -= 1;
+                    }
+                }
+                OrderType::StopCapture => {
+                    // :1331-1337.
+                    self.orders.pop_top();
+                    continue;
+                }
+                OrderType::Empty => {}
+            }
+            self.orders.rotate_top_to_back();
+            cnt += 1;
+        }
+    }
+
+    /// Port of the ROT_CAPTURE_FACTORY dispatch case
+    /// (MatrixRobot.cpp:1203-1329). Returns `true` when the robot got
+    /// consumed by completing a base capture.
+    fn dispatch_capture_factory(
+        &mut self,
+        cms: i32,
+        map: &GameMap,
+        _rng: &mut Rnd,
+        objs: &mut Objects,
+        top: Order,
+    ) -> bool {
+        use crate::matrix_game::object_building::{BaseState, Building, CaptureStatus};
+        const BASE_DIST: f32 = 70.0;
+
+        let Some(fid) = top.target else { return false };
+        // Validate the factory still exists.
+        let Some(obj) = objs.get(fid) else {
+            return false;
+        };
+        if !matches!(obj.core().obj_type, ObjectType::Building) {
+            return false;
+        }
+        let (f_pos, f_is_base, f_state, f_fwd) = {
+            let b: &Building = unsafe { &*(obj as *const dyn MapStatic as *const Building) };
+            (
+                b.pos,
+                b.is_base(),
+                b.state,
+                // `factory->GetMatrix()._21/_22` — the building's
+                // local Y axis in world space (forward).
+                glam::Vec2::new(b.core().matrix.y_axis.x, b.core().matrix.y_axis.y),
+            )
+        };
+
+        // `factory->SetCapturedBy(this)` (:1209).
+        if let Some(bm) = objs.get_mut(fid) {
+            let b: &mut Building = unsafe { &mut *(bm as *mut dyn MapStatic as *mut Building) };
+            b.set_captured_by(self.self_id);
+        }
+
+        let phase = top.phase;
+        match phase {
+            OrderPhase::Empty => {
+                // :1213-1238.
+                if (self.pos_x - f_pos.x).abs() < 2.0 && (self.pos_y - f_pos.y).abs() < 2.0 {
+                    if let Some(o) = self.orders.top_mut() {
+                        o.set_phase(OrderPhase::CaptureSettingUp);
+                    }
+                    return false;
+                }
+                if let Some(o) = self.orders.top_mut() {
+                    o.set_phase(OrderPhase::CaptureMoving);
+                }
+                use crate::matrix_game::common::trunc_float;
+                let (mut mx, mut my);
+                if f_is_base {
+                    let tgt = f_pos + f_fwd * 100.0;
+                    mx = trunc_float(tgt.x / GameMap::GLOBAL_SCALE_MOVE) as i32
+                        - ROBOT_MOVECELLS_PER_SIZE / 2;
+                    my = trunc_float(tgt.y / GameMap::GLOBAL_SCALE_MOVE) as i32
+                        - ROBOT_MOVECELLS_PER_SIZE / 2;
+                } else {
+                    mx = trunc_float(f_pos.x / GameMap::GLOBAL_SCALE_MOVE) as i32
+                        - ROBOT_MOVECELLS_PER_SIZE / 2;
+                    my = trunc_float(f_pos.y / GameMap::GLOBAL_SCALE_MOVE) as i32
+                        - ROBOT_MOVECELLS_PER_SIZE / 2;
+                }
+                if let Some((nx, ny)) = logic::place_find_near(
+                    map,
+                    objs,
+                    self.chassis.kind_index(),
+                    ROBOT_MOVECELLS_PER_SIZE,
+                    mx,
+                    my,
+                    self.self_id,
+                ) {
+                    mx = nx;
+                    my = ny;
+                }
+                // `MoveTo` pushes a MOVE_TO on top — the capture
+                // order slides down one slot, exactly like the C++
+                // pool insert. The C++ `cnt--` compensates the extra
+                // rotation; our rotation loop reads len() live so the
+                // net behaviour matches.
+                self.move_to(mx, my);
+                if let Some(o) = self.orders.iter_mut().find(|o| o.ty == OrderType::MoveTo) {
+                    // The capture-MoveTo is marked with the capture
+                    // phase so StopCapture can find it (:4829).
+                    o.set_phase(OrderPhase::CaptureMoving);
+                }
+            }
+            OrderPhase::CaptureMoving => {
+                // :1239-1251.
+                let dist = glam::Vec2::new(f_pos.x - self.pos_x, f_pos.y - self.pos_y);
+                let limit = if f_is_base {
+                    (BASE_DIST + 60.0) * (BASE_DIST + 60.0)
+                } else {
+                    BASE_DIST * BASE_DIST
+                };
+                if !self
+                    .orders
+                    .has_with_phase(OrderType::MoveTo, OrderPhase::CaptureMoving)
+                    && dist.length_squared() <= limit
+                {
+                    if let Some(o) = self.orders.top_mut() {
+                        o.set_phase(OrderPhase::CaptureInPosition);
+                    }
+                }
+            }
+            OrderPhase::CaptureInPosition => {
+                // :1252-1278.
+                if f_is_base {
+                    self.base = Some(fid);
+                    if f_state != BaseState::Opened && f_state != BaseState::Opening {
+                        if let Some(bm) = objs.get_mut(fid) {
+                            let b: &mut Building =
+                                unsafe { &mut *(bm as *mut dyn MapStatic as *mut Building) };
+                            b.open();
+                        }
+                        return false;
+                    } else if f_state != BaseState::Opened {
+                        return false;
+                    }
+                    self.object_state |= ROBOT_FLAG_DISABLE_MANUAL;
+                    self.low_level_move(
+                        cms,
+                        map,
+                        &*objs,
+                        glam::Vec2::new(f_pos.x, f_pos.y),
+                        false,
+                        false,
+                        false,
+                        false,
+                    );
+                } else {
+                    self.low_level_move(
+                        cms,
+                        map,
+                        &*objs,
+                        glam::Vec2::new(f_pos.x, f_pos.y),
+                        true,
+                        true,
+                        false,
+                        false,
+                    );
+                }
+                if (self.pos_x - f_pos.x).abs() < 2.0 && (self.pos_y - f_pos.y).abs() < 2.0 {
+                    if let Some(o) = self.orders.top_mut() {
+                        o.set_phase(OrderPhase::CaptureSettingUp);
+                    }
+                }
+            }
+            OrderPhase::CaptureSettingUp => {
+                // :1279-1285 — face the building's forward axis, hull
+                // follows chassis.
+                let dest = glam::Vec2::new(self.pos_x + f_fwd.x, self.pos_y + f_fwd.y);
+                let (aligned, _) = self.rotate_robot(cms, dest);
+                if aligned {
+                    if let Some(o) = self.orders.top_mut() {
+                        o.set_phase(OrderPhase::Capturing);
+                    }
+                    self.low_level_stop();
+                }
+                let hull = glam::Vec2::new(self.pos_x + self.forward.x, self.pos_y + self.forward.y);
+                self.rotate_hull(hull, cms);
+            }
+            OrderPhase::Capturing => {
+                // :1286-1327. (The player-side deselection of the
+                // captured building lands with the side layer.)
+                if f_is_base {
+                    if f_state != BaseState::Closed && f_state != BaseState::Closing {
+                        self.state = RobotState::BaseCapture;
+                        if let Some(bm) = objs.get_mut(fid) {
+                            let b: &mut Building =
+                                unsafe { &mut *(bm as *mut dyn MapStatic as *mut Building) };
+                            b.close();
+                        }
+                    } else if f_state == BaseState::Closed {
+                        // Sound: S_ENEMY_BASE_CAPTURED / S_PLAYER_BASE_
+                        // CAPTURED — lands with the sound manager.
+                        if let Some(bm) = objs.get_mut(fid) {
+                            let b: &mut Building =
+                                unsafe { &mut *(bm as *mut dyn MapStatic as *mut Building) };
+                            b.side = self.side;
+                            b.build_stack.clear();
+                        }
+                        self.orders.pop_top();
+                        self.consumed_by_capture = true;
+                        if let Some(me) = self.self_id {
+                            objs.remove_deferred(me);
+                        }
+                        return true;
+                    }
+                } else {
+                    let status = self.building_capture_step(fid, objs);
+                    if status == CaptureStatus::Done {
+                        self.orders.pop_top();
+                    }
+                }
+            }
+            _ => {}
+        }
+        false
+    }
+
+    /// One `factory->Capture(this)` call (:1321) — precomputes the
+    /// nearest-robot check the C++ does inside
+    /// `CMatrixBuilding::Capture` via `FindObjects`, then runs the
+    /// building's paint/erase state machine.
+    fn building_capture_step(
+        &mut self,
+        fid: ObjectId,
+        objs: &mut Objects,
+    ) -> crate::matrix_game::object_building::CaptureStatus {
+        use crate::matrix_game::object_building::{Building, CaptureStatus};
+
+        let Some(obj) = objs.get(fid) else {
+            return CaptureStatus::TooFar;
+        };
+        if !matches!(obj.core().obj_type, ObjectType::Building) {
+            return CaptureStatus::TooFar;
+        }
+        let f_pos = {
+            let b: &Building = unsafe { &*(obj as *const dyn MapStatic as *const Building) };
+            b.pos
+        };
+
+        // `FindRobotForCapture` (MatrixObjectBuilding.cpp:1125-1146):
+        // capture proceeds only when *we* are the nearest robot within
+        // CAPTURE_RADIUS of the building.
+        const CAPTURE_RADIUS: f32 = 50.0; // MatrixObjectBuilding.hpp:27
+        let mut nearest: Option<(ObjectId, f32)> = None;
+        let mut best = CAPTURE_RADIUS * CAPTURE_RADIUS;
+        for id in objs.iter_live() {
+            let Some(o) = objs.get(id) else { continue };
+            if !matches!(o.core().obj_type, ObjectType::RobotAi) {
+                continue;
+            }
+            if !o.is_live() {
+                continue;
+            }
+            let gc = o.core().geo_center;
+            let d2 = (gc.x - f_pos.x).powi(2) + (gc.y - f_pos.y).powi(2);
+            if d2 < best {
+                best = d2;
+                nearest = Some((id, d2));
+            }
+        }
+        // The robot running this takt is checked out of the arena
+        // (take-the-box), so its own distance must join the scan — the
+        // C++ `FindObjects` sees the capturer like any other robot.
+        let my_d2 =
+            (self.core.geo_center.x - f_pos.x).powi(2) + (self.core.geo_center.y - f_pos.y).powi(2);
+        let me_nearest = my_d2 < best || nearest.map(|(id, _)| Some(id) == self.self_id).unwrap_or(false);
+
+        let now = crate::matrix_game::map::current_elapsed_ms();
+        let Some(bm) = objs.get_mut(fid) else {
+            return CaptureStatus::TooFar;
+        };
+        let b: &mut Building = unsafe { &mut *(bm as *mut dyn MapStatic as *mut Building) };
+        b.capture(self.side, me_nearest, now)
+    }
+
+    /// Port of the ROT_MOVE_TO / ROT_MOVE_TO_BACK dispatch case
+    /// (MatrixRobot.cpp:1020-1112), minus the arcade branch (manual
+    /// control is out of scope).
+    fn dispatch_move_to(&mut self, cms: i32, map: &GameMap, objs: &Objects, elapsed_ms: i64) {
+        self.map_pos_calc(map);
+        self.zone_cur_find(map);
+
+        if self.zone_cur < 0 {
+            // :1061-1066 — no zone under us: keep walking whatever
+            // path remains.
+            if !self.move_path.pts.is_empty() {
+                self.move_by_move_path(cms, map, objs, elapsed_ms);
+            }
+            return;
+        }
+
+        // :1075-1092 — once 70% of the local path is walked, resync
+        // the zone cursor to where we actually are.
+        if self.zone_path_next >= 0 && (self.zone_path_next as usize) < self.zone_path.len() {
+            if self.move_path.followed_len > self.move_path.total_len * 0.7 {
+                let mut i = self.zone_path_next as usize;
+                while i < self.zone_path.len() {
+                    if self.zone_path[i] == self.zone_cur {
+                        self.zone_path_next = (i + 1) as i32;
+                        self.move_path.cur = 0;
+                        self.move_path.pts.clear();
+                        break;
+                    }
+                    i += 1;
+                }
+                if i >= self.zone_path.len() {
+                    self.zone_path.clear();
+                    self.zone_path_next = -1;
+                    self.move_path.cur = 0;
+                    self.move_path.pts.clear();
+                }
+            }
+        }
+
+        if !self.move_path.pts.is_empty() {
+            self.move_by_move_path(cms, map, objs, elapsed_ms);
+            return;
+        }
+
+        // :1098-1101 — resolve the destination zone lazily.
+        if self.zone_des < 0 {
+            self.zone_des =
+                logic::zone_find_near(map, self.chassis.kind_index() as i32, self.des_x, self.des_y);
+            self.zone_path.clear();
+            self.zone_path_next = -1;
+        }
+
+        if self.zone_path.is_empty() {
+            self.zone_path_calc(map);
+        }
+
+        self.zone_move_calc(map, objs, elapsed_ms);
+        if self.move_path.pts.is_empty() {
+            self.stop_moving();
+        }
     }
 
     /// Port of `CMatrixRobotAI::MoveByMovePath(ms)`
@@ -963,12 +1909,12 @@ impl Robot {
         let (des_x, des_y) = map_trace::waypoint_to_world(des_pt);
         let dest = glam::Vec2::new(des_x, des_y);
 
+        // `globalend` — the next waypoint IS the order's destination
+        // cell (MatrixRobot.cpp:1721). `end_path` additionally
+        // requires it to be the final segment of this local path.
+        let globalend = self.des_x == des_pt.x && self.des_y == des_pt.y;
         let last_seg = self.move_path.cur + 1 == self.move_path.pts.len() - 1;
-        // `globalend` in the C++ = `m_MovePathCur+1 == m_MovePathCnt-1`,
-        // i.e. we're on the final leg AND there is no follow-up zone
-        // segment. Zone chaining isn't ported yet, so `globalend` ==
-        // `last_seg` always. Matches MatrixRobot.cpp:1723.
-        let end_path = last_seg;
+        let end_path = globalend && last_seg;
 
         // C++: LowLevelMove(ms, dest, robot_coll=true, obst_coll=true,
         //                    end_path=globalend && last, back=false).
@@ -978,36 +1924,46 @@ impl Robot {
         self.low_level_move(cms, map, objs, dest, true, true, end_path, false);
 
         // Port of the segment-advance test at MatrixRobot.cpp:1725-1750.
+        // `vMeProj` is the projection of our offset onto the segment;
+        // the C++ compares squared lengths (sign-blind).
         let seg = glam::Vec2::new(des_x - sou_x, des_y - sou_y);
         let seg_len_sq = seg.length_squared().max(1.0e-6);
         let me = glam::Vec2::new(self.pos_x - sou_x, self.pos_y - sou_y);
-        // `proj` is the projected distance along the segment normalized
-        // to segment length — equivalent to `(me·seg)/|seg|`.
-        let proj = me.dot(seg) / seg_len_sq.sqrt();
-        let seg_len = seg_len_sq.sqrt();
-        let reached = if last_seg {
-            (glam::Vec2::new(self.pos_x - des_x, self.pos_y - des_y)).length_squared() < 0.2
+        let dot = me.dot(seg);
+        let proj_len_sq = dot * dot / seg_len_sq;
+        let reached = if globalend {
+            (self.pos_x - des_x).powi(2) + (self.pos_y - des_y).powi(2) < 0.2
         } else {
-            proj >= seg_len
+            proj_len_sq >= seg_len_sq
         };
         if reached {
             self.move_path.cur += 1;
             if self.move_path.cur + 1 >= self.move_path.pts.len() {
-                self.pos_x = des_x;
-                self.pos_y = des_y;
-                self.orders.remove_type(OrderType::MoveTo);
-                self.move_path.clear();
-                self.velocity = glam::Vec2::ZERO;
-                self.speed = 0.0;
+                // :1739-1748 — chain into the next zone segment, or
+                // finish the order.
+                self.zone_path_next += 1;
+                if self.zone_path_next >= 0
+                    && (self.zone_path_next as usize) < self.zone_path.len()
+                {
+                    self.move_path.cur = 0;
+                    self.move_path.pts.clear();
+                } else {
+                    self.pos_x = des_x;
+                    self.pos_y = des_y;
+                    self.stop_moving();
+                }
             }
         }
 
-        // Stuck-watchdog — MatrixRobot.cpp:1753-1761.
+        // Stuck-watchdog — MatrixRobot.cpp:1753-1761: wipe both the
+        // zone route and the local path so the next takt recomputes.
         let dpos = glam::Vec2::new(self.pos_x, self.pos_y) - self.move_test_pos;
         if dpos.length_squared() > 25.0 {
             self.move_test_pos = glam::Vec2::new(self.pos_x, self.pos_y);
             self.move_test_change_ms = elapsed_ms;
         } else if elapsed_ms - self.move_test_change_ms > 2000 {
+            self.zone_path.clear();
+            self.zone_path_next = -1;
             self.move_path.clear();
         }
 
@@ -1794,10 +2750,76 @@ impl MapStatic for Robot {
         self.rchange = 0;
     }
 
-    fn takt(&mut self, cms: i32, _rng: &mut Rnd, _objs: &mut Objects) {
+    fn takt(&mut self, cms: i32, rng: &mut Rnd, objs: &mut Objects) {
         // HP-bar timer decay (`RobotTakt`, MatrixRobot.cpp:313-317).
         if self.show_hitpoint_time > 0 {
             self.show_hitpoint_time = (self.show_hitpoint_time - cms).max(0);
+        }
+
+        // Keel-water / hovercraft dust (CMatrixRobot::Takt,
+        // MatrixObjectRobot.cpp:911-948).
+        const KEELWATER_SPAWN_FACTOR: f32 = 0.01;
+        const DUST_SPAWN_FACTOR: f32 = 0.007;
+        if !matches!(
+            self.state,
+            RobotState::Carrying | RobotState::Falling | RobotState::InSpawn | RobotState::BaseCapture
+        ) {
+            let on_water =
+                self.object_state & crate::matrix_game::map_static::ROBOT_FLAG_ONWATER != 0;
+            if on_water {
+                self.keelwater_count += self.speed * KEELWATER_SPAWN_FACTOR * cms as f32;
+            } else if self.chassis == ChassisKind::Hovercraft {
+                self.dust_count += (self.speed + 1.0) * DUST_SPAWN_FACTOR * cms as f32;
+            }
+            while self.keelwater_count > 1.0 {
+                // CreateBillboard(.., WATER_LEVEL, 5, 40, ttl 3000,
+                // keelwater texture, m_Forward).
+                // The C++ uses a ground-aligned quad growing 5→40
+                // along m_Forward; a forward-aligned line billboard
+                // with the same texture/TTL is the closest primitive
+                // the port's queue offers.
+                let p0 = glam::Vec3::new(
+                    self.pos_x,
+                    self.pos_y,
+                    crate::matrix_game::common::WATER_LEVEL,
+                );
+                let f3 = glam::Vec3::new(self.forward.x, self.forward.y, 0.0);
+                objs.pending_effects.push(
+                    crate::matrix_game::effects::GameEffect::BillboardLine(
+                        crate::matrix_game::effects::billboard_fx::BillboardLineFx::new(
+                            p0 - f3 * 20.0,
+                            p0,
+                            5.0,
+                            0xFFFF_FFFF,
+                            0x00FF_FFFF,
+                            3000.0,
+                            crate::matrix_lib::three_g::billboard::TexRef::Path(
+                                crate::matrix_game::effects::effects_renderer::TEXTURE_PATH_KEELWATER,
+                            ),
+                        ),
+                    ),
+                );
+                self.keelwater_count -= 1.0;
+            }
+            if self.chassis == ChassisKind::Hovercraft {
+                while self.dust_count > 1.0 {
+                    let spd = self.velocity
+                        * (cms as f32 / crate::matrix_game::logic::LOGIC_TAKT_PERIOD_MS as f32);
+                    objs.pending_effects
+                        .push(crate::matrix_game::effects::GameEffect::Dust(
+                            crate::matrix_game::effects::dust::Dust::new(
+                                glam::Vec2::new(
+                                    self.core.geo_center.x,
+                                    self.core.geo_center.y,
+                                ),
+                                spd,
+                                500.0,
+                                rng,
+                            ),
+                        ));
+                    self.dust_count -= 1.0;
+                }
+            }
         }
     }
 
@@ -1844,6 +2866,11 @@ impl MapStatic for Robot {
         };
         let elapsed_ms = crate::matrix_game::map::current_elapsed_ms();
 
+        // Minimap blink countdown (MatrixRobot.cpp:406-409).
+        if self.mini_map_flash_time > 0 {
+            self.mini_map_flash_time -= cms;
+        }
+
         // ROBOT_DIP — `DIPTakt` (MatrixRobot.cpp:178-283): pieces fly
         // with gravity, bounce nothing, splash into water, damage
         // objects they strike (WEAPON_DEBRIS) and pop a small boom at
@@ -1863,6 +2890,23 @@ impl MapStatic for Robot {
         // at construction in the C++; the arena id isn't known until
         // after spawn here).
         self.robot_weapon_init(objs);
+
+        // Base watchdog (MatrixRobot.cpp:361-371): stuck with a base
+        // >10s → close it and self-destruct.
+        if self.base.is_some() {
+            self.time_with_base += cms;
+            if self.time_with_base > 10_000 {
+                if let Some(bid) = self.base {
+                    if let Some(b) = crate::matrix_game::logic::building_mut(objs, bid) {
+                        b.close();
+                    }
+                }
+                self.time_with_base = 0;
+                self.must_die = true;
+            }
+        } else {
+            self.time_with_base = 0;
+        }
 
         // MUST_DIE flag — set by BigBoom (MatrixRobot.cpp:4774).
         if self.must_die {
@@ -1886,6 +2930,44 @@ impl MapStatic for Robot {
         if self.dot_takt(objs) {
             return;
         }
+
+        // ROBOT_FALLING (MatrixRobot.cpp:570-607): gravity until the
+        // terrain catches us, then dust + back to normal duty.
+        if self.state == RobotState::Falling {
+            let dtime = cms as f32 * 0.013;
+            self.falling_speed += dtime;
+            self.pos_z -= self.falling_speed * dtime;
+            let z = map.get_z(self.pos_x, self.pos_y);
+            if self.pos_z < z {
+                self.pos_z = z;
+                self.falling_speed = 0.0;
+                self.state = RobotState::Idle;
+                self.map_pos_calc(map);
+                let gc = glam::Vec2::new(self.pos_x, self.pos_y);
+                for _ in 0..4 {
+                    objs.pending_effects
+                        .push(crate::matrix_game::effects::GameEffect::Dust(
+                            crate::matrix_game::effects::dust::Dust::new(
+                                gc,
+                                glam::Vec2::ZERO,
+                                3000.0,
+                                rng,
+                            ),
+                        ));
+                }
+            }
+            self.core.geo_center =
+                glam::Vec3::new(self.pos_x, self.pos_y, self.pos_z + 3.0);
+            return;
+        }
+
+        // ROBOT_CARRYING (MatrixRobot.cpp:612-716): spring toward the
+        // flyer's hook point; spin up the elevator field.
+        if self.state == RobotState::Carrying {
+            self.carrying_takt(cms, map, objs);
+            return;
+        }
+
         // A shorted robot is paralyzed — no orders, movement or
         // weapons until the TTL clears (MatrixRobot.cpp:717).
         if self.object_state & OBJECT_STATE_SHORTED != 0 {
@@ -1893,7 +2975,7 @@ impl MapStatic for Robot {
         }
 
         match self.state {
-            RobotState::Dip => unreachable!(),
+            RobotState::Dip | RobotState::Carrying | RobotState::Falling => unreachable!(),
             RobotState::InSpawn => {
                 // Reach into the base; downcast-via-raw-pointer is
                 // safe because the arena slot holds a concrete Building
@@ -2010,39 +3092,21 @@ impl MapStatic for Robot {
                     self.get_lost(map, &*objs, self.forward, rng);
                 }
             }
-            RobotState::Idle => {
-                // ROT_FIRE / ROT_STOP_FIRE first — a FIRE order on top
-                // `break`s the C++ order loop, holding position
-                // (MatrixRobot.cpp:1143-1205).
-                let firing = self.dispatch_fire_order(objs);
-
-                // Dispatch the top-of-pool order. For now only
-                // ROT_MOVE_TO (and implicitly its GetingLost-phase
-                // variant) is handled — the rest land with combat
-                // / capture. Mirrors the while-loop around
-                // MatrixRobot.cpp:1012.
-                let top_ty = self.orders.top().map(|o| o.ty);
-                if firing {
-                    self.velocity = glam::Vec2::ZERO;
-                    self.speed = 0.0;
-                } else if matches!(top_ty, Some(OrderType::MoveTo)) {
-                    let o = *self.orders.top().unwrap();
-                    self.des_x = o.p1 as i32;
-                    self.des_y = o.p2 as i32;
-                    // `dispatch_move_to` → `move_by_move_path` →
-                    // `low_level_move` already runs `robot_to_object_
-                    // collision` (the separation + stop-on-aligned
-                    // branches), so no extra call is needed here.
-                    self.dispatch_move_to(cms, map, &*objs, elapsed_ms);
-                    self.core.geo_center.x = self.pos_x;
-                    self.core.geo_center.y = self.pos_y;
-                } else {
-                    // No order in the pool — the C++ eventually hits
-                    // `LowLevelStop` which zeroes m_Speed. That's
-                    // what the do_animation block below reads to
-                    // pick ANIMATION_STAY.
-                    self.velocity = glam::Vec2::ZERO;
-                    self.speed = 0.0;
+            RobotState::Idle | RobotState::BaseCapture => {
+                // Port of `TaktCaptureCandidate` gating at
+                // MatrixRobot.cpp:1005-1006: auto-capture decisions
+                // run for non-player sides (and for the player side
+                // under MMFLAG_AUTOMATIC_MODE, which we don't model).
+                if self.side != crate::matrix_game::common::PLAYER_SIDE {
+                    self.takt_capture_candidate(cms, objs, rng);
+                }
+                self.process_orders_list(cms, map, rng, objs, elapsed_ms);
+                self.core.geo_center.x = self.pos_x;
+                self.core.geo_center.y = self.pos_y;
+                if self.consumed_by_capture {
+                    // CAPTURING consumed the robot (StaticDelete at
+                    // MatrixRobot.cpp:1317) — bail before animation.
+                    return;
                 }
             }
         }
@@ -2086,7 +3150,7 @@ impl MapStatic for Robot {
                 while i < objs.pending_hit_notices.len() {
                     if objs.pending_hit_notices[i].0 == me {
                         let (_, hit, pos) = objs.pending_hit_notices.swap_remove(i);
-                        self.hit_to(hit, pos);
+                        self.hit_to(hit, pos, objs);
                     } else {
                         i += 1;
                     }
@@ -2174,8 +3238,42 @@ impl MapStatic for Robot {
                 return false;
             }
 
-            // (Cannon-attacker enemy-list / target-switch block at
-            // :1870-1878 needs SMatrixRobotAIEnv — lands with the AI.)
+            // Cannon attacker → enemy list + retarget when idle
+            // (MatrixRobot.cpp:1870-1878).
+            if !friendly_fire {
+                if let Some(att) = _attacker {
+                    let attacker_is_enemy_cannon =
+                        crate::matrix_game::logic::cannon_ref(objs, att)
+                            .map(|c| {
+                                !matches!(
+                                    c.state,
+                                    crate::matrix_game::object_cannon::CannonState::Dip
+                                ) && c.side != self.side
+                            })
+                            .unwrap_or(false);
+                    if attacker_is_enemy_cannon {
+                        if !self.env.search_enemy(att) {
+                            self.env.add_to_list(att);
+                        }
+                        let target_is_cannon = self
+                            .env
+                            .target_attack
+                            .map(|t| {
+                                crate::matrix_game::logic::cannon_ref(objs, t).is_some()
+                            })
+                            .unwrap_or(true);
+                        let now_i = now as i32;
+                        if target_is_cannon
+                            && now_i - self.env.last_hit_target > 4000
+                            && now_i - self.env.target_change > 1000
+                        {
+                            self.env.target_last = self.env.target_attack;
+                            self.env.target_attack = Some(att);
+                            self.env.target_change = now_i;
+                        }
+                    }
+                }
+            }
 
             if self.hit_point > dmg.mindamage as f32 {
                 let mut damage = damagek
@@ -2188,6 +3286,10 @@ impl MapStatic for Robot {
                     damage -= damage * self.bomb_protect;
                 }
                 self.hit_point -= damage;
+                // `m_MiniMapFlashTime = FLASH_PERIOD` (MatrixRobot.cpp:1896).
+                if !friendly_fire {
+                    self.mini_map_flash_time = 1000;
+                }
             }
 
             if weap == WEAPON_FLAMETHROWER {
@@ -2362,6 +3464,24 @@ impl MapStatic for Robot {
             });
         let on_water = self.object_state & crate::matrix_game::map_static::ROBOT_FLAG_ONWATER != 0;
 
+        // ReleaseMe cascade (MatrixRobot.cpp:5071-5160): drop
+        // selection flags, break orders (releases a mid-capture
+        // factory), clear capture candidates, erase this robot from
+        // every other robot's environment, clear our own env.
+        self.unselect();
+        self.break_all_orders(objs);
+        self.clear_capture_candidates();
+        if let Some(me) = self.self_id {
+            let others: Vec<ObjectId> = objs.iter_live().collect();
+            for oid in others {
+                if let Some(other) = crate::matrix_game::logic::robot_mut(objs, oid) {
+                    other.env.remove_from_list(me);
+                }
+            }
+        }
+        self.env.clear();
+        self.env.reset();
+
         self.state = RobotState::Dip;
         self.dip_ttl = 5000; // FRND(3000)+2000 unit TTL ceiling
         self.speed = 0.0;
@@ -2428,6 +3548,11 @@ pub struct Order {
     pub p2: f32,
     pub p3: f32,
     pub p4: i32,
+    /// Port of `SOrder::m_Static` (MatrixRobot.hpp:190) — the object
+    /// a CAPTURE_FACTORY / STOP_CAPTURE order references. The C++
+    /// ref-counts the core; the arena's generational ids make a plain
+    /// copy safe (a dead id simply fails `objs.get`).
+    pub target: Option<ObjectId>,
 }
 
 impl Default for Order {
@@ -2439,6 +3564,7 @@ impl Default for Order {
             p2: 0.0,
             p3: 0.0,
             p4: 0,
+            target: None,
         }
     }
 }
@@ -2453,7 +3579,27 @@ impl Order {
             p2,
             p3,
             p4,
+            target: None,
         }
+    }
+
+    /// Port of `SOrder::SetOrder(type, CMatrixMapStatic*)`
+    /// (MatrixRobot.hpp:206).
+    pub fn set_static(ty: OrderType, target: Option<ObjectId>) -> Self {
+        Self {
+            ty,
+            phase: OrderPhase::Empty,
+            p1: 0.0,
+            p2: 0.0,
+            p3: 0.0,
+            p4: 0,
+            target,
+        }
+    }
+
+    /// Port of `SOrder::SetPhase` (MatrixRobot.hpp:215).
+    pub fn set_phase(&mut self, phase: OrderPhase) {
+        self.phase = phase;
     }
 }
 
@@ -2520,11 +3666,32 @@ impl OrderList {
     }
 
     /// Port of `CMatrixRobotAI::RemoveOrder(OrderType)`.
+    /// Drop every order (the `while(m_OrdersInPool>0) RemoveOrder(...)`
+    /// tail of BreakAllOrders).
+    pub fn clear(&mut self) {
+        self.orders.clear();
+    }
+
     pub fn remove_type(&mut self, ty: OrderType) {
         self.orders.retain(|o| o.ty != ty);
     }
 
     /// Port of `CMatrixRobotAI::FindOrderLikeThat(OrderType)`.
+    /// Port of `FindOrder` (MatrixRobot.cpp:4929-4940) — order of
+    /// `ty` whose static target is `obj`.
+    pub fn find_order(&self, ty: OrderType, obj: ObjectId) -> bool {
+        self.orders
+            .iter()
+            .any(|o| o.ty == ty && o.target == Some(obj))
+    }
+
+    /// Port of `RemoveOrder(int pos)` (MatrixRobot.cpp:4582-4589).
+    pub fn remove_at(&mut self, pos: usize) {
+        if pos < self.orders.len() {
+            self.orders.remove(pos);
+        }
+    }
+
     pub fn has(&self, ty: OrderType) -> bool {
         self.orders.iter().any(|o| o.ty == ty)
     }
@@ -2532,6 +3699,16 @@ impl OrderList {
     /// Port of `CMatrixRobotAI::FindOrderLikeThat(OrderType, OrderPhase)`.
     pub fn has_with_phase(&self, ty: OrderType, phase: OrderPhase) -> bool {
         self.orders.iter().any(|o| o.ty == ty && o.phase == phase)
+    }
+
+    /// Port of `CMatrixRobotAI::ProcessOrdersList` (MatrixRobot.cpp:
+    /// 4604-4615) — rotate the top order to the back so each pool
+    /// entry gets one dispatch per LogicTakt.
+    pub fn rotate_top_to_back(&mut self) {
+        if self.orders.len() > 1 {
+            let top = self.orders.remove(0);
+            self.orders.push(top);
+        }
     }
 }
 
@@ -2678,6 +3855,7 @@ impl Robot {
             we.modify_dist(fire_dist);
             let mut heat_mod = oh.heat_mod;
             heat_mod += (heat_mod as f32 * overheat) as i32;
+            let wdist = we.weapon_dist();
             let id = objs.weapons.create(we);
             self.weapons.push(BotWeapon {
                 weapon: id,
@@ -2689,6 +3867,51 @@ impl Robot {
                 cool_down_mod: oh.cool_mod,
                 on: true,
             });
+            // Fire-distance extremes (CalcRobotMass,
+            // MatrixRobot.cpp:4294-4330): BIGBOOM skipped, REPAIR
+            // feeds repair_dist only.
+            match wtype {
+                WEAPON_BIGBOOM => {}
+                WEAPON_REPAIR => {
+                    self.repair_dist = if self.repair_dist == 0.0 {
+                        wdist
+                    } else {
+                        self.repair_dist.min(wdist)
+                    };
+                }
+                _ => {
+                    self.min_fire_dist = if self.max_fire_dist == 0.0 {
+                        wdist
+                    } else {
+                        self.min_fire_dist.min(wdist)
+                    };
+                    self.max_fire_dist = self.max_fire_dist.max(wdist);
+                }
+            }
+        }
+
+        // m_HaveRepair (CalcRobotMass, MatrixRobot.cpp:4226-4231):
+        // 1 = repairer present, 2 = nothing but repairers (the
+        // self-destruct bomb RUK_WEAPON_BOMB doesn't count).
+        let mut have_repair = 0;
+        let mut normal_weapon = false;
+        for w in self.config.weapon.iter() {
+            match w.kind.0 {
+                0 => {}
+                10 => have_repair = 1,
+                7 => {}
+                _ => normal_weapon = true,
+            }
+        }
+        if have_repair != 0 && !normal_weapon {
+            have_repair = 2;
+        }
+        self.have_repair = have_repair;
+
+        // m_AimProtect (MatrixRobot.cpp:4287-4288).
+        if !self.config.head.kind.is_empty() {
+            let h = self.config.head.kind.as_index();
+            self.aim_protect = (cfg.head_chars.aim_protect[h.min(3)] / 100.0).clamp(0.0, 1.0);
         }
     }
 
@@ -2714,6 +3937,45 @@ impl Robot {
         }
     }
 
+    /// Port of `CMatrixRobotAI::BreakAllOrders` (MatrixRobot.cpp:
+    /// 4942-4981): full stop, env reset, weapons off, release any
+    /// factory this robot is mid-capturing, drop the order pool.
+    pub fn break_all_orders(&mut self, objs: &mut Objects) {
+        self.low_level_stop();
+        self.env.reset();
+        self.low_level_stop_fire(objs);
+
+        let my_id = self.self_id;
+        let captures: Vec<ObjectId> = self
+            .orders
+            .iter()
+            .filter(|o| o.ty == OrderType::CaptureFactory)
+            .filter_map(|o| o.target)
+            .collect();
+        let disable_manual = self.is_disable_manual();
+        for fid in captures {
+            let Some(b) = crate::matrix_game::logic::building_mut(objs, fid) else {
+                continue;
+            };
+            if b.capturer.is_some() && b.capturer == my_id {
+                b.reset_captured();
+                if !disable_manual {
+                    if b.is_base()
+                        && !matches!(
+                            b.state,
+                            crate::matrix_game::object_building::BaseState::Closed
+                        )
+                    {
+                        b.close();
+                    }
+                } else {
+                    self.must_die = true;
+                }
+            }
+        }
+        self.orders.clear();
+    }
+
     /// Port of `LowLevelStopFire` (MatrixRobot.cpp:5044-5052).
     pub fn low_level_stop_fire(&mut self, objs: &mut Objects) {
         for bw in &self.weapons {
@@ -2727,13 +3989,68 @@ impl Robot {
     /// the FIRE_END_HANDLER target. The env target-switching half
     /// needs `SMatrixRobotAIEnv` (not ported); the hit timestamps are
     /// the part current systems read.
-    pub fn hit_to(&mut self, hit: Option<(i32, ObjectType)>, _pos: glam::Vec3) {
+    pub fn hit_to(
+        &mut self,
+        hit: Option<(ObjectId, i32, ObjectType)>,
+        _pos: glam::Vec3,
+        objs: &mut Objects,
+    ) {
         let now = crate::matrix_game::map::current_elapsed_ms();
-        match hit {
-            Some((_, ObjectType::Building)) => {}
-            Some((side, _)) if side != self.side => self.last_hit_enemy_ms = now,
-            Some(_) => self.last_hit_friendly_ms = now,
-            None => {}
+        let now_i = now as i32;
+        let Some((hid, side, ty)) = hit else { return };
+
+        if self.env.target == Some(hid) {
+            self.env.last_hit_enemy = now_i;
+            self.env.last_hit_target = now_i;
+            self.last_hit_enemy_ms = now;
+            self.last_hit_target_ms = now;
+        } else if ty == ObjectType::Building {
+            // buildings don't count
+        } else if side != self.side {
+            self.env.last_hit_enemy = now_i;
+            self.last_hit_enemy_ms = now;
+        } else {
+            self.env.last_hit_friendly = now_i;
+            self.last_hit_friendly_ms = now;
+        }
+
+        // Retaliation (MatrixRobot.cpp:4038-4048): a robot we hit
+        // learns about us, and if it was busy shooting a cannon it
+        // switches onto us.
+        if ty == ObjectType::RobotAi {
+            let Some(me_id) = self.self_id else { return };
+            if hid == me_id {
+                return;
+            }
+            let victim_is_enemy = crate::matrix_game::logic::robot_ref(objs, hid)
+                .map(|v| v.side != self.side)
+                .unwrap_or(false);
+            if victim_is_enemy {
+                if let Some(victim) = crate::matrix_game::logic::robot_mut(objs, hid) {
+                    if !victim.env.search_enemy(me_id) {
+                        victim.env.add_to_list(me_id);
+                    }
+                }
+            }
+            let do_retarget = {
+                let victim_ok = crate::matrix_game::logic::robot_ref(objs, hid)
+                    .map(|v| {
+                        v.env
+                            .target_attack
+                            .map(|t| crate::matrix_game::logic::cannon_ref(objs, t).is_some())
+                            .unwrap_or(false)
+                            && v.env.search_enemy(me_id)
+                    })
+                    .unwrap_or(false);
+                victim_ok && now_i - self.env.target_change > 1000
+            };
+            if do_retarget {
+                self.env.target_last = self.env.target_attack;
+                if let Some(victim) = crate::matrix_game::logic::robot_mut(objs, hid) {
+                    victim.env.target_attack = Some(me_id);
+                }
+                self.env.target_change = now_i;
+            }
         }
     }
 

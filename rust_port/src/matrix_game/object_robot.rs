@@ -131,6 +131,9 @@ struct ChassisShadowSource {
 /// Identifies which mesh slot supplies geometry for a `PartDraw`.
 #[derive(Clone, Copy, Debug)]
 enum PartKind {
+    /// Flyer hull / rotor by EFlyerKind index.
+    FlyerBody(usize),
+    FlyerVint(usize),
     Chassis(ChassisKind),
     /// `kind - 1` index into `RobotsRenderer::armor`.
     Armor(usize),
@@ -464,6 +467,11 @@ pub struct RobotsRenderer {
     head: Vec<Option<ChassisGpu>>,
     /// Per-`RUK_WEAPON_*` weapon mesh.
     weapon: Vec<Option<ChassisGpu>>,
+    /// Flyer hull + rotor meshes per EFlyerKind (SPEED/ATTACK/
+    /// TRANSPORT/BOMB) and the rotor attach matrix from the body VO.
+    flyer_bodies: Vec<Option<ChassisGpu>>,
+    flyer_vints: Vec<Option<ChassisGpu>>,
+    flyer_vint_attach: Vec<glam::Mat4>,
     /// Per-frame instance buffer: one `InstanceData` per live part
     /// (chassis + armor + head + per-weapon). Written contiguously in
     /// `sync_robots`; each `PartDraw::instance_offset` points into here.
@@ -647,14 +655,14 @@ impl RobotsRenderer {
         // per-slot GPU resources. Used both for chassis and for the
         // constructor's armor / head / weapon overlays.
         let load_part_meshes = |kind_count: usize,
-                                path_prefix: &str,
+                                path_fn: &dyn Fn(usize) -> (String, String),
                                 tex_cache: &mut HashMap<String, wgpu::TextureView>|
          -> (Vec<Option<ChassisGpu>>, usize) {
             let mut out: Vec<Option<ChassisGpu>> = (0..kind_count).map(|_| None).collect();
             let mut surf_count = 0usize;
             let mut enemy_surf_count = 0usize;
             for n in 1..=kind_count {
-                let vo_path = format!("Matrix/Robot/{}{}.vo", path_prefix, n);
+                let (vo_path, tex_base) = path_fn(n);
                 let Some(vo_bytes) = read_texture(&vo_path) else {
                     continue;
                 };
@@ -677,8 +685,8 @@ impl RobotsRenderer {
                     usage: wgpu::BufferUsages::VERTEX,
                 });
                 let vo_dir = vo_path.rsplit_once('/').map(|(d, _)| format!("{d}/"));
-                let top_diffuse = format!("Matrix/Robot/{}{}", path_prefix, n);
-                let top_gloss = format!("Matrix/Robot/{}{}_gloss", path_prefix, n);
+                let top_diffuse = tex_base.clone();
+                let top_gloss = format!("{}_gloss", tex_base);
 
                 let mut frames: Vec<FrameGpu> = Vec::with_capacity(vo_mesh.frames.len());
                 for frame in &vo_mesh.frames {
@@ -833,8 +841,7 @@ impl RobotsRenderer {
                 });
             }
             log::info!(
-                "robots: {} loaded {}/{} surfaces with `_e` enemy variant",
-                path_prefix,
+                "robots: part set loaded {}/{} surfaces with `_e` enemy variant",
                 enemy_surf_count,
                 surf_count,
             );
@@ -1081,7 +1088,15 @@ impl RobotsRenderer {
         // (4 kinds), weapon (10 kinds). Counts mirror MatrixConfig.hpp's
         // ROBOT_*_CNT constants. Missing meshes (older asset bundles
         // pre-dating the pack_bundle update) leave those slots None.
-        let (armor, armor_surfs) = load_part_meshes(6, "Armor", &mut tex_cache);
+        let robot_path = |prefix: &'static str| {
+            move |n: usize| {
+                (
+                    format!("Matrix/Robot/{}{}.vo", prefix, n),
+                    format!("Matrix/Robot/{}{}", prefix, n),
+                )
+            }
+        };
+        let (armor, armor_surfs) = load_part_meshes(6, &robot_path("Armor"), &mut tex_cache);
         // Populate the global weapon-matrix table from the just-loaded
         // armor VOs. Faithful port of CMatrixMap::RobotPreload's
         // weapon-slot construction (MatrixMap.cpp:270-326): each
@@ -1096,8 +1111,42 @@ impl RobotsRenderer {
                 );
             }
         }
-        let (head, head_surfs) = load_part_meshes(4, "Head", &mut tex_cache);
-        let (weapon, weapon_surfs) = load_part_meshes(10, "Weapon", &mut tex_cache);
+        let (head, head_surfs) = load_part_meshes(4, &robot_path("Head"), &mut tex_cache);
+        let (weapon, weapon_surfs) = load_part_meshes(10, &robot_path("Weapon"), &mut tex_cache);
+
+        // Flyer hulls + rotors (Models/Flyers — kind order SPEED,
+        // ATTACK, TRANSPORT, BOMB; model paths fixed in the shipped
+        // robots.dat: {SH,AH,TH,BH}.VO + Screw_*.VO).
+        const FLYER_TAGS: [&str; 4] = ["SH", "AH", "TH", "BH"];
+        let flyer_body_path = |n: usize| {
+            let t = FLYER_TAGS[n - 1];
+            (
+                format!("Matrix/Flyer/{}.VO", t),
+                format!("Matrix/Flyer/{}", t.to_lowercase()),
+            )
+        };
+        let flyer_vint_path = |n: usize| {
+            let t = FLYER_TAGS[n - 1];
+            (
+                format!("Matrix/Flyer/Screw_{}.VO", t),
+                // The rotor's diffuse is `TextureVint` —
+                // `Matrix\Flyer\screw{kind}` (SCREWSH.DDS etc.).
+                format!("Matrix/Flyer/screw{}", t.to_lowercase()),
+            )
+        };
+        let (flyer_bodies, _fb_surfs) = load_part_meshes(4, &flyer_body_path, &mut tex_cache);
+        let (flyer_vints, _fv_surfs) = load_part_meshes(4, &flyer_vint_path, &mut tex_cache);
+        // Rotor attach point: exporter matrix id 1 of the body VO
+        // (the Vint block's `Matrix` param; 1 in the shipped data).
+        let flyer_vint_attach: Vec<glam::Mat4> = flyer_bodies
+            .iter()
+            .map(|b| {
+                b.as_ref()
+                    .and_then(|g| g.vo_mesh.matrix_by_id(1, 0))
+                    .map(|m| glam::Mat4::from_cols_array(&m))
+                    .unwrap_or(glam::Mat4::IDENTITY)
+            })
+            .collect();
         log::info!(
             "robots: preview parts loaded — armor={}/{}, head={}/{}, weapon={}/{} ({} surfaces)",
             armor.iter().filter(|c| c.is_some()).count(),
@@ -1119,6 +1168,9 @@ impl RobotsRenderer {
             armor,
             head,
             weapon,
+            flyer_bodies,
+            flyer_vints,
+            flyer_vint_attach,
             instance_buffer,
             instance_capacity: MAX_LIVE_INSTANCES,
             draws: Vec::new(),
@@ -1571,6 +1623,67 @@ impl RobotsRenderer {
             let Some(obj) = objs.get_mut(id) else {
                 continue;
             };
+            // Flyer hull + spinning rotor (CMatrixFlyer::Draw,
+            // MatrixFlyer.cpp:1880-2020 — body/vint unit draws).
+            if matches!(obj.core().obj_type, ObjectType::Flyer) {
+                let fl: &crate::matrix_game::flyer::Flyer = unsafe {
+                    &*(obj as *const dyn MapStatic as *const crate::matrix_game::flyer::Flyer)
+                };
+                let kidx = fl.kind.clamp(0, 3) as usize;
+                if self.flyer_bodies.get(kidx).map(|o| o.is_none()).unwrap_or(true) {
+                    continue;
+                }
+                let (s, c) = fl.angle.sin_cos();
+                let forward = glam::Vec3::new(-s, c, 0.0);
+                let up = glam::Vec3::Z;
+                let side = forward.cross(up).normalize_or_zero();
+                let body: [[f32; 4]; 4] = [
+                    [side.x, side.y, side.z, 0.0],
+                    [forward.x, forward.y, forward.z, 0.0],
+                    [up.x, up.y, up.z, 0.0],
+                    [fl.pos.x - cx, fl.pos.y - cy, fl.pos.z, 1.0],
+                ];
+                let terrain_color = [1.0, 1.0, 1.0, 1.0];
+                let side_color = {
+                    let [sr, sg, sb] = crate::matrix_game::side::side_color_rgb(fl.side);
+                    [sr, sg, sb, 1.0]
+                };
+                if offset < self.instance_capacity {
+                    instance_data.push(pack_part_instance(&body, terrain_color, side_color));
+                    self.draws.push(PartDraw {
+                        kind: PartKind::FlyerBody(kidx),
+                        instance_offset: offset,
+                        vo_frame: 0,
+                        invert: false,
+                        is_enemy: fl.side != crate::matrix_game::common::PLAYER_SIDE,
+                    });
+                    offset += 1;
+                }
+                if self.flyer_vints.get(kidx).map(|o| o.is_some()).unwrap_or(false)
+                    && offset < self.instance_capacity
+                {
+                    let attach = self.flyer_vint_attach[kidx].to_cols_array_2d();
+                    let (vs, vc) = fl.vint_angle.sin_cos();
+                    let spin: [[f32; 4]; 4] = [
+                        [vc, vs, 0.0, 0.0],
+                        [-vs, vc, 0.0, 0.0],
+                        [0.0, 0.0, 1.0, 0.0],
+                        [0.0, 0.0, 0.0, 1.0],
+                    ];
+                    let local = matmul(&spin, &attach);
+                    let world = matmul(&local, &body);
+                    instance_data.push(pack_part_instance(&world, terrain_color, side_color));
+                    self.draws.push(PartDraw {
+                        kind: PartKind::FlyerVint(kidx),
+                        instance_offset: offset,
+                        vo_frame: 0,
+                        invert: false,
+                        is_enemy: fl.side != crate::matrix_game::common::PLAYER_SIDE,
+                    });
+                    offset += 1;
+                }
+                continue;
+            }
             if !matches!(obj.core().obj_type, ObjectType::RobotAi) {
                 continue;
             }
@@ -2058,6 +2171,18 @@ impl RobotsRenderer {
         let mut current_pipeline_inverted = false;
         for draw in &self.draws {
             let gpu = match draw.kind {
+                PartKind::FlyerBody(idx) => {
+                    let Some(g) = self.flyer_bodies.get(idx).and_then(|o| o.as_ref()) else {
+                        continue;
+                    };
+                    g
+                }
+                PartKind::FlyerVint(idx) => {
+                    let Some(g) = self.flyer_vints.get(idx).and_then(|o| o.as_ref()) else {
+                        continue;
+                    };
+                    g
+                }
                 PartKind::Chassis(chassis) => {
                     let Some(g) = self
                         .chassis

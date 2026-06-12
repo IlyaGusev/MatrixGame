@@ -605,6 +605,7 @@ impl WeaponEffect {
         objs: &mut Objects,
         rng: &mut crate::matrix_game::logic::Rnd,
     ) {
+        use crate::matrix_game::effects::smoke_and_fire::{frnd, fsrnd};
         use crate::matrix_game::effects::{
             big_boom::BigBoom, fire_plasma::FirePlasma, flame::Flame, moving_object::MoKind,
             moving_object::MovingObject, GameEffect,
@@ -789,7 +790,32 @@ impl WeaponEffect {
                     self.flags |= WEAPFLAGS_HITWAS;
                     if dead {
                         s = TraceStop::None;
+                    } else {
+                        // Short-out arc to the ground next to the hit
+                        // (MatrixEffectWeapon.cpp:556-559).
+                        let px = hitpos.x + fsrnd(rng, 20.0);
+                        let py = hitpos.y + fsrnd(rng, 20.0);
+                        let pz = map.get_z(px, py);
+                        objs.pending_effects
+                            .push(crate::matrix_game::effects::GameEffect::Lightening(
+                                crate::matrix_game::effects::lightening::Lightening::new_shorted(
+                                    hitpos,
+                                    glam::Vec3::new(px, py, pz),
+                                    frnd(rng, 500.0) + 400.0,
+                                    0xFFFF_FFFF,
+                                ),
+                            ));
                     }
+                } else if s == TraceStop::Landscape {
+                    // SPOT_PLASMA_HIT scorch (MatrixEffectWeapon.cpp:565).
+                    objs.pending_spots.push(
+                        crate::matrix_game::effects::landscape_spot::SpotSpawn {
+                            pos: glam::Vec2::new(hitpos.x, hitpos.y),
+                            angle: fsrnd(rng, std::f32::consts::PI),
+                            scale: frnd(rng, 1.0) + 0.5,
+                            kind: crate::matrix_game::effects::landscape_spot::SpotKind::PlasmaHit,
+                        },
+                    );
                 }
                 dispatch_fire_end_handler(objs, self.handler, s, hitpos, FEHF_LASTHIT);
             }
@@ -1210,13 +1236,12 @@ pub fn dispatch_fire_end_handler(
     match handler {
         WeaponHandler::None => {}
         WeaponHandler::Robot(id) => {
-            // HitTo reads the victim's side/type — fetch before the
+            // HitTo reads the victim's id/side/type — fetch before the
             // mutable borrow of the shooter.
             let hit_info = hiti
                 .object()
-                .and_then(|tid| objs.get(tid))
-                .map(|o| (o.side(), o.core().obj_type));
-            let Some(obj) = objs.get_mut(id) else {
+                .and_then(|tid| objs.get(tid).map(|o| (tid, o.side(), o.core().obj_type)));
+            if objs.get(id).is_none() {
                 // The shooter's box is checked out (its own weapon takt
                 // fired a hitscan) — queue the notice; the robot drains
                 // it right after `weapons_logic_takt`.
@@ -1224,14 +1249,20 @@ pub fn dispatch_fire_end_handler(
                     objs.pending_hit_notices.push((id, hit_info, pos));
                 }
                 return;
-            };
-            if !matches!(obj.core().obj_type, ObjectType::RobotAi) {
-                return;
             }
-            let r: &mut crate::matrix_game::robot::Robot = unsafe {
-                &mut *(obj as *mut dyn MapStatic as *mut crate::matrix_game::robot::Robot)
+            // hit_to mutates the victim's env too — use the
+            // take-the-box pattern.
+            let Some(mut boxed) = objs.take_obj(id) else {
+                return;
             };
-            r.hit_to(hit_info, pos);
+            if matches!(boxed.core().obj_type, ObjectType::RobotAi) {
+                let r: &mut crate::matrix_game::robot::Robot = unsafe {
+                    &mut *(boxed.as_mut() as *mut dyn MapStatic
+                        as *mut crate::matrix_game::robot::Robot)
+                };
+                r.hit_to(hit_info, pos, objs);
+            }
+            objs.put_obj(id, boxed);
         }
         WeaponHandler::Cannon(id) => {
             if flags & FEHF_DAMAGE_ROBOT == 0 {

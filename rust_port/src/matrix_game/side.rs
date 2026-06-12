@@ -17,7 +17,185 @@
 //! their call sites need them.
 
 use crate::matrix_game::config::{Resource, MAX_RESOURCES};
-use crate::matrix_game::map_static::ObjectId;
+use crate::matrix_game::map_static::{ObjectId, ObjectType};
+use crate::matrix_game::road_network::RoadRoute;
+
+/// `MAX_ROBOTS` (MatrixSide.hpp:14).
+pub const MAX_ROBOTS: usize = 60;
+/// `MAX_LOGIC_GROUP` (MatrixSide.hpp:17).
+pub const MAX_LOGIC_GROUP: usize = MAX_ROBOTS + 1;
+/// `REGION_PATH_MAX_CNT` (MatrixSide.hpp:171).
+pub const REGION_PATH_MAX_CNT: usize = 32;
+/// `FRIENDLY_SEARCH_RADIUS` (MatrixSide.hpp:30).
+pub const FRIENDLY_SEARCH_RADIUS: f32 = 400.0;
+
+/// Port of `ESideStatus` (MatrixSide.hpp:103-112).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SideStatus {
+    /// Side absent.
+    None,
+    /// Active side.
+    #[default]
+    Active,
+    /// Just died — CheckStatus consumes this and flips it to `None`.
+    JustDead,
+    /// Just won — valid only for the player side.
+    JustWin,
+}
+
+/// Port of `EStat` (MatrixSide.hpp:54-64).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stat {
+    RobotBuild = 0,
+    RobotKill = 1,
+    TurretBuild = 2,
+    TurretKill = 3,
+    BuildingKill = 4,
+    Time = 5,
+}
+pub const MAX_STATISTICS: usize = 6;
+
+/// Port of `EMatrixPlayerOrder` (MatrixSide.hpp:200-214).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PlayerOrder {
+    #[default]
+    Stop,
+    MoveTo,
+    Capture,
+    Attack,
+    Patrol,
+    Repair,
+    Bomb,
+    AutoCapture,
+    AutoAttack,
+    AutoDefence,
+}
+
+/// Port of `SMatrixPlayerGroup` (MatrixSide.hpp:216-245). The C++
+/// packs order + 3 flags into `m_Bits`; plain fields here.
+#[derive(Debug, Clone, Default)]
+pub struct PlayerGroup {
+    pub order: PlayerOrder,
+    /// Bit 31 — group has engaged in combat.
+    pub war: bool,
+    /// Bit 30 — PGShowPlace should run after the next assignment.
+    pub show_place: bool,
+    /// Bit 29 — patrol leg direction.
+    pub patrol_return: bool,
+    pub robot_cnt: i32,
+    pub from: (i32, i32),
+    pub to: (i32, i32),
+    pub obj: Option<ObjectId>,
+    pub region: i32,
+    /// `m_RegionPath[REGION_PATH_MAX_CNT]` + cnt — start→end order.
+    pub region_path: Vec<i32>,
+    /// `m_RoadPath` — owned route storage (the C++ news a
+    /// `CMatrixRoadRoute` per group).
+    pub road_path: RoadRoute,
+}
+
+/// Port of `CMatrixGroupObject` payload (MatrixAIGroup.h:30) — one
+/// `(object, team)` membership entry.
+#[derive(Debug, Clone, Copy)]
+pub struct GroupObject {
+    pub object: ObjectId,
+    pub team: i32,
+}
+
+/// Port of `CMatrixGroup` (MatrixAIGroup.h:55) — an ordered roster of
+/// selected objects with cached per-type counts.
+#[derive(Debug, Clone, Default)]
+pub struct Group {
+    pub objects: Vec<GroupObject>,
+    pub robots_cnt: i32,
+    pub flyers_cnt: i32,
+    pub buildings_cnt: i32,
+    pub team: i32,
+    pub id: i32,
+}
+
+impl Group {
+    pub fn objects_cnt(&self) -> i32 {
+        self.objects.len() as i32
+    }
+
+    /// `CMatrixGroup::AddObject` (MatrixAIGroup.cpp). The C++ reads
+    /// the object's type for the counters; the caller passes it since
+    /// the group has no arena access. Duplicates are skipped like the
+    /// original (FindObject guard at every call site that matters).
+    pub fn add_object(&mut self, object: ObjectId, team: i32, ty: ObjectType) {
+        if self.find_object(object) {
+            return;
+        }
+        self.objects.push(GroupObject { object, team });
+        match ty {
+            ObjectType::RobotAi => self.robots_cnt += 1,
+            ObjectType::Flyer => self.flyers_cnt += 1,
+            ObjectType::Building => self.buildings_cnt += 1,
+            _ => {}
+        }
+    }
+
+    /// `CMatrixGroup::RemoveObject(CMatrixMapStatic*)`. Needs the type
+    /// to decrement the right counter; callers resolve it.
+    pub fn remove_object(&mut self, object: ObjectId, ty: ObjectType) {
+        let Some(pos) = self.objects.iter().position(|o| o.object == object) else {
+            return;
+        };
+        self.objects.remove(pos);
+        match ty {
+            ObjectType::RobotAi => self.robots_cnt -= 1,
+            ObjectType::Flyer => self.flyers_cnt -= 1,
+            ObjectType::Building => self.buildings_cnt -= 1,
+            _ => {}
+        }
+    }
+
+    /// Drop members whose id no longer resolves (dead objects) —
+    /// the C++ relies on explicit RemoveObject calls from death
+    /// paths; this is the arena-handle equivalent sweep.
+    pub fn prune_dead(&mut self, mut alive: impl FnMut(ObjectId) -> Option<ObjectType>) {
+        let mut i = 0;
+        while i < self.objects.len() {
+            match alive(self.objects[i].object) {
+                Some(_) => i += 1,
+                None => {
+                    // Type unknown once dead; recount below.
+                    self.objects.remove(i);
+                }
+            }
+        }
+        self.robots_cnt = 0;
+        self.flyers_cnt = 0;
+        self.buildings_cnt = 0;
+        for o in &self.objects {
+            match alive(o.object) {
+                Some(ObjectType::RobotAi) => self.robots_cnt += 1,
+                Some(ObjectType::Flyer) => self.flyers_cnt += 1,
+                Some(ObjectType::Building) => self.buildings_cnt += 1,
+                _ => {}
+            }
+        }
+    }
+
+    /// `CMatrixGroup::RemoveAll`.
+    pub fn remove_all(&mut self) {
+        self.objects.clear();
+        self.robots_cnt = 0;
+        self.flyers_cnt = 0;
+        self.buildings_cnt = 0;
+    }
+
+    /// `CMatrixGroup::FindObject`.
+    pub fn find_object(&self, object: ObjectId) -> bool {
+        self.objects.iter().any(|o| o.object == object)
+    }
+
+    /// `CMatrixGroup::GetObjectByN`.
+    pub fn get_object_by_n(&self, num: i32) -> Option<ObjectId> {
+        self.objects.get(num.max(0) as usize).map(|o| o.object)
+    }
+}
 
 /// Port of the hard-coded 9000 cap inside `CMatrixSideUnit::AddResourceAmount`
 /// (MatrixSide.hpp:438-443). Every `AddResourceAmount` call clamps the
@@ -101,6 +279,57 @@ pub struct Side {
     /// `RobotBuilder` sub-struct lives in `interface::constructor`.
     /// `None` for neutral / AI sides that don't need the player UI.
     pub builder: Option<crate::matrix_game::interface::constructor::RobotBuilder>,
+
+    /// `m_SideStatus` (MatrixSide.hpp:371).
+    pub status: SideStatus,
+    /// `m_Statistic[MAX_STATISTICS]` (MatrixSide.hpp:396).
+    pub statistic: [i32; MAX_STATISTICS],
+    /// `m_PlayerGroup[MAX_LOGIC_GROUP]` (MatrixSide.hpp:415).
+    pub player_groups: Vec<PlayerGroup>,
+    /// `m_CurSelGroup` — the scratch group marquee / shift-click
+    /// selection accumulates into before `CreateGroupFromCurrent`.
+    pub cur_sel_group: Group,
+    /// `m_FirstGroup..m_LastGroup` — saved groups. `PumpGroups`
+    /// deletes everything except the current one each takt, so this
+    /// rarely holds more than one entry.
+    pub groups: Vec<Group>,
+    /// `m_CurrentGroup` — index into `groups`; `None` = no selection.
+    pub current_group: Option<usize>,
+    /// `m_CurSelNum` (MatrixSide.hpp:394) — primary-selection index
+    /// within the current group.
+    pub cur_sel_num: i32,
+    /// `m_LastTaktHL` — TaktPL 100ms gate (MatrixSide.cpp:6046; the
+    /// player takt reuses the HL timestamp). PGOrder* force a re-run
+    /// by setting it to -1000.
+    pub last_takt_pl: i32,
+    /// `m_LastTaktUnderfire` — 500ms underfire-recalc gate
+    /// (MatrixSide.cpp:6054).
+    pub last_takt_underfire: i32,
+    /// `m_Region` (SMatrixLogicRegion per road-network region) —
+    /// PGCalcStat scratch, lazily sized.
+    pub region_stats: Vec<LogicRegion>,
+    /// `m_RegionIndex` — wave-search scratch parallel to regions.
+    pub region_index: Vec<i32>,
+}
+
+/// Port of `SMatrixLogicRegion` (MatrixSide.hpp:327-355) — the subset
+/// the player-order logic reads (war-counters are TaktHL-only).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LogicRegion {
+    pub enemy_robot_cnt: i32,
+    pub enemy_cannon_cnt: i32,
+    pub enemy_building_cnt: i32,
+    pub enemy_base_cnt: i32,
+    pub neutral_cannon_cnt: i32,
+    pub neutral_building_cnt: i32,
+    pub neutral_base_cnt: i32,
+    pub our_robot_cnt: i32,
+    pub our_cannon_cnt: i32,
+    pub our_building_cnt: i32,
+    pub our_base_cnt: i32,
+    pub danger: f32,
+    pub danger_add: f32,
+    pub data: u32,
 }
 
 impl Side {
@@ -119,6 +348,60 @@ impl Side {
             robots_cnt: 0,
             base_res_force: 100,
             builder: Some(crate::matrix_game::interface::constructor::RobotBuilder::new()),
+            status: SideStatus::Active,
+            statistic: [0; MAX_STATISTICS],
+            player_groups: std::iter::repeat_with(PlayerGroup::default)
+                .take(MAX_LOGIC_GROUP)
+                .collect(),
+            cur_sel_group: Group::default(),
+            groups: Vec::new(),
+            current_group: None,
+            cur_sel_num: 0,
+            last_takt_pl: 0,
+            last_takt_underfire: 0,
+            region_stats: Vec::new(),
+            region_index: Vec::new(),
+        }
+    }
+
+    /// `GetStatValue` / `SetStatValue` / `IncStatValue`
+    /// (MatrixSide.hpp:428-430).
+    pub fn get_stat(&self, stat: Stat) -> i32 {
+        self.statistic[stat as usize]
+    }
+    pub fn set_stat(&mut self, stat: Stat, v: i32) {
+        self.statistic[stat as usize] = v;
+    }
+    pub fn inc_stat(&mut self, stat: Stat) {
+        self.statistic[stat as usize] += 1;
+    }
+
+    /// `GetCurGroup()` (MatrixSide.hpp:482).
+    pub fn cur_group(&self) -> Option<&Group> {
+        self.current_group.and_then(|i| self.groups.get(i))
+    }
+    pub fn cur_group_mut(&mut self) -> Option<&mut Group> {
+        self.current_group.and_then(move |i| self.groups.get_mut(i))
+    }
+
+    /// `GetCurSelObject` (MatrixSide.cpp:1438) — the
+    /// `m_CurSelNum`-th member of the current group.
+    pub fn get_cur_sel_object(&self) -> Option<ObjectId> {
+        self.cur_group()?.get_object_by_n(self.cur_sel_num)
+    }
+
+    /// `PumpGroups` (MatrixSide.cpp:1518) — drop every saved group
+    /// except the current one.
+    pub fn pump_groups(&mut self) {
+        match self.current_group {
+            Some(cur) => {
+                if cur != 0 {
+                    self.groups.swap(0, cur);
+                    self.current_group = Some(0);
+                }
+                self.groups.truncate(1);
+            }
+            None => self.groups.clear(),
         }
     }
 

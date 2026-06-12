@@ -230,7 +230,7 @@ impl Cannon {
     }
 
     /// `GetFireRadius` (MatrixObjectCannon.hpp:163).
-    fn fire_radius(&self, objs: &Objects) -> f32 {
+    pub fn fire_radius(&self, objs: &Objects) -> f32 {
         self.weapons
             .first()
             .and_then(|&w| objs.weapons.get(w))

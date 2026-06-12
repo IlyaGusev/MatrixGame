@@ -8,6 +8,7 @@
 //! (Logic/MatrixAIGroup.cpp) and future siblings declare here.
 
 pub mod ai_group;
+pub mod environment;
 
 use crate::matrix_game::camera::Camera;
 use crate::matrix_game::common::{PLAYER_SIDE, TRACE_ANYOBJECT};
@@ -17,7 +18,7 @@ use crate::matrix_game::config::{
     ItemCharsTable, ItemDescriptions, ItemLabels, ObjectDamages, PriceTable, RobotDamages,
     RobotNameParts, StringTables, Timings, TurretProps, WeaponCooldown, WeaponStrengthAI,
 };
-use crate::matrix_game::map::GameMap;
+use crate::matrix_game::map::{GameMap, MoveCell};
 use crate::matrix_game::map_static::{MapStatic, ObjectId, ObjectType, Objects};
 use crate::matrix_game::object::MapObject;
 use crate::matrix_game::object_building::{Building, BuildingType};
@@ -74,6 +75,48 @@ pub struct MapLogic {
     /// Port of `g_MatrixMap->GetPlayerSide()`. Full per-side state
     /// lands with `CMatrixSide`.
     pub player_side: Side,
+    /// Non-player sides (`m_Side[]` minus the player) — created by
+    /// [`MapLogic::ensure_sides_from_objects`] from the side ids the
+    /// map spawns. Neutral (side 0) owns no Side entry, as in C++.
+    pub other_sides: Vec<Side>,
+    /// `m_GatherInfoLast` (MatrixLogic.cpp:51) — 100ms env-refresh gate.
+    pub gather_info_last: i64,
+    /// `m_PrevTimeCheckStatus` (MatrixMap.hpp:421) — 1s win/lose gate.
+    pub prev_time_check_status: i64,
+    /// `m_BeforeWinLooseDialogCount` (MatrixMap.hpp:422).
+    pub before_win_loose_dialog_count: i32,
+    /// `m_BeforeWinCount` (MatrixMap.hpp:309) — outstanding special
+    /// map objects that must break before victory can trigger.
+    pub before_win_count: i32,
+    /// `MMFLAG_WIN` + EnterDialogMode(WIN/LOOSE) outcome —
+    /// `Some(true)` = player won, `Some(false)` = lost. The UI layer
+    /// reads this to show the end dialog.
+    pub game_over: Option<bool>,
+    /// Queued gameplay sounds (CSound::Play call sites). The audio
+    /// backend drains this each frame; until it lands the queue is
+    /// the verified dispatch surface.
+    pub sound_queue: Vec<crate::matrix_game::side_player::GameSound>,
+    /// `MMFLAG_SOUND_ORDER_CAPTURE_ENABLED` (set by PGOrderCapture,
+    /// consumed by SoundCapture).
+    pub sound_order_capture_enabled: bool,
+    /// `MMFLAG_ENABLE_CAPTURE_FUCKOFF_SOUND`.
+    pub enable_capture_fuckoff_sound: bool,
+    /// `MMFLAG_SOUND_ORDER_ATTACK_DISABLE`.
+    pub sound_order_attack_disable: bool,
+    /// Move-to ping world positions queued by `PGShowPlace`; the
+    /// renderer drains them. `moveto_clear_pending` mirrors
+    /// `CMatrixEffect::DeleteAllMoveto` preceding the new batch.
+    pub moveto_pings: Vec<glam::Vec3>,
+    pub moveto_clear_pending: bool,
+    /// `MMFLAG_WIN` (set when victory is detected, read by the
+    /// delayed dialog entry).
+    pub win_flag: bool,
+    /// `m_MaintenanceTime` (MatrixMap.hpp:434) — countdown until the
+    /// next supply drop may be called.
+    pub maintenance_time: i32,
+    /// `m_MaintenancePRC` (MatrixMap.hpp:435) — map-level maintenance
+    /// scale percent; 0 disables.
+    pub maintenance_prc: i32,
 }
 
 impl Default for MapLogic {
@@ -97,6 +140,70 @@ impl MapLogic {
             tick: 0,
             elapsed_ms: 0,
             player_side: Side::new(PLAYER_SIDE),
+            other_sides: Vec::new(),
+            gather_info_last: 0,
+            prev_time_check_status: 0,
+            before_win_loose_dialog_count: 0,
+            before_win_count: 0,
+            game_over: None,
+            sound_queue: Vec::new(),
+            sound_order_capture_enabled: false,
+            enable_capture_fuckoff_sound: false,
+            sound_order_attack_disable: false,
+            moveto_pings: Vec::new(),
+            moveto_clear_pending: false,
+            win_flag: false,
+            maintenance_time: 0,
+            maintenance_prc: 100,
+        }
+    }
+
+    /// `MaintenanceDisabled` / `BeforeMaintenanceTime` /
+    /// `InitMaintenanceTime` (MatrixMap.hpp:468-475).
+    pub fn maintenance_disabled(&self) -> bool {
+        self.maintenance_prc == 0
+    }
+    pub fn init_maintenance_time(&mut self) {
+        let cfg = crate::matrix_game::config::global();
+        self.maintenance_time = (cfg.difficulty.k_time_before_maintenance
+            * cfg.timings.maintenance_period as f32
+            * self.maintenance_prc as f32
+            / 100.0) as i32;
+    }
+
+    /// `GetSideById` (MatrixMap.cpp). Side 0 (neutral) has no entry.
+    pub fn side_by_id(&self, id: i32) -> Option<&Side> {
+        if id == self.player_side.id {
+            return Some(&self.player_side);
+        }
+        self.other_sides.iter().find(|s| s.id == id)
+    }
+
+    pub fn side_by_id_mut(&mut self, id: i32) -> Option<&mut Side> {
+        if id == self.player_side.id {
+            return Some(&mut self.player_side);
+        }
+        self.other_sides.iter_mut().find(|s| s.id == id)
+    }
+
+    /// Create a `Side` entry for every non-neutral side id present in
+    /// the spawned objects — the C++ builds `m_Side[]` from the map
+    /// data at load (MatrixMapPrepare.cpp). Call after spawning.
+    pub fn ensure_sides_from_objects(&mut self) {
+        let mut ids: Vec<i32> = Vec::new();
+        for id in self.objects.iter_live() {
+            let Some(obj) = self.objects.get(id) else {
+                continue;
+            };
+            let side = obj.side();
+            if side > 0 && side != self.player_side.id && !ids.contains(&side) {
+                ids.push(side);
+            }
+        }
+        for sid in ids {
+            if self.side_by_id(sid).is_none() {
+                self.other_sides.push(Side::new(sid));
+            }
         }
     }
 
@@ -107,16 +214,37 @@ impl MapLogic {
         if step_ms <= 0 {
             return;
         }
+        // Maintenance countdown (MatrixLogic.cpp:2655-2663).
+        if self.maintenance_time > 0 {
+            self.maintenance_time = (self.maintenance_time - step_ms).max(0);
+        }
+        // GatherInfo every >100ms (MatrixLogic.cpp:2713-2718), before
+        // the logic portions like the C++ Takt.
+        if self.elapsed_ms - self.gather_info_last > 100 {
+            self.gather_info_last = self.elapsed_ms;
+            if let Some(map) = crate::matrix_game::map::current_map() {
+                self.gather_info(map, 0);
+                self.gather_info(map, 1);
+            }
+        }
         let full = step_ms / LOGIC_TAKT_PERIOD_MS;
         for _ in 0..full {
             self.objects
                 .proceed_logic(LOGIC_TAKT_PERIOD_MS, &mut self.rng);
             self.tick += 1;
+            // `m_Side[i].LogicTakt(LOGIC_TAKT_PERIOD)` — player side
+            // only (enemy-AI sides excluded by scope),
+            // MatrixLogic.cpp:2737-2745.
+            if let Some(map) = crate::matrix_game::map::current_map() {
+                self.side_logic_takt(map);
+            }
         }
         let rem = step_ms - full * LOGIC_TAKT_PERIOD_MS;
         if rem > 0 {
             self.objects.proceed_logic(rem, &mut self.rng);
         }
+        // Win/lose CheckStatus once per second (MatrixLogic.cpp:2773+).
+        self.check_status();
         // Notices addressed to robots that died before draining them.
         self.objects.pending_hit_notices.clear();
         // Gameplay effects tick on the frame clock — the effect-list
@@ -139,7 +267,350 @@ impl MapLogic {
         // without threading the player Side through `proceed_logic`.
         self.accrue_resources(step_ms);
         self.refresh_side_robots();
+        // The standalone build plays no audio (g_RangersInterface is
+        // NULL in the original) — drain the queued sound events each
+        // frame so the dispatch surface can't grow unboundedly. A
+        // future host backend consumes them here instead.
+        self.sound_queue.clear();
         self.elapsed_ms += step_ms as i64;
+    }
+
+    /// Port of the side-status / win-lose check in
+    /// `CMatrixMapLogic::Takt` (MatrixLogic.cpp:2773-2955). Runs once
+    /// per ~2s (the C++ `m_PrevTimeCheckStatus = GetTime() + 1001`
+    /// quirk is kept). Dialog entry becomes `game_over`.
+    pub(crate) fn check_status(&mut self) {
+        use crate::matrix_game::side::{SideStatus, Stat};
+
+        if self.elapsed_ms - self.prev_time_check_status <= 1001 {
+            return;
+        }
+        self.prev_time_check_status = self.elapsed_ms + 1001;
+
+        // Which sides still own a live robot or a live base?
+        let mut ids: Vec<i32> = vec![self.player_side.id];
+        ids.extend(self.other_sides.iter().map(|s| s.id));
+        let mut alive: Vec<bool> = vec![false; ids.len()];
+        let mut was_none: Vec<bool> = vec![false; ids.len()];
+        for (k, &sid) in ids.iter().enumerate() {
+            if self.side_by_id(sid).map(|s| s.status) == Some(SideStatus::None) {
+                was_none[k] = true;
+                alive[k] = true;
+            }
+        }
+        for id in self.objects.iter_live() {
+            let Some(obj) = self.objects.get(id) else {
+                continue;
+            };
+            let side = obj.side();
+            let Some(k) = ids.iter().position(|&s| s == side) else {
+                continue;
+            };
+            if alive[k] {
+                continue;
+            }
+            let lives = match obj.core().obj_type {
+                ObjectType::RobotAi => obj.is_live(),
+                ObjectType::Building => {
+                    obj.is_live()
+                        && building_ref(&self.objects, id)
+                            .map(|b| b.is_base())
+                            .unwrap_or(false)
+                }
+                _ => false,
+            };
+            if lives {
+                alive[k] = true;
+            }
+        }
+
+        // Freshly dead sides: JUST_DEAD + neutralize their buildings
+        // (MatrixLogic.cpp:2860-2886).
+        for (k, &sid) in ids.iter().enumerate() {
+            if alive[k] {
+                continue;
+            }
+            if let Some(s) = self.side_by_id_mut(sid) {
+                s.status = SideStatus::JustDead;
+            }
+            let buildings: Vec<ObjectId> = self
+                .objects
+                .iter_live()
+                .filter(|&id| {
+                    building_ref(&self.objects, id)
+                        .map(|b| b.is_live() && b.side == sid)
+                        .unwrap_or(false)
+                })
+                .collect();
+            for bid in buildings {
+                if let Some(b) = building_mut(&mut self.objects, bid) {
+                    b.set_neutral();
+                }
+            }
+        }
+
+        // Win/lose bookkeeping (MatrixLogic.cpp:2891-2954).
+        if self.game_over.is_some() {
+            return;
+        }
+        if self.before_win_loose_dialog_count > 1 {
+            self.before_win_loose_dialog_count -= 1;
+        } else if self.before_win_loose_dialog_count == 1 {
+            let win = self.win_flag;
+            if win {
+                let t = self.player_side.get_stat(Stat::Time);
+                self.player_side.set_stat(Stat::Time, -t);
+            }
+            self.game_over = Some(win);
+        } else if self.player_side.status == SideStatus::JustWin {
+            self.player_side.status = SideStatus::Active;
+            self.before_win_loose_dialog_count = 1;
+            self.win_flag = true;
+        } else if self.player_side.status == SideStatus::JustDead {
+            for (k, &sid) in ids.iter().enumerate() {
+                if alive[k] && !was_none[k] {
+                    if let Some(s) = self.side_by_id_mut(sid) {
+                        let t = s.get_stat(Stat::Time);
+                        s.set_stat(Stat::Time, -t);
+                    }
+                }
+            }
+            self.player_side.status = SideStatus::None;
+            self.before_win_loose_dialog_count = 1;
+            self.win_flag = false;
+        } else {
+            let mut acnt = 0;
+            for &sid in &ids {
+                let st = self.side_by_id(sid).map(|s| s.status);
+                if st == Some(SideStatus::JustDead) {
+                    if let Some(s) = self.side_by_id_mut(sid) {
+                        s.status = SideStatus::None;
+                    }
+                }
+                if self.side_by_id(sid).map(|s| s.status) == Some(SideStatus::Active) {
+                    acnt += 1;
+                }
+            }
+            if acnt == 1
+                && self.before_win_count <= 0
+                && self.player_side.status == SideStatus::Active
+                && !self.other_sides.is_empty()
+            {
+                // Only one active side left — the player. Win.
+                self.before_win_loose_dialog_count = 1;
+                self.win_flag = true;
+            }
+        }
+    }
+
+    /// Port of `CMatrixMapLogic::GatherInfo` (MatrixLogic.cpp:115-134)
+    /// + `CMatrixRobotAI::GatherInfo` (MatrixRobot.cpp:4333-4552).
+    /// `gtype` 0 = line-of-sight scan, 1 = radio exchange within the
+    /// same logic group / team+region.
+    pub fn gather_info(&mut self, map: &GameMap, gtype: i32) {
+        use crate::matrix_game::common::float2int;
+        use crate::matrix_game::object_cannon::CannonState;
+        use crate::matrix_game::robot::BARREL_TO_SHOT_ANGLE;
+
+        let now = self.elapsed_ms as i32;
+        let gs = GameMap::GLOBAL_SCALE_MOVE;
+
+        let robot_ids: Vec<ObjectId> = self
+            .objects
+            .iter_live()
+            .filter(|&id| robot_ref(&self.objects, id).map(|r| r.is_live()).unwrap_or(false))
+            .collect();
+
+        enum Act {
+            Add(ObjectId),
+            AddIgnore(ObjectId),
+            RemoveSlowly(ObjectId),
+            AddSlowly(ObjectId),
+        }
+
+        for &rid in &robot_ids {
+            // CalcStrength at the top of GatherInfo (MatrixRobot.cpp:4337).
+            let strength = robot_ref(&self.objects, rid)
+                .map(|r| r.calc_strength(&self.objects))
+                .unwrap_or(0.0);
+            if let Some(r) = robot_mut(&mut self.objects, rid) {
+                r.strength = strength;
+            }
+
+            let Some(me) = robot_ref(&self.objects, rid) else {
+                continue;
+            };
+            let my_side = me.side;
+            let my_pos = glam::Vec2::new(me.pos_x, me.pos_y);
+            let my_map = (me.map_x, me.map_y);
+            let my_geo = me.core().geo_center;
+            let my_maxfd = me.max_fire_dist;
+            let my_chassis = me.chassis.kind_index() as u8;
+            let my_group_logic = me.group_logic;
+            let my_team = me.team;
+
+            let mut acts: Vec<Act> = Vec::new();
+
+            if gtype == 0 {
+                let mut place_buf: Vec<i32> = Vec::new();
+                for oid in self.objects.iter_live() {
+                    if oid == rid {
+                        continue;
+                    }
+                    let Some(obj) = self.objects.get(oid) else {
+                        continue;
+                    };
+                    match obj.core().obj_type {
+                        ObjectType::RobotAi => {
+                            let other = robot_ref(&self.objects, oid).unwrap();
+                            if other.side == my_side {
+                                continue;
+                            }
+                            let d = glam::Vec2::new(other.pos_x, other.pos_y) - my_pos;
+                            let dist_enemy = d.length_squared();
+                            let t1 = other.max_fire_dist.max(my_maxfd) * 1.1;
+                            if dist_enemy <= t1 * t1 && other.is_live() {
+                                if is_logic_visible(map, &self.objects, rid, oid, 0.0) {
+                                    let me_env = &robot_ref(&self.objects, rid).unwrap().env;
+                                    if !me_env.search_enemy(oid) && !me_env.is_ignore(oid, now) {
+                                        let p_to = (other.map_x, other.map_y);
+                                        let (st, dist) = place_list(
+                                            map,
+                                            my_chassis,
+                                            my_map,
+                                            p_to,
+                                            float2int(my_maxfd / gs),
+                                            false,
+                                            &mut place_buf,
+                                        );
+                                        let d2 = {
+                                            let dx = (my_map.0 - p_to.0) as i64;
+                                            let dy = (my_map.1 - p_to.1) as i64;
+                                            dx * dx + dy * dy
+                                        };
+                                        if st != 0 && ((dist / 4) as i64).pow(2) < d2 {
+                                            acts.push(Act::Add(oid));
+                                        } else {
+                                            acts.push(Act::AddIgnore(oid));
+                                        }
+                                    }
+                                }
+                            } else {
+                                let t2 = other.max_fire_dist.max(my_maxfd) * 1.4;
+                                if dist_enemy > t2 * t2 {
+                                    acts.push(Act::RemoveSlowly(oid));
+                                }
+                            }
+                        }
+                        ObjectType::Cannon => {
+                            let cannon = cannon_ref(&self.objects, oid).unwrap();
+                            if cannon.side == my_side
+                                || matches!(cannon.state, CannonState::UnderConstruction)
+                            {
+                                continue;
+                            }
+                            let cgeo = cannon.core().geo_center;
+                            let dvec =
+                                cgeo - glam::Vec3::new(my_pos.x, my_pos.y, 0.0);
+                            let dist_enemy = dvec.length_squared();
+                            let fire_r = cannon.fire_radius(&self.objects);
+                            let t1 = (fire_r * 1.01).max(my_maxfd * 1.1);
+                            if dist_enemy <= t1 * t1
+                                && !matches!(cannon.state, CannonState::Dip)
+                            {
+                                if is_logic_visible(map, &self.objects, rid, oid, 0.0) {
+                                    let me_env = &robot_ref(&self.objects, rid).unwrap().env;
+                                    if !me_env.search_enemy(oid) && !me_env.is_ignore(oid, now) {
+                                        let p_to = (
+                                            float2int(cannon.pos.x / gs),
+                                            float2int(cannon.pos.y / gs),
+                                        );
+                                        let d2 = {
+                                            let dx = (my_map.0 - p_to.0) as i64;
+                                            let dy = (my_map.1 - p_to.1) as i64;
+                                            dx * dx + dy * dy
+                                        };
+                                        let d = (d2 as f32).sqrt();
+                                        let z = (cgeo.z - my_geo.z).abs();
+                                        if z / (d * gs) >= BARREL_TO_SHOT_ANGLE.tan() {
+                                            acts.push(Act::AddIgnore(oid));
+                                        } else {
+                                            let (st, dist) = place_list(
+                                                map,
+                                                my_chassis,
+                                                my_map,
+                                                p_to,
+                                                float2int(my_maxfd / gs),
+                                                false,
+                                                &mut place_buf,
+                                            );
+                                            if st != 0 && ((dist / 4) as i64).pow(2) < d2 {
+                                                acts.push(Act::Add(oid));
+                                            } else {
+                                                acts.push(Act::AddIgnore(oid));
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                let t2 = fire_r.max(my_maxfd) * 1.5;
+                                if cannon.target != Some(rid) && dist_enemy > t2 * t2 {
+                                    acts.push(Act::RemoveSlowly(oid));
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            } else if gtype == 1 {
+                // Radio (MatrixRobot.cpp:4481-4520): merge enemies of
+                // same-group robots, or same-team robots in my region.
+                let my_region = get_region(map, my_map.0, my_map.1);
+                for oid in self.objects.iter_live() {
+                    if oid == rid {
+                        continue;
+                    }
+                    let Some(other) = robot_ref(&self.objects, oid) else {
+                        continue;
+                    };
+                    if other.side != my_side {
+                        continue;
+                    }
+                    let same_group = other.group_logic == my_group_logic;
+                    let same_team_region = !same_group
+                        && other.team == my_team
+                        && get_region(map, other.map_x, other.map_y) == my_region;
+                    if !(same_group || same_team_region) {
+                        continue;
+                    }
+                    for e in &other.env.enemies {
+                        let eside = self
+                            .objects
+                            .get(e.enemy)
+                            .map(|o| o.side())
+                            .unwrap_or(my_side);
+                        if eside != my_side && e.del_slowly == 0 {
+                            acts.push(Act::AddSlowly(e.enemy));
+                        }
+                    }
+                }
+            }
+
+            if let Some(r) = robot_mut(&mut self.objects, rid) {
+                for a in acts {
+                    match a {
+                        Act::Add(id) => {
+                            if !r.env.search_enemy(id) {
+                                r.env.add_to_list(id);
+                            }
+                        }
+                        Act::AddIgnore(id) => r.env.add_ignore(id, now),
+                        Act::RemoveSlowly(id) => r.env.remove_from_list_slowly(id),
+                        Act::AddSlowly(id) => r.env.add_to_list_slowly(id),
+                    }
+                }
+            }
+        }
     }
 
     /// Port of `CMatrixMap::Takt`'s `SortEndGraphicTakt` call
@@ -216,11 +687,17 @@ impl MapLogic {
             buildings.base_name,
             popup_none,
         );
+        config::set_give_bot_config(
+            config::GiveBotConfig::from_matrix_data(matrix_data).unwrap_or_default(),
+        );
+        let turrets_labels =
+            config::TurretLabels::from_matrix_data(matrix_data).unwrap_or_default();
         config::set_global_strings(StringTables {
             labels,
             descriptions,
             robot_names,
             buildings,
+            turrets: turrets_labels,
             popup_none,
         });
         // AI robot catalogue (CConstructor.cpp:1361 / SSpecialBot::LoadAIRobotType).
@@ -567,6 +1044,10 @@ impl MapLogic {
         // routes ROBOT / BUILDING / FLYER, not CANNON).
         let mask = TRACE_ANYOBJECT & !crate::matrix_game::common::TRACE_CANNON;
         let hit = self.objects.pick_object(origin, dir, mask, None);
+        // `SideSelectionCallBack` (MatrixSide.cpp:1711-1714) rejects
+        // anything not owned by the player — enemy / neutral objects
+        // are unselectable; the click falls through to "clear".
+        let hit = hit.filter(|&(id, _)| self.object_side(id) == self.player_side.id);
         match hit {
             Some((id, _t)) => {
                 let sel = self.curr_sel_for(id);
@@ -631,78 +1112,76 @@ impl MapLogic {
         let Some((wx, wy)) = screen_to_terrain_xy(camera, map, sx, sy, screen_w, screen_h) else {
             return Vec::new();
         };
-        // World XY → move-cell upper-left corner of the robot's 4×4
-        // footprint, matching the conversion at MatrixRobot.cpp:4625 /
-        // MatrixSide.cpp:816-817.
+        // World XY → move-cell, then the `-ROBOT_MOVECELLS_PER_SIZE/2`
+        // footprint offset of MatrixSide.cpp:847.
         let (cmx, cmy) = map.world_to_move(wx, wy);
-        let center_mx = cmx - ROBOT_MOVECELLS_PER_SIZE / 2;
-        let center_my = cmy - ROBOT_MOVECELLS_PER_SIZE / 2;
+        let tp = (
+            cmx - ROBOT_MOVECELLS_PER_SIZE / 2,
+            cmy - ROBOT_MOVECELLS_PER_SIZE / 2,
+        );
+        let no = self.sel_group_to_logic_group();
+        self.pg_order_move_to(map, no, tp);
+        // Pings flow through `moveto_pings` (PGShowPlace) now.
+        Vec::new()
+    }
 
-        // Seed the blocker list with every out-of-group robot's
-        // claimed place. The C++ at MatrixSide.cpp:8700-8727 walks
-        // `GetFirstLogic` and adds entries where `GetGroupLogic != no`
-        // — we approximate "not in our group" as "not in the current
-        // selection" since per-side logical groups aren't ported yet.
-        let selected: Vec<ObjectId> = self.player_side.selected.clone();
-        let mut blockers: Vec<(i32, i32)> = Vec::new();
-        for id in self.objects.iter_live() {
-            let Some(obj) = self.objects.get(id) else {
-                continue;
-            };
-            if !matches!(obj.core().obj_type, ObjectType::RobotAi) {
-                continue;
-            }
-            if selected.contains(&id) {
-                continue;
-            }
-            let other: &crate::matrix_game::robot::Robot = unsafe {
-                &*(obj as *const dyn MapStatic as *const crate::matrix_game::robot::Robot)
-            };
-            if let Some((px, py)) = other.place_add {
-                blockers.push((px, py));
-            }
+    /// Port of `CMatrixSideUnit::OnRButtonDown` (MatrixSide.cpp:
+    /// 799-863) — the no-preorder right-click dispatch: capture an
+    /// enemy building, attack an enemy unit, or move.
+    pub fn on_right_click(
+        &mut self,
+        camera: &Camera,
+        sx: f32,
+        sy: f32,
+        screen_w: f32,
+        screen_h: f32,
+        map: &GameMap,
+    ) {
+        use crate::matrix_game::side::CurrSel;
+        if !matches!(self.player_side.curr_sel, CurrSel::RobotsSelected) {
+            return;
+        }
+        if self
+            .player_side
+            .cur_group()
+            .map(|g| g.objects_cnt() == 0)
+            .unwrap_or(true)
+        {
+            return;
         }
 
-        // Spiral-search a unique cell per in-group robot; each newly
-        // assigned slot joins the blocker list before the next robot
-        // starts searching. Matches the second loop in
-        // `PGAssignPlacePlayer` (MatrixSide.cpp:8729-8756) — that loop
-        // also stamps the result into the robot's env via
-        // `PGSetPlace` + feeds it back into `other_des`.
-        let mut out: Vec<(f32, f32)> = Vec::new();
-        for id in selected {
-            let Some(obj) = self.objects.get_mut(id) else {
-                continue;
+        let (origin, dir) = camera.screen_to_world_ray(sx, sy, screen_w, screen_h);
+        let hit = self.objects.pick_object(origin, dir, TRACE_ANYOBJECT, None);
+
+        if let Some((id, _)) = hit {
+            let (side, is_building, is_unit_live) = {
+                let Some(obj) = self.objects.get(id) else {
+                    return;
+                };
+                (
+                    obj.side(),
+                    matches!(obj.core().obj_type, ObjectType::Building) && obj.is_live(),
+                    is_live_unit(&self.objects, id),
+                )
             };
-            if !matches!(obj.core().obj_type, ObjectType::RobotAi) {
-                continue;
+            if is_building && side != self.player_side.id {
+                // Capture (MatrixSide.cpp:837-839).
+                let no = self.sel_group_to_logic_group();
+                self.pg_order_capture(map, no, id);
+                return;
             }
-            let r: &mut crate::matrix_game::robot::Robot = unsafe {
-                &mut *(obj as *mut dyn MapStatic as *mut crate::matrix_game::robot::Robot)
-            };
-            if r.side != self.player_side.id {
-                continue;
+            if is_unit_live && side != self.player_side.id {
+                // Attack (MatrixSide.cpp:841-843).
+                if let Some(tp) = get_map_pos(&self.objects, id) {
+                    let no = self.sel_group_to_logic_group();
+                    self.pg_order_attack(map, no, tp, Some(id));
+                }
+                return;
             }
-            let chassis = r.chassis.kind_index();
-            let (mx, my) = place_find_near_with_blockers(
-                map,
-                chassis,
-                ROBOT_MOVECELLS_PER_SIZE,
-                center_mx,
-                center_my,
-                &blockers,
-            )
-            .unwrap_or((center_mx, center_my));
-            // `PGSetPlace` → `m_PlaceAdd = (mx, my)` (MatrixSide.cpp:8473).
-            r.place_add = Some((mx, my));
-            r.move_to(mx, my);
-            blockers.push((mx, my));
-            // World-space ping position = footprint center.
-            let gs = crate::matrix_game::map::GameMap::GLOBAL_SCALE_MOVE;
-            let half = ROBOT_MOVECELLS_PER_SIZE as f32 * 0.5;
-            out.push(((mx as f32 + half) * gs, (my as f32 + half) * gs));
+            // Own / neutral object under cursor → move next to it
+            // (the final `else` arm includes IS_TRACE_STOP_OBJECT).
         }
-        out
+        self.order_move_to_at(camera, sx, sy, screen_w, screen_h, map);
     }
 
     /// Right-click attack/repair order — the order-issuing slice of
@@ -722,97 +1201,38 @@ impl MapLogic {
         sy: f32,
         screen_w: f32,
         screen_h: f32,
+        map: &GameMap,
     ) -> Option<ObjectId> {
-        use crate::matrix_game::robot::Robot;
-
+        // PREORDER_FIRE click (MatrixSide.cpp:702-713): live/special
+        // object → PGOrderAttack at it; terrain → attack-move there.
         let (origin, dir) = camera.screen_to_world_ray(sx, sy, screen_w, screen_h);
-        let (hit, _t) = self
-            .objects
-            .pick_object(origin, dir, TRACE_ANYOBJECT, None)?;
-        let (tgt_side, tgt_pos, needs_repair) = {
-            let o = self.objects.get(hit)?;
-            (o.side(), o.core().geo_center, o.need_repair())
-        };
-        let player = self.player_side.id;
-        // Neutral scenery isn't an attack target via this path.
-        if tgt_side <= 0 {
-            return None;
-        }
-        let repair_own = tgt_side == player && needs_repair;
-        let attack = tgt_side != player;
-        if !attack && !repair_own {
-            return None;
-        }
-        let selected: Vec<ObjectId> = self.player_side.selected.clone();
-        let mut issued = false;
-        for id in selected {
-            let Some(obj) = self.objects.get_mut(id) else {
-                continue;
-            };
-            if !matches!(obj.core().obj_type, ObjectType::RobotAi) {
-                continue;
+        let hit = self.objects.pick_object(origin, dir, TRACE_ANYOBJECT, None);
+        match hit {
+            Some((id, _)) if self.objects.get(id).map(|o| o.is_live()).unwrap_or(false) => {
+                let tp = get_map_pos(&self.objects, id)?;
+                let no = self.sel_group_to_logic_group();
+                self.pg_order_attack(map, no, tp, Some(id));
+                Some(id)
             }
-            let r: &mut Robot = unsafe { &mut *(obj as *mut dyn MapStatic as *mut Robot) };
-            if r.side != player {
-                continue;
+            _ => {
+                let (wx, wy) = screen_to_terrain_xy(camera, map, sx, sy, screen_w, screen_h)?;
+                let (cmx, cmy) = map.world_to_move(wx, wy);
+                let tp = (
+                    cmx - ROBOT_MOVECELLS_PER_SIZE / 2,
+                    cmy - ROBOT_MOVECELLS_PER_SIZE / 2,
+                );
+                let no = self.sel_group_to_logic_group();
+                self.pg_order_attack(map, no, tp, None);
+                None
             }
-            r.fire(tgt_pos, if attack { 0 } else { 2 });
-            issued = true;
         }
-        issued.then_some(hit)
     }
 
-    /// Explicit attack order at a world position — the
-    /// `PGOrderAttack(group, point, NULL)` half of the PREORDER_FIRE
-    /// click (MatrixSide.cpp:712): every selected robot opens fire at
-    /// the point, object there or not.
-    pub fn order_fire_at_point(&mut self, pos: glam::Vec3) -> usize {
-        use crate::matrix_game::robot::Robot;
-        let player = self.player_side.id;
-        let selected: Vec<ObjectId> = self.player_side.selected.clone();
-        let mut issued = 0;
-        for id in selected {
-            let Some(obj) = self.objects.get_mut(id) else {
-                continue;
-            };
-            if !matches!(obj.core().obj_type, ObjectType::RobotAi) {
-                continue;
-            }
-            let r: &mut Robot = unsafe { &mut *(obj as *mut dyn MapStatic as *mut Robot) };
-            if r.side != player {
-                continue;
-            }
-            r.fire(pos, 0);
-            issued += 1;
-        }
-        issued
-    }
-
-    /// `PGOrderStop` for the selection (MatrixSide.cpp via IF_ORDER_STOP,
-    /// CInterface.cpp:3472): break off fire + movement.
-    pub fn order_stop(&mut self) {
-        use crate::matrix_game::robot::{OrderType, Robot};
-        let player = self.player_side.id;
-        let selected: Vec<ObjectId> = self.player_side.selected.clone();
-        for id in selected {
-            let Some(obj) = self.objects.get_mut(id) else {
-                continue;
-            };
-            if !matches!(obj.core().obj_type, ObjectType::RobotAi) {
-                continue;
-            }
-            let r: &mut Robot = unsafe { &mut *(obj as *mut dyn MapStatic as *mut Robot) };
-            if r.side != player {
-                continue;
-            }
-            // Convert FIRE → STOP_FIRE (processed next takt) and drop
-            // movement orders; the robot decelerates to a stand.
-            r.stop_fire();
-            r.orders.remove_type(OrderType::MoveTo);
-            r.orders.remove_type(OrderType::MoveToBack);
-            r.velocity = glam::Vec2::ZERO;
-            r.speed = 0.0;
-        }
+    /// `PGOrderStop` for the selection (the IF_ORDER_STOP button,
+    /// CInterface.cpp:3472 → MatrixSide.cpp:7930).
+    pub fn order_stop(&mut self, map: &GameMap) {
+        let no = self.sel_group_to_logic_group();
+        self.pg_order_stop(map, no);
     }
 
     /// Return the active-selection id if it's still a live object.
@@ -1188,13 +1608,63 @@ pub fn place_is_empty(
     true
 }
 
-/// Port of `CMatrixMapLogic::PlaceFindNear(nsh, size, mx, my)` —
-/// the commented-out simpler variant from MatrixLogic.cpp:540-570
-/// (the full variant at :713-758 adds other-robot-destination
-/// avoidance; we defer that). Spirals outward looking for a cell
-/// that passes `place_is_empty` for `(chassis_kind, size)`.
-/// Returns the nearest valid cell as `(mx, my)`.
-#[allow(clippy::too_many_arguments)]
+/// Collect the occupancy blockers every `PlaceFindNear`-family call
+/// scans from the live-object list (MatrixLogic.cpp:713-758): for
+/// each non-DIP robot (except `skip`) its MOVE_RETURN anchor, plus
+/// either its MOVE_TO destination or its standing map cell; for each
+/// live cannon its claimed place cell. All entries use footprint
+/// size 4.
+///
+/// The C++ reads the cannon's road-network place
+/// (`m_RN.GetPlace(cannon->m_Place)->m_Pos`); until the cannon side
+/// carries a place index we derive the same cell from its position
+/// like `ZoneMoveCalc` does at MatrixRobot.cpp:1651.
+pub fn collect_place_blockers(objs: &Objects, skip: Option<ObjectId>) -> Vec<(i32, i32)> {
+    use crate::matrix_game::common::float2int;
+    use crate::matrix_game::object_cannon::{Cannon, CannonState};
+    use crate::matrix_game::robot::Robot;
+
+    let mut out: Vec<(i32, i32)> = Vec::new();
+    for id in objs.iter_live() {
+        if skip == Some(id) {
+            continue;
+        }
+        let Some(obj) = objs.get(id) else { continue };
+        match obj.core().obj_type {
+            ObjectType::RobotAi => {
+                let r: &Robot = unsafe { &*(obj as *const dyn MapStatic as *const Robot) };
+                if !r.is_live() {
+                    continue;
+                }
+                if let Some(tp) = r.return_coords() {
+                    out.push(tp);
+                }
+                if let Some(tp) = r.move_to_coords() {
+                    out.push(tp);
+                } else {
+                    out.push((r.map_x, r.map_y));
+                }
+            }
+            ObjectType::Cannon => {
+                let c: &Cannon = unsafe { &*(obj as *const dyn MapStatic as *const Cannon) };
+                if matches!(c.state, CannonState::Dip) {
+                    continue;
+                }
+                out.push((
+                    float2int(c.pos.x / GameMap::GLOBAL_SCALE_MOVE) - ROBOT_MOVECELLS_PER_SIZE / 2,
+                    float2int(c.pos.y / GameMap::GLOBAL_SCALE_MOVE) - ROBOT_MOVECELLS_PER_SIZE / 2,
+                ));
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Port of `CMatrixMapLogic::PlaceFindNear(nsh, size, mx, my, skip)`
+/// (MatrixLogic.cpp:713-758): collects the live robots' / cannons'
+/// claimed cells, then spirals outward from `(mx, my)` via the
+/// blocker variant. Returns the nearest valid cell.
 pub fn place_find_near(
     map: &GameMap,
     objs: &Objects,
@@ -1202,27 +1672,10 @@ pub fn place_find_near(
     size: i32,
     mx: i32,
     my: i32,
-    radius: i32,
     skip: Option<ObjectId>,
 ) -> Option<(i32, i32)> {
-    if place_is_empty(map, objs, chassis_kind, size, mx, my, skip) {
-        return Some((mx, my));
-    }
-    for r in 1..=radius {
-        for dy in -r..=r {
-            for dx in -r..=r {
-                if dx.abs() != r && dy.abs() != r {
-                    continue;
-                } // ring only
-                let nx = mx + dx;
-                let ny = my + dy;
-                if place_is_empty(map, objs, chassis_kind, size, nx, ny, skip) {
-                    return Some((nx, ny));
-                }
-            }
-        }
-    }
-    None
+    let blockers = collect_place_blockers(objs, skip);
+    place_find_near_with_blockers(map, chassis_kind, size, mx, my, &blockers)
 }
 
 /// Port of `CMatrixMapLogic::PlaceFindNear` with blocker list
@@ -1767,9 +2220,6 @@ mod tests {
 // world coords is `((mx + 2) * GLOBAL_SCALE_MOVE, (my + 2) * GLOBAL_SCALE_MOVE)`.
 // ════════════════════════════════════════════════════════════════════════
 
-use std::cmp::Ordering;
-use std::collections::BinaryHeap;
-
 /// Half of the footprint — how far the robot's center is from its
 /// upper-left corner in move cells.
 pub const ROBOT_FOOTPRINT_HALF: i32 = ROBOT_MOVECELLS_PER_SIZE / 2;
@@ -1804,10 +2254,14 @@ impl MovePt {
 #[derive(Debug, Clone, Copy)]
 pub struct Blocker {
     /// Current standing cell (upper-left corner of footprint). `None`
-    /// for stationary objects where only the final pos is known.
+    /// for stationary objects where only the final pos is known —
+    /// C++ `other_path_cnt[i] == 0`.
     pub pos: Option<MovePt>,
     /// Destination cell (upper-left corner of footprint).
     pub dest: MovePt,
+    /// Footprint side in move cells — C++ `other_size[i]` (always 4
+    /// for robots/cannons today).
+    pub size: i32,
 }
 
 /// Port of `m_MovePath[]` contents — a contiguous list of move-cell
@@ -1851,299 +2305,1268 @@ pub fn footprint_passable(map: &GameMap, mx: i32, my: i32, chassis_kind: usize) 
     crate::matrix_game::logic::is_absence_wall(map, chassis_kind, ROBOT_MOVECELLS_PER_SIZE, mx, my)
 }
 
-#[derive(Copy, Clone, PartialEq)]
-struct Node {
-    f: f32,
-    g: f32,
-    x: i32,
-    y: i32,
+/// Axis-aligned rect over move cells with exclusive right/bottom,
+/// mirroring how `FindLocalPath` treats `Base::CRect` after the
+/// clamps at MatrixLogic.cpp:1251-1259.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MoveRect {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
 }
-impl Eq for Node {}
-impl Ord for Node {
-    fn cmp(&self, o: &Self) -> Ordering {
-        // Min-heap by f.
-        o.f.partial_cmp(&self.f).unwrap_or(Ordering::Equal)
+
+/// Result of [`find_local_path`]. The C++ stamps `m_Weight` into the
+/// persistent move grid and `OptimizeMovePath` reads those stamps
+/// right after `FindLocalPath` returns (MatrixRobot.cpp:1658-1681);
+/// we thread the same data through this struct instead of mutating
+/// the map. Cells outside the search rect read 0 — same as freshly
+/// `HAllocClear`ed grid memory the C++ starts from.
+pub struct LocalPathResult {
+    pub path: Vec<MovePt>,
+    pub weight: Vec<i32>,
+}
+
+/// Stamp one blocker window into the weight grid. Port of the two
+/// loops at MatrixLogic.cpp:1278-1300, including the original's
+/// row-advance arithmetic `smm += m_SizeMove.x - (ey - sy)` (note:
+/// `ey - sy`, not `ex - sx` — at clamped map borders the C++ pointer
+/// walk skews rows; we reproduce it via the same linear-index math).
+fn stamp_blocker_window(
+    weight: &mut [i32],
+    stride: usize,
+    sx_map: i32,
+    sy_map: i32,
+    c: MovePt,
+    bsize: i32,
+    wval: i32,
+) {
+    let sx = 0.max(c.x - (bsize - 1));
+    let sy = 0.max(c.y - (bsize - 1));
+    let ex = sx_map.min(c.x + bsize);
+    let ey = sy_map.min(c.y + bsize);
+    if sy >= ey {
+        return;
     }
-}
-impl PartialOrd for Node {
-    fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
-        Some(self.cmp(o))
+    let mut idx = sy as usize * stride + sx as usize;
+    for _y in sy..ey {
+        for _x in sx..ex {
+            if idx >= weight.len() {
+                return;
+            }
+            if weight[idx] < wval {
+                weight[idx] = wval;
+            }
+            idx += 1;
+        }
+        // C++ for-loop increment: `smm += m_SizeMove.x - (ey - sy)`.
+        // The window height (≤ 2*size-1) is always smaller than the
+        // grid stride, so this cannot underflow.
+        idx += stride - (ey - sy) as usize;
     }
 }
 
-/// Per-cell traversal weight grid stamped from the blocker list —
-/// the Rust analogue of the persistent `m_Weight` stamps
-/// `FindLocalPath` writes into the move grid (MatrixLogic.cpp:1278-
-/// 1300). Base = 1.0; each blocker stamps a footprint window around
-/// `pos` (weight 6.0) and `dest` (weight 40.0). `max` between old
-/// and new matches C++ `if(w<200) w=200` / `if(w<30) w=30`
-/// semantics (MatrixLogic.cpp:1285, 1297).
+/// Port of `CMatrixMapLogic::FindLocalPath` (MatrixLogic.cpp:1217-
+/// 1435) — the 4-way cost-wave search the original uses for all
+/// robot movement. Faithful details preserved:
 ///
-/// The C++ 4-way costs are 5 / 30 / 200; Rust rescales to 1 / 6 / 40
-/// so the octile heuristic stays admissible at step=1.
-fn blocker_weight_grid(sx: i32, sy: i32, blockers: &[Blocker]) -> Vec<f32> {
-    let w = sx as usize;
-    let mut weight = vec![1.0_f32; w * sy as usize];
-    const W_POS: f32 = 6.0; // C++ 30 / 5
-    const W_DEST: f32 = 40.0; // C++ 200 / 5
-    let mut stamp = |c: MovePt, new_w: f32| {
-        // Footprint window = `[c.x-(S-1) .. c.x+S) × [c.y-(S-1) ..
-        // c.y+S)` — same `other_size[i]=4` window the C++ uses at
-        // :1278-1287 and :1290-1299.
-        for dy in -(ROBOT_MOVECELLS_PER_SIZE - 1)..ROBOT_MOVECELLS_PER_SIZE {
-            for dx in -(ROBOT_MOVECELLS_PER_SIZE - 1)..ROBOT_MOVECELLS_PER_SIZE {
-                let bx = c.x + dx;
-                let by = c.y + dy;
-                if bx >= 0 && by >= 0 && bx < sx && by < sy {
-                    let i = (by as usize) * w + (bx as usize);
-                    if weight[i] < new_w {
-                        weight[i] = new_w;
-                    }
-                }
-            }
-        }
+///   - The search window is the union of the first
+///     `min(zone_path.len()-1, 6) + 1` zone bounding rects, expanded
+///     by the start cell and a `size` margin (:1245-1259). When a
+///     zone rect is unavailable (`zone_rect_of` returns `None`) the
+///     window falls back to the whole map.
+///   - Cell weights: base 5, other-robot standing cell 30, other
+///     robot/cannon destination 200 (:1267-1300).
+///   - Neighbors of the *start* cell skip the impassability mask
+///     (`sme != 0` at :1349) so a robot can escape a blocked cell.
+///   - Exact-target match wins immediately; otherwise, when more
+///     zones remain beyond the window, the cheapest cell belonging
+///     to the window's last zone is tracked as `findbest`
+///     (:1354-1360).
+///   - The wave keeps expanding 16 levels past the first hit to
+///     improve `findbest` (:1379-1386).
+///   - Backtrace walks descending `m_Find` with a `lastangle`
+///     direction preference (:1391-1427) and caps the path at
+///     `MatrixPathMoveMax` cells.
+///
+/// `zone_path` must contain at least the current zone (the C++
+/// asserts `zonepathcnt >= 1` and callers pass `&m_ZoneCur, 1` when
+/// no zone path exists — MatrixRobot.cpp:1662).
+#[allow(clippy::too_many_arguments)]
+pub fn find_local_path(
+    map: &GameMap,
+    nsh: usize,
+    size: i32,
+    mx: i32,
+    my: i32,
+    zone_path: &[i32],
+    zone_rect_of: &dyn Fn(i32) -> Option<MoveRect>,
+    dx: i32,
+    dy: i32,
+    others: &[Blocker],
+) -> LocalPathResult {
+    const MATRIX_PATH_MOVE_MAX: usize = 256; // MatrixMap.hpp:22
+
+    let sx_map = map.size_move_x as i32;
+    let sy_map = map.size_move_y as i32;
+    let stride = map.size_move_x;
+    let mut weight = vec![0i32; stride * map.size_move_y];
+    let fail = |weight: Vec<i32>| LocalPathResult {
+        path: Vec::new(),
+        weight,
     };
-    for b in blockers {
-        // Dest first (higher weight) then pos — stamp order matches
-        // C++ and the `max` semantics make it order-insensitive.
-        stamp(b.dest, W_DEST);
+
+    debug_assert!(!zone_path.is_empty());
+    if zone_path.is_empty() || map.move_cell(mx, my).is_none() {
+        return fail(weight);
+    }
+
+    // Search window — union of the first zoneskipcnt+1 zone rects
+    // (MatrixLogic.cpp:1245-1259).
+    let zoneskipcnt = ((zone_path.len() as i32 - 1).min(6)) as usize;
+    let full_map = MoveRect {
+        left: 0,
+        top: 0,
+        right: sx_map,
+        bottom: sy_map,
+    };
+    let mut re = zone_rect_of(zone_path[zoneskipcnt]).unwrap_or(full_map);
+    for &z in &zone_path[..zoneskipcnt] {
+        let r = zone_rect_of(z).unwrap_or(full_map);
+        re.left = re.left.min(r.left);
+        re.top = re.top.min(r.top);
+        re.right = re.right.max(r.right);
+        re.bottom = re.bottom.max(r.bottom);
+    }
+    re.left = re.left.min(mx);
+    re.top = re.top.min(my);
+    re.right = re.right.max(mx + 1);
+    re.bottom = re.bottom.max(my + 1);
+    re.left = (re.left - size).max(0);
+    re.top = (re.top - size).max(0);
+    re.right = (re.right + size).min(sx_map - size);
+    re.bottom = (re.bottom + size).min(sy_map - size);
+    if re.left >= re.right || re.top >= re.bottom {
+        return fail(weight);
+    }
+
+    // Reset weight=5 inside the window (:1263-1269); `find` starts -1.
+    let mut find = vec![-1i32; stride * map.size_move_y];
+    for y in re.top..re.bottom {
+        let row = y as usize * stride;
+        for x in re.left..re.right {
+            weight[row + x as usize] = 5;
+        }
+    }
+
+    // Blocker stamps (:1271-1301): destination 200, standing cell 30.
+    for b in others {
+        stamp_blocker_window(&mut weight, stride, sx_map, sy_map, b.dest, b.size, 200);
         if let Some(p) = b.pos {
-            stamp(p, W_POS);
+            stamp_blocker_window(&mut weight, stride, sx_map, sy_map, p, b.size, 30);
         }
     }
-    weight
-}
 
-/// A* on the move grid with 8-way connectivity. Returns a path
-/// inclusive of `start` and `goal` as move-cell upper-left corners.
-/// The robot's 4×4 footprint must be passable at every cell on the
-/// path (see `footprint_passable`).
-///
-/// `blockers` is a list of `(pos, dest)` cells from other live
-/// robots / cannons. Port of the `other_des` / `other_path_list`
-/// arguments to `CMatrixMap::FindLocalPath` (MatrixRobot.cpp:1658-
-/// 1664 + MatrixLogic.cpp:1217-1301). Each blocker raises the
-/// per-cell traversal weight inside a footprint-sized window:
-///   - `dest` → weight 200 (line 1285),
-///   - `pos`  → weight 30  (line 1297).
-///
-/// Everything else has a base weight of 5. Rust rescales to 1.0 /
-/// 6.0 / 40.0 so the octile heuristic stays admissible at step=1.
-///
-/// Port of `CMatrixMap::FindLocalPath` (MatrixLogic.cpp:1217). The
-/// zone-constraint argument (`zonepath`) is omitted — the regions
-/// network isn't ported yet and the C++ uses it purely as an
-/// efficiency hint (restricts the search rectangle); correctness
-/// is preserved by letting A* see the full map.
-pub fn find_path(
-    map: &GameMap,
-    start: MovePt,
-    goal: MovePt,
-    chassis_kind: usize,
-    blockers: &[Blocker],
-) -> Option<Vec<MovePt>> {
-    let sx = map.size_move_x as i32;
-    let sy = map.size_move_y as i32;
-
-    let in_bounds = |p: MovePt| {
-        p.x >= 0
-            && p.y >= 0
-            && p.x + ROBOT_MOVECELLS_PER_SIZE <= sx
-            && p.y + ROBOT_MOVECELLS_PER_SIZE <= sy
+    let idx = |x: i32, y: i32| -> usize { y as usize * stride + x as usize };
+    let nsh_mask = MoveCell::stop_mask(nsh, size);
+    let stop_at = |x: i32, y: i32| -> bool {
+        map.move_cell(x, y)
+            .map(|c| (c.stop & nsh_mask) != 0)
+            .unwrap_or(true)
     };
-    if !in_bounds(start) || !in_bounds(goal) {
-        return None;
-    }
-    if !footprint_passable(map, goal.x, goal.y, chassis_kind) {
-        return None;
-    }
+    let zone_at = |x: i32, y: i32| -> i32 { map.move_cell(x, y).map(|c| c.zone).unwrap_or(-1) };
 
-    let w = sx as usize;
-    let h = sy as usize;
-    let mut weight = blocker_weight_grid(sx, sy, blockers);
-    // Never penalise our own start cell — the C++ never does because
-    // path_list[0] of the *current* robot was never added to its own
-    // blocker list.
-    weight[(start.y as usize) * w + (start.x as usize)] = 1.0;
+    // Cost wave (:1316-1387).
+    let maxmax = stride * map.size_move_y;
+    let mut queue: Vec<MovePt> = Vec::with_capacity(1024);
+    queue.push(MovePt::new(mx, my));
+    find[idx(mx, my)] = 0;
+    let mut sme = 0usize;
+    let mut cnt = 1usize;
+    let mut next = cnt;
+    let mut findok = 0i32;
+    let mut findbest = -1i32;
+    let mut tpfind = MovePt::new(mx, my);
 
-    let idx = |p: MovePt| -> usize { (p.y as usize) * w + (p.x as usize) };
-
-    let mut g = vec![f32::INFINITY; w * h];
-    let mut parent = vec![(-1i32, -1i32); w * h];
-    let mut closed = vec![false; w * h];
-
-    let h_cost = |p: MovePt| -> f32 {
-        let dx = (goal.x - p.x).abs() as f32;
-        let dy = (goal.y - p.y).abs() as f32;
-        // Octile distance — admissible for 8-way grid with min weight
-        // 1.0. Safe overestimate for weighted cells (conservative).
-        let (a, b) = if dx < dy { (dx, dy) } else { (dy, dx) };
-        (b - a) + std::f32::consts::SQRT_2 * a
-    };
-
-    let mut open = BinaryHeap::new();
-    g[idx(start)] = 0.0;
-    open.push(Node {
-        f: h_cost(start),
-        g: 0.0,
-        x: start.x,
-        y: start.y,
-    });
-
-    const D: f32 = std::f32::consts::SQRT_2;
-    const MOVES: [(i32, i32, f32); 8] = [
-        (1, 0, 1.0),
-        (-1, 0, 1.0),
-        (0, 1, 1.0),
-        (0, -1, 1.0),
-        (1, 1, D),
-        (1, -1, D),
-        (-1, 1, D),
-        (-1, -1, D),
-    ];
-
-    while let Some(Node { g: gu, x, y, .. }) = open.pop() {
-        let u = MovePt::new(x, y);
-        if u == goal {
-            let mut out = vec![goal];
-            let mut cur = goal;
-            while cur != start {
-                let (px, py) = parent[idx(cur)];
-                if px < 0 {
-                    return None;
+    'wave: while sme < cnt {
+        let cur = queue[sme];
+        let cur_find = find[idx(cur.x, cur.y)];
+        for u in 0..4 {
+            let tp = match u {
+                0 => {
+                    if cur.x - 1 < re.left {
+                        continue;
+                    }
+                    MovePt::new(cur.x - 1, cur.y)
                 }
-                cur = MovePt::new(px, py);
-                out.push(cur);
+                1 => {
+                    if cur.y - 1 < re.top {
+                        continue;
+                    }
+                    MovePt::new(cur.x, cur.y - 1)
+                }
+                2 => {
+                    if cur.x + 1 >= re.right {
+                        continue;
+                    }
+                    MovePt::new(cur.x + 1, cur.y)
+                }
+                _ => {
+                    if cur.y + 1 >= re.bottom {
+                        continue;
+                    }
+                    MovePt::new(cur.x, cur.y + 1)
+                }
+            };
+            // Neighbors of the start cell skip the stop mask (:1349).
+            if sme != 0 && stop_at(tp.x, tp.y) {
+                continue;
             }
-            out.reverse();
-            return Some(out);
-        }
-        let iu = idx(u);
-        if closed[iu] {
-            continue;
-        }
-        closed[iu] = true;
+            let ti = idx(tp.x, tp.y);
+            let new_cost = cur_find + weight[ti];
+            if find[ti] >= 0 && new_cost >= find[ti] {
+                continue;
+            }
 
-        for (dx, dy, step) in MOVES {
-            let v = MovePt::new(u.x + dx, u.y + dy);
-            if !in_bounds(v) {
-                continue;
-            }
-            if !footprint_passable(map, v.x, v.y, chassis_kind) {
-                continue;
-            }
-            if dx != 0 && dy != 0 {
-                if !footprint_passable(map, u.x + dx, u.y, chassis_kind) {
+            if findok == 0 && tp.x == dx && tp.y == dy {
+                tpfind = tp;
+                findok = 1;
+            } else if (findok == 0 || findbest >= 0)
+                && zoneskipcnt + 1 < zone_path.len()
+                && zone_at(tp.x, tp.y) == zone_path[zoneskipcnt]
+            {
+                if findbest >= 0 && new_cost >= findbest {
                     continue;
                 }
-                if !footprint_passable(map, u.x, u.y + dy, chassis_kind) {
+                findbest = new_cost;
+                tpfind = tp;
+                findok = 1;
+            }
+
+            if cnt >= maxmax {
+                break 'wave;
+            }
+            find[ti] = new_cost;
+            queue.push(tp);
+            cnt += 1;
+        }
+        sme += 1;
+        if sme >= next {
+            next = cnt;
+            if findok != 0 {
+                findok += 1;
+                if findok > 16 {
+                    break;
+                }
+            }
+        }
+    }
+
+    if findok == 0 {
+        return fail(weight);
+    }
+
+    // Backtrace (:1391-1430) — descending `find`, preferring the last
+    // direction taken.
+    let mut out: Vec<MovePt> = Vec::with_capacity(64);
+    out.push(tpfind);
+    let mut lastangle = 0i32;
+    let mut cur = tpfind;
+    while find[idx(cur.x, cur.y)] != 0 {
+        let mut best: Option<(MovePt, i32, i32)> = None;
+        for u in 0..4 {
+            let a = (u + lastangle) & 3;
+            let tp = match a {
+                0 => {
+                    if cur.x - 1 < re.left {
+                        continue;
+                    }
+                    MovePt::new(cur.x - 1, cur.y)
+                }
+                1 => {
+                    if cur.y - 1 < re.top {
+                        continue;
+                    }
+                    MovePt::new(cur.x, cur.y - 1)
+                }
+                2 => {
+                    if cur.x + 1 >= re.right {
+                        continue;
+                    }
+                    MovePt::new(cur.x + 1, cur.y)
+                }
+                _ => {
+                    if cur.y + 1 >= re.bottom {
+                        continue;
+                    }
+                    MovePt::new(cur.x, cur.y + 1)
+                }
+            };
+            let f2 = find[idx(tp.x, tp.y)];
+            if f2 < 0 {
+                continue;
+            }
+            if let Some((_, _, bf)) = best {
+                if bf <= f2 {
                     continue;
                 }
             }
-
-            let iv = idx(v);
-            if closed[iv] {
-                continue;
-            }
-            // Step cost = base direction cost × enter-cell weight —
-            // matches C++ `smm->m_Find = smm2->m_Find + smm->m_Weight`
-            // where the step itself is free and the entered cell's
-            // weight dominates (MatrixLogic.cpp:1373).
-            let new_g = gu + step * weight[iv];
-            if new_g + 1e-5 < g[iv] {
-                g[iv] = new_g;
-                parent[iv] = (u.x, u.y);
-                open.push(Node {
-                    f: new_g + h_cost(v),
-                    g: new_g,
-                    x: v.x,
-                    y: v.y,
-                });
-            }
+            best = Some((tp, a, f2));
         }
+        let Some((tp, a, _)) = best else {
+            // C++ ERROR_E — should be unreachable on a consistent wave.
+            return fail(weight);
+        };
+        cur = tp;
+        lastangle = a;
+        if out.len() >= MATRIX_PATH_MOVE_MAX {
+            // C++ ERROR_E on path overflow.
+            return fail(weight);
+        }
+        out.push(cur);
     }
-    None
+    out.reverse();
+
+    LocalPathResult { path: out, weight }
 }
 
-/// Port of `CMatrixMap::OptimizeMovePath` (MatrixRobot.cpp:1681
-/// caller, actual impl in MatrixMapTrace.cpp). Walks the raw A*
-/// path and drops intermediate waypoints whose entire line-of-sight
-/// segment to the latest kept waypoint is passable — yielding a
-/// shorter path of diagonal straight runs.
-///
-/// Blocker awareness: `CanOptimize` (MatrixLogic.cpp:1893-1916) also
-/// rejects any shortcut whose footprint touches a cell with
-/// `m_Weight >= 40` on the C++ 5/30/200 scale — i.e. the weight-200
-/// destination stamps other robots / cannons leave behind. We rebuild
-/// the same weight grid from `blockers` and apply the rescaled
-/// threshold.
-pub fn optimize_path(
+/// Port of `CMatrixMapLogic::CanOptimize` (MatrixLogic.cpp:1865-
+/// 1918): Bresenham walk from `(x1,y1)` to `(x2,y2)` over move
+/// cells. Each visited cell (the start cell is pre-incremented past,
+/// like the C++) must pass the size-aware stop mask AND its whole
+/// `size × size` footprint window must carry blocker weight < 40 —
+/// i.e. shortcuts may cross "standing" stamps (30) but not
+/// "destination" stamps (200).
+fn can_optimize(
     map: &GameMap,
-    path: &[MovePt],
-    chassis_kind: usize,
-    blockers: &[Blocker],
-) -> Vec<MovePt> {
-    if path.len() <= 2 {
-        return path.to_vec();
-    }
-    let weight = blocker_weight_grid(map.size_move_x as i32, map.size_move_y as i32, blockers);
-    let mut out = Vec::with_capacity(path.len());
-    out.push(path[0]);
-    let mut anchor = 0usize;
-    let mut i = 1usize;
-    while i < path.len() {
-        if i + 1 < path.len()
-            && line_of_sight(map, path[anchor], path[i + 1], chassis_kind, &weight)
-        {
-            i += 1;
-        } else {
-            out.push(path[i]);
-            anchor = i;
-            i += 1;
-        }
-    }
-    out
-}
+    nsh: usize,
+    size: i32,
+    x1: i32,
+    y1: i32,
+    x2: i32,
+    y2: i32,
+    weight: &[i32],
+) -> bool {
+    let stride = map.size_move_x;
+    let nsh_mask = MoveCell::stop_mask(nsh, size);
+    let dx = (x2 - x1).abs();
+    let dy = (y2 - y1).abs();
+    let sx = if x2 >= x1 { 1i32 } else { -1i32 };
+    let sy = if y2 >= y1 { 1i32 } else { -1i32 };
 
-/// Port of `CMatrixMapLogic::CanOptimize` (MatrixLogic.cpp:1838-1916):
-/// every step along the line must be footprint-passable AND no cell of
-/// the size×size footprint window may carry a blocker weight at or
-/// above the C++ 40 threshold — 8.0 on our 1/6/40 rescale, so only
-/// the weight-40 `dest` stamps trip it. Like the C++ (whose Bresenham
-/// loop pre-increments past the first cell), the weight check skips
-/// the starting cell.
-fn line_of_sight(map: &GameMap, a: MovePt, b: MovePt, chassis_kind: usize, weight: &[f32]) -> bool {
-    const BLOCK_WEIGHT: f32 = 8.0; // C++ 40 / 5
-    let w = map.size_move_x;
-    let dx = b.x - a.x;
-    let dy = b.y - a.y;
-    let steps = dx.abs().max(dy.abs());
-    if steps == 0 {
-        return footprint_passable(map, a.x, a.y, chassis_kind);
-    }
-    let fx = dx as f32 / steps as f32;
-    let fy = dy as f32 / steps as f32;
-    for s in 0..=steps {
-        let x = (a.x as f32 + fx * s as f32).round() as i32;
-        let y = (a.y as f32 + fy * s as f32).round() as i32;
-        if !footprint_passable(map, x, y, chassis_kind) {
-            return false;
-        }
-        if s == 0 {
-            continue;
-        }
-        // footprint_passable guarantees the size×size window is in
-        // bounds here.
-        for fy_c in 0..ROBOT_MOVECELLS_PER_SIZE {
-            for fx_c in 0..ROBOT_MOVECELLS_PER_SIZE {
-                let i = ((y + fy_c) as usize) * w + (x + fx_c) as usize;
-                if weight[i] >= BLOCK_WEIGHT {
-                    return false;
+    let mut x = x1;
+    let mut y = y1;
+    let window_blocked = |x: i32, y: i32| -> bool {
+        for wy in 0..size {
+            for wx in 0..size {
+                let i = (y + wy) as usize * stride + (x + wx) as usize;
+                if weight.get(i).copied().unwrap_or(0) >= 40 {
+                    return true;
                 }
             }
+        }
+        false
+    };
+    let stop = |x: i32, y: i32| -> bool {
+        map.move_cell(x, y)
+            .map(|c| (c.stop & nsh_mask) != 0)
+            .unwrap_or(true)
+    };
+
+    if dy <= dx {
+        let mut d = (dy << 1) - dx;
+        let d1 = dy << 1;
+        let d2 = (dy - dx) << 1;
+        x += sx;
+        for _ in 1..=dx {
+            if d > 0 {
+                d += d2;
+                y += sy;
+            } else {
+                d += d1;
+            }
+            if stop(x, y) || window_blocked(x, y) {
+                return false;
+            }
+            x += sx;
+        }
+    } else {
+        let mut d = (dx << 1) - dy;
+        let d1 = dx << 1;
+        let d2 = (dx - dy) << 1;
+        y += sy;
+        for _ in 1..=dy {
+            if d > 0 {
+                d += d2;
+                x += sx;
+            } else {
+                d += d1;
+            }
+            if stop(x, y) || window_blocked(x, y) {
+                return false;
+            }
+            y += sy;
         }
     }
     true
+}
+
+/// Port of `OptimizeMovePath_Delete` (MatrixLogic.cpp:1856-1863):
+/// removes the points strictly between `from` and `to`.
+fn optimize_move_path_delete(path: &mut Vec<MovePt>, from: i32, to: i32) {
+    if from >= to || from < 0 || to as usize >= path.len() {
+        return;
+    }
+    path.drain((from + 1) as usize..to as usize);
+}
+
+/// Port of `CMatrixMapLogic::OptimizeMovePath` (MatrixLogic.cpp:1920-
+/// 2010) + `OptimizeMovePathSimple` (:2012-2034). Finds every corner
+/// (direction change) of the raw wave path, grows straight intervals
+/// outward from each corner while `CanOptimize` holds, deletes the
+/// in-between points, then runs the simple forward shortcutter.
+///
+/// `weight` is the stamp grid returned by [`find_local_path`] — the
+/// C++ reads the same `m_Weight` cells it just stamped.
+pub fn optimize_move_path(
+    map: &GameMap,
+    nsh: usize,
+    size: i32,
+    path: &mut Vec<MovePt>,
+    weight: &[i32],
+) {
+    if path.len() <= 2 {
+        return;
+    }
+    let cnt = path.len();
+
+    struct Os {
+        ibegin: i32,
+        iend: i32,
+        loopagain: bool,
+    }
+    let mut os: Vec<Os> = Vec::with_capacity(cnt + 2);
+
+    // Corner detection (:1932-1958) — interval [0,0], every direction
+    // change, and [cnt-1, cnt-1].
+    let mut prevangle = (path[1].x - path[0].x, path[1].y - path[0].y);
+    os.push(Os {
+        ibegin: 0,
+        iend: 0,
+        loopagain: true,
+    });
+    for i in 2..cnt {
+        let curangle = (path[i].x - path[i - 1].x, path[i].y - path[i - 1].y);
+        if curangle != prevangle {
+            prevangle = curangle;
+            os.push(Os {
+                ibegin: i as i32 - 1,
+                iend: i as i32 - 1,
+                loopagain: true,
+            });
+        }
+    }
+    os.push(Os {
+        ibegin: cnt as i32 - 1,
+        iend: cnt as i32 - 1,
+        loopagain: true,
+    });
+    let oscnt = os.len();
+
+    // Grow corners in both directions (:1966-1989).
+    let mut loopagain = true;
+    while loopagain {
+        loopagain = false;
+        for i in 0..oscnt {
+            if !os[i].loopagain {
+                continue;
+            }
+            os[i].loopagain = false;
+
+            if (i == 0 && os[i].ibegin > 0) || (i != 0 && os[i].ibegin > os[i - 1].iend) {
+                let a = path[(os[i].ibegin - 1) as usize];
+                let b = path[os[i].iend as usize];
+                if can_optimize(map, nsh, size, a.x, a.y, b.x, b.y, weight) {
+                    loopagain = true;
+                    os[i].loopagain = true;
+                    os[i].ibegin -= 1;
+                }
+            }
+            if (i == oscnt - 1 && (os[i].iend as usize) < cnt - 1)
+                || (i != oscnt - 1 && os[i].iend < os[i + 1].ibegin)
+            {
+                let a = path[os[i].ibegin as usize];
+                let b = path[(os[i].iend + 1) as usize];
+                if can_optimize(map, nsh, size, a.x, a.y, b.x, b.y, weight) {
+                    loopagain = true;
+                    os[i].loopagain = true;
+                    os[i].iend += 1;
+                }
+            }
+        }
+    }
+
+    // Delete the covered spans, back to front (:1997-2003).
+    for i in (1..oscnt).rev() {
+        optimize_move_path_delete(path, os[i].ibegin, os[i].iend);
+        optimize_move_path_delete(path, os[i - 1].iend, os[i].ibegin);
+    }
+    optimize_move_path_delete(path, os[0].ibegin, os[0].iend);
+
+    optimize_move_path_simple(map, nsh, size, path, weight);
+}
+
+/// Port of `CMatrixMapLogic::OptimizeMovePathSimple` (MatrixLogic.cpp:
+/// 2012-2034) — forward scan collapsing runs of waypoints reachable
+/// in a straight line, with the two distance escape hatches that let
+/// short blocked hops be skipped anyway.
+fn optimize_move_path_simple(
+    map: &GameMap,
+    nsh: usize,
+    size: i32,
+    path: &mut Vec<MovePt>,
+    weight: &[i32],
+) {
+    let mut from = 0usize;
+    while path.len() >= 2 && from <= path.len() - 2 {
+        let mut to = from + 2;
+        while to < path.len() {
+            let a = path[from];
+            let b = path[to];
+            if !can_optimize(map, nsh, size, a.x, a.y, b.x, b.y, weight) {
+                let p = path[to - 1];
+                let d_prev = (p.x - b.x).pow(2) + (p.y - b.y).pow(2);
+                let d_from = (a.x - b.x).pow(2) + (a.y - b.y).pow(2);
+                if d_prev >= 16 {
+                    break;
+                } else if d_from >= 64 {
+                    break;
+                }
+            }
+            to += 1;
+        }
+        to -= 1;
+        if to - from > 1 {
+            path.drain(from + 1..to);
+            from += 1;
+        } else {
+            from = to;
+        }
+    }
+}
+
+/// Port of `CMatrixMapLogic::ZoneFindNear` (MatrixLogic.cpp:440-463):
+/// the zone of the cell at `(mx, my)` when valid and passable for
+/// chassis `nsh` (or `nsh < 0`), otherwise the zone with the nearest
+/// center. Returns -1 when neither resolves (the C++ ERROR_Es).
+pub fn zone_find_near(map: &GameMap, nsh: i32, mx: i32, my: i32) -> i32 {
+    let Some(c) = map.move_cell(mx, my) else {
+        return -1;
+    };
+    if c.zone >= 0 && (nsh < 0 || (c.stop & (1u32 << nsh)) == 0) {
+        return c.zone;
+    }
+    let Some(rn) = map.road_network.as_ref() else {
+        return -1;
+    };
+    let rn = rn.lock().unwrap();
+    let mut mind = i64::MAX;
+    let mut minz = -1i32;
+    for (i, z) in rn.zones.iter().enumerate() {
+        let dx = (mx - z.center.x) as i64;
+        let dy = (my - z.center.y) as i64;
+        let d = dx * dx + dy * dy;
+        if d < mind {
+            mind = d;
+            minz = i as i32;
+        }
+    }
+    minz
+}
+
+// ── Typed arena accessors ───────────────────────────────────────────────
+// The `AsRobot()` / `AsCannon()` / `AsBuilding()` downcasts of
+// CMatrixMapStatic. Type is checked via `core().obj_type` before the
+// pointer cast, so these are safe at the same level as the C++ pattern.
+
+pub fn robot_ref(objs: &Objects, id: ObjectId) -> Option<&crate::matrix_game::robot::Robot> {
+    let obj = objs.get(id)?;
+    if !matches!(obj.core().obj_type, ObjectType::RobotAi) {
+        return None;
+    }
+    Some(unsafe { &*(obj as *const dyn MapStatic as *const crate::matrix_game::robot::Robot) })
+}
+
+pub fn robot_mut(
+    objs: &mut Objects,
+    id: ObjectId,
+) -> Option<&mut crate::matrix_game::robot::Robot> {
+    let obj = objs.get_mut(id)?;
+    if !matches!(obj.core().obj_type, ObjectType::RobotAi) {
+        return None;
+    }
+    Some(unsafe { &mut *(obj as *mut dyn MapStatic as *mut crate::matrix_game::robot::Robot) })
+}
+
+pub fn cannon_ref(
+    objs: &Objects,
+    id: ObjectId,
+) -> Option<&crate::matrix_game::object_cannon::Cannon> {
+    let obj = objs.get(id)?;
+    if !matches!(obj.core().obj_type, ObjectType::Cannon) {
+        return None;
+    }
+    Some(unsafe {
+        &*(obj as *const dyn MapStatic as *const crate::matrix_game::object_cannon::Cannon)
+    })
+}
+
+pub fn cannon_mut(
+    objs: &mut Objects,
+    id: ObjectId,
+) -> Option<&mut crate::matrix_game::object_cannon::Cannon> {
+    let obj = objs.get_mut(id)?;
+    if !matches!(obj.core().obj_type, ObjectType::Cannon) {
+        return None;
+    }
+    Some(unsafe {
+        &mut *(obj as *mut dyn MapStatic as *mut crate::matrix_game::object_cannon::Cannon)
+    })
+}
+
+pub fn flyer_ref(objs: &Objects, id: ObjectId) -> Option<&crate::matrix_game::flyer::Flyer> {
+    let obj = objs.get(id)?;
+    if !matches!(obj.core().obj_type, ObjectType::Flyer) {
+        return None;
+    }
+    Some(unsafe { &*(obj as *const dyn MapStatic as *const crate::matrix_game::flyer::Flyer) })
+}
+
+pub fn flyer_mut(
+    objs: &mut Objects,
+    id: ObjectId,
+) -> Option<&mut crate::matrix_game::flyer::Flyer> {
+    let obj = objs.get_mut(id)?;
+    if !matches!(obj.core().obj_type, ObjectType::Flyer) {
+        return None;
+    }
+    Some(unsafe { &mut *(obj as *mut dyn MapStatic as *mut crate::matrix_game::flyer::Flyer) })
+}
+
+pub fn building_ref(
+    objs: &Objects,
+    id: ObjectId,
+) -> Option<&crate::matrix_game::object_building::Building> {
+    let obj = objs.get(id)?;
+    if !matches!(obj.core().obj_type, ObjectType::Building) {
+        return None;
+    }
+    Some(unsafe {
+        &*(obj as *const dyn MapStatic as *const crate::matrix_game::object_building::Building)
+    })
+}
+
+pub fn building_mut(
+    objs: &mut Objects,
+    id: ObjectId,
+) -> Option<&mut crate::matrix_game::object_building::Building> {
+    let obj = objs.get_mut(id)?;
+    if !matches!(obj.core().obj_type, ObjectType::Building) {
+        return None;
+    }
+    Some(unsafe {
+        &mut *(obj as *mut dyn MapStatic as *mut crate::matrix_game::object_building::Building)
+    })
+}
+
+/// Port of `IsLiveUnit` (MatrixSide.cpp:9358-9363): live robot, or a
+/// cannon that is neither DIP nor under construction. Anything else
+/// (buildings included) is not a "unit".
+pub fn is_live_unit(objs: &Objects, id: ObjectId) -> bool {
+    use crate::matrix_game::object_cannon::CannonState;
+    let Some(obj) = objs.get(id) else {
+        return false;
+    };
+    match obj.core().obj_type {
+        ObjectType::RobotAi => obj.is_live(),
+        ObjectType::Cannon => cannon_ref(objs, id)
+            .map(|c| !matches!(c.state, CannonState::Dip | CannonState::UnderConstruction))
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// Port of `GetMapPos` (MatrixSide.cpp:9365-9376) — the object's
+/// upper-left move-cell coordinate.
+pub fn get_map_pos(objs: &Objects, id: ObjectId) -> Option<(i32, i32)> {
+    let obj = objs.get(id)?;
+    let gs = GameMap::GLOBAL_SCALE_MOVE;
+    match obj.core().obj_type {
+        ObjectType::RobotAi => robot_ref(objs, id).map(|r| (r.map_x, r.map_y)),
+        ObjectType::Cannon => {
+            cannon_ref(objs, id).map(|c| ((c.pos.x / gs) as i32, (c.pos.y / gs) as i32))
+        }
+        ObjectType::Building => {
+            building_ref(objs, id).map(|b| ((b.pos.x / gs) as i32, (b.pos.y / gs) as i32))
+        }
+        _ => {
+            let gc = obj.core().geo_center;
+            Some(((gc.x / gs) as i32, (gc.y / gs) as i32))
+        }
+    }
+}
+
+/// Port of `GetWorldPos` (MatrixSide.cpp:9378-9386).
+pub fn get_world_pos(objs: &Objects, id: ObjectId) -> Option<glam::Vec2> {
+    let obj = objs.get(id)?;
+    match obj.core().obj_type {
+        ObjectType::RobotAi => robot_ref(objs, id).map(|r| glam::Vec2::new(r.pos_x, r.pos_y)),
+        ObjectType::Cannon => cannon_ref(objs, id).map(|c| glam::Vec2::new(c.pos.x, c.pos.y)),
+        ObjectType::Building => building_ref(objs, id).map(|b| glam::Vec2::new(b.pos.x, b.pos.y)),
+        _ => {
+            let gc = obj.core().geo_center;
+            Some(glam::Vec2::new(gc.x, gc.y))
+        }
+    }
+}
+
+/// Port of `PointOfAim` (MatrixSide.cpp:9494-9517).
+pub fn point_of_aim(map: &GameMap, objs: &Objects, id: ObjectId) -> Option<glam::Vec3> {
+    let obj = objs.get(id)?;
+    let mut p = obj.core().geo_center;
+    match obj.core().obj_type {
+        ObjectType::RobotAi | ObjectType::Cannon => p.z += 5.0,
+        ObjectType::Building => p.z = map.get_z(p.x, p.y) + 20.0,
+        _ => {}
+    }
+    Some(p)
+}
+
+/// Port of `CMatrixMapLogic::GetRegion` (MatrixLogic.hpp:186-211):
+/// move-cell zone → zone's region, falling back to the nearest
+/// region by center distance.
+pub fn get_region(map: &GameMap, x: i32, y: i32) -> i32 {
+    let Some(rn_lock) = map.road_network.as_ref() else {
+        return -1;
+    };
+    let rn = rn_lock.lock().unwrap();
+    if let Some(c) = map.move_cell(x, y) {
+        if c.zone >= 0 && (c.zone as usize) < rn.zones.len() {
+            let reg = rn.zones[c.zone as usize].region;
+            if reg >= 0 {
+                return reg;
+            }
+        }
+    }
+    rn.find_nerest_region(&crate::matrix_game::road_network::Point { x, y })
+}
+
+/// Port of `CMatrixMapLogic::IsLogicVisible` (MatrixLogic.cpp:
+/// 3188-3227) — double trace with a building re-test, optionally
+/// repeated from 50 units higher.
+pub fn is_logic_visible(
+    map: &GameMap,
+    objs: &Objects,
+    ofrom: ObjectId,
+    oto: ObjectId,
+    second_z: f32,
+) -> bool {
+    use crate::matrix_game::common::{
+        TRACE_BUILDING, TRACE_CANNON, TRACE_FLYER, TRACE_NONOBJECT, TRACE_OBJECT,
+        TRACE_OBJECTSPHERE, TRACE_ROBOT, TRACE_SKIP_INVISIBLE,
+    };
+    use crate::matrix_game::map_trace::{trace, TraceStop};
+
+    let Some(from_obj) = objs.get(ofrom) else {
+        return false;
+    };
+    let Some(to_obj) = objs.get(oto) else {
+        return false;
+    };
+    let mut vstart = from_obj.core().geo_center;
+    let vend = if matches!(to_obj.core().obj_type, ObjectType::Cannon) {
+        let c = cannon_ref(objs, oto).unwrap();
+        glam::Vec3::new(c.pos.x, c.pos.y, map.get_z(c.pos.x, c.pos.y) + 20.0)
+    } else {
+        to_obj.core().geo_center
+    };
+
+    for pass in 0..2 {
+        if pass == 1 {
+            if second_z == 0.0 {
+                return false;
+            }
+            vstart.z += 50.0;
+        }
+        let (mut res, _) = trace(
+            map,
+            objs,
+            vstart,
+            vend,
+            TRACE_ANYOBJECT | TRACE_NONOBJECT | TRACE_OBJECTSPHERE | TRACE_SKIP_INVISIBLE,
+            Some(ofrom),
+        );
+        if let TraceStop::Object(hit) = res {
+            let hit_is_building = objs
+                .get(hit)
+                .map(|o| matches!(o.core().obj_type, ObjectType::Building))
+                .unwrap_or(false);
+            if hit_is_building {
+                let (res2, _) = trace(
+                    map,
+                    objs,
+                    vstart,
+                    vend,
+                    TRACE_BUILDING | TRACE_SKIP_INVISIBLE,
+                    Some(ofrom),
+                );
+                let blocked = matches!(res2, TraceStop::Object(h2) if objs
+                    .get(h2)
+                    .map(|o| matches!(o.core().obj_type, ObjectType::Building))
+                    .unwrap_or(false));
+                if blocked {
+                    continue; // C++ `break` out of the while(true) → next pass
+                }
+                let (res3, _) = trace(
+                    map,
+                    objs,
+                    vstart,
+                    vend,
+                    (TRACE_OBJECT | TRACE_ROBOT | TRACE_CANNON | TRACE_FLYER)
+                        | TRACE_NONOBJECT
+                        | TRACE_OBJECTSPHERE
+                        | TRACE_SKIP_INVISIBLE,
+                    Some(ofrom),
+                );
+                res = res3;
+            }
+        }
+        if res.object() == Some(oto) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Port of `CMatrixMapLogic::FindNearPlace` (MatrixLogic.cpp:2077-2125)
+/// — BFS over zones from the cell at `mappos` until a zone with
+/// places is found; returns the place nearest to `mappos`, or -1.
+pub fn find_near_place(map: &GameMap, mm: u8, mappos: (i32, i32)) -> i32 {
+    let Some(rn) = map.road_network.as_ref() else {
+        return -1;
+    };
+    let rn = rn.lock().unwrap();
+    find_near_place_impl(&rn, map, mm, mappos)
+}
+
+fn find_near_place_impl(
+    rn: &crate::matrix_game::road_network::RoadNetwork,
+    map: &GameMap,
+    mm: u8,
+    mappos: (i32, i32),
+) -> i32 {
+    let Some(c) = map.move_cell(mappos.0, mappos.1) else {
+        return -1;
+    };
+    let zone = c.zone;
+    if zone < 0 || zone as usize >= rn.zones.len() {
+        return -1;
+    }
+    let d2 = |p: &crate::matrix_game::road_network::Point| -> i64 {
+        let dx = (mappos.0 - p.x) as i64;
+        let dy = (mappos.1 - p.y) as i64;
+        dx * dx + dy * dy
+    };
+    let mut seen = vec![false; rn.zones.len()];
+    let mut index: Vec<i32> = vec![zone];
+    seen[zone as usize] = true;
+    let mut sme = 0usize;
+    while sme < index.len() {
+        let z = &rn.zones[index[sme] as usize];
+        if !z.place.is_empty() {
+            let mut pl = z.place[0];
+            let mut md = d2(&rn.places[pl as usize].pos);
+            for &p in &z.place[1..] {
+                let pd = d2(&rn.places[p as usize].pos);
+                if pd < md {
+                    md = pd;
+                    pl = p;
+                }
+            }
+            return pl;
+        }
+        for (i, &nz) in z.near_zone.iter().enumerate() {
+            if seen[nz as usize] {
+                continue;
+            }
+            if z.near_zone_move[i] & mm != 0 {
+                continue;
+            }
+            index.push(nz);
+            seen[nz as usize] = true;
+        }
+        sme += 1;
+    }
+    -1
+}
+
+/// Port of `CMatrixMapLogic::PlaceList` (MatrixLogic.cpp:2144-2362).
+/// Fills `list` with reachable places around `to` (radius in move
+/// cells) for chassis mask `mm`, starting from `from`. Returns
+/// `(status, outdist)`: status 0 = unreachable, 1 = reachable via
+/// the simple zone wave, 2 = via the cluster fallback. `outdist`
+/// mirrors the C++ `dist*16` wave estimate.
+pub fn place_list(
+    map: &GameMap,
+    mm: u8,
+    from: (i32, i32),
+    to: (i32, i32),
+    radius: i32,
+    farpath: bool,
+    list: &mut Vec<i32>,
+) -> (i32, i32) {
+    list.clear();
+    let Some(rn_lock) = map.road_network.as_ref() else {
+        return (0, 0);
+    };
+    let rn = rn_lock.lock().unwrap();
+    let pcnt = rn.places.len();
+    if pcnt == 0 {
+        return (0, 0);
+    }
+
+    let dist2 = |a: (i32, i32), b: &crate::matrix_game::road_network::Point| -> i64 {
+        let dx = (a.0 - b.x) as i64;
+        let dy = (a.1 - b.y) as i64;
+        dx * dx + dy * dy
+    };
+
+    let fromplace = find_near_place_impl(&rn, map, mm, from);
+    if fromplace < 0 {
+        return (0, 0);
+    }
+    let toplace = find_near_place_impl(&rn, map, mm, to);
+
+    let mut outdist;
+    // `m_ZoneDataZero` equivalent, indexed by place.
+    let mut data = vec![0u32; pcnt];
+    let mut index: Vec<i32> = Vec::new();
+
+    if toplace >= 0 {
+        let tm = rn.places[toplace as usize].move_mask;
+        if (tm & 0x1f) == 0x1f || (tm & mm) == 0 {
+            let mut findend = -1i32;
+            index.push(toplace);
+            data[toplace as usize] = 1;
+            list.push(toplace);
+            if fromplace == toplace {
+                findend = 0;
+            }
+
+            // Collect places within the radius (MatrixLogic.cpp:2172).
+            let mut sme = 0usize;
+            while sme < index.len() {
+                let place = &rn.places[index[sme] as usize];
+                for (i, &np) in place.near.iter().enumerate() {
+                    if data[np as usize] != 0 {
+                        continue;
+                    }
+                    if place.near_move[i] & mm != 0 {
+                        continue;
+                    }
+                    if dist2(to, &rn.places[np as usize].pos) > (radius as i64) * (radius as i64) {
+                        continue;
+                    }
+                    if fromplace == np {
+                        findend = 0;
+                    }
+                    index.push(np);
+                    data[np as usize] = 1;
+                    list.push(np);
+                }
+                sme += 1;
+            }
+
+            // Can we reach the start point? (MatrixLogic.cpp:2194).
+            let mut sme = 0usize;
+            let mut dist = 0i32;
+            let mut next = index.len();
+            let mut reached = findend >= 0;
+            if !reached {
+                'wave: while sme < index.len() {
+                    let place_idx = index[sme] as usize;
+                    let near_cnt = rn.places[place_idx].near.len();
+                    for i in 0..near_cnt {
+                        let np = rn.places[place_idx].near[i];
+                        if data[np as usize] != 0 {
+                            continue;
+                        }
+                        if rn.places[place_idx].near_move[i] & mm != 0 {
+                            continue;
+                        }
+                        if np == fromplace {
+                            reached = true;
+                            break 'wave;
+                        }
+                        if index.len() >= pcnt {
+                            break;
+                        }
+                        index.push(np);
+                        data[np as usize] = 1;
+                    }
+                    sme += 1;
+                    if sme >= next {
+                        next = index.len();
+                        dist += 1;
+                    }
+                }
+            }
+            outdist = dist * 16;
+            for &i in &index {
+                data[i as usize] = 0;
+            }
+            if reached {
+                let fd2 = {
+                    let dx = (from.0 - to.0) as i64;
+                    let dy = (from.1 - to.1) as i64;
+                    dx * dx + dy * dy
+                };
+                if farpath || (dist as i64 * 4) * (dist as i64 * 4) <= fd2 {
+                    return (1, outdist);
+                }
+            }
+        }
+    }
+
+    // Fallback: rect-scan the place grid + clusterize
+    // (MatrixLogic.cpp:2229-2361).
+    list.clear();
+    index.clear();
+
+    let rc = crate::matrix_game::road_network::Rect {
+        left: to.0 - radius - ROBOT_MOVECELLS_PER_SIZE,
+        top: to.1 - radius - ROBOT_MOVECELLS_PER_SIZE,
+        right: to.0 + radius + ROBOT_MOVECELLS_PER_SIZE,
+        bottom: to.1 + radius + ROBOT_MOVECELLS_PER_SIZE,
+    };
+    let plr = rn.correct_rect_pl(&rc);
+    for y in plr.top..plr.bottom {
+        for x in plr.left..plr.right {
+            let plist = rn.pl_list[(x + y * rn.pl_size_x) as usize];
+            for u in 0..plist.cnt {
+                let ip = plist.sme + u;
+                let place = &rn.places[ip as usize];
+                if place.move_mask & mm != 0 {
+                    continue;
+                }
+                if dist2(to, &place.pos) > (radius as i64) * (radius as i64) {
+                    continue;
+                }
+                index.push(ip);
+                data[ip as usize] = (list.len() as u32 + 1) | 0x8000_0000;
+                list.push(ip);
+            }
+        }
+    }
+
+    // Clusterize (MatrixLogic.cpp:2260-2308).
+    let mut findend = -1i64;
+    let oldcnt = index.len();
+    let mut clcnt = 0u32;
+    for u in 0..list.len() {
+        if data[list[u] as usize] & 0x7fff_0000 != 0 {
+            continue;
+        }
+        clcnt += 1;
+
+        let mut sme = index.len();
+        index.push(list[u]);
+        data[list[u] as usize] |= clcnt << 16;
+
+        while sme < index.len() {
+            let place_idx = index[sme] as usize;
+            let near_cnt = rn.places[place_idx].near.len();
+            for i in 0..near_cnt {
+                let np = rn.places[place_idx].near[i] as usize;
+                if data[np] & 0x7fff_0000 != 0 {
+                    continue;
+                }
+                if rn.places[place_idx].near_move[i] & mm != 0 {
+                    continue;
+                }
+                if index.len() >= pcnt * 2 {
+                    break;
+                }
+                if data[np] & 0x8000_0000 != 0 {
+                    index.push(np as i32);
+                    data[np] |= clcnt << 16;
+                    if fromplace == np as i32 {
+                        findend = (data[np] & 0x7fff_0000) as i64;
+                    }
+                } else {
+                    let mut x = data[place_idx];
+                    if x & 0x8000_0000 != 0 {
+                        x = 1;
+                    } else {
+                        x = (x & 0xffff) + 1;
+                    }
+                    if x < 4 {
+                        index.push(np as i32);
+                        data[np] = x | (clcnt << 16);
+                    }
+                }
+            }
+            sme += 1;
+        }
+    }
+    for &i in &index[oldcnt..] {
+        if data[i as usize] & 0x8000_0000 == 0 {
+            data[i as usize] = 0;
+        }
+    }
+    index.truncate(oldcnt);
+
+    // Wave from the clusters back to the start place
+    // (MatrixLogic.cpp:2310-2344).
+    let mut sme = 0usize;
+    let mut dist = 0i32;
+    let mut next = index.len();
+    let mut u: i64 = 0;
+    if findend >= 0 {
+        u = findend;
+    } else {
+        'wave2: while sme < index.len() {
+            if index[sme] == fromplace {
+                u = (data[index[sme] as usize] & 0x7fff_0000) as i64;
+                break;
+            }
+            let place_idx = index[sme] as usize;
+            let near_cnt = rn.places[place_idx].near.len();
+            for i in 0..near_cnt {
+                let np = rn.places[place_idx].near[i] as usize;
+                if data[np] & 0x7fff_0000 != 0 {
+                    continue;
+                }
+                if rn.places[place_idx].near_move[i] & mm != 0 {
+                    continue;
+                }
+                if np as i32 == fromplace {
+                    u = (data[place_idx] & 0x7fff_0000) as i64;
+                    break 'wave2;
+                }
+                if index.len() >= pcnt * 2 {
+                    break;
+                }
+                index.push(np as i32);
+                data[np] = data[place_idx] & 0x7fff_0000;
+            }
+            if u != 0 {
+                break;
+            }
+            sme += 1;
+            if sme >= next {
+                next = index.len();
+                dist += 1;
+            }
+        }
+    }
+    if u == 0 {
+        list.clear();
+        return (0, 0);
+    }
+    outdist = dist * 16;
+
+    // Final list: places of the winning cluster (MatrixLogic.cpp:2348).
+    let winners: Vec<i32> = index[..oldcnt.min(index.len())]
+        .iter()
+        .copied()
+        .filter(|&i| (data[i as usize] & 0x7fff_0000) as i64 == u)
+        .collect();
+    list.clear();
+    list.extend(winners);
+    (2, outdist)
+}
+
+/// Port of `CMatrixMapLogic::PlaceListGrow` (MatrixLogic.cpp:
+/// 2364-2405) — BFS-extend `list` by up to `growcnt` reachable
+/// places. Returns the number added.
+pub fn place_list_grow(map: &GameMap, mm: u8, list: &mut Vec<i32>, growcnt: i32) -> i32 {
+    let Some(rn_lock) = map.road_network.as_ref() else {
+        return 0;
+    };
+    let rn = rn_lock.lock().unwrap();
+    let pcnt = rn.places.len();
+    if pcnt == 0 {
+        return 0;
+    }
+
+    let mut addcnt = 0i32;
+    let mut data = vec![false; pcnt];
+    let mut index: Vec<i32> = Vec::with_capacity(list.len());
+    for &p in list.iter() {
+        index.push(p);
+        data[p as usize] = true;
+    }
+
+    let mut sme = 0usize;
+    'outer: while sme < index.len() {
+        let place_idx = index[sme] as usize;
+        let near_cnt = rn.places[place_idx].near.len();
+        for i in 0..near_cnt {
+            let np = rn.places[place_idx].near[i];
+            if data[np as usize] {
+                continue;
+            }
+            if rn.places[place_idx].near_move[i] & mm != 0 {
+                continue;
+            }
+            index.push(np);
+            data[np as usize] = true;
+            list.push(np);
+            addcnt += 1;
+            if addcnt >= growcnt {
+                break 'outer;
+            }
+        }
+        sme += 1;
+    }
+    addcnt
+}
+
+/// Wrapper over `CMatrixMapLogic::FindPathInZone` (MatrixLogic.cpp:
+/// 1446+, ported in [`crate::matrix_game::road_network`]) returning
+/// the zone path as a Vec. Empty when no road network is loaded or no
+/// path exists.
+pub fn find_path_in_zone(
+    map: &GameMap,
+    nsh: usize,
+    zstart: i32,
+    zend: i32,
+    route: Option<(&crate::matrix_game::road_network::RoadRoute, usize)>,
+) -> Vec<i32> {
+    let Some(rn) = map.road_network.as_ref() else {
+        return Vec::new();
+    };
+    let mut rn = rn.lock().unwrap();
+    let mut path = vec![0i32; rn.zones.len().max(1)];
+    let cnt = rn.find_path_in_zone(nsh, zstart, zend, route, &mut path);
+    path.truncate(cnt);
+    path
+}
+
+/// Bounding rect of a road-network zone as a [`MoveRect`] — the
+/// `m_RN.m_Zone[...].m_Rect` lookups `FindLocalPath` makes at
+/// MatrixLogic.cpp:1247-1250. `None` when the network or zone is
+/// missing (callers fall back to the whole map).
+pub fn zone_move_rect(map: &GameMap, zone: i32) -> Option<MoveRect> {
+    let rn = map.road_network.as_ref()?.lock().unwrap();
+    let z = rn.zones.get(usize::try_from(zone).ok()?)?;
+    Some(MoveRect {
+        left: z.rect.left,
+        top: z.rect.top,
+        right: z.rect.right,
+        bottom: z.rect.bottom,
+    })
 }
 
 /// Compute the total world-space length of a sequence of waypoints,

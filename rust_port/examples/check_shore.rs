@@ -35,7 +35,7 @@ fn main() {
             continue;
         }
         let id = strings.get_as_wstr(*t as usize);
-        let Some(paths) = vector_object::resolve_paths(&id) else {
+        let Some(paths) = matrixgame_rs::matrix_game::object::resolve_paths(&id) else {
             continue;
         };
         let key = paths.vo_path.to_uppercase();

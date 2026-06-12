@@ -269,6 +269,16 @@ pub struct GameMap {
     /// CMatrixMapGroup::{m_minz, m_maxz} (MatrixMapGroup.hpp:103); fed into
     /// the 3D frustum-AABB test for the IsInFrustum fallback branch.
     pub group_bounds: Vec<GroupBounds>,
+    /// `CMatrixMap::m_RN` — the road/zone/region network the robot AI
+    /// navigates, loaded from the ver-27 `roads/Data` blob
+    /// (MatrixMapPrepare.cpp:1599-1610). `None` when the map ships no
+    /// roads block.
+    /// `m_RN` (MatrixMap.hpp:298). `Mutex` (never contended — game
+    /// logic is single-threaded) because the zone-path queries
+    /// (`FindPathInZone`) mutate scratch fields inside the network
+    /// while callers only hold `&GameMap`, and `GameMap` must stay
+    /// `Sync` for the render-side closures.
+    pub road_network: Option<std::sync::Mutex<crate::matrix_game::road_network::RoadNetwork>>,
 }
 
 impl GameMap {
@@ -348,6 +358,7 @@ impl GameMap {
             size_move_y: size_y * 2,
             min_z: z,
             group_bounds: Vec::new(),
+            road_network: None,
         }
     }
 }
@@ -733,6 +744,8 @@ impl GameMap {
         let min_z = points.iter().map(|p| p.z).fold(f32::INFINITY, f32::min);
         let group_bounds = compute_group_bounds(&points, size_x, size_y, group_w, group_h);
 
+        let road_network = wrap_road_network(load_road_network(&stor, size_move_x, size_move_y)?);
+
         let inshore_prespawns = load_inshore_prespawns(&stor, group_w, group_h);
         let total_inshores: usize = inshore_prespawns.iter().map(|v| v.len()).sum();
         log::info!(
@@ -780,6 +793,7 @@ impl GameMap {
             size_move_y,
             min_z,
             group_bounds,
+            road_network,
         })
     }
 
@@ -1299,6 +1313,55 @@ fn load_move_cells(
         }
     }
     (cells, size_move_x, size_move_y)
+}
+
+/// Ports the `roads/Data` load step (MatrixMapPrepare.cpp:1599-1610):
+/// the blob starts with a DWORD format version that must be 27, the
+/// rest is the `CMatrixRoadNetwork::Load` stream; `InitPL` then builds
+/// the place lookup grid over the move-cell grid.
+fn load_road_network(
+    stor: &crate::matrix_lib::base::storage::Storage,
+    size_move_x: usize,
+    size_move_y: usize,
+) -> Result<Option<crate::matrix_game::road_network::RoadNetwork>> {
+    let Some(buf) = stor.get_buf("roads", "Data") else {
+        return Ok(None);
+    };
+    if buf.arrays_count() == 0 {
+        return Ok(None);
+    }
+    let data = buf.get_bytes(0);
+    if data.is_empty() {
+        return Ok(None);
+    }
+    if data.len() < 4 {
+        bail!("roads/Data too small: {} bytes", data.len());
+    }
+    let ver = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+    if ver != 27 {
+        // C++ ERROR_S "Please, recompile map with last editor..."
+        bail!("roads/Data version {} unsupported (expected 27)", ver);
+    }
+
+    let mut rn = crate::matrix_game::road_network::RoadNetwork::new();
+    rn.load(&data[4..]).context("loading road network")?;
+    rn.init_pl(size_move_x as i32, size_move_y as i32);
+    log::info!(
+        "map: road network: {} zones, {} crotches, {} roads, {} places, {} regions",
+        rn.zones.len(),
+        rn.crotches.len(),
+        rn.roads.len(),
+        rn.places.len(),
+        rn.regions.len(),
+    );
+    Ok(Some(rn))
+}
+
+/// Convenience wrapper matching the `Option<Mutex<...>>` field shape.
+fn wrap_road_network(
+    rn: Option<crate::matrix_game::road_network::RoadNetwork>,
+) -> Option<std::sync::Mutex<crate::matrix_game::road_network::RoadNetwork>> {
+    rn.map(std::sync::Mutex::new)
 }
 
 fn compute_units(points: &[CompilePoint], size_x: usize, size_y: usize) -> Vec<MapUnit> {
@@ -4202,6 +4265,19 @@ pub fn side_color_rgb(side: i32) -> [f32; 3] {
         c[1] as f32 / 255.0,
         c[2] as f32 / 255.0,
     ]
+}
+
+/// `GetSideColor` as a packed ARGB dword (alpha 0) — the form the
+/// capture paint (`m_TrueColor.m_Color`) consumes.
+pub fn side_color_u32(side: i32) -> u32 {
+    let c: [u8; 3] = match side {
+        1 => [227, 158, 31],
+        2 => [142, 0, 0],
+        3 => [0, 0, 150],
+        4 => [0, 150, 0],
+        _ => [128, 128, 128],
+    };
+    ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | c[2] as u32
 }
 
 /// Port of `CMatrixMap::GetSideColorMM` (MatrixMap.cpp:1015,

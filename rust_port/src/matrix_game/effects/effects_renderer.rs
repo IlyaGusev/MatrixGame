@@ -29,13 +29,18 @@ pub const TEXTURE_PATH_SPLASH: &str = "Matrix/Textures/Effects/splash";
 pub const TEXTURE_PATH_BIGBOOM: &str = "Matrix/Textures/Effects/bigboom";
 pub const TEXTURE_PATH_GUN_BULLETS1: &str = "Matrix/Textures/Effects/gun_bullets1";
 pub const TEXTURE_PATH_GUN_BULLETS2: &str = "Matrix/Textures/Effects/gun_bullets2";
+/// `TEXTURE_PATH_KEELWATER` (StringConstants.hpp:137).
+pub const TEXTURE_PATH_KEELWATER: &str = "Matrix/Textures/Billboard/keelwater";
 
-const PATH_TEXTURES: [&str; 5] = [
+const PATH_TEXTURES: [&str; 8] = [
     TEXTURE_PATH_GUN_FIRE,
     TEXTURE_PATH_SPLASH,
     TEXTURE_PATH_BIGBOOM,
     TEXTURE_PATH_GUN_BULLETS1,
     TEXTURE_PATH_GUN_BULLETS2,
+    TEXTURE_PATH_KEELWATER,
+    crate::matrix_game::effects::zahvat::TEXTURE_PATH_ZAHVAT,
+    crate::matrix_game::effects::dust::TEXTURE_PATH_DUST,
 ];
 
 /// One BBT table entry — atlas rect in the sortable texture (alpha

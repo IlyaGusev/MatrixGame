@@ -12,8 +12,9 @@
 // while the definitive home is `logic.rs`. The re-exports document the
 // physical location move without churning every call site.
 pub use crate::matrix_game::logic::{
-    find_path, footprint_passable, optimize_path, path_total_length, waypoint_to_world, Blocker,
-    MovePath, MovePt, ROBOT_FOOTPRINT_HALF,
+    find_local_path, footprint_passable, optimize_move_path, path_total_length,
+    waypoint_to_world, Blocker, LocalPathResult, MovePath, MovePt, MoveRect,
+    ROBOT_FOOTPRINT_HALF,
 };
 
 /// Object-scan branch of `CMatrixMap::Trace` (MatrixMapTrace.cpp —

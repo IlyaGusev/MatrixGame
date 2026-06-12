@@ -73,12 +73,17 @@ Form, Helper, ShadowProj, ShadowStencil. (Math3D partial — CTrajectory.)
 | matrix_game/robot.rs          | MatrixRobot.cpp (CMatrixRobotAI — spawn flow + move-out + MoveTo + GetLost + SBotWeapon fire control / heat / Damage / ablaze-shorted DOT) |
 | matrix_game/water.rs          | MatrixWater.cpp + BuildWater in MatrixMapGroup.cpp + WaterAlpha_t3 in MatrixRenderPipeline.cpp — will split in Stage 2 part 2 |
 
-Not yet ported: MatrixConfig, MatrixCursor, MatrixDebugInfo,
-MatrixFlyer, MatrixInstantDraw, MatrixLoadProgress,
-MatrixMapTexture, MatrixMultiSelection,
-MatrixObjectCannon, MatrixSampleStateManager, MatrixShadowManager,
-MatrixSkinManager, MatrixSoundManager, MatrixTransition,
-MatrixVisiCalc, DevConsole, StringConstants.
+N/A-by-design (D3D9 infrastructure replaced by the wgpu glue):
+MatrixInstantDraw, MatrixMapTexture, MatrixSampleStateManager,
+MatrixSkinManager (vector_object.rs handles materials), MatrixVisiCalc
+(frustum culling lives in the renderers), MatrixCursor (only
+CURSOR_ARROW is ever selected — the OS cursor stands in),
+MatrixLoadProgress / MatrixTransition (index.html spinner + CSS fade),
+MatrixDebugInfo + DevConsole (dev/cheat tooling). MatrixSoundManager:
+the standalone original is silent (every CSound::Play is gated on the
+NULL g_RangersInterface host) — the dispatch surfaces are ported
+(`MapLogic::sound_queue`, interface/sound.rs) so a host backend can
+attach like the original DLL mode. StringConstants: inlined per use.
 
 ## matrix_game/effects/ (MatrixGame/src/Effects/)
 
@@ -98,11 +103,15 @@ MatrixVisiCalc, DevConsole, StringConstants.
 | matrix_game/effects/moving_object.rs    | MatrixEffectMovingObject.cpp (gun/cannon/missile/bomb takts + trails/tracers/meshes) |
 | matrix_game/effects/smoke_and_fire.rs   | MatrixEffectSmokeAndFire.cpp (smoke + fire puff emitters) |
 | matrix_game/effects/weapon.rs           | MatrixEffectWeapon.{cpp,hpp} (EWeapon + CMatrixEffectWeapon + WeaponHit + CLaser/CVolcano/repair-beam visuals) |
+| matrix_game/effects/zahvat.rs           | MatrixEffectZahvat.{cpp,hpp} (capture-progress dot ring)   |
+| matrix_game/effects/dust.rs             | MatrixEffectDust.{cpp,hpp} (drifting dust puffs)           |
+| matrix_game/effects/elevator_field.rs   | MatrixEffectElevatorField.{cpp,hpp} (flyer tractor-beam helices) |
+| matrix_game/effects/move_to.rs          | MatrixEffectMoveTo.{cpp,hpp} (move-order ping)             |
 
-Not yet ported: MatrixEffect (base class itself — its list/limits are
-the GameEffect enum + effects_takt), Dust, ElevatorField, Path,
-Zahvat. (Shleif's AddSmoke/AddFire map to standalone Smoke/Fire
-spawns; the repair beam visuals live on the weapon.)
+Done-by-design: MatrixEffect base (GameEffect enum + effects_takt +
+enforce_limits port the list/limits), Shleif (AddSmoke/AddFire map to
+standalone Smoke/Fire spawns at the same call sites), Path (no spawn
+sites exist in the original — dead code).
 
 ## matrix_game/interface/ (MatrixGame/src/Interface/)
 
@@ -128,7 +137,9 @@ Not yet ported: CAnimation → animation.rs, MatrixHint → hint.rs.
 |-----------------------------------------|---------------------------------|
 | matrix_game/logic/ai_group.rs           | MatrixAIGroup.cpp (stub)        |
 
-Not yet ported: MatrixEnvironment, MatrixLogicSlot, MatrixRoadNetwork,
+| matrix_game/logic/environment.rs        | Logic/MatrixEnvironment.{cpp,h} (CInfo/CEnemy robot sensing) |
+
+Out of scope (enemy AI by project decision): MatrixLogicSlot,
 MatrixRule, MatrixState, MatrixTactics.
 
 ## Top-level files

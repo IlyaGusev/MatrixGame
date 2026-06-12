@@ -36,6 +36,9 @@ struct AppState {
     /// marquee-drag; `None` → button released. `CMultiSelection::Begin`
     /// in the C++ stores the same state (MatrixMultiSelection.cpp).
     lmb_anchor: Option<[f32; 2]>,
+    /// Previous click (time_ms, x, y) for double-click detection —
+    /// drives `OnLButtonDouble` (MatrixFormGame.cpp WM_LBUTTONDBLCLK).
+    last_click: Option<(i64, f32, f32)>,
     /// Whether the current LMB press was consumed by UI / minimap
     /// (if so, release mustn't issue a world click or marquee).
     lmb_consumed_by_ui: bool,
@@ -191,6 +194,7 @@ impl ApplicationHandler for App {
             log::info!("world: spawned {} buildings", building_ids.len());
             let robot_ids = game.spawn_robots(&map);
             log::info!("world: spawned {} initial robots", robot_ids.len());
+            game.ensure_sides_from_objects();
             let (_ids, stats) = game.spawn_map_objects(&map, &stor);
             log::info!(
                 "world: spawned {} map objects (static={}, burn={}, break={}, anim={}, sens={}, spawner={}, terron={}, portret={}, special={})",
@@ -297,6 +301,7 @@ impl ApplicationHandler for App {
                 minimap_dragging: false,
                 shift_down: false,
                 lmb_anchor: None,
+                last_click: None,
                 lmb_consumed_by_ui: false,
                 marquee_last_rect: None,
                 selection_ring,
@@ -396,6 +401,7 @@ impl ApplicationHandler for App {
                 log::info!("world: spawned {} buildings", building_ids.len());
                 let robot_ids = game.spawn_robots(&map);
                 log::info!("world: spawned {} initial robots", robot_ids.len());
+                game.ensure_sides_from_objects();
                 let (_ids, stats) = game.spawn_map_objects(&map, &stor);
                 log::info!(
                     "world: spawned {} map objects (static={}, burn={}, break={}, anim={}, sens={}, spawner={}, terron={}, portret={}, special={})",
@@ -490,6 +496,7 @@ impl ApplicationHandler for App {
                     minimap_dragging: false,
                     shift_down: false,
                     lmb_anchor: None,
+                    last_click: None,
                     lmb_consumed_by_ui: false,
                     marquee_last_rect: None,
                     selection_ring,
@@ -590,34 +597,33 @@ impl ApplicationHandler for App {
                     {
                         log::debug!("order: cancelled by right-click");
                     } else if !ui_consumed_rmb
+                        && btn_state == ElementState::Pressed
+                        && !state.game.player_side.selected.is_empty()
+                        && state.minimap.click_to_world(cx, cy).is_some()
+                    {
+                        // Right-click on the minimap → move order at the
+                        // minimap world position + red ping
+                        // (MatrixSide.cpp:821-830).
+                        if let Some(tgt) = state.minimap.click_to_world(cx, cy) {
+                            state.game.order_move_to_world(
+                                &state.map,
+                                glam::Vec2::new(tgt[0], tgt[1]),
+                            );
+                            state
+                                .minimap
+                                .add_event(tgt[0], tgt[1], 0xffff0000, 0xffff0000);
+                        }
+                    } else if !ui_consumed_rmb
                         && !over_ui
                         && btn_state == ElementState::Pressed
                         && !state.game.player_side.selected.is_empty()
                     {
-                        // Object under cursor → attack / repair order;
-                        // bare terrain → move order (the C++
-                        // OnRButtonDown branches the same way).
-                        if let Some(tgt) =
-                            state.game.order_fire_at_screen(&state.camera, cx, cy, w, h)
-                        {
-                            log::debug!("fire order: issued at {:?}", tgt);
-                        } else {
-                            let slots = state.game.order_move_to_at(
-                                &state.camera,
-                                cx,
-                                cy,
-                                w,
-                                h,
-                                &state.map,
-                            );
-                            if !slots.is_empty() {
-                                log::debug!("move order: issued to {} robot(s)", slots.len());
-                                for (wx, wy) in slots {
-                                    let wz = state.map.get_z(wx, wy);
-                                    state.move_to.spawn(glam::Vec3::new(wx, wy, wz));
-                                }
-                            }
-                        }
+                        // Full OnRButtonDown dispatch (MatrixSide.cpp:
+                        // 799-863): enemy building → capture, enemy
+                        // unit → attack, else move.
+                        state
+                            .game
+                            .on_right_click(&state.camera, cx, cy, w, h, &state.map);
                     }
                 } else if button == MouseButton::Left {
                     use crate::matrix_game::minimap::MinimapClick;
@@ -717,6 +723,31 @@ impl ApplicationHandler for App {
                                     let dy = (cy - ay).abs();
                                     const DRAG_PX: f32 = 4.0;
                                     if dx <= DRAG_PX && dy <= DRAG_PX {
+                                        // Double-click → select all own
+                                        // robots in radius (OnLButtonDouble).
+                                        let now_ms = state.game.elapsed_ms;
+                                        let dbl = state
+                                            .last_click
+                                            .map(|(t, px, py)| {
+                                                now_ms - t < 350
+                                                    && (px - cx).abs() <= DRAG_PX
+                                                    && (py - cy).abs() <= DRAG_PX
+                                            })
+                                            .unwrap_or(false);
+                                        state.last_click = Some((now_ms, cx, cy));
+                                        if dbl
+                                            && state.game.on_left_double_click(
+                                                &state.camera,
+                                                cx,
+                                                cy,
+                                                w,
+                                                h,
+                                            )
+                                        {
+                                            state.lmb_consumed_by_ui = false;
+                                            state.lmb_anchor = None;
+                                            return;
+                                        }
                                         let hit = state.game.click_at_screen(
                                             &state.camera,
                                             cx,
@@ -736,6 +767,10 @@ impl ApplicationHandler for App {
                                                 state.game.player_side.selected.len(),
                                             ),
                                         }
+                                        // Mirror into the CMatrixGroup
+                                        // machinery the PGOrder layer
+                                        // dispatches on.
+                                        state.game.sync_group_from_selection();
                                     } else {
                                         let rmin = [ax.min(cx), ay.min(cy)];
                                         let rmax = [ax.max(cx), ay.max(cy)];
@@ -749,6 +784,7 @@ impl ApplicationHandler for App {
                                             state.shift_down,
                                         );
                                         log::debug!("marquee: selected {} robot(s)", n,);
+                                        state.game.sync_group_from_selection();
                                         // Start the 50ms DIP fade — port
                                         // of `CMultiSelection::End` at
                                         // MatrixMultiSelection.cpp:278-279.
@@ -979,6 +1015,17 @@ impl ApplicationHandler for App {
                     );
                 }
 
+                // Drain the move-order pings PGShowPlace queued — the
+                // CreateMoveto / DeleteAllMoveto pair (MatrixSide.cpp:
+                // 8542-8562).
+                if state.game.moveto_clear_pending {
+                    state.game.moveto_clear_pending = false;
+                    state.move_to.clear();
+                }
+                for p in std::mem::take(&mut state.game.moveto_pings) {
+                    state.move_to.spawn(p);
+                }
+
                 // Per-frame move-order ping animation advance — port
                 // of `CMatrixEffectMoveto::Takt` (MatrixEffectMoveTo.cpp:93).
                 if state.move_to.is_active() {
@@ -1187,6 +1234,28 @@ impl ApplicationHandler for App {
                                                 for u in &c.dip_units {
                                                     u.smoke.draw(&mut state.bb_queue);
                                                 }
+                                            }
+                                        }
+                                        crate::matrix_game::map_static::ObjectType::Building => {
+                                            let b: &crate::matrix_game::object_building::Building = unsafe {
+                                                &*(o as *const dyn crate::matrix_game::map_static::MapStatic
+                                                    as *const crate::matrix_game::object_building::Building)
+                                            };
+                                            // Capture-progress ring
+                                            // (CMatrixEffectZahvat::Draw).
+                                            if let Some(z) = b.zahvat.as_ref() {
+                                                z.draw(&mut state.bb_queue);
+                                            }
+                                        }
+                                        crate::matrix_game::map_static::ObjectType::Flyer => {
+                                            let f: &crate::matrix_game::flyer::Flyer = unsafe {
+                                                &*(o as *const dyn crate::matrix_game::map_static::MapStatic
+                                                    as *const crate::matrix_game::flyer::Flyer)
+                                            };
+                                            // Tractor-beam spirals
+                                            // (CMatrixEffectElevatorField::Draw).
+                                            if let Some(e) = f.carry.elevator.as_ref() {
+                                                e.draw(&mut state.bb_queue);
                                             }
                                         }
                                         _ => {}
@@ -1787,8 +1856,57 @@ fn dispatch_ui_click(state: &mut AppState, click: &crate::matrix_game::interface
         }
         "ost" => {
             state.iface_list.pre_order = None;
-            state.game.order_stop();
+            state.game.order_stop(&state.map);
             log::debug!("order: stop issued");
+            return;
+        }
+        "oca" => {
+            state.iface_list.pre_order =
+                Some(crate::matrix_game::interface::iface_list::PreOrder::Capture);
+            log::debug!("order: capture armed — click an enemy building");
+            return;
+        }
+        "opa" => {
+            state.iface_list.pre_order =
+                Some(crate::matrix_game::interface::iface_list::PreOrder::Patrol);
+            log::debug!("order: patrol armed — click a destination");
+            return;
+        }
+        "obomb" => {
+            state.iface_list.pre_order =
+                Some(crate::matrix_game::interface::iface_list::PreOrder::Bomb);
+            log::debug!("order: bomb armed — click a target");
+            return;
+        }
+        "orep" => {
+            state.iface_list.pre_order =
+                Some(crate::matrix_game::interface::iface_list::PreOrder::Repair);
+            log::debug!("order: repair armed — click a damaged friendly");
+            return;
+        }
+        // Auto-order toggles act immediately (CInterface.cpp:3480-3499).
+        "oacapn" | "oacapf" => {
+            let no = state.game.sel_group_to_logic_group();
+            state.game.pg_order_auto_capture(&state.map, no);
+            return;
+        }
+        "oafrn" | "oafrf" | "oafron" | "oafrof" => {
+            let no = state.game.sel_group_to_logic_group();
+            state.game.pg_order_auto_attack(&state.map, no);
+            return;
+        }
+        "oafcn" | "oafcf" => {
+            let no = state.game.sel_group_to_logic_group();
+            state.game.pg_order_auto_defence(&state.map, no);
+            return;
+        }
+        // IF_BUILD_REPAIR — the base "call maintenance" button
+        // (CInterface.cpp:3501-3508).
+        "bure" => {
+            if let Some(b) = state.game.active_object() {
+                state.game.building_maintenance(&state.map, b);
+                log::debug!("maintenance: requested");
+            }
             return;
         }
         _ => {}
@@ -1867,7 +1985,6 @@ fn dispatch_ui_click(state: &mut AppState, click: &crate::matrix_game::interface
 /// fire is the player's prerogative, like `PGOrderAttack(.., pObject)`),
 /// otherwise the bare terrain point.
 fn execute_pre_order(state: &mut AppState, cx: f32, cy: f32, w: f32, h: f32) {
-    use crate::matrix_game::common::TRACE_ANYOBJECT;
     use crate::matrix_game::interface::iface_list::PreOrder;
 
     let Some(po) = state.iface_list.pre_order.take() else {
@@ -1875,36 +1992,41 @@ fn execute_pre_order(state: &mut AppState, cx: f32, cy: f32, w: f32, h: f32) {
     };
     match po {
         PreOrder::Move => {
-            let slots = state
+            state
                 .game
                 .order_move_to_at(&state.camera, cx, cy, w, h, &state.map);
-            log::debug!("order: move issued to {} robot(s)", slots.len());
-            for (wx, wy) in slots {
-                let wz = state.map.get_z(wx, wy);
-                state.move_to.spawn(glam::Vec3::new(wx, wy, wz));
-            }
         }
         PreOrder::Fire => {
-            let (origin, dir) = state.camera.screen_to_world_ray(cx, cy, w, h);
-            let target_pos = state
+            let hit = state
                 .game
-                .objects
-                .pick_object(origin, dir, TRACE_ANYOBJECT, None)
-                .and_then(|(id, _t)| state.game.objects.get(id).map(|o| o.core().geo_center))
-                .or_else(|| {
-                    crate::matrix_game::logic::screen_to_terrain_xy(
-                        &state.camera,
-                        &state.map,
-                        cx,
-                        cy,
-                        w,
-                        h,
-                    )
-                    .map(|(wx, wy)| glam::Vec3::new(wx, wy, state.map.get_z(wx, wy)))
-                });
-            if let Some(pos) = target_pos {
-                let n = state.game.order_fire_at_point(pos);
-                log::debug!("order: attack at {:?} issued to {} robot(s)", pos, n);
+                .order_fire_at_screen(&state.camera, cx, cy, w, h, &state.map);
+            log::debug!("order: attack dispatched (target: {:?})", hit);
+        }
+        PreOrder::Capture => {
+            if !state
+                .game
+                .order_capture_at_screen(&state.camera, cx, cy, w, h, &state.map)
+            {
+                // Invalid target keeps the order armed (MatrixSide.cpp:715).
+                state.iface_list.pre_order = Some(PreOrder::Capture);
+            }
+        }
+        PreOrder::Patrol => {
+            state
+                .game
+                .order_patrol_at_screen(&state.camera, cx, cy, w, h, &state.map);
+        }
+        PreOrder::Bomb => {
+            state
+                .game
+                .order_bomb_at_screen(&state.camera, cx, cy, w, h, &state.map);
+        }
+        PreOrder::Repair => {
+            if !state
+                .game
+                .order_repair_at_screen(&state.camera, cx, cy, w, h, &state.map)
+            {
+                state.iface_list.pre_order = Some(PreOrder::Repair);
             }
         }
     }
@@ -2123,12 +2245,34 @@ fn refresh_hint_replacements(state: &mut AppState) {
                 }
             }
         }
-        _ => {
-            // Other hinted elements (call-from-hell, combat-mode, …)
-            // require plumbing we haven't ported yet. The base
-            // template still renders — unresolved `[keys]` fall
-            // through as empty strings per `HintReplacer::get` → `None`.
+        // IF_CALL_FROM_HELL — maintenance availability + countdown
+        // (CInterface.cpp:4520-4539).
+        "callhell" | "bure" => {
+            let repl = &mut state.iface_list.hint_replacer;
+            repl.set("_ch_cant", String::new());
+            repl.set("_ch_can", String::new());
+            repl.set("_ch_time_min", String::new());
+            repl.set("_ch_time_sec", String::new());
+            if state.game.maintenance_disabled() {
+                state
+                    .iface_list
+                    .hint_replacer
+                    .set("_ch_cant", "1".to_string());
+            } else if state.game.maintenance_time > 0 {
+                let ms = state.game.maintenance_time;
+                let minutes = ms / 60000;
+                let seconds = ms / 1000 - minutes * 60;
+                let repl = &mut state.iface_list.hint_replacer;
+                repl.set("_ch_time_min", minutes.max(0).to_string());
+                repl.set("_ch_time_sec", seconds.max(0).to_string());
+            } else {
+                state
+                    .iface_list
+                    .hint_replacer
+                    .set("_ch_can", "1".to_string());
+            }
         }
+        _ => {}
     }
 }
 

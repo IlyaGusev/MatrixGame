@@ -279,6 +279,12 @@ impl MoveToRenderer {
         });
     }
 
+    /// Port of `CMatrixEffect::DeleteAllMoveto` (the PGShowPlace
+    /// preamble at MatrixSide.cpp:8542).
+    pub fn clear(&mut self) {
+        self.effects.clear();
+    }
+
     /// Per-frame takt — port of `CMatrixEffectMoveto::Takt`
     /// (MatrixEffectMoveTo.cpp:93-113). Decrement TTL, drop expired.
     pub fn takt(&mut self, step_ms: f32) {

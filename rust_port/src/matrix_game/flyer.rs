@@ -1,0 +1,322 @@
+//! Port of `MatrixFlyer.{cpp,hpp}` — `CMatrixFlyer`, scoped to the
+//! robot-delivery role (`FO_GIVE_BOT`): maintenance supply drops fly
+//! in carrying a robot, release it mid-pass and leave the map.
+//!
+//! Manual/arcade piloting (FLYER_MANUAL, LogicTaktArcade, the strategy
+//! trajectory mode and the render-to-texture UI clones) is out of
+//! scope by project decision — those paths are dead or commented out
+//! in the shipped C++ too (MatrixFlyer.cpp:1344-1350).
+
+use crate::matrix_game::logic::Rnd;
+use crate::matrix_game::map::GameMap;
+use crate::matrix_game::map_static::{HpBar, MapStatic, ObjectCore, ObjectId, ObjectType, Objects};
+use crate::matrix_lib::three_g::math3d::Trajectory;
+use glam::{Vec2, Vec3};
+
+/// `FLYER_ALT_EMPTY` / `FLYER_ALT_MIN` (MatrixFlyer.hpp).
+pub const FLYER_ALT_EMPTY: f32 = 70.0;
+pub const FLYER_ALT_MIN: f32 = 20.0;
+/// `ENGINE_ANGLE_STAY` / `ENGINE_ANGLE_MOVE`, `YAW_ANGLE_STAY` /
+/// `YAW_ANGLE_MOVE` (MatrixFlyer.hpp, GRAD2RAD already applied).
+pub const ENGINE_ANGLE_STAY: f32 = std::f32::consts::FRAC_PI_2;
+pub const ENGINE_ANGLE_MOVE: f32 = 0.0;
+pub const YAW_ANGLE_STAY: f32 = 0.0;
+pub const YAW_ANGLE_MOVE: f32 = -20.0 * std::f32::consts::PI / 180.0;
+/// Default rotor spin rate (`DAngle`, MatrixFlyer.cpp:546).
+pub const VINT_SPEED: f32 = -0.025;
+
+/// `SCarryData` (MatrixFlyer.hpp) — the dangling-robot spring state.
+#[derive(Debug, Clone)]
+pub struct CarryData {
+    pub robot_forward: Vec2,
+    pub robot_up: Vec3,
+    pub robot_up_back: Vec3,
+    pub robot_angle: f32,
+    pub robot_mass_factor: f32,
+    pub elevator: Option<crate::matrix_game::effects::elevator_field::ElevatorField>,
+}
+
+impl Default for CarryData {
+    fn default() -> Self {
+        Self {
+            robot_forward: Vec2::new(0.0, -1.0),
+            robot_up: Vec3::Z,
+            robot_up_back: Vec3::ZERO,
+            robot_angle: 0.0,
+            robot_mass_factor: 0.0,
+            elevator: None,
+        }
+    }
+}
+
+pub struct Flyer {
+    core: ObjectCore,
+    rchange: u32,
+    object_state: u32,
+
+    pub self_id: Option<ObjectId>,
+    pub side: i32,
+    /// `m_FlyerKind` (EFlyerKind 0-3).
+    pub kind: i32,
+    pub pos: Vec3,
+    /// `m_AngleZ` heading (radians; 0 = +Y like the robots).
+    pub angle: f32,
+    pub yaw: f32,
+    pub pitch: f32,
+    pub engine_angle: f32,
+    pub target_engine_angle: f32,
+    pub target_yaw: f32,
+    pub target_pitch: f32,
+    pub move_speed: f32,
+    /// Rotor spin accumulator (m_Units[vint].m_Vint.m_Angle).
+    pub vint_angle: f32,
+
+    pub hit_point: f32,
+    pub hit_point_max: f32,
+
+    trajectory: Option<Trajectory>,
+    trajectory_pos: f32,
+    trajectory_len_rev: f32,
+    trajectory_target_angle: f32,
+
+    pub carrying: Option<ObjectId>,
+    pub carry: CarryData,
+}
+
+impl Flyer {
+    /// The FO_GIVE_BOT slice of `ApplyOrder` (MatrixFlyer.cpp:
+    /// 1154-1262) minus the robot creation (the caller owns that —
+    /// arena spawning can't happen from inside a constructor here).
+    /// `target` is the world-space drop point, `ang` the approach
+    /// heading, `dist`/`height`/`land_height` the GiveBot config
+    /// values (Distance already FSRND(150)-jittered by the caller).
+    pub fn new_give_bot(
+        map: &GameMap,
+        target: Vec2,
+        side: i32,
+        ang: f32,
+        dist: f32,
+        height: f32,
+        land_height: f32,
+        kind: i32,
+        hitpoint: f32,
+    ) -> Self {
+        let z = map.get_z(target.x, target.y);
+        let p = Vec3::new(target.x, target.y, z + land_height);
+        let dir = Vec3::new(ang.sin(), ang.cos(), 0.0);
+
+        let pts = [
+            p - dir * dist + Vec3::new(0.0, 0.0, height),
+            p - dir * 100.0,
+            p + dir * 100.0,
+            p + dir * dist * 2.0 + Vec3::new(0.0, 0.0, height * 3.0),
+        ];
+        let trajectory = Trajectory::new_approx(&pts);
+        let len = trajectory.calc_length().max(1.0);
+
+        let mut core = ObjectCore {
+            obj_type: ObjectType::Flyer,
+            ..Default::default()
+        };
+        core.geo_center = pts[0];
+        core.radius = 15.0; // FLYER_RADIUS
+
+        Self {
+            core,
+            rchange: 0,
+            object_state: 0,
+            self_id: None,
+            side,
+            kind,
+            pos: pts[0],
+            angle: 0.0,
+            yaw: 0.0,
+            pitch: 0.0,
+            engine_angle: ENGINE_ANGLE_STAY,
+            target_engine_angle: ENGINE_ANGLE_STAY,
+            target_yaw: YAW_ANGLE_STAY,
+            target_pitch: 0.0,
+            move_speed: 0.0,
+            vint_angle: 0.0,
+            hit_point: hitpoint,
+            hit_point_max: hitpoint,
+            trajectory: Some(trajectory),
+            trajectory_pos: 0.0,
+            trajectory_len_rev: 1.0 / len,
+            trajectory_target_angle: ang,
+            carrying: None,
+            carry: CarryData::default(),
+        }
+    }
+
+    pub fn carrying_robot(&self) -> Option<ObjectId> {
+        self.carrying
+    }
+
+    /// `ProceedTrajectory` (MatrixFlyer.cpp:1640-1691) — the live part
+    /// before the unconditional `return`.
+    fn proceed_trajectory(&mut self, ms: f32) {
+        let Some(tr) = self.trajectory.as_ref() else {
+            return;
+        };
+        let ptp = self.trajectory_pos;
+        self.trajectory_pos += ms * self.trajectory_len_rev * 0.09;
+
+        let p = tr.calc_point(self.trajectory_pos);
+        let fdir = p - self.pos;
+        let dd = fdir.length();
+        self.move_speed = dd / ms.max(0.001);
+
+        let mut a = (-fdir.x).atan2(fdir.y);
+        let aa = angle_dist(a, self.trajectory_target_angle);
+        a += kscale(self.trajectory_pos, 0.8, 0.99) * aa;
+
+        let da = angle_dist(self.angle, a);
+        if da.abs() < 30.0f32.to_radians() {
+            self.pos = p;
+        } else {
+            self.trajectory_pos = ptp;
+        }
+
+        let mul = (1.0 - 0.997f64.powf(ms as f64)) as f32 * da;
+        self.angle += mul;
+
+        self.target_engine_angle = lerp(ENGINE_ANGLE_STAY, ENGINE_ANGLE_MOVE - self.yaw, 0.5);
+        self.target_yaw = lerp(YAW_ANGLE_STAY, YAW_ANGLE_MOVE, 0.5);
+        self.target_pitch = 0.0;
+
+        if self.trajectory_pos > 0.98 {
+            self.trajectory = None; // CancelTrajectory
+        }
+    }
+
+    /// `CalcFlyerZInPoint` (MatrixFlyer.cpp:249-262).
+    fn calc_z_in_point(&self, map: &GameMap, x: f32, y: f32) -> f32 {
+        let addz = map.get_z(x, y);
+        if addz > FLYER_ALT_EMPTY {
+            addz + FLYER_ALT_MIN
+        } else {
+            FLYER_ALT_EMPTY + FLYER_ALT_MIN
+        }
+    }
+}
+
+/// `AngleDist` — shortest signed angular distance.
+pub fn angle_dist(from: f32, to: f32) -> f32 {
+    let mut d = (to - from) % std::f32::consts::TAU;
+    if d > std::f32::consts::PI {
+        d -= std::f32::consts::TAU;
+    } else if d < -std::f32::consts::PI {
+        d += std::f32::consts::TAU;
+    }
+    d
+}
+
+/// `KSCALE(x, a, b)` — clamped 0..1 ramp of x across [a, b].
+fn kscale(x: f32, a: f32, b: f32) -> f32 {
+    ((x - a) / (b - a)).clamp(0.0, 1.0)
+}
+
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t
+}
+
+impl MapStatic for Flyer {
+    fn core(&self) -> &ObjectCore {
+        &self.core
+    }
+    fn core_mut(&mut self) -> &mut ObjectCore {
+        &mut self.core
+    }
+    fn rchange(&self) -> u32 {
+        self.rchange
+    }
+    fn rchange_set(&mut self, bits: u32) {
+        self.rchange |= bits;
+    }
+    fn rchange_clear(&mut self, bits: u32) {
+        self.rchange &= !bits;
+    }
+    fn object_state(&self) -> u32 {
+        self.object_state
+    }
+    fn object_state_set(&mut self, bits: u32) {
+        self.object_state |= bits;
+    }
+    fn object_state_clear(&mut self, bits: u32) {
+        self.object_state &= !bits;
+    }
+    fn ablaze_ttl(&self) -> i32 {
+        0
+    }
+    fn set_ablaze_ttl(&mut self, _ttl: i32) {}
+    fn shorted_ttl(&self) -> i32 {
+        0
+    }
+    fn set_shorted_ttl(&mut self, _ttl: i32) {}
+    fn r_need(&mut self, _need: u32) {}
+    fn side(&self) -> i32 {
+        self.side
+    }
+    fn hitpoint_bar(&self, _map: &GameMap) -> Option<HpBar> {
+        None
+    }
+
+    fn takt(&mut self, cms: i32, rng: &mut Rnd, _objs: &mut Objects) {
+        // Rotor spin (m_Vint.m_AngleSpeedMax) — pure visual.
+        self.vint_angle += VINT_SPEED * cms as f32;
+        // Tractor-beam tracers advance on the frame clock
+        // (CMatrixEffectElevatorField::Takt).
+        if let Some(e) = self.carry.elevator.as_mut() {
+            e.takt(cms as f32, rng);
+        }
+    }
+
+    /// `LogicTakt` (MatrixFlyer.cpp:1291-1382), delivery slice.
+    fn logic_takt(&mut self, cms: i32, _rng: &mut Rnd, objs: &mut Objects) {
+        let Some(map) = crate::matrix_game::map::current_map() else {
+            return;
+        };
+        let ms = cms as f32;
+        let mul = (1.0 - 0.998f64.powf(ms as f64)) as f32;
+
+        // LogicTaktOrder (1265-1289).
+        self.proceed_trajectory(ms);
+        if self.trajectory.is_none() {
+            // Done — leave the map. Drop the robot first if the pass
+            // never crossed 0.5 (degenerate short trajectory).
+            if let Some(rid) = self.carrying.take() {
+                if let Some(r) = crate::matrix_game::logic::robot_mut(objs, rid) {
+                    r.carry_release();
+                }
+            }
+            if let Some(me) = self.self_id {
+                objs.remove_deferred(me);
+            }
+            return;
+        }
+        self.core.geo_center = self.pos;
+
+        if self.trajectory_pos > 0.5 {
+            if let Some(rid) = self.carrying.take() {
+                if let Some(r) = crate::matrix_game::logic::robot_mut(objs, rid) {
+                    r.carry_release();
+                }
+                self.carry.elevator = None;
+            }
+        }
+
+        // Engine / yaw / pitch easing (1356-1372).
+        let d = angle_dist(self.engine_angle, self.target_engine_angle);
+        self.engine_angle += d * mul;
+        let d = angle_dist(self.yaw, self.target_yaw);
+        self.yaw += d * mul;
+        let d = angle_dist(self.pitch, self.target_pitch);
+        self.pitch += d * mul;
+
+        // Altitude tracking (1374-1382).
+        let newz = self.calc_z_in_point(map, self.pos.x, self.pos.y);
+        self.pos.z += (newz - self.pos.z) * mul;
+        self.core.geo_center = self.pos;
+    }
+}

@@ -618,6 +618,7 @@ mod tests {
                 min_z: 0.0,
                 max_z: 0.0,
             }],
+            road_network: None,
         }
     }
 

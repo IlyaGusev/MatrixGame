@@ -192,6 +192,39 @@ pub struct IFaceElement {
     /// :540-541.
     pub hint_offset_x: i32,
     pub hint_offset_y: i32,
+    /// Port of `CAnimation` (Interface/CAnimation.{cpp,h}) — optional
+    /// frame cycler; when present, the renderer draws the current
+    /// frame's atlas rect in place of the Normal state image.
+    pub animation: Option<ElementAnimation>,
+}
+
+/// `CAnimation` payload: the frame rects live in the same atlas as the
+/// element's Normal image (CInterface.cpp:480-516); `period` ms per
+/// frame.
+#[derive(Debug, Clone)]
+pub struct ElementAnimation {
+    pub frames: Vec<StateImage>,
+    pub period: i32,
+    pub current: usize,
+    pub time_pass: i32,
+}
+
+impl ElementAnimation {
+    /// `CAnimation::LogicTakt` (CAnimation.cpp:41-53).
+    pub fn logic_takt(&mut self, ms: i32) {
+        self.time_pass += ms;
+        if self.time_pass >= self.period {
+            self.time_pass = 0;
+            self.current += 1;
+            if self.current >= self.frames.len() {
+                self.current = 0;
+            }
+        }
+    }
+
+    pub fn current_frame(&self) -> Option<&StateImage> {
+        self.frames.get(self.current)
+    }
 }
 
 impl IFaceElement {
@@ -243,6 +276,14 @@ impl IFaceElement {
     /// C++ `GetStateImage` which just reads the slot directly but
     /// most elements only ship `sNormal`.
     pub fn current_image(&self) -> Option<&StateImage> {
+        // An attached CAnimation overrides the Normal image while the
+        // element is in its default state (CIFaceElement render path —
+        // the C++ draws m_Animation->GetCurrentFrame() instead).
+        if self.cur_state == ElementState::Normal {
+            if let Some(f) = self.animation.as_ref().and_then(|a| a.current_frame()) {
+                return Some(f);
+            }
+        }
         let idx = self.cur_state as usize;
         if let Some(img) = self.images.get(idx).and_then(|x| x.as_ref()) {
             return Some(img);

@@ -529,6 +529,12 @@ pub struct Timings {
     pub unit_flyer: i32,
     pub unit_turret: i32,
     pub maintenance_period: i32,
+    /// `m_CaptureTimeErase` / `m_CaptureTimePaint` / `m_CaptureTimeRolback`
+    /// (MatrixConfig.cpp:660-663, loaded from `Timings/Capture/*`).
+    /// Defaults 750 / 500 / 1500 (MatrixConfig.cpp:322-324).
+    pub capture_time_erase: i32,
+    pub capture_time_paint: i32,
+    pub capture_time_rollback: i32,
 }
 
 impl Timings {
@@ -558,6 +564,22 @@ impl Timings {
             unit_turret: read_at(&units_rec, "UNIT_TURRET"),
             // Top-level Timings param (MatrixConfig.cpp:644).
             maintenance_period: read_at(&timings_rec, "MAINTENANCE"),
+            // Capture sub-block (MatrixConfig.cpp:660-663).
+            capture_time_erase: stor
+                .block_record(&timings_rec, "Capture")
+                .map(|rec| read_at(&rec, "ERASE"))
+                .filter(|v| *v > 0)
+                .unwrap_or(750),
+            capture_time_paint: stor
+                .block_record(&timings_rec, "Capture")
+                .map(|rec| read_at(&rec, "PAINT"))
+                .filter(|v| *v > 0)
+                .unwrap_or(500),
+            capture_time_rollback: stor
+                .block_record(&timings_rec, "Capture")
+                .map(|rec| read_at(&rec, "ROLLBACK"))
+                .filter(|v| *v > 0)
+                .unwrap_or(1500),
         })
     }
 }
@@ -1417,6 +1439,31 @@ impl BuildingLabels {
     }
 }
 
+/// `Labels/Turrets` — Tur{1..4}_Name / Tur{1..4}_Range, consumed by
+/// the turret-button hover hints (CInterface.cpp:4463-4520).
+#[derive(Debug, Clone, Default)]
+pub struct TurretLabels {
+    pub name: [String; 4],
+    pub range: [String; 4],
+}
+
+impl TurretLabels {
+    pub fn from_matrix_data(stor: &Storage) -> Option<Self> {
+        let labels_rec = stor.block_record("da", "Labels")?;
+        let rec = stor.block_record(&labels_rec, "Turrets")?;
+        let mut out = Self::default();
+        for i in 0..4 {
+            if let Some(s) = stor.block_param(&rec, &format!("Tur{}_Name", i + 1)) {
+                out.name[i] = s;
+            }
+            if let Some(s) = stor.block_param(&rec, &format!("Tur{}_Range", i + 1)) {
+                out.range[i] = s;
+            }
+        }
+        Some(out)
+    }
+}
+
 /// Bundle of the string-heavy tables. Held behind a separate static so
 /// `GlobalConfig` can stay `Copy`.
 #[derive(Debug, Clone, Default)]
@@ -1425,11 +1472,115 @@ pub struct StringTables {
     pub descriptions: ItemDescriptions,
     pub robot_names: RobotNameParts,
     pub buildings: BuildingLabels,
+    pub turrets: TurretLabels,
     /// Localised "none" word — port of `AllLabels/Base/none` loaded at
     /// startup (MatrixGame.cpp:521-523) and assigned to
     /// `g_PopupHead[0].text` / `g_PopupWeaponNormal[0].text` /
     /// `g_PopupWeaponExtern[0].text` as the empty-slot popup row.
     pub popup_none: String,
+}
+
+/// One supply-drop robot loadout — a child block of
+/// `FlyerOrders/GiveBot` whose NAME is the score cost
+/// (MatrixObjectBuilding.cpp:1334, MatrixFlyer.cpp:1196-1219).
+#[derive(Debug, Clone, Default)]
+pub struct GiveBotEntry {
+    pub score: i32,
+    pub chassis: i32,
+    pub armor: i32,
+    pub head: i32,
+    pub weapons: Vec<i32>,
+    pub strength: f32,
+    pub hitpoint: f32,
+}
+
+/// Port of the `FlyerOrders/GiveBot` block (PAR_SOURCE_FLYER_ORDERS,
+/// MatrixFlyer.cpp:1162-1250).
+#[derive(Debug, Clone, Default)]
+pub struct GiveBotConfig {
+    pub distance: f32,
+    pub height: f32,
+    pub land_height: f32,
+    pub flyer_kind: i32,
+    pub hitpoint: f32,
+    pub bots: Vec<GiveBotEntry>,
+}
+
+impl GiveBotConfig {
+    pub fn from_matrix_data(stor: &Storage) -> Option<Self> {
+        let fo = stor.block_record("da", "FlyerOrders")?;
+        let gb = stor.block_record(&fo, "GiveBot")?;
+        let pf = |k: &str| -> f32 {
+            stor.block_param(&gb, k)
+                .and_then(|s| s.trim().parse::<f32>().ok())
+                .unwrap_or(0.0)
+        };
+        let mut out = Self {
+            distance: pf("Distance"),
+            height: pf("Height"),
+            land_height: pf("LandHeight"),
+            flyer_kind: pf("Flyer") as i32,
+            hitpoint: pf("Hitpoint"),
+            bots: Vec::new(),
+        };
+        // Child blocks: names (column "2") are the score costs,
+        // records (column "3") hold the loadout params.
+        let names = stor.get_buf(&gb, "2")?;
+        let records = stor.get_buf(&gb, "3")?;
+        for i in 0..names.arrays_count() {
+            let score = names.get_as_wstr(i).trim().parse::<i32>().unwrap_or(0);
+            let rec = records.get_as_wstr(i);
+            let pi = |k: &str| -> i32 {
+                stor.block_param(&rec, k)
+                    .and_then(|s| s.trim().parse::<i32>().ok())
+                    .unwrap_or(0)
+            };
+            let pe = |k: &str| -> f32 {
+                stor.block_param(&rec, k)
+                    .and_then(|s| s.trim().parse::<f32>().ok())
+                    .unwrap_or(0.0)
+            };
+            // BotWeapon appears multiple times — walk the raw key/value
+            // columns in lock-step.
+            let mut weapons = Vec::new();
+            if let (Some(keys), Some(vals)) = (stor.get_buf(&rec, "0"), stor.get_buf(&rec, "1")) {
+                for k in 0..keys.arrays_count() {
+                    if keys.get_as_wstr(k).eq_ignore_ascii_case("BotWeapon") {
+                        if let Ok(w) = vals.get_as_wstr(k).trim().parse::<i32>() {
+                            weapons.push(w);
+                        }
+                    }
+                }
+            }
+            out.bots.push(GiveBotEntry {
+                score,
+                chassis: pi("BotChassis"),
+                armor: pi("BotArmor"),
+                head: pi("BotHead"),
+                weapons,
+                strength: pe("BotStrength"),
+                hitpoint: pe("BotHitpoint"),
+            });
+        }
+        Some(out)
+    }
+}
+
+static GIVE_BOT_CONFIG: std::sync::OnceLock<std::sync::RwLock<std::sync::Arc<GiveBotConfig>>> =
+    std::sync::OnceLock::new();
+
+pub fn give_bot_config() -> std::sync::Arc<GiveBotConfig> {
+    GIVE_BOT_CONFIG
+        .get_or_init(|| std::sync::RwLock::new(std::sync::Arc::new(GiveBotConfig::default())))
+        .read()
+        .unwrap()
+        .clone()
+}
+
+pub fn set_give_bot_config(c: GiveBotConfig) {
+    let slot = GIVE_BOT_CONFIG
+        .get_or_init(|| std::sync::RwLock::new(std::sync::Arc::new(GiveBotConfig::default())));
+    *slot.write().unwrap() = std::sync::Arc::new(c);
 }
 
 static GLOBAL_STRINGS: std::sync::OnceLock<std::sync::RwLock<std::sync::Arc<StringTables>>> =

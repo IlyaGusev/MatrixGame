@@ -17,6 +17,17 @@ struct SplineKoefs {
 }
 
 /// `CalcBSplineKoefs2` (Math3D.cpp:409-431) — Catmull-Rom basis.
+/// `CalcBSplineKoefs1` (Math3D.cpp:391-407) — uniform cubic B-spline.
+fn koefs1(p0: Vec3, p1: Vec3, p2: Vec3, p3: Vec3) -> SplineKoefs {
+    let sixth = 1.0 / 6.0;
+    SplineKoefs {
+        pos0: (4.0 * p1 + p0 + p2) * sixth,
+        a: (p2 - p0) * 0.5,
+        b: (p0 + p2) * 0.5 - p1,
+        c: (p1 - p2) * 0.5 + (p3 - p0) * sixth,
+    }
+}
+
 fn koefs2(p0: Vec3, p1: Vec3, p2: Vec3, p3: Vec3) -> SplineKoefs {
     SplineKoefs {
         pos0: p1,
@@ -39,6 +50,36 @@ pub struct Trajectory {
 }
 
 impl Trajectory {
+    /// `Init1` (Math3D.cpp:432-460) — uniform B-spline segments
+    /// (approximating, "примерно"); the flyer trajectories use this.
+    pub fn new_approx(points: &[Vec3]) -> Self {
+        assert!(points.len() >= 4);
+        let n = points.len();
+        let segments = (0..n - 1)
+            .map(|i| {
+                let i0 = i.saturating_sub(1);
+                let i3 = (i + 2).min(n - 1);
+                koefs1(points[i0], points[i], points[i + 1], points[i3])
+            })
+            .collect();
+        Self { segments }
+    }
+
+    /// `CalcLength` (Math3D.cpp:668-686) — 100-step arc-length sum.
+    pub fn calc_length(&self) -> f32 {
+        let dt = 0.01f32;
+        let mut len = 0.0;
+        let mut p1 = self.calc_point(0.0);
+        let mut t = dt;
+        while t <= 1.0 {
+            let p0 = p1;
+            p1 = self.calc_point(t);
+            t += dt;
+            len += (p1 - p0).length();
+        }
+        len
+    }
+
     /// `pcnt >= 4` asserted in the C++; shorter inputs would index out
     /// of range there too.
     pub fn new(points: &[Vec3]) -> Self {

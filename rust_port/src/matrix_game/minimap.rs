@@ -1167,26 +1167,66 @@ impl Minimap {
         let mut markers: Vec<MMVertex> =
             Vec::with_capacity((map.buildings.len() + self.events.len()) * 6);
         let mut point_markers: Vec<MMVertex> = Vec::with_capacity(self.events.len() * 6);
-        for b in &map.buildings {
-            let mut px_px = self.world_to_map(b.x, b.y);
+        // Building markers from the LIVE arena (not the static map
+        // instance list) so capture re-tints them — the C++ walks
+        // GetFirstLogic and reads GetSide() each frame
+        // (MatrixMinimap.cpp:700-762). Falls back to the static list
+        // before the arena is populated (minimap bake at load).
+        let mut any_live_building = false;
+        for id in objects.iter_live() {
+            let Some(b) = crate::matrix_game::logic::building_ref(objects, id) else {
+                continue;
+            };
+            any_live_building = true;
+            if matches!(
+                b.state,
+                crate::matrix_game::object_building::BaseState::Dip
+                    | crate::matrix_game::object_building::BaseState::DipExploded
+            ) {
+                continue;
+            }
+            let mut px_px = self.world_to_map(b.pos.x, b.pos.y);
             px_px = self.apply_rotation(px_px);
-            // Pixel snap happens inside push_marker.
-            let icon = if b.kind == 0 {
+            let is_base = b.is_base();
+            let icon = if is_base {
                 self.icon_base
             } else {
                 self.icon_factory
             };
             let color = self
                 .side_colors
-                .get(b.side as usize)
+                .get(b.side.max(0) as usize)
                 .copied()
                 .unwrap_or([0.85, 0.85, 0.85, 1.0]);
-            let radius = if b.kind == 0 {
+            let radius = if is_base {
                 MINIMAP_BUILDING_BASE_R * ui_scale
             } else {
                 marker_r
             };
             Self::push_marker(&mut markers, px_px, radius, icon, color);
+        }
+        if !any_live_building {
+            for b in &map.buildings {
+                let mut px_px = self.world_to_map(b.x, b.y);
+                px_px = self.apply_rotation(px_px);
+                // Pixel snap happens inside push_marker.
+                let icon = if b.kind == 0 {
+                    self.icon_base
+                } else {
+                    self.icon_factory
+                };
+                let color = self
+                    .side_colors
+                    .get(b.side as usize)
+                    .copied()
+                    .unwrap_or([0.85, 0.85, 0.85, 1.0]);
+                let radius = if b.kind == 0 {
+                    MINIMAP_BUILDING_BASE_R * ui_scale
+                } else {
+                    marker_r
+                };
+                Self::push_marker(&mut markers, px_px, radius, icon, color);
+            }
         }
 
         // Robot / cannon markers — port of MatrixMinimap.cpp:679-763.

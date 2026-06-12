@@ -200,6 +200,32 @@ impl BillboardQueue {
         });
     }
 
+    /// Flat ground-aligned quad — the `CMatrixEffectBillboard` shape
+    /// (MatrixEffectBillboard.cpp:30-33 + 50-60): unit XY-plane quad
+    /// scaled by `radius`, world matrix = identity + translation. Used
+    /// by the zahvat dots and dust puffs; lying flat keeps them from
+    /// being depth-clipped by the terrain.
+    pub fn quad_flat(&mut self, center: Vec3, radius: f32, color: u32, tex: TexRef) {
+        let p00 = center + Vec3::new(-radius, -radius, 0.0);
+        let p10 = center + Vec3::new(radius, -radius, 0.0);
+        let p11 = center + Vec3::new(radius, radius, 0.0);
+        let p01 = center + Vec3::new(-radius, radius, 0.0);
+        self.tris.push(QueuedTri {
+            v: [p00, p10, p11],
+            uv: [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0]],
+            color,
+            tex,
+            additive: false,
+        });
+        self.tris.push(QueuedTri {
+            v: [p00, p11, p01],
+            uv: [[0.0, 1.0], [1.0, 0.0], [0.0, 0.0]],
+            color,
+            tex,
+            additive: false,
+        });
+    }
+
     pub fn line(&mut self, p0: Vec3, p1: Vec3, width: f32, color: u32, tex: TexRef) {
         self.lines.push(QueuedLine {
             p0,

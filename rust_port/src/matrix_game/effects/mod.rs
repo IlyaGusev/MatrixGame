@@ -18,7 +18,10 @@ pub mod moving_object;
 pub mod point_light;
 pub mod selection;
 pub mod smoke_and_fire;
+pub mod dust;
+pub mod elevator_field;
 pub mod weapon;
+pub mod zahvat;
 
 use crate::matrix_game::logic::Rnd;
 use crate::matrix_game::map::GameMap;
@@ -39,6 +42,7 @@ pub enum GameEffect {
     Lightening(lightening::Lightening),
     Explosion(explosion::Explosion),
     FireAnim(explosion::FireAnim),
+    Dust(dust::Dust),
 }
 
 impl GameEffect {
@@ -56,6 +60,7 @@ impl GameEffect {
             GameEffect::Lightening(e) => e.takt(step, rng),
             GameEffect::Explosion(e) => e.takt(step, map, rng),
             GameEffect::FireAnim(e) => e.takt(step),
+            GameEffect::Dust(e) => e.takt(step, map),
         }
     }
 
@@ -90,6 +95,7 @@ impl GameEffect {
             GameEffect::Lightening(e) => e.draw(q),
             GameEffect::Explosion(e) => e.draw(q, meshes),
             GameEffect::FireAnim(e) => e.draw(q),
+            GameEffect::Dust(e) => e.draw(q),
         }
     }
 }
@@ -150,4 +156,57 @@ pub fn effects_takt(
     }
     *effects = survivors;
     effects.append(&mut objs.pending_effects);
+    enforce_limits(effects, objs);
+}
+
+/// Per-type count caps with delete-oldest semantics — the
+/// `MAX_EFFECTS_*` + `DeleteFirst` machinery of CMatrixEffect
+/// (MatrixEffect.hpp:186-190, AddEffect list bookkeeping).
+fn enforce_limits(effects: &mut Vec<GameEffect>, objs: &mut Objects) {
+    const MAX_EXPLOSIONS: usize = 50; // MAX_EFFECTS_EXPLOSIONS
+    const MAX_FIREANIM: usize = 50; // MAX_EFFECTS_FIREANIM
+    const MAX_SMOKEFIRES: usize = 100; // MAX_EFFECTS_SMOKEFIRES
+
+    let mut explosions = 0usize;
+    let mut fireanims = 0usize;
+    let mut smokefires = 0usize;
+    for e in effects.iter() {
+        match e {
+            GameEffect::Explosion(_) => explosions += 1,
+            GameEffect::FireAnim(_) => fireanims += 1,
+            GameEffect::Smoke(_) | GameEffect::Fire(_) => smokefires += 1,
+            _ => {}
+        }
+    }
+    let mut kill_explosions = explosions.saturating_sub(MAX_EXPLOSIONS);
+    let mut kill_fireanims = fireanims.saturating_sub(MAX_FIREANIM);
+    let mut kill_smokefires = smokefires.saturating_sub(MAX_SMOKEFIRES);
+    if kill_explosions == 0 && kill_fireanims == 0 && kill_smokefires == 0 {
+        return;
+    }
+    let list = std::mem::take(effects);
+    for e in list {
+        let drop_it = match &e {
+            GameEffect::Explosion(_) if kill_explosions > 0 => {
+                kill_explosions -= 1;
+                true
+            }
+            GameEffect::FireAnim(_) if kill_fireanims > 0 => {
+                kill_fireanims -= 1;
+                true
+            }
+            GameEffect::Smoke(_) | GameEffect::Fire(_) if kill_smokefires > 0 => {
+                kill_smokefires -= 1;
+                true
+            }
+            _ => false,
+        };
+        if drop_it {
+            if let Some(w) = e.weapon() {
+                objs.weapons.release(w);
+            }
+        } else {
+            effects.push(e);
+        }
+    }
 }

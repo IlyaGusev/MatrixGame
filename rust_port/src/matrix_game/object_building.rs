@@ -104,6 +104,34 @@ pub enum BaseState {
 /// definition when the animation code lands.
 pub const BASE_FLOOR_Z: f32 = -63.0;
 
+/// `MAX_ZAHVAT_POINTS` (MatrixObjectBuilding.hpp:14) — capture
+/// progress steps until ownership flips.
+pub const MAX_ZAHVAT_POINTS: i32 = 14;
+
+/// `CAPTURE_RADIUS` (MatrixObjectBuilding.hpp:27).
+pub const CAPTURE_RADIUS: f32 = 50.0;
+/// `CAPTURE_SEEK_ROBOT_PERIOD` (MatrixObjectBuilding.hpp:28).
+pub const CAPTURE_SEEK_ROBOT_PERIOD: i64 = 500;
+/// `DISTANCE_CAPTURE_ME` (MatrixObjectBuilding.hpp:30).
+pub const DISTANCE_CAPTURE_ME: f32 = 300.0;
+
+/// Port of `STrueColor` (MatrixObjectBuilding.hpp:93-99) — the
+/// capture-progress paint state.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TrueColor {
+    pub color: u32,
+    pub colored_cnt: i32,
+}
+
+/// Port of `ECaptureStatus` (MatrixObjectBuilding.hpp:84-90).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureStatus {
+    Done,
+    InProgress,
+    TooFar,
+    Busy,
+}
+
 /// Max queued build items per building (MatrixObjectBuilding.hpp:43).
 /// `CBuildStack` rejects AddItem once the queue hits this.
 pub const MAX_STACK_UNITS: usize = 6;
@@ -182,6 +210,13 @@ impl BuildStack {
     /// room. The C++ also creates a UI stack-icon on the player-side
     /// HUD (`g_IFaceList->CreateStackIcon`); that hook lands with the
     /// rest of the player-side interface integration.
+    /// Port of `CBuildStack::ClearStack` (MatrixObjectBuilding.cpp) —
+    /// drop everything queued, reset the timer.
+    pub fn clear(&mut self) {
+        self.items.clear();
+        self.timer = 0;
+    }
+
     pub fn add_item(&mut self, item: PendingItem) -> bool {
         if self.is_full() {
             return false;
@@ -550,6 +585,25 @@ pub struct Building {
     /// `m_CaptureMeNextTime` (MatrixObjectBuilding.hpp:172). Throttle
     /// on capture candidacy announcements.
     pub capture_me_next_time: i32,
+    /// `m_CaptureSeekRobotNextTime` (MatrixObjectBuilding.hpp:222) —
+    /// next game-time the building scans for an adjacent capturer.
+    pub capture_seek_robot_next_time: i64,
+    /// `m_InCaptureTime` (MatrixObjectBuilding.hpp:215) — ms left of
+    /// "actively being captured"; while >0 the rollback is suppressed.
+    pub in_capture_time: i32,
+    /// `m_InCaptureNextTimeErase` / `m_InCaptureNextTimePaint`
+    /// (MatrixObjectBuilding.hpp:218-221) — pacing for the erase /
+    /// paint halves of the capture progress.
+    pub in_capture_next_time_erase: i64,
+    pub in_capture_next_time_paint: i64,
+    /// `m_CaptureNextTimeRollback` (MatrixObjectBuilding.hpp:219).
+    pub capture_next_time_rollback: i64,
+    /// `m_TrueColor` (MatrixObjectBuilding.hpp:93-99) — capture paint
+    /// progress (color + painted points).
+    pub true_color: TrueColor,
+    /// `m_capture` (MatrixObjectBuilding.hpp) — the Zahvat capture
+    /// ring; created lazily for non-base factories.
+    pub zahvat: Option<crate::matrix_game::effects::zahvat::Zahvat>,
 
     /// `m_ResourcePeriod` (MatrixObjectBuilding.hpp:165, union member).
     /// Ms until the next resource payout; counted down in Takt.
@@ -668,6 +722,13 @@ impl Building {
                 .collect(),
             under_attack_time: 0,
             capture_me_next_time: 0,
+            capture_seek_robot_next_time: 0,
+            in_capture_time: 0,
+            in_capture_next_time_erase: 0,
+            in_capture_next_time_paint: 0,
+            capture_next_time_rollback: 0,
+            true_color: TrueColor::default(),
+            zahvat: None,
             resource_period: 0, // MatrixObjectBuilding.cpp:53
 
             shadow_type: 0,   // SHADOW_OFF sentinel; CMAP sets
@@ -817,6 +878,132 @@ impl Building {
             return;
         }
         self.state = BaseState::Closing;
+    }
+
+    /// `IsBase()` (MatrixObjectBuilding.hpp:189).
+    pub fn is_base(&self) -> bool {
+        self.kind == BuildingType::Base
+    }
+
+    /// `CanBeCaptured()` (MatrixObjectBuilding.hpp:191).
+    pub fn can_be_captured(&self) -> bool {
+        self.object_state
+            & crate::matrix_game::map_static::OBJECT_STATE_BUILDING_CAPTURE_IN_PROGRESS
+            == 0
+    }
+
+    /// `SetCapturedBy(ms)` (MatrixObjectBuilding.hpp:193-197).
+    pub fn set_captured_by(&mut self, by: Option<ObjectId>) {
+        self.object_state |=
+            crate::matrix_game::map_static::OBJECT_STATE_BUILDING_CAPTURE_IN_PROGRESS;
+        self.capturer = by;
+    }
+
+    /// `ResetCaptured()` (MatrixObjectBuilding.hpp:198-202).
+    pub fn reset_captured(&mut self) {
+        self.object_state &=
+            !crate::matrix_game::map_static::OBJECT_STATE_BUILDING_CAPTURE_IN_PROGRESS;
+        self.capturer = None;
+    }
+
+    /// Port of `CMatrixBuilding::SetNeutral` (MatrixObjectBuilding.cpp:
+    /// 1143-1151).
+    pub fn set_neutral(&mut self) {
+        self.true_color = TrueColor::default();
+        self.side = 0;
+        self.build_stack.clear();
+        self.rchange |= crate::matrix_game::map_static::MR_MINIMAP;
+    }
+
+    /// Port of `CMatrixBuilding::Capture(by)` (MatrixObjectBuilding.cpp:
+    /// 1154-1263) — one paint/erase step of the capture progress. The
+    /// nearest-robot `FindObjects` scan is precomputed by the caller
+    /// (`me_nearest`); `by_side` is the capturing robot's side; `now`
+    /// is game time in ms.
+    pub fn capture(&mut self, by_side: i32, me_nearest: bool, now: i64) -> CaptureStatus {
+        let cfg = crate::matrix_game::config::global();
+        let erase = cfg.timings.capture_time_erase as i64;
+        let paint = cfg.timings.capture_time_paint as i64;
+
+        if self.in_capture_time <= 0 {
+            self.in_capture_time = (erase + paint) as i32;
+            self.in_capture_next_time_erase = now;
+            self.in_capture_next_time_paint = now;
+        }
+
+        if self.in_capture_next_time_erase >= now || self.in_capture_next_time_paint >= now {
+            return CaptureStatus::Busy;
+        }
+
+        if !me_nearest {
+            return CaptureStatus::TooFar;
+        }
+
+        // C++ `0xFF000000 | g_MatrixMap->GetSideColor(side)` — the
+        // real side color: the zahvat ring renders this value
+        // directly (MatrixObjectBuilding.cpp:1183).
+        let capturer_color =
+            0xFF00_0000u32 | crate::matrix_game::map::side_color_u32(by_side);
+
+        self.in_capture_time = (erase + paint) as i32;
+
+        if self.side == 0 {
+            if self.true_color.color == 0 || self.true_color.color == capturer_color {
+                self.true_color.color = capturer_color;
+                while self.in_capture_next_time_paint < now {
+                    self.in_capture_next_time_paint += paint;
+                    self.in_capture_next_time_erase = now;
+                    if self.true_color.colored_cnt == MAX_ZAHVAT_POINTS {
+                        // Sound S_ENEMY_FACTORY_CAPTURED — sound
+                        // manager pending.
+                        self.side = by_side;
+                        self.build_stack.clear();
+                        self.rchange |= crate::matrix_game::map_static::MR_MINIMAP;
+                        return CaptureStatus::Done;
+                    }
+                    self.true_color.colored_cnt += 1;
+                }
+            } else {
+                while self.in_capture_next_time_erase < now {
+                    self.in_capture_next_time_erase += erase;
+                    self.in_capture_next_time_paint = now;
+                    if self.true_color.colored_cnt == 0 {
+                        self.true_color.color = 0;
+                        return CaptureStatus::InProgress;
+                    }
+                    self.true_color.colored_cnt -= 1;
+                }
+            }
+        } else if self.true_color.color == capturer_color {
+            while self.in_capture_next_time_paint < now {
+                self.in_capture_next_time_paint += paint;
+                self.in_capture_next_time_erase = now;
+                if self.true_color.colored_cnt == MAX_ZAHVAT_POINTS {
+                    // "дозахват" — re-capture by the same color.
+                    self.side = by_side;
+                    self.rchange |= crate::matrix_game::map_static::MR_MINIMAP;
+                    return CaptureStatus::Done;
+                }
+                self.true_color.colored_cnt += 1;
+            }
+        } else {
+            while self.in_capture_next_time_erase < now {
+                self.in_capture_next_time_erase += erase;
+                self.in_capture_next_time_paint = now + paint;
+                if self.true_color.colored_cnt == 0 {
+                    // Sound S_PLAYER_FACTORY_CAPTURED — sound manager
+                    // pending.
+                    self.true_color.color = 0;
+                    self.side = 0;
+                    self.rchange |= crate::matrix_game::map_static::MR_MINIMAP;
+                    self.build_stack.clear();
+                    return CaptureStatus::InProgress;
+                }
+                self.true_color.colored_cnt -= 1;
+            }
+        }
+
+        CaptureStatus::InProgress
     }
 }
 
@@ -982,9 +1169,90 @@ impl MapStatic for Building {
             }
         }
 
-        // Pre-DIP pass: countdowns + capture/resource. Capture and
-        // resources are still deferred; the countdowns are portable.
+        // Zahvat capture ring — lazy creation for non-base factories
+        // (MatrixObjectBuilding.cpp:410-437) + per-takt repaint (:392).
+        if self.zahvat.is_none()
+            && !self.is_base()
+            && !matches!(self.state, BaseState::Dip | BaseState::DipExploded)
+        {
+            // The C++ branches on the core matrix Y axis; the four
+            // cases map 1:1 onto the placement angle quadrant.
+            let deg: f32 = match self.angle & 3 {
+                0 => 102.0,
+                1 => 192.0,
+                2 => -79.0,
+                _ => 12.0,
+            };
+            let (s, c) = ((self.angle & 3) as f32 * std::f32::consts::FRAC_PI_2).sin_cos();
+            // Y axis of Rz(angle*90°) = (-sin, cos).
+            let yaxis = glam::Vec2::new(-s, c);
+            let pos = glam::Vec3::new(
+                self.pos.x + yaxis.x * 2.7,
+                self.pos.y + yaxis.y * 2.7,
+                self.build_z + 0.8,
+            );
+            self.zahvat = Some(crate::matrix_game::effects::zahvat::Zahvat::new(
+                pos,
+                24.0,
+                deg.to_radians(),
+                MAX_ZAHVAT_POINTS as usize,
+            ));
+            if self.side == 0 {
+                self.true_color = TrueColor::default();
+            } else {
+                self.true_color.color =
+                    0xFF00_0000 | crate::matrix_game::map::side_color_u32(self.side);
+                self.true_color.colored_cnt = MAX_ZAHVAT_POINTS;
+            }
+        }
+        if let Some(z) = self.zahvat.as_mut() {
+            z.update_data(self.true_color.color, self.true_color.colored_cnt);
+        }
+
+        // Pre-DIP pass: countdowns + capture announce / seek / rollback
+        // (MatrixObjectBuilding.cpp:503-594).
         if !matches!(self.state, BaseState::Dip | BaseState::DipExploded) {
+            use crate::matrix_game::robot::Robot;
+            let now = crate::matrix_game::map::current_elapsed_ms();
+
+            // :506-527 — announce ourselves as a capture candidate to
+            // enemy robots nearby, and retract from robots that fell
+            // out of range. (AI robots act on the candidates; player
+            // robots ignore them outside automatic mode.)
+            if (self.capture_me_next_time as i64) < now
+                && self.capturer.is_none()
+                && !(self.is_base() && self.turrets_have > 0)
+            {
+                self.capture_me_next_time = (now + 1002) as i32;
+                if let Some(self_id) = self.self_id {
+                    let my_side = self.side;
+                    let my_pos = self.pos;
+                    let live: Vec<_> = objs.iter_live().collect();
+                    for id in live {
+                        let Some(o) = objs.get_mut(id) else { continue };
+                        if !matches!(o.core().obj_type, ObjectType::RobotAi) {
+                            continue;
+                        }
+                        let r: &mut Robot =
+                            unsafe { &mut *(o as *mut dyn MapStatic as *mut Robot) };
+                        if !r.is_live() {
+                            continue;
+                        }
+                        r.object_state_clear(crate::matrix_game::map_static::ROBOT_CAPTURE_INFORMED);
+                        let gc = r.core().geo_center;
+                        let d2 = (gc.x - my_pos.x).powi(2) + (gc.y - my_pos.y).powi(2);
+                        if d2 < DISTANCE_CAPTURE_ME * DISTANCE_CAPTURE_ME && r.side != my_side {
+                            r.add_capture_candidate(self_id, _rng);
+                        }
+                        if r.object_state() & crate::matrix_game::map_static::ROBOT_CAPTURE_INFORMED
+                            == 0
+                        {
+                            r.remove_capture_candidate(self_id);
+                        }
+                    }
+                }
+            }
+
             // MatrixObjectBuilding.cpp:529 — under-attack warning
             // timer decays; floor at 0.
             self.under_attack_time = (self.under_attack_time - cms).max(0);
@@ -994,11 +1262,70 @@ impl MapStatic for Building {
                 self.show_hitpoint_time = (self.show_hitpoint_time - cms).max(0);
             }
 
-            // Capture / resource payout — deferred until sides land.
-            // TODO: `FindObjects(CAPTURE_RADIUS, TRACE_ROBOT)` +
-            // `Capture(robot)` state machine (MatrixObjectBuilding.cpp:
-            // 539-594), `m_ResourcePeriod` per-kind payout
-            // (:605-667).
+            if self.kind != BuildingType::Base {
+                // :537-565 — proactive capture: the nearest enemy robot
+                // standing in CAPTURE_RADIUS captures without an order.
+                if self.capture_seek_robot_next_time < now {
+                    let mut found: Option<(crate::matrix_game::map_static::ObjectId, i32)> = None;
+                    let mut best = CAPTURE_RADIUS * CAPTURE_RADIUS;
+                    for id in objs.iter_live() {
+                        let Some(o) = objs.get(id) else { continue };
+                        if !matches!(o.core().obj_type, ObjectType::RobotAi) {
+                            continue;
+                        }
+                        if !o.is_live() {
+                            continue;
+                        }
+                        let gc = o.core().geo_center;
+                        let d2 = (gc.x - self.pos.x).powi(2) + (gc.y - self.pos.y).powi(2);
+                        if d2 < best {
+                            best = d2;
+                            found = Some((id, o.side()));
+                        }
+                    }
+                    if let Some((_, rside)) = found.filter(|(_, s)| *s != self.side) {
+                        // The found robot IS the nearest within radius,
+                        // so the Capture() inner scan succeeds.
+                        self.capture(rside, true, now);
+                        let cfg = crate::matrix_game::config::global();
+                        let nt = 100
+                            .min(cfg.timings.capture_time_erase)
+                            .min(cfg.timings.capture_time_paint);
+                        self.capture_seek_robot_next_time = now + nt as i64;
+                    } else {
+                        self.capture_seek_robot_next_time = now + CAPTURE_SEEK_ROBOT_PERIOD;
+                    }
+                }
+
+                // :566-594 — capture-progress decay and rollback.
+                if self.in_capture_time > 0 {
+                    self.in_capture_time -= cms;
+                    if self.in_capture_time <= 0 {
+                        self.in_capture_time = 0;
+                        self.capture_next_time_rollback = now;
+                    }
+                } else {
+                    let rollback =
+                        crate::matrix_game::config::global().timings.capture_time_rollback as i64;
+                    if self.side == 0 && self.true_color.colored_cnt > 0 {
+                        while self.capture_next_time_rollback < now
+                            && self.true_color.colored_cnt > 0
+                        {
+                            self.capture_next_time_rollback += rollback;
+                            self.true_color.colored_cnt -= 1;
+                        }
+                    } else if self.side != 0 && self.true_color.colored_cnt < MAX_ZAHVAT_POINTS {
+                        while self.capture_next_time_rollback < now
+                            && self.true_color.colored_cnt < MAX_ZAHVAT_POINTS
+                        {
+                            self.capture_next_time_rollback += rollback;
+                            self.true_color.colored_cnt += 1;
+                        }
+                    }
+                }
+            }
+            // Per-side resource payout (:600-667) is centralised in
+            // `MapLogic::accrue_resources`.
         }
 
         // DIP explosion sequence (MatrixObjectBuilding.cpp:672-808):
@@ -1233,6 +1560,32 @@ impl MapStatic for Building {
             // still needs effects). `0` = "fire as soon as possible".
             self.next_explosion_time = 0;
             self.next_explosion_time_sound = 0;
+
+            // ReleaseMe cascade (MatrixObjectBuilding.cpp:1364-1431):
+            // robots spawning here die, capture state referencing this
+            // building clears, child cannons orphan.
+            if let Some(me) = self.self_id {
+                let ids: Vec<crate::matrix_game::map_static::ObjectId> =
+                    objs.iter_live().collect();
+                for oid in ids {
+                    if let Some(r) = crate::matrix_game::logic::robot_mut(objs, oid) {
+                        if r.base == Some(me) {
+                            r.base = None;
+                            r.must_die = true;
+                        }
+                        r.remove_capture_candidate(me);
+                        r.env.remove_from_list(me);
+                        if r.get_capture_factory() == Some(me) {
+                            r.stop_capture();
+                        }
+                    } else if let Some(c) = crate::matrix_game::logic::cannon_mut(objs, oid) {
+                        if c.parent == Some(me) {
+                            c.parent = None;
+                        }
+                    }
+                }
+            }
+            self.zahvat = None;
             return true;
         }
 
@@ -1794,13 +2147,16 @@ impl BuildingsRenderer {
     ) {
         use crate::matrix_game::map_static::{MapStatic, ObjectType};
 
-        // Collect live Building progress keyed by (pos_x, pos_y) so
-        // the renderer can match its static `BuildingInstance` list.
+        // Collect live Building progress + current side keyed by
+        // (pos_x, pos_y) so the renderer can match its static
+        // `BuildingInstance` list.
         //
         // The C++ keeps `CMatrixBuilding::m_Pos` and the renderer's
         // CVectorObjectGroup sharing the same world transform, so
         // identical (pos.x, pos.y) is a safe key.
         let mut progress_by_pos: std::collections::HashMap<(i32, i32), f32> =
+            std::collections::HashMap::new();
+        let mut side_by_pos: std::collections::HashMap<(i32, i32), u8> =
             std::collections::HashMap::new();
         for id in objs.iter_live() {
             if let Some(obj) = objs.get(id) {
@@ -1808,12 +2164,37 @@ impl BuildingsRenderer {
                     continue;
                 }
                 let b: &Building = unsafe { &*(obj as *const dyn MapStatic as *const Building) };
+                let key = ((b.pos.x * 10.0) as i32, (b.pos.y * 10.0) as i32);
+                side_by_pos.insert(key, b.side.clamp(0, 255) as u8);
                 if b.kind == BuildingType::Base {
-                    progress_by_pos.insert(
-                        ((b.pos.x * 10.0) as i32, (b.pos.y * 10.0) as i32),
-                        b.base_floor_progress,
-                    );
+                    progress_by_pos.insert(key, b.base_floor_progress);
                 }
+            }
+        }
+
+        // Side re-tint on capture (CMatrixBuilding::Capture flips
+        // m_Side; the C++ re-reads GetSideColor every Draw — our
+        // instance buffers are baked, so rewrite any batch whose
+        // stored side went stale).
+        for batch in &mut self.batches {
+            let mut dirty = false;
+            for b in batch.buildings.iter_mut() {
+                let key = ((b.x * 10.0) as i32, (b.y * 10.0) as i32);
+                if let Some(&side) = side_by_pos.get(&key) {
+                    if b.side != side {
+                        b.side = side;
+                        dirty = true;
+                    }
+                }
+            }
+            if dirty {
+                let [cx, cy] = batch.center;
+                let inst_data: Vec<InstanceData> = batch
+                    .buildings
+                    .iter()
+                    .map(|b| instance_matrix(b, cx, cy, map, Some(point_lights)))
+                    .collect();
+                queue.write_buffer(&batch.instance_buffer, 0, bytemuck::cast_slice(&inst_data));
             }
         }
 

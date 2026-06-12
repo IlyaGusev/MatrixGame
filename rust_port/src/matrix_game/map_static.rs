@@ -77,6 +77,12 @@ pub const OBJECT_STATE_TERRON_EXPL1: u32 = 1 << 15;
 pub const OBJECT_STATE_TERRON_EXPL2: u32 = 1 << 16;
 
 // Robot-only (`ROBOT_FLAG_*` — MatrixMapStatic.hpp:62-77).
+/// `ROBOT_FLAG_SGROUP` (`SETBIT(12)`, MatrixMapStatic.hpp:74) —
+/// selected as part of the current group (drives the selection ring).
+pub const ROBOT_FLAG_SGROUP: u32 = 1 << 12;
+/// `ROBOT_FLAG_SARCADE` (`SETBIT(13)`) — arcade-selected (FPS mode,
+/// out of scope; kept for flag parity).
+pub const ROBOT_FLAG_SARCADE: u32 = 1 << 13;
 /// `ROBOT_FLAG_ONWATER` (`SETBIT(14)`, MatrixMapStatic.hpp:76). Set by
 /// `Z_From_Pos` (MatrixObjectRobot.cpp:282) whenever the terrain height
 /// at the robot's XY is below `WATER_LEVEL`. Read by `Seek`
@@ -86,6 +92,14 @@ pub const ROBOT_FLAG_ONWATER: u32 = 1 << 14;
 /// correction kicked in this tick (MatrixRobot.cpp:2623).
 #[allow(dead_code)]
 pub const ROBOT_FLAG_COLLISION: u32 = 1 << 15;
+/// `ROBOT_FLAG_DISABLE_MANUAL` (`SETBIT(16)`, MatrixMapStatic.hpp:78).
+/// Set when a base capture commits the robot — blocks manual-control
+/// handover and forces MustDie on order break (MatrixRobot.cpp:1267).
+pub const ROBOT_FLAG_DISABLE_MANUAL: u32 = 1 << 16;
+/// `ROBOT_CAPTURE_INFORMED` (`SETBIT(22)`, MatrixMapStatic.hpp:85).
+/// Transient mark used by the building's capture-candidate announce
+/// scan (MatrixObjectBuilding.cpp:506-527).
+pub const ROBOT_CAPTURE_INFORMED: u32 = 1 << 22;
 
 // Building-only (overlays bits 10..=12 from MatrixMapStatic.hpp:88-90).
 /// `BUILDING_NEW_INCOME` — a resource tick just fired; Takt emits a
@@ -362,6 +376,18 @@ pub struct ObjectId {
     generation: u32,
 }
 
+#[cfg(test)]
+impl ObjectId {
+    /// Test-only handle minting for unit tests that don't need an
+    /// arena (e.g. env list bookkeeping).
+    pub(crate) fn synthetic(index: u32) -> Self {
+        Self {
+            index,
+            generation: 0,
+        }
+    }
+}
+
 struct Slot {
     generation: u32,
     obj: Option<Box<dyn MapStatic>>,
@@ -429,7 +455,7 @@ pub struct Objects {
     /// own hitscan weapon lands (the C++ calls the fire-end handler
     /// synchronously; here the robot drains its entries right after
     /// `weapons_logic_takt`). `(shooter, victim (side, type), hit pos)`.
-    pub pending_hit_notices: Vec<(ObjectId, Option<(i32, ObjectType)>, glam::Vec3)>,
+    pub pending_hit_notices: Vec<(ObjectId, Option<(ObjectId, i32, ObjectType)>, glam::Vec3)>,
     /// Self-despawn queue — an object can't `remove()` itself while
     /// its box is checked out by a takt driver, so DIP wrecks queue
     /// here and `flush_removals` (run by the takt drivers after each
@@ -722,6 +748,29 @@ impl Objects {
         }
         self.next_logic_object = None;
         self.flush_removals();
+    }
+
+    /// Take an object's box out of its slot — the same
+    /// "take-the-box" pattern `proceed_logic` uses, exposed for
+    /// callers that must run an object method needing `&mut Objects`
+    /// (e.g. `Robot::big_boom`). MUST be paired with [`Self::put_obj`].
+    pub fn take_obj(&mut self, id: ObjectId) -> Option<Box<dyn MapStatic>> {
+        self.slots.get_mut(id.index as usize).and_then(|s| {
+            if s.generation == id.generation {
+                s.obj.take()
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Return a box taken with [`Self::take_obj`].
+    pub fn put_obj(&mut self, id: ObjectId, b: Box<dyn MapStatic>) {
+        if let Some(s) = self.slots.get_mut(id.index as usize) {
+            if s.generation == id.generation && s.obj.is_none() {
+                s.obj = Some(b);
+            }
+        }
     }
 
     /// Used by tests + future sides code. Iterates the logic-temp list
