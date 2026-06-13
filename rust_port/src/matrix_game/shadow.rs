@@ -543,11 +543,26 @@ impl ShadowSystem {
     /// Render every batch with the projection pipeline. Caller is responsible
     /// for `update_view` having been called this frame.
     pub fn render<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, batches: &'a [ShadowBatch]) {
+        self.render_visible(pass, batches, &[]);
+    }
+
+    /// Like [`Self::render`] but skips batches whose `visible` entry is
+    /// false (a dead building hides its projected shadow). Entries past
+    /// the end of `visible` default to drawn.
+    pub fn render_visible<'a>(
+        &'a self,
+        pass: &mut wgpu::RenderPass<'a>,
+        batches: &'a [ShadowBatch],
+        visible: &[bool],
+    ) {
         if batches.is_empty() {
             return;
         }
         pass.set_pipeline(&self.proj_pipeline);
-        for batch in batches {
+        for (i, batch) in batches.iter().enumerate() {
+            if !visible.get(i).copied().unwrap_or(true) {
+                continue;
+            }
             pass.set_bind_group(0, &batch.bind_group, &[]);
             pass.set_vertex_buffer(0, batch.vertex_buffer.slice(..));
             pass.set_index_buffer(batch.index_buffer.slice(..), wgpu::IndexFormat::Uint32);

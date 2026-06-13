@@ -92,6 +92,11 @@ pub struct MapLogic {
     /// `Some(true)` = player won, `Some(false)` = lost. The UI layer
     /// reads this to show the end dialog.
     pub game_over: Option<bool>,
+    /// One-shot dialog request — stands in for the direct
+    /// `EnterDialogMode(TEMPLATE_DIALOG_WIN/LOOSE)` call at
+    /// MatrixLogic.cpp:2900-2906 (logic can't reach the UI layer
+    /// here). The form-game loop takes it each frame.
+    pub pending_win_loose_dialog: Option<bool>,
     /// Queued gameplay sounds (CSound::Play call sites). The audio
     /// backend drains this each frame; until it lands the queue is
     /// the verified dispatch surface.
@@ -111,6 +116,10 @@ pub struct MapLogic {
     /// `MMFLAG_WIN` (set when victory is detected, read by the
     /// delayed dialog entry).
     pub win_flag: bool,
+    /// `MMFLAG_SPECIAL_BROKEN` (MatrixMap.hpp:232) — all special
+    /// win-target objects destroyed; exempts the player from the
+    /// JUST_DEAD scan (MatrixLogic.cpp:2866).
+    pub special_broken: bool,
     /// `m_MaintenanceTime` (MatrixMap.hpp:434) — countdown until the
     /// next supply drop may be called.
     pub maintenance_time: i32,
@@ -146,6 +155,7 @@ impl MapLogic {
             before_win_loose_dialog_count: 0,
             before_win_count: 0,
             game_over: None,
+            pending_win_loose_dialog: None,
             sound_queue: Vec::new(),
             sound_order_capture_enabled: false,
             enable_capture_fuckoff_sound: false,
@@ -153,6 +163,7 @@ impl MapLogic {
             moveto_pings: Vec::new(),
             moveto_clear_pending: false,
             win_flag: false,
+            special_broken: false,
             maintenance_time: 0,
             maintenance_prc: 100,
         }
@@ -243,6 +254,30 @@ impl MapLogic {
         if rem > 0 {
             self.objects.proceed_logic(rem, &mut self.rng);
         }
+        // Special win-target deaths queued by map objects this takt
+        // (MatrixObject.cpp:203-212 / :249-260 / :1244-1258).
+        if !self.objects.pending_special_deaths.is_empty() {
+            use crate::matrix_game::map_static::SpecialDeathKind;
+            use crate::matrix_game::side::SideStatus;
+            let deaths: Vec<_> = self.objects.pending_special_deaths.drain(..).collect();
+            for d in deaths {
+                self.before_win_count -= 1;
+                match d {
+                    SpecialDeathKind::Target => {
+                        if self.before_win_count <= 0 {
+                            self.special_broken = true;
+                            self.player_side.status = SideStatus::JustWin;
+                        }
+                    }
+                    SpecialDeathKind::Terron => {
+                        // SS_ACTIVE → SS_JUST_WIN + MMFLAG_WIN,
+                        // unconditional (MatrixObject.cpp:1251-1258).
+                        self.win_flag = true;
+                        self.player_side.status = SideStatus::JustWin;
+                    }
+                }
+            }
+        }
         // Win/lose CheckStatus once per second (MatrixLogic.cpp:2773+).
         self.check_status();
         // Notices addressed to robots that died before draining them.
@@ -267,6 +302,7 @@ impl MapLogic {
         // without threading the player Side through `proceed_logic`.
         self.accrue_resources(step_ms);
         self.refresh_side_robots();
+        self.sync_side_stats();
         // The standalone build plays no audio (g_RangersInterface is
         // NULL in the original) — drain the queued sound events each
         // frame so the dispatch surface can't grow unboundedly. A
@@ -330,6 +366,11 @@ impl MapLogic {
             if alive[k] {
                 continue;
             }
+            // MatrixLogic.cpp:2864-2867 — a player who already broke
+            // the terron / all special targets can't lose to attrition.
+            if sid == self.player_side.id && (self.special_broken || self.objects.terron_dead) {
+                continue;
+            }
             if let Some(s) = self.side_by_id_mut(sid) {
                 s.status = SideStatus::JustDead;
             }
@@ -362,6 +403,7 @@ impl MapLogic {
                 self.player_side.set_stat(Stat::Time, -t);
             }
             self.game_over = Some(win);
+            self.pending_win_loose_dialog = Some(win);
         } else if self.player_side.status == SideStatus::JustWin {
             self.player_side.status = SideStatus::Active;
             self.before_win_loose_dialog_count = 1;
@@ -418,7 +460,11 @@ impl MapLogic {
         let robot_ids: Vec<ObjectId> = self
             .objects
             .iter_live()
-            .filter(|&id| robot_ref(&self.objects, id).map(|r| r.is_live()).unwrap_or(false))
+            .filter(|&id| {
+                robot_ref(&self.objects, id)
+                    .map(|r| r.is_live())
+                    .unwrap_or(false)
+            })
             .collect();
 
         enum Act {
@@ -510,14 +556,11 @@ impl MapLogic {
                                 continue;
                             }
                             let cgeo = cannon.core().geo_center;
-                            let dvec =
-                                cgeo - glam::Vec3::new(my_pos.x, my_pos.y, 0.0);
+                            let dvec = cgeo - glam::Vec3::new(my_pos.x, my_pos.y, 0.0);
                             let dist_enemy = dvec.length_squared();
                             let fire_r = cannon.fire_radius(&self.objects);
                             let t1 = (fire_r * 1.01).max(my_maxfd * 1.1);
-                            if dist_enemy <= t1 * t1
-                                && !matches!(cannon.state, CannonState::Dip)
-                            {
+                            if dist_enemy <= t1 * t1 && !matches!(cannon.state, CannonState::Dip) {
                                 if is_logic_visible(map, &self.objects, rid, oid, 0.0) {
                                     let me_env = &robot_ref(&self.objects, rid).unwrap().env;
                                     if !me_env.search_enemy(oid) && !me_env.is_ignore(oid, now) {
@@ -749,6 +792,9 @@ impl MapLogic {
             }
             ids.push(id);
         }
+        // `++m_BeforeWinCount` per '+'-prefixed behaviour row
+        // (MatrixObject.cpp:1020-1026).
+        self.before_win_count += stats.special_win_target as i32;
         (ids, stats)
     }
 
@@ -1470,6 +1516,30 @@ impl MapLogic {
     pub fn refresh_side_robots(&mut self) {
         self.player_side.robots_cnt = self.compute_side_robots(self.player_side.id);
     }
+
+    /// Mirror the kill/build counters accumulated in the object arena
+    /// (`Objects::side_stats`) into each side's stat array. The C++
+    /// increments `m_Statistic` on the side directly
+    /// (`IncStatValue(STAT_*)`); the object code here can't reach the
+    /// sides, so the arena accumulates and this copies every takt.
+    fn sync_side_stats(&mut self) {
+        use crate::matrix_game::side::Stat;
+        let ids: Vec<i32> = std::iter::once(self.player_side.id)
+            .chain(self.other_sides.iter().map(|s| s.id))
+            .collect();
+        for sid in ids {
+            let Some(&stats) = self.objects.side_stats.get(sid as usize) else {
+                continue;
+            };
+            if let Some(s) = self.side_by_id_mut(sid) {
+                s.set_stat(Stat::RobotBuild, stats.robot_build);
+                s.set_stat(Stat::RobotKill, stats.robot_kill);
+                s.set_stat(Stat::TurretBuild, stats.turret_build);
+                s.set_stat(Stat::TurretKill, stats.turret_kill);
+                s.set_stat(Stat::BuildingKill, stats.building_kill);
+            }
+        }
+    }
 }
 
 /// Shape of one per-kind income emission. Internal to `accrue_resources`.
@@ -1659,6 +1729,61 @@ pub fn collect_place_blockers(objs: &Objects, skip: Option<ObjectId>) -> Vec<(i3
         }
     }
     out
+}
+
+/// Port of `CMatrixMapLogic::PlaceFindNearReturn` (MatrixLogic.cpp:
+/// 760-826): the step-aside variant of `place_find_near`. The blocker
+/// list additionally carries the stepping robot's accumulated bad
+/// coords, and *every* live robot's current cell + return coords —
+/// no skip, so the robot's own spot blocks and the spiral must yield
+/// a genuinely different cell. (The original pushes the return coords
+/// twice — a harmless quirk we don't replicate.)
+pub fn place_find_near_return(
+    map: &GameMap,
+    objs: &Objects,
+    chassis_kind: usize,
+    size: i32,
+    mx: i32,
+    my: i32,
+    bad_coords: &[(i32, i32)],
+) -> Option<(i32, i32)> {
+    use crate::matrix_game::common::float2int;
+    use crate::matrix_game::object_cannon::{Cannon, CannonState};
+    use crate::matrix_game::robot::{Robot, RobotState};
+
+    let mut blockers: Vec<(i32, i32)> = bad_coords.to_vec();
+    for id in objs.iter_live() {
+        let Some(obj) = objs.get(id) else { continue };
+        match obj.core().obj_type {
+            ObjectType::RobotAi => {
+                let r: &Robot = unsafe { &*(obj as *const dyn MapStatic as *const Robot) };
+                if matches!(r.state, RobotState::Dip) {
+                    continue;
+                }
+                blockers.push((r.map_x, r.map_y));
+                if let Some(tp) = r.return_coords() {
+                    blockers.push(tp);
+                }
+                if let Some(tp) = r.move_to_coords() {
+                    blockers.push(tp);
+                } else {
+                    blockers.push((r.map_x, r.map_y));
+                }
+            }
+            ObjectType::Cannon => {
+                let c: &Cannon = unsafe { &*(obj as *const dyn MapStatic as *const Cannon) };
+                if matches!(c.state, CannonState::Dip) {
+                    continue;
+                }
+                blockers.push((
+                    float2int(c.pos.x / GameMap::GLOBAL_SCALE_MOVE) - ROBOT_MOVECELLS_PER_SIZE / 2,
+                    float2int(c.pos.y / GameMap::GLOBAL_SCALE_MOVE) - ROBOT_MOVECELLS_PER_SIZE / 2,
+                ));
+            }
+            _ => {}
+        }
+    }
+    place_find_near_with_blockers(map, chassis_kind, size, mx, my, &blockers)
 }
 
 /// Port of `CMatrixMapLogic::PlaceFindNear(nsh, size, mx, my, skip)`
@@ -2067,6 +2192,47 @@ mod tests {
         w.takt(-5);
         assert_eq!(w.tick, 0);
         assert_eq!(w.elapsed_ms, 0);
+    }
+
+    #[test]
+    fn last_special_target_death_sets_just_win() {
+        use crate::matrix_game::map_static::SpecialDeathKind;
+        use crate::matrix_game::side::SideStatus;
+        let mut w = MapLogic::new();
+        w.before_win_count = 2;
+        w.objects
+            .pending_special_deaths
+            .push(SpecialDeathKind::Target);
+        w.takt(10);
+        // One of two targets down — no win yet.
+        assert_eq!(w.before_win_count, 1);
+        assert!(!w.special_broken);
+        assert_ne!(w.player_side.status, SideStatus::JustWin);
+
+        w.objects
+            .pending_special_deaths
+            .push(SpecialDeathKind::Target);
+        w.takt(10);
+        assert_eq!(w.before_win_count, 0);
+        assert!(w.special_broken);
+        // check_status (gated to ~1s) hasn't consumed JUST_WIN yet at
+        // 20ms elapsed, so the status must still be visible here.
+        assert_eq!(w.player_side.status, SideStatus::JustWin);
+    }
+
+    #[test]
+    fn terron_death_wins_regardless_of_remaining_targets() {
+        use crate::matrix_game::map_static::SpecialDeathKind;
+        use crate::matrix_game::side::SideStatus;
+        let mut w = MapLogic::new();
+        w.before_win_count = 5;
+        w.objects
+            .pending_special_deaths
+            .push(SpecialDeathKind::Terron);
+        w.takt(10);
+        assert_eq!(w.before_win_count, 4);
+        assert!(w.win_flag);
+        assert_eq!(w.player_side.status, SideStatus::JustWin);
     }
 
     // ── Economy / robot-limit tests ───────────────────────────────

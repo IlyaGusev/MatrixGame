@@ -433,8 +433,13 @@ impl Robot {
     pub fn new(pos: glam::Vec3, side: i32, chassis: ChassisKind) -> Self {
         let core = ObjectCore {
             obj_type: ObjectType::RobotAi,
-            geo_center: pos + glam::Vec3::new(0.0, 0.0, 3.0),
-            radius: 6.0,
+            // Placeholder until the first rendered frame: the robot
+            // renderer overwrites both with the real CalcBounds AABB
+            // (JoinToGroup semantics — geo_center mid-body, radius =
+            // half-diagonal, ~13 for a typical build). The old 6-unit
+            // sphere at z+3 made hitscan beams pass clean over robots.
+            geo_center: pos + glam::Vec3::new(0.0, 0.0, 9.0),
+            radius: 13.0,
             matrix: glam::Mat4::from_translation(pos),
             ..Default::default()
         };
@@ -848,7 +853,7 @@ impl Robot {
         if self.pos_z < cz {
             self.pos_z = cz;
         }
-        self.core.geo_center = glam::Vec3::new(self.pos_x, self.pos_y, self.pos_z + 3.0);
+        self.core.geo_center = glam::Vec3::new(self.pos_x, self.pos_y, self.pos_z + 9.0);
 
         // Sway + heading follow (MatrixRobot.cpp:651-668).
         {
@@ -1494,7 +1499,7 @@ impl Robot {
                         }
                     }
                     if !frozen {
-                        self.dispatch_move_to(cms, map, &*objs, elapsed_ms);
+                        self.dispatch_move_to(cms, map, objs, elapsed_ms);
                     }
                 }
                 OrderType::MoveReturn => {
@@ -1695,7 +1700,7 @@ impl Robot {
                     self.low_level_move(
                         cms,
                         map,
-                        &*objs,
+                        objs,
                         glam::Vec2::new(f_pos.x, f_pos.y),
                         false,
                         false,
@@ -1706,7 +1711,7 @@ impl Robot {
                     self.low_level_move(
                         cms,
                         map,
-                        &*objs,
+                        objs,
                         glam::Vec2::new(f_pos.x, f_pos.y),
                         true,
                         true,
@@ -1834,7 +1839,7 @@ impl Robot {
     /// Port of the ROT_MOVE_TO / ROT_MOVE_TO_BACK dispatch case
     /// (MatrixRobot.cpp:1020-1112), minus the arcade branch (manual
     /// control is out of scope).
-    fn dispatch_move_to(&mut self, cms: i32, map: &GameMap, objs: &Objects, elapsed_ms: i64) {
+    fn dispatch_move_to(&mut self, cms: i32, map: &GameMap, objs: &mut Objects, elapsed_ms: i64) {
         self.map_pos_calc(map);
         self.zone_cur_find(map);
 
@@ -1900,7 +1905,7 @@ impl Robot {
     /// when the projected progress along the segment exceeds the
     /// segment length (stop on the final waypoint). The stuck-watchdog
     /// + terrain-Z + ONWATER flag update all live here too.
-    fn move_by_move_path(&mut self, cms: i32, map: &GameMap, objs: &Objects, elapsed_ms: i64) {
+    fn move_by_move_path(&mut self, cms: i32, map: &GameMap, objs: &mut Objects, elapsed_ms: i64) {
         let Some((sou_pt, des_pt)) = self.move_path.current_segment() else {
             self.stop_moving();
             return;
@@ -1974,7 +1979,7 @@ impl Robot {
         self.pos_z = self.z_from_pos(map);
         self.core.geo_center.x = self.pos_x;
         self.core.geo_center.y = self.pos_y;
-        self.core.geo_center.z = self.pos_z + 3.0;
+        self.core.geo_center.z = self.pos_z + 9.0;
         self.rchange |= MR_MATRIX;
     }
 
@@ -1996,7 +2001,7 @@ impl Robot {
         &mut self,
         cms: i32,
         map: &GameMap,
-        objs: &Objects,
+        objs: &mut Objects,
         dest: glam::Vec2,
         robot_coll: bool,
         obst_coll: bool,
@@ -2013,7 +2018,7 @@ impl Robot {
         let mut result_coll = glam::Vec2::ZERO;
 
         if robot_coll {
-            r = self.robot_to_object_collision(objs, gmv);
+            r = self.robot_to_object_collision(cms, map, objs, gmv);
             result_coll = r;
         }
         if obst_coll {
@@ -2139,55 +2144,202 @@ impl Robot {
     }
 
     /// Port of `CMatrixRobotAI::RobotToObjectCollision`
-    /// (MatrixRobot.cpp:3059-3074). Calls `FindObjects` within `3R` to
-    /// collect nearby robots / cannons and runs `CollisionCallback`
-    /// (:2892-3003) on each hit. The callback:
+    /// (MatrixRobot.cpp:3055-3074) + `CollisionCallback` (:2892-3053).
+    /// Per nearby robot (within the FindObjects `3R` search):
     ///   - separates overlapping pairs along the connecting vector,
-    ///   - stops forward progress when an aligned robot is ahead
-    ///     (matching m_ColSpeed to half of theirs, :2933),
-    ///   - increments `m_Cols` / `m_ColsWeight` / `m_ColsWeight2`
-    ///     counters used by the AI's "get lost" heuristic.
-    ///
-    /// The Rust port carries the separation + m_Cols bits; the
-    /// ColsWeight / stop-on-alignment machinery is faithful to the
-    /// original but simplified to pairwise separation until the full
-    /// group AI lands (m_ColSpeed still resets to 100 in the no-far
-    /// branch at :3070 — the observable speed clamp).
-    fn robot_to_object_collision(&mut self, objs: &Objects, vel: glam::Vec2) -> glam::Vec2 {
+    ///   - freshly-colliding pair moving the same way → the rear robot
+    ///     stops this tick (`data->stop`) and clamps `m_ColSpeed` to
+    ///     half the leader's group speed (:2921-2940),
+    ///   - sustained jam against a same-side robot dead ahead moving
+    ///     opposite (or idle) → that robot is told to step aside:
+    ///     MoveReturn + PlaceFindNearReturn + MoveTo + AddBadCoord
+    ///     (:2946-2983),
+    ///   - far look (2R..4R): the group-speed clamp without the stop
+    ///     (:3006-3034).
+    /// Returns the displacement to add to this tick's movement, or
+    /// `-vel` (full stop) when the callback raised `stop` (:3072).
+    fn robot_to_object_collision(
+        &mut self,
+        cms: i32,
+        map: &GameMap,
+        objs: &mut Objects,
+        vel: glam::Vec2,
+    ) -> glam::Vec2 {
         const COLLIDE_BOT_R: f32 = 18.0;
         const COLLIDE_BOT_2R: f32 = COLLIDE_BOT_R + COLLIDE_BOT_R;
         // `CANNON_COLLIDE_R` (MatrixObjectCannon.hpp:20).
         const CANNON_COLLIDE_R: f32 = 20.0;
+        // `const int tm = 2` (:2895) — collision-weight multiplier.
+        const TM: i32 = 2;
 
         // `my_pos + vel` — where the robot would end up this tick without
         // any collision response. The callback uses this for the distance
         // check at :2902.
         let my_pos = glam::Vec2::new(self.pos_x + vel.x, self.pos_y + vel.y);
+        let my_cur = glam::Vec2::new(self.pos_x, self.pos_y);
+        let self_has_return = self.return_coords().is_some();
 
         let mut result = glam::Vec2::ZERO;
         let mut far_col = false;
+        let mut stop = false;
 
-        for id in objs.iter_live() {
+        let ids: Vec<ObjectId> = objs.iter_live().collect();
+        for id in ids {
             let Some(other_obj) = objs.get(id) else {
                 continue;
             };
             match other_obj.core().obj_type {
                 ObjectType::RobotAi => {
+                    // Snapshot, then drop the borrow — the weight inc /
+                    // step-aside below need `objs` mutably.
                     let other: &Robot =
                         unsafe { &*(other_obj as *const dyn MapStatic as *const Robot) };
+                    // :2897 — automatic-mode robots (spawn / move-out /
+                    // base-capture ride) don't take part in collisions.
+                    if other.is_automatic_mode() {
+                        continue;
+                    }
                     let their_pos = glam::Vec2::new(other.pos_x, other.pos_y);
+                    // FindObjects search radius (3R around the current
+                    // position, :3068) bounds the far-look branch.
+                    if (their_pos - my_cur).length()
+                        >= COLLIDE_BOT_R * 3.0 + other.core.radius
+                    {
+                        continue;
+                    }
+                    let other_vel = other.velocity;
+                    let other_group_speed = other.group_speed;
+                    let other_side = other.side;
+                    let other_map = (other.map_x, other.map_y);
+                    let other_kind = other.chassis.kind_index();
+                    let other_bad: Vec<(i32, i32)> = other.env.bad_coords().to_vec();
+
                     let dv = my_pos - their_pos;
                     let dist = dv.length();
-                    if dist < COLLIDE_BOT_2R && dist > 1.0e-3 {
-                        let correction = (COLLIDE_BOT_2R - dist) * 0.5;
-                        result += (dv / dist) * correction;
+
+                    if dist < COLLIDE_BOT_2R {
+                        'pass: {
+                            // :2908 — not moving → no fancy logic.
+                            let vd = vel.length_squared();
+                            if vd < 1.0e-8 {
+                                break 'pass;
+                            }
+                            let vdir = vel / vd.sqrt();
+
+                            // :2915-2919 — both parties accumulate weight;
+                            // the short-window one clamps at 500*tm.
+                            self.cols_weight += cms * TM;
+                            self.cols_weight2 += cms * TM;
+                            if let Some(o) = crate::matrix_game::logic::robot_mut(objs, id) {
+                                o.cols_weight += cms * TM;
+                                o.cols_weight2 += cms * TM;
+                            }
+                            if self.cols_weight2 > 500 * TM {
+                                self.cols_weight2 = 500 * TM;
+                            }
+
+                            // :2921-2940 — fresh collision with a robot
+                            // ahead moving roughly the same way: stop and
+                            // match half the leader's group speed. The id
+                            // comparison is the C++ pointer tie-break so
+                            // only one of the pair yields.
+                            if self.cols_weight2 < 200 * TM
+                                && other_vel.length_squared() > 1.0e-8
+                                && vdir.dot(-dv) > 0.0
+                                && vdir.dot(other_vel) > 0.0
+                                && !(other_vel.dot(dv) > 0.0
+                                    && self.self_id.map_or(false, |me| id < me))
+                            {
+                                stop = true;
+                                far_col = true;
+                                self.col_speed = self.group_speed.min(other_group_speed * 0.5);
+                            }
+
+                            // :2946-2983 — sustained jam: once the long
+                            // window saturates, a same-side robot dead
+                            // ahead that is idle (or driving into us) is
+                            // asked to step aside.
+                            if self.cols_weight < 500 * TM {
+                                break 'pass;
+                            }
+                            self.cols_weight = 500 * TM;
+                            if dist <= 1.0e-3 {
+                                break 'pass;
+                            }
+                            let to_other = -dv / dist;
+                            // cos(90°) = 0 — the other must be in front.
+                            if vdir.dot(to_other) <= 0.0 {
+                                break 'pass;
+                            }
+                            if other_vel.length_squared() > 0.0 {
+                                let dvn = other_vel.normalize();
+                                // Moving, but not against us (within 45°
+                                // of head-on) → the jam resolves itself.
+                                if vdir.dot(dvn) >= -((45.0f32).to_radians().cos()) {
+                                    self.cols_weight = 0;
+                                    break 'pass;
+                                }
+                            }
+                            if !self_has_return && other_side == self.side {
+                                // The blocker remembers where to come back
+                                // to (its move-to target, else its spot)…
+                                if let Some(o) = crate::matrix_game::logic::robot_mut(objs, id)
+                                {
+                                    if o.return_coords().is_none() {
+                                        let tp = o
+                                            .move_to_coords()
+                                            .unwrap_or((o.map_x, o.map_y));
+                                        o.move_return(tp.0, tp.1);
+                                    }
+                                }
+                                // …then sidesteps to the nearest free cell
+                                // not on its bad-coord list.
+                                if let Some(tp) = crate::matrix_game::logic::place_find_near_return(
+                                    map,
+                                    objs,
+                                    other_kind,
+                                    4,
+                                    other_map.0,
+                                    other_map.1,
+                                    &other_bad,
+                                ) {
+                                    if let Some(o) =
+                                        crate::matrix_game::logic::robot_mut(objs, id)
+                                    {
+                                        o.move_to(tp.0, tp.1);
+                                        o.env.add_bad_coord(tp);
+                                    }
+                                }
+                            }
+                            self.cols_weight = 0;
+                        }
+                        // :2999-3003 — separation displacement, halved
+                        // (the other side pushes back symmetrically).
+                        if dist > 1.0e-3 {
+                            let correction = (COLLIDE_BOT_2R - dist) * 0.5;
+                            result += (dv / dist) * correction;
+                        }
                         self.cols += 1;
-                        far_col = true;
+                    } else if dist < COLLIDE_BOT_R * 4.0 {
+                        // :3006-3034 — far look: group-speed clamp for an
+                        // aligned robot ahead, without the stop.
+                        let vd = vel.length_squared();
+                        if vd >= 1.0e-8 && other_vel.length_squared() > 1.0e-8 {
+                            let vdir = vel / vd.sqrt();
+                            if vdir.dot(-dv) > 0.0
+                                && vdir.dot(other_vel) > 0.0
+                                && !(other_vel.dot(dv) > 0.0
+                                    && self.self_id.map_or(false, |me| id < me))
+                            {
+                                far_col = true;
+                                self.col_speed = self.group_speed.min(other_group_speed * 0.5);
+                            }
+                        }
                     }
                 }
                 ObjectType::Cannon => {
                     // Cannon branch of CollisionCallback (MatrixRobot.cpp:
-                    // 3036-3066). Correction is UNHALVED — the cannon
+                    // 3036-3053). Correction is UNHALVED — the cannon
                     // never moves, so the robot takes the whole push-out.
                     let cannon: &Cannon =
                         unsafe { &*(other_obj as *const dyn MapStatic as *const Cannon) };
@@ -2208,6 +2360,10 @@ impl Robot {
         // stick at a stale clamp after the colliding robot moves away.
         if !far_col {
             self.col_speed = 100.0;
+        }
+        // :3072 — `data.stop` cancels this tick's movement outright.
+        if stop {
+            return -vel;
         }
         result
     }
@@ -2756,6 +2912,14 @@ impl MapStatic for Robot {
             self.show_hitpoint_time = (self.show_hitpoint_time - cms).max(0);
         }
 
+        // Collision-weight decay (MatrixRobot.cpp:375-376).
+        if self.cols_weight != 0 {
+            self.cols_weight = (self.cols_weight - cms).max(0);
+        }
+        if self.cols_weight2 != 0 {
+            self.cols_weight2 = (self.cols_weight2 - cms).max(0);
+        }
+
         // Keel-water / hovercraft dust (CMatrixRobot::Takt,
         // MatrixObjectRobot.cpp:911-948).
         const KEELWATER_SPAWN_FACTOR: f32 = 0.01;
@@ -2957,7 +3121,7 @@ impl MapStatic for Robot {
                 }
             }
             self.core.geo_center =
-                glam::Vec3::new(self.pos_x, self.pos_y, self.pos_z + 3.0);
+                glam::Vec3::new(self.pos_x, self.pos_y, self.pos_z + 9.0);
             return;
         }
 
@@ -3000,7 +3164,7 @@ impl MapStatic for Robot {
 
                 // Update core so the selection ring / robot light
                 // follow the rising robot.
-                self.core.geo_center.z = self.pos_z + 3.0;
+                self.core.geo_center.z = self.pos_z + 9.0;
                 self.rchange |= MR_MATRIX;
 
                 if b.state == BaseState::Opened {
@@ -3025,7 +3189,7 @@ impl MapStatic for Robot {
                     self.pos_x + self.forward.x * 100.0,
                     self.pos_y + self.forward.y * 100.0,
                 );
-                self.low_level_move(cms, map, &*objs, dest_far, true, false, false, false);
+                self.low_level_move(cms, map, objs, dest_far, true, false, false, false);
 
                 let Some(base_id) = self.base else {
                     self.state = RobotState::Idle;
@@ -3068,7 +3232,7 @@ impl MapStatic for Robot {
 
                 self.core.geo_center.x = self.pos_x;
                 self.core.geo_center.y = self.pos_y;
-                self.core.geo_center.z = self.pos_z + 3.0;
+                self.core.geo_center.z = self.pos_z + 9.0;
                 self.rchange |= MR_MATRIX;
 
                 if dist_sq >= BASE_DIST * BASE_DIST {

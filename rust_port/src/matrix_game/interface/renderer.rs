@@ -93,6 +93,13 @@ pub struct InterfaceRenderer {
     vertex_capacity: usize,
     atlases: HashMap<String, Atlas>,
     draw_groups: Vec<DrawGroup>,
+    /// First draw-group index of the "above the constructor preview"
+    /// layer (dialog hints, Hints buttons, popup, hover hint). The C++
+    /// renders CConstructor::Render mid-interface, after the panel
+    /// backdrop but below popups/hints (CInterface.cpp:929-933);
+    /// `render_base` / `render_overlay` split here so the 3D preview
+    /// pass can slot between them.
+    overlay_start: usize,
     num_verts: u32,
     /// Glyph cache + GPU upload tracking. Re-uploaded whenever a new
     /// glyph is rasterised (atlas.generation changes).
@@ -300,6 +307,7 @@ impl InterfaceRenderer {
             vertex_capacity,
             atlases: solid_atlases,
             draw_groups: Vec::new(),
+            overlay_start: 0,
             num_verts: 0,
             glyph_atlas: GlyphAtlas::new(),
             glyph_atlas_generation: 0,
@@ -803,7 +811,17 @@ impl InterfaceRenderer {
         screen_w: f32,
         screen_h: f32,
     ) {
-        self.upload_inner(device, queue, panels, popup, None, None, screen_w, screen_h);
+        self.upload_inner(
+            device,
+            queue,
+            panels,
+            popup,
+            None,
+            &[],
+            None,
+            screen_w,
+            screen_h,
+        );
     }
 
     /// Full-fat upload that also renders a hovering tooltip on top.
@@ -817,12 +835,21 @@ impl InterfaceRenderer {
         panels: &[&CInterface],
         popup: Option<&super::iface_menu::CIFaceMenu>,
         hint: Option<&Hint>,
+        dialog_hints: &[&Hint],
         chrome: Option<&HintChromeLibrary>,
         screen_w: f32,
         screen_h: f32,
     ) {
         self.upload_inner(
-            device, queue, panels, popup, hint, chrome, screen_w, screen_h,
+            device,
+            queue,
+            panels,
+            popup,
+            hint,
+            dialog_hints,
+            chrome,
+            screen_w,
+            screen_h,
         );
     }
 
@@ -835,7 +862,17 @@ impl InterfaceRenderer {
         screen_w: f32,
         screen_h: f32,
     ) {
-        self.upload_inner(device, queue, panels, None, None, None, screen_w, screen_h);
+        self.upload_inner(
+            device,
+            queue,
+            panels,
+            None,
+            None,
+            &[],
+            None,
+            screen_w,
+            screen_h,
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -846,6 +883,7 @@ impl InterfaceRenderer {
         panels: &[&CInterface],
         popup: Option<&super::iface_menu::CIFaceMenu>,
         hint: Option<&Hint>,
+        dialog_hints: &[&Hint],
         chrome: Option<&HintChromeLibrary>,
         screen_w: f32,
         screen_h: f32,
@@ -897,93 +935,140 @@ impl InterfaceRenderer {
         let mut per_panel_missing: std::collections::BTreeMap<String, u32> =
             std::collections::BTreeMap::new();
 
-        for panel in panels {
-            if !panel.visible {
-                continue;
+        // Two passes: 0 = every panel except `Hints`, 1 = the dialog-
+        // mode hint widgets followed by the `Hints` button panel. The
+        // C++ draws hints AFTER the whole interface (MatrixMap.cpp:
+        // 2472-2474) and lets the buttons show through alpha holes
+        // that `CMatrixHint::Build` punches into the hint bitmap with
+        // raw `bmpf.Copy` of the bhole/exit anchor images
+        // (MatrixHint.cpp:397-403). A quad streamer can't erase
+        // already-emitted pixels, so we reach the same visual stack by
+        // drawing the buttons after the dialog hints instead.
+        for pass in 0..2u32 {
+            if pass == 1 {
+                // Everything emitted so far draws BELOW the constructor
+                // 3D preview; dialogs / hint buttons / popup / hover
+                // hint draw ABOVE it. Flush the open run so the split
+                // lands on a group boundary.
+                if let Some(k) = current_key.take() {
+                    let end = all_verts.len() as u32;
+                    if end > current_start {
+                        self.draw_groups.push(DrawGroup {
+                            atlas_key: k,
+                            start: current_start,
+                            count: end - current_start,
+                        });
+                    }
+                    current_start = all_verts.len() as u32;
+                }
+                self.overlay_start = self.draw_groups.len();
+                if let Some(c) = chrome {
+                    for h in dialog_hints {
+                        emit_hint(
+                            &mut all_verts,
+                            &mut current_key,
+                            &mut current_start,
+                            &mut self.draw_groups,
+                            &mut self.glyph_atlas,
+                            &self.atlases,
+                            c,
+                            h,
+                            scale,
+                        );
+                    }
+                }
             }
-            let [px, py] = panel.resolved_pos(screen_w, screen_h, scale);
-            let mut n_visible = 0u32;
-            for elem in &panel.elements {
-                if !elem.visible() {
+            for panel in panels {
+                if (pass == 0) == (panel.name == "Hints") {
                     continue;
                 }
-                let Some(img) = elem.current_image() else {
-                    continue;
-                };
-                let key = normalise_atlas_key(&img.tex_path);
-                if !self.atlases.contains_key(&key) {
-                    *per_panel_missing
-                        .entry(format!("{}::{}", panel.name, key))
-                        .or_insert(0) += 1;
+                if !panel.visible {
                     continue;
                 }
-                n_visible += 1;
-                let [x, y, w, h] = elem.rect_in_panel([px, py], scale);
-                // Half-pixel UV inset. The atlas textures aren't edge-
-                // padded: atlas col 511 (just outside mp1's sub-rect)
-                // and col 175 (just outside mp2's) are fully
-                // transparent. Linear filtering at UV=img.x/tex_w or
-                // (img.x+img.w)/tex_w lands exactly on the sub-rect
-                // edge, so the sampler blends 50/50 with the neighbour
-                // column — making mp1's rightmost ~1 px and mp2's
-                // leftmost ~1 px render at half alpha. Stacked at the
-                // mp1/mp2 screen junction this shows the map through a
-                // 1–2 px seam. Inset by 0.5 px so the filter stays
-                // inside the sub-rect.
-                let u0 = (img.x + 0.5) / img.tex_w;
-                let v0 = (img.y + 0.5) / img.tex_h;
-                let u1 = (img.x + img.w - 0.5) / img.tex_w;
-                let v1 = (img.y + img.h - 0.5) / img.tex_h;
-                let tint = match elem.cur_state {
-                    ElementState::Focused => [1.0, 1.0, 1.0, 1.0],
-                    ElementState::Pressed => [0.8, 0.8, 0.8, 1.0],
-                    ElementState::Disabled => [0.5, 0.5, 0.5, 0.8],
-                    ElementState::Normal => [1.0, 1.0, 1.0, 1.0],
-                    // Latched check buttons draw their authored
-                    // `sPressedUnFocused` art untinted.
-                    ElementState::PressedUnfocused => [1.0, 1.0, 1.0, 1.0],
-                };
-                open_run(
-                    &key,
-                    &all_verts,
-                    &mut current_key,
-                    &mut current_start,
-                    &mut self.draw_groups,
-                );
-                all_verts.extend_from_slice(&[
-                    Vertex {
-                        pos: [x, y],
-                        uv: [u0, v0],
-                        tint,
-                    },
-                    Vertex {
-                        pos: [x + w, y],
-                        uv: [u1, v0],
-                        tint,
-                    },
-                    Vertex {
-                        pos: [x, y + h],
-                        uv: [u0, v1],
-                        tint,
-                    },
-                    Vertex {
-                        pos: [x + w, y],
-                        uv: [u1, v0],
-                        tint,
-                    },
-                    Vertex {
-                        pos: [x + w, y + h],
-                        uv: [u1, v1],
-                        tint,
-                    },
-                    Vertex {
-                        pos: [x, y + h],
-                        uv: [u0, v1],
-                        tint,
-                    },
-                ]);
+                let [px, py] = panel.resolved_pos(screen_w, screen_h, scale);
+                let mut n_visible = 0u32;
+                for elem in &panel.elements {
+                    if !elem.visible() {
+                        continue;
+                    }
+                    let Some(img) = elem.current_image() else {
+                        continue;
+                    };
+                    let key = normalise_atlas_key(&img.tex_path);
+                    if !self.atlases.contains_key(&key) {
+                        *per_panel_missing
+                            .entry(format!("{}::{}", panel.name, key))
+                            .or_insert(0) += 1;
+                        continue;
+                    }
+                    n_visible += 1;
+                    let [x, y, w, h] = elem.rect_in_panel([px, py], scale);
+                    // Half-pixel UV inset. The atlas textures aren't edge-
+                    // padded: atlas col 511 (just outside mp1's sub-rect)
+                    // and col 175 (just outside mp2's) are fully
+                    // transparent. Linear filtering at UV=img.x/tex_w or
+                    // (img.x+img.w)/tex_w lands exactly on the sub-rect
+                    // edge, so the sampler blends 50/50 with the neighbour
+                    // column — making mp1's rightmost ~1 px and mp2's
+                    // leftmost ~1 px render at half alpha. Stacked at the
+                    // mp1/mp2 screen junction this shows the map through a
+                    // 1–2 px seam. Inset by 0.5 px so the filter stays
+                    // inside the sub-rect.
+                    let u0 = (img.x + 0.5) / img.tex_w;
+                    let v0 = (img.y + 0.5) / img.tex_h;
+                    let u1 = (img.x + img.w - 0.5) / img.tex_w;
+                    let v1 = (img.y + img.h - 0.5) / img.tex_h;
+                    let tint = match elem.cur_state {
+                        ElementState::Focused => [1.0, 1.0, 1.0, 1.0],
+                        ElementState::Pressed => [0.8, 0.8, 0.8, 1.0],
+                        ElementState::Disabled => [0.5, 0.5, 0.5, 0.8],
+                        ElementState::Normal => [1.0, 1.0, 1.0, 1.0],
+                        // Latched check buttons draw their authored
+                        // `sPressedUnFocused` art untinted.
+                        ElementState::PressedUnfocused => [1.0, 1.0, 1.0, 1.0],
+                    };
+                    open_run(
+                        &key,
+                        &all_verts,
+                        &mut current_key,
+                        &mut current_start,
+                        &mut self.draw_groups,
+                    );
+                    all_verts.extend_from_slice(&[
+                        Vertex {
+                            pos: [x, y],
+                            uv: [u0, v0],
+                            tint,
+                        },
+                        Vertex {
+                            pos: [x + w, y],
+                            uv: [u1, v0],
+                            tint,
+                        },
+                        Vertex {
+                            pos: [x, y + h],
+                            uv: [u0, v1],
+                            tint,
+                        },
+                        Vertex {
+                            pos: [x + w, y],
+                            uv: [u1, v0],
+                            tint,
+                        },
+                        Vertex {
+                            pos: [x + w, y + h],
+                            uv: [u1, v1],
+                            tint,
+                        },
+                        Vertex {
+                            pos: [x, y + h],
+                            uv: [u0, v1],
+                            tint,
+                        },
+                    ]);
+                }
+                per_panel_counts.push((panel.name.clone(), n_visible));
             }
-            per_panel_counts.push((panel.name.clone(), n_visible));
         }
 
         // ── Popup overlay ─────────────────────────────────────────
@@ -1482,13 +1567,28 @@ impl InterfaceRenderer {
     }
 
     pub fn render<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
-        if self.num_verts == 0 || self.draw_groups.is_empty() {
+        self.render_groups(pass, 0, self.draw_groups.len());
+    }
+
+    /// Panels only — everything below the constructor 3D preview.
+    pub fn render_base<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
+        self.render_groups(pass, 0, self.overlay_start.min(self.draw_groups.len()));
+    }
+
+    /// Dialog hints / hint buttons / popup / hover hint — everything
+    /// above the constructor 3D preview.
+    pub fn render_overlay<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
+        self.render_groups(pass, self.overlay_start.min(self.draw_groups.len()), self.draw_groups.len());
+    }
+
+    fn render_groups<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, from: usize, to: usize) {
+        if self.num_verts == 0 || from >= to {
             return;
         }
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.uniform_bg, &[]);
         pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-        for g in &self.draw_groups {
+        for g in &self.draw_groups[from..to] {
             let Some(atlas) = self.atlases.get(&g.atlas_key) else {
                 continue;
             };

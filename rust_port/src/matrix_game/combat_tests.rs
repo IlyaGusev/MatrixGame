@@ -31,6 +31,11 @@ fn install_test_config() {
     for i in 0..WEAPON_COUNT {
         cfg.robot_damages.table[i] = dmg;
         cfg.cannon_damages.table[i] = dmg;
+        // Flyer table too — global config is process-wide, so every
+        // concurrent install_test_config must write the same values
+        // or the flyer-damage test flakes when another test clobbers
+        // its locally-seeded table.
+        cfg.flyer_damages.table[i] = dmg;
         cfg.weapon_radius.table[i] = 500.0;
         cfg.weapon_cooldown.table[i] = 100;
     }
@@ -48,6 +53,30 @@ fn install_test_config() {
     cfg.overheat.gun = oh;
     cfg.overheat.lightening = oh;
     cfg.difficulty = Difficulty::default();
+    // Turret props for the turret-fire tests — must live HERE so every
+    // concurrent test writes the identical global config.
+    {
+        use crate::matrix_game::config::CannonProps;
+        use crate::matrix_game::effects::weapon::{
+            WEAPON_CANNON0, WEAPON_CANNON1, WEAPON_CANNON2, WEAPON_CANNON3,
+        };
+        for (i, w) in [WEAPON_CANNON0, WEAPON_CANNON1, WEAPON_CANNON2, WEAPON_CANNON3]
+            .into_iter()
+            .enumerate()
+        {
+            cfg.turrets.cannons[i] = CannonProps {
+                resources: [0; 4],
+                strength: 10.0,
+                hitpoint: 100.0,
+                max_top_angle: 89.0f32.to_radians(),
+                max_bottom_angle: -30.0f32.to_radians(),
+                weapon: w,
+                // Real data: Rotation=0.5..0.9 degrees per takt.
+                max_da: 0.5f32.to_radians(),
+                seek_radius: 400.0,
+            };
+        }
+    }
     config::set_global(cfg);
 }
 
@@ -385,4 +414,109 @@ fn laser_beam_visual_tracks_while_firing_and_clears_on_fire_end() {
         objs.weapons.get(wid).unwrap().beam.is_none(),
         "beam not cleared"
     );
+}
+
+#[test]
+fn flyer_damage_decrements_hp_and_death_drops_cargo() {
+    use crate::matrix_game::flyer::Flyer;
+    install_test_config();
+    let map = GameMap::test_flat(32, 32, 0.0);
+    let mut objs = Objects::new();
+
+    let mut f = Flyer::new_give_bot(
+        &map,
+        glam::Vec2::new(100.0, 100.0),
+        2,
+        0.0,
+        300.0,
+        100.0,
+        20.0,
+        2,
+        25.0,
+    );
+    f.hit_point = 25.0;
+    f.hit_point_max = 25.0;
+    let robot_id = spawn_robot(&mut objs, Vec3::new(100.0, 100.0, 50.0), PLAYER_SIDE, 100.0);
+    if let Some(r) = crate::matrix_game::logic::robot_mut(&mut objs, robot_id) {
+        r.state = RobotState::Carrying;
+    }
+    f.carrying = Some(robot_id);
+    let fid = objs.spawn(Box::new(f));
+
+    // Two hits: 25 -> 15 -> 5 (alive).
+    objs.apply_damage(fid, WEAPON_GUN, Vec3::ZERO, Vec3::X, 2, None);
+    objs.apply_damage(fid, WEAPON_GUN, Vec3::ZERO, Vec3::X, 2, None);
+    {
+        let obj = objs.get(fid).unwrap();
+        let f: &Flyer = unsafe { &*(obj as *const dyn MapStatic as *const Flyer) };
+        assert!((f.hit_point - 5.0).abs() < 1e-3);
+    }
+
+    // Third hit kills: cargo drops into Falling, flyer reports death.
+    let dead = objs.apply_damage(fid, WEAPON_GUN, Vec3::ZERO, Vec3::X, 2, None);
+    assert!(dead);
+    let r = crate::matrix_game::logic::robot_mut(&mut objs, robot_id).unwrap();
+    assert_eq!(r.state, RobotState::Falling);
+}
+
+/// End-to-end turret fire: a kind-`kind` turret with `weapon` must
+/// damage an enemy robot parked inside its fire radius within a few
+/// simulated seconds. Drives the real seek/aim/fire pipeline.
+#[cfg(test)]
+fn run_turret_vs_robot(kind: i32, _weapon: crate::matrix_game::effects::weapon::Weapon) -> f32 {
+    use crate::matrix_game::object_cannon::Cannon;
+
+    install_test_config();
+
+    let map = GameMap::test_flat(64, 64, 0.0);
+    let mut objs = Objects::new();
+    let mut rng = Rnd::new(11);
+
+    let robot_id = spawn_robot(&mut objs, Vec3::new(220.0, 100.0, 0.0), 2, 10_000.0);
+
+    let mut c = Cannon::new(glam::Vec2::new(100.0, 100.0), 0.0, 0.0, PLAYER_SIDE, kind, None, 0);
+    c.hit_point = 100.0;
+    c.hit_point_max = 100.0;
+    let cid = objs.spawn(Box::new(c));
+    if let Some(obj) = objs.get_mut(cid) {
+        let cm: &mut Cannon = unsafe { &mut *(obj as *mut dyn MapStatic as *mut Cannon) };
+        cm.self_id = Some(cid);
+    }
+    objs.add_lt(cid);
+    objs.add_lt(robot_id);
+
+    // ~8 simulated seconds at the 10ms logic cadence, with the
+    // pending-effect drain + effects_takt the real MapLogic::takt runs
+    // (projectile weapons live as MovingObject effects).
+    let mut effects: Vec<crate::matrix_game::effects::GameEffect> = Vec::new();
+    for t in 0..800i64 {
+        let _scope = crate::matrix_game::map::MapScope::enter(&map, t * 10);
+        objs.proceed_logic(10, &mut rng);
+        crate::matrix_game::effects::effects_takt(&mut effects, 10.0, &map, &mut objs, &mut rng);
+    }
+
+    crate::matrix_game::logic::robot_mut(&mut objs, robot_id)
+        .map(|r| r.hit_point)
+        .unwrap_or(-1.0)
+}
+
+#[test]
+fn laser_turret_damages_enemy_robot() {
+    use crate::matrix_game::effects::weapon::WEAPON_CANNON2;
+    let hp = run_turret_vs_robot(3, WEAPON_CANNON2);
+    assert!(hp < 10_000.0, "laser turret never damaged the robot (hp={hp})");
+}
+
+#[test]
+fn rocket_turret_damages_enemy_robot() {
+    use crate::matrix_game::effects::weapon::WEAPON_CANNON3;
+    let hp = run_turret_vs_robot(4, WEAPON_CANNON3);
+    assert!(hp < 10_000.0, "rocket turret never damaged the robot (hp={hp})");
+}
+
+#[test]
+fn gun_turret_damages_enemy_robot() {
+    use crate::matrix_game::effects::weapon::WEAPON_CANNON0;
+    let hp = run_turret_vs_robot(1, WEAPON_CANNON0);
+    assert!(hp < 10_000.0, "gun turret never damaged the robot (hp={hp})");
 }

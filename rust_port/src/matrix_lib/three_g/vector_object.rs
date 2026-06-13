@@ -625,6 +625,31 @@ pub fn chassis_vo(idx: usize) -> Option<Arc<VoMesh>> {
     chassis_slot().read().unwrap().get(idx).cloned().flatten()
 }
 
+/// Same pattern for the cannon shaft VOs (`Matrix/Cannon/Shaft{1-4}.vo`),
+/// populated by `CannonsRenderer::new`. The cannon game object needs
+/// frame durations to drive the fire/idle shaft animation
+/// (MatrixObjectCannon.cpp:448-460, 824-851). Indexed by kind − 1.
+static CANNON_SHAFT_VOS: OnceLock<RwLock<[Option<Arc<VoMesh>>; 4]>> = OnceLock::new();
+
+fn cannon_shaft_slot() -> &'static RwLock<[Option<Arc<VoMesh>>; 4]> {
+    CANNON_SHAFT_VOS.get_or_init(|| RwLock::new([const { None }; 4]))
+}
+
+pub fn set_cannon_shaft_vo(idx: usize, vo: Arc<VoMesh>) {
+    if idx < 4 {
+        cannon_shaft_slot().write().unwrap()[idx] = Some(vo);
+    }
+}
+
+pub fn cannon_shaft_vo(idx: usize) -> Option<Arc<VoMesh>> {
+    cannon_shaft_slot()
+        .read()
+        .unwrap()
+        .get(idx)
+        .cloned()
+        .flatten()
+}
+
 #[derive(Debug, Clone)]
 pub struct AnimState {
     /// `m_Anim` — index into `VoMesh::animations`.
@@ -687,6 +712,42 @@ impl AnimState {
         self.looped = looped;
         self.first_frame(vo);
         false
+    }
+
+    /// Port of `SetAnimByName(name)` single-arg overload (VectorObject.
+    /// hpp:524): loopedness comes from the data (`SetLoopStatus` —
+    /// the sign of the new anim's first frame duration, hpp:390).
+    pub fn set_anim_by_name_data_looped(&mut self, vo: &VoMesh, name: &str) -> bool {
+        let Some(idx) = vo.animations.iter().position(|a| a.name == name) else {
+            return true;
+        };
+        self.anim = idx as i32;
+        self.looped = anim_data_looped(vo, self.anim);
+        self.first_frame(vo);
+        false
+    }
+
+    /// Port of `SetAnimByNameNoBegin(name)` (VectorObject.hpp:527):
+    /// like `set_anim_by_name` but doesn't restart when the anim is
+    /// already current. NB: the C++ calls `SetLoopStatus()` BEFORE
+    /// switching `m_Anim`, so the loop flag is read from the PREVIOUS
+    /// anim's data — kept verbatim (benign in practice since idle
+    /// anims are looped).
+    pub fn set_anim_by_name_no_begin(&mut self, vo: &VoMesh, name: &str) -> bool {
+        let Some(idx) = vo.animations.iter().position(|a| a.name == name) else {
+            return true;
+        };
+        self.looped = anim_data_looped(vo, self.anim);
+        if self.anim != idx as i32 {
+            self.anim = idx as i32;
+            self.first_frame(vo);
+        }
+        false
+    }
+
+    /// Port of `SetAnimLooped` (VectorObject.hpp:530).
+    pub fn set_anim_looped(&mut self, looped: bool) {
+        self.looped = looped;
     }
 
     /// Port of `IsAnimEnd` (VectorObject.hpp:553).
@@ -766,6 +827,13 @@ fn anim_frame(vo: &VoMesh, anim: i32, frame: i32) -> Option<(usize, i32)> {
     let a = vo.animations.get(anim as usize)?;
     let f = a.frames.get(frame as usize)?;
     Some((f.frame_index, f.time_ms))
+}
+
+/// Port of `GetAnimLooped` (VectorObject.hpp:390): the sign of an
+/// anim's first authored frame duration encodes loopedness in the
+/// data — positive means looped.
+fn anim_data_looped(vo: &VoMesh, anim: i32) -> bool {
+    anim_frame(vo, anim, 0).map(|(_, t)| t > 0).unwrap_or(false)
 }
 
 impl AnimState {

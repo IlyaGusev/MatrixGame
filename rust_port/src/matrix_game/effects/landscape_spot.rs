@@ -11,8 +11,8 @@ use crate::matrix_lib::three_g::billboard::TexRef;
 /// `SPOT_ALTITUDE` / `SPOT_SIZE` (MatrixEffectLandscapeSpot.cpp).
 const SPOT_ALTITUDE: f32 = 0.7;
 const SPOT_SIZE: f32 = 5.0;
-/// Cap on live spots (the C++ relies on the global effect cap).
-const MAX_SPOTS: usize = 96;
+/// `MAX_EFFECTS_LANDSPOTS` (MatrixEffect.hpp) — live-spot cap.
+const MAX_SPOTS: usize = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpotKind {

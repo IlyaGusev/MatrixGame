@@ -19,7 +19,7 @@ use wgpu::util::DeviceExt;
 use crate::matrix_game::camera::Camera;
 use crate::matrix_game::common::{unpack_rgb, FOG_END, FOG_START};
 use crate::matrix_game::common::{
-    OBJECT_ABLAZE_BURNED_AT_MS, OTP_BEHAVIOUR, OTP_INVLOGIC, PLAYER_SIDE,
+    OBJECT_ABLAZE_BURNED_AT_MS, OTP_BEHAVIOUR, OTP_BIAS, OTP_INVLOGIC, PLAYER_SIDE,
 };
 use crate::matrix_game::effects::point_light::PointLightSystem;
 use crate::matrix_game::effects::weapon::{
@@ -29,8 +29,9 @@ use crate::matrix_game::logic::Rnd;
 use crate::matrix_game::map::{GameMap, ObjectInstance, ObjectShadow};
 use crate::matrix_game::map_static::{
     MapStatic, ObjectCore, ObjectId, ObjectType, Objects, MR_ALL, MR_GRAPH, MR_MATRIX,
-    MR_SHADOW_PROJ_GEOM, MR_SHADOW_PROJ_TEX, OBJECT_STATE_ABLAZE, OBJECT_STATE_BURNED,
-    OBJECT_STATE_SHADOW_SPECIAL, OBJECT_STATE_SPECIAL, OBJECT_STATE_TRACE_INVISIBLE,
+    MR_SHADOW_PROJ_GEOM, MR_SHADOW_PROJ_TEX, MR_SHADOW_STENCIL, OBJECT_STATE_ABLAZE,
+    OBJECT_STATE_BURNED, OBJECT_STATE_SHADOW_SPECIAL, OBJECT_STATE_SPECIAL,
+    OBJECT_STATE_TRACE_INVISIBLE,
 };
 use crate::matrix_lib::base::storage::Storage;
 use crate::matrix_lib::base::wstr;
@@ -151,6 +152,39 @@ fn parse_shadow_spec(raw: &str) -> ShadowSpec {
     }
 }
 
+// ── Global object-Ids table (g_MatrixMap->m_Ids) ─────────────────────────
+//
+// `CMatrixMapObject::Init` re-reads `g_MatrixMap->IdsGet(m_Type)` at
+// runtime (MatrixObject.cpp:985-1018) when a BREAK death / terron corpse
+// swaps the object to its replacement type. The damage path only carries
+// `&mut Objects`, so — like the C++ global map pointer — the rows are
+// published process-globally at map load (`GameMap::from_cmap_bytes`).
+
+static GLOBAL_IDS: std::sync::OnceLock<std::sync::RwLock<std::sync::Arc<Vec<String>>>> =
+    std::sync::OnceLock::new();
+
+fn global_ids_slot() -> &'static std::sync::RwLock<std::sync::Arc<Vec<String>>> {
+    GLOBAL_IDS.get_or_init(|| std::sync::RwLock::new(std::sync::Arc::new(Vec::new())))
+}
+
+pub fn set_global_ids(rows: Vec<String>) {
+    *global_ids_slot().write().unwrap() = std::sync::Arc::new(rows);
+}
+
+/// `g_MatrixMap->IdsGet(type)`. Out-of-range / negative types yield an
+/// empty row (parses to BEHF_STATIC with no textures).
+pub fn ids_get(type_id: i32) -> String {
+    if type_id < 0 {
+        return String::new();
+    }
+    global_ids_slot()
+        .read()
+        .unwrap()
+        .get(type_id as usize)
+        .cloned()
+        .unwrap_or_default()
+}
+
 // ── Game-object side of CMatrixMapObject ────────────────────────────────
 //
 // Scope B: the struct + `MapStatic` trait impl. The member list matches
@@ -231,6 +265,11 @@ pub struct MapObject {
     /// set and the skin swaps to the burnt variant.
     pub burn_time_total: i32,
 
+    /// Own arena id, captured on the first `damage` call (the C++ uses
+    /// `this`; the takt drivers don't pass an id). Needed by the terron
+    /// death sequence to own its WEAPON_BIGBOOM blasts.
+    self_id: Option<ObjectId>,
+
     /// `m_BreakHitPoint` (BEHF_BREAK/ANIM/TERRON union, MatrixObject.hpp:73).
     /// Current hit points — decremented by [`MapStatic::damage`] via the
     /// damage-table lookup; object transitions state / breaks when this
@@ -251,6 +290,12 @@ pub struct MapObject {
     /// the world-scope Ids table isn't reachable from `damage` here,
     /// so `apply_ids_row` keeps a copy.
     pub behaviour: String,
+
+    /// VO path of an explicitly-loaded graph — `InitAsBaseRuins`' direct
+    /// `LoadObject(namev, …)` (MatrixObject.cpp:1137). `None` for normal
+    /// objects whose VO derives from `type_id`. The render side keys its
+    /// preloaded ruin batches off this path.
+    pub ruin_graph: Option<String>,
 }
 
 impl MapObject {
@@ -296,6 +341,7 @@ impl MapObject {
             type_id: inst.type_id as i32,
             uid: -1,                   // MatrixObject.cpp:61
             beh_flag: BehFlag::Static, // MatrixObject.cpp:56
+            self_id: None,
             photo: 0,
             photo_time: 0,
             prev_state_robots_in_radius: 0,
@@ -306,6 +352,73 @@ impl MapObject {
             break_hit_point_max: 0,
             anim_state: -1,
             behaviour: String::new(),
+            ruin_graph: None,
+        }
+    }
+
+    /// Port of `CMatrixMapObject::InitAsBaseRuins`
+    /// (MatrixObject.cpp:1110-1141): a ruin spawned where a building
+    /// finished its DIP explosion sequence. `angle` is the building's
+    /// 0..3 quarter-turn (`m_AngleZ = angle * GRAD2RAD(90)`, :1120); `z`
+    /// is `GetZ(pos)` (:1119). The C++ also picks SHADOW_PROJ_DYNAMIC /
+    /// SHADOW_OFF and `m_BiasBuildings` — both render-side concerns the
+    /// port resolves in the ruin batch, so they carry no field here.
+    pub fn init_as_base_ruins(pos: glam::Vec2, z: f32, angle: i32, namev: &str) -> Self {
+        let inst = ObjectInstance {
+            x: pos.x,
+            y: pos.y,
+            z,
+            angle_z: angle as f32 * std::f32::consts::FRAC_PI_2,
+            angle_x: 0.0,
+            angle_y: 0.0,
+            scale: 1.0,
+            type_id: 0,
+            shadow: None,
+        };
+        let mut o = Self::from_instance(&inst);
+        o.type_id = -1; // :1133
+        o.ruin_graph = Some(namev.to_string());
+        // :1135 — `m_RChange &= ~MR_Graph`: the graph is bound eagerly
+        // (render-side ruin batch), not via the dirty-bit pipeline.
+        o.rchange &= !MR_GRAPH;
+        o.r_need(MR_MATRIX); // RNeed(MR_Matrix), :1140
+        o
+    }
+
+    /// Runtime re-Init — port of `CMatrixMapObject::Init`
+    /// (MatrixObject.cpp:929-1096). Swaps this object to type `ids`:
+    /// BREAK death (:233) and the terron corpse (:1261) call this to
+    /// become their broken-variant object. The graph / shadow releases
+    /// (:960-979) are render-side; the MR_* dirty bits + the `type_id`
+    /// change tell the instance sync to rebind the mesh.
+    pub fn init(&mut self, ids: i32, objs: &mut Objects) {
+        if self.type_id == ids {
+            return; // :931
+        }
+        // :933-956 — MMFLAG_TERRON_ONMAP, progress-bar deletes and the
+        // spawner-core release: all tied to unported subsystems.
+        self.uid = -1; // :958
+        self.type_id = ids;
+        // :982 — RChange(MR_Graph|MR_ShadowStencil|MR_ShadowProjGeom|MR_ShadowProjTex)
+        self.rchange |= MR_GRAPH | MR_SHADOW_STENCIL | MR_SHADOW_PROJ_GEOM | MR_SHADOW_PROJ_TEX;
+
+        let row = ids_get(ids);
+        self.tex_bias = wstr::double_par(&row, OTP_BIAS, "*") as f32; // :985
+        self.beh_flag = BehFlag::Static; // :988
+
+        // OTP_SHADOW parse (:991-1003) — shadow type resolves render-side
+        // from the same row; no logic-side field.
+
+        // :1005-1093 — shared with load-time init. A '+' prefix on a
+        // runtime row would need m_BeforeWinCount plumbed out of
+        // MapLogic; replacement rows never carry one, so the callback is
+        // a no-op. The rng only seeds Portret's photo timer.
+        let mut rng = Rnd::new((ids ^ 0x5bd1).max(1));
+        let add_lt = self.apply_ids_row(&row, &mut rng, || {});
+        if add_lt {
+            if let Some(id) = self.self_id {
+                objs.add_lt(id); // AddLT() inside the behaviour branches
+            }
         }
     }
 
@@ -354,10 +467,12 @@ impl MapObject {
 
         if wstr::compare_first(&beh, "Burn") {
             self.beh_flag = BehFlag::Burn;
-            // `m_NextTime / m_BurnTimeTotal / m_BurnSkinVis` zero-init —
-            // matches the defaults in our ctor. The `Tex`-variant burn
-            // skin load (MatrixObject.cpp:1035-1042) depends on the skin
-            // manager, still unported.
+            // `m_NextTime = 0; m_BurnTimeTotal = 0` (MatrixObject.cpp:
+            // 1031-1032) — matters on a runtime re-`init` where the old
+            // behaviour left them non-zero. The `Tex`-variant burn skin
+            // load (:1035-1042) depends on the skin manager, unported.
+            self.next_time = 0;
+            self.burn_time_total = 0;
             false // BEHF_BURN is not AddLT'd — it enrolls on damage.
         } else if wstr::compare_first(&beh, "Break") {
             // "Break,<something>,<hp>,Terron?"  (MatrixObject.cpp:1043-1058)
@@ -450,6 +565,121 @@ impl MapObject {
                 break;
             }
         }
+    }
+
+    /// Terron death countdown — port of the OBJECT_STATE_TERRON_EXPL
+    /// branch of `CMatrixMapObject::LogicTakt` (MatrixObject.cpp:1235-1330).
+    fn terron_expl_takt(
+        &mut self,
+        ms: i32,
+        rng: &mut crate::matrix_game::logic::Rnd,
+        objs: &mut crate::matrix_game::map_static::Objects,
+    ) {
+        use crate::matrix_game::map_static::{
+            SpecialDeathKind, OBJECT_STATE_TERRON_EXPL1, OBJECT_STATE_TERRON_EXPL2,
+        };
+
+        self.ablaze_ttl -= ms;
+        if self.ablaze_ttl < 0 {
+            // MatrixObject.cpp:1244-1258 — special-win bookkeeping.
+            // Unlike BREAK, SS_JUST_WIN fires regardless of the
+            // remaining win counter (the count check is commented out
+            // in the original).
+            if self.object_state & OBJECT_STATE_SPECIAL != 0 {
+                self.object_state &= !OBJECT_STATE_SPECIAL;
+                objs.inc_side_stat(PLAYER_SIDE, |s| s.building_kill += 1);
+                objs.pending_special_deaths
+                    .push(SpecialDeathKind::Terron);
+            }
+            // `Init(temp.GetIntPar(1,L","))` — re-init as the corpse
+            // type (MatrixObject.cpp:1260-1262).
+            let new_type = wstr::int_par(&self.behaviour, 1, ",");
+            self.init(new_type, objs);
+        } else if self.ablaze_ttl < 100 && self.object_state & OBJECT_STATE_TERRON_EXPL2 == 0 {
+            self.object_state |= OBJECT_STATE_TERRON_EXPL2;
+            self.terron_bigboom(rng, objs);
+        } else if self.ablaze_ttl < 1000 && self.object_state & OBJECT_STATE_TERRON_EXPL1 == 0 {
+            self.object_state |= OBJECT_STATE_TERRON_EXPL1;
+            self.terron_bigboom(rng, objs);
+        } else {
+            // Rolling pops every BUILDING_EXPLOSION_PERIOD (10ms),
+            // 4-attempt surface pick around the geo-center, 4% Boom2
+            // (MatrixObject.cpp:1292-1330). `next_time` (zeroed when
+            // the death started) runs as a countdown accumulator.
+            use crate::matrix_game::effects::smoke_and_fire::{frnd, fsrnd};
+            let origin = self.core.geo_center;
+            let radius = self.core.radius.max(3.0);
+            let mut vrng = crate::matrix_game::logic::Rnd::new(
+                ((self.ablaze_ttl) ^ ((origin.x + origin.y) as i32)).max(1),
+            );
+            self.next_time -= ms;
+            while self.next_time <= 0 {
+                self.next_time += 10; // BUILDING_EXPLOSION_PERIOD
+                let mut found = None;
+                for _ in 0..4 {
+                    let pos = origin
+                        + glam::Vec3::new(
+                            fsrnd(&mut vrng, radius),
+                            fsrnd(&mut vrng, radius),
+                            frnd(&mut vrng, 2.0 * radius),
+                        );
+                    let dir = (origin - pos).normalize_or_zero();
+                    if dir == glam::Vec3::ZERO {
+                        continue;
+                    }
+                    if let Some(t) = crate::matrix_game::map_trace::pick_sphere(
+                        pos,
+                        dir,
+                        self.core.geo_center,
+                        self.core.radius,
+                    ) {
+                        found = Some(pos + dir * (t + 2.0));
+                        break;
+                    }
+                }
+                let Some(pos) = found else { continue };
+                let props = if frnd(&mut vrng, 1.0) < 0.04 {
+                    &crate::matrix_game::effects::explosion::EXPLOSION_BUILDING_BOOM2
+                } else {
+                    &crate::matrix_game::effects::explosion::EXPLOSION_BUILDING_BOOM
+                };
+                objs.pending_explosions
+                    .push(crate::matrix_game::map_static::ExplosionSpawn {
+                        pos,
+                        props,
+                        fire: false,
+                    });
+            }
+        }
+    }
+
+    /// One real WEAPON_BIGBOOM blast at the terron's geo-center
+    /// (MatrixObject.cpp:1267-1273 / :1281-1287) — same create/fire/
+    /// takt/release shape as the dying base's final blast.
+    fn terron_bigboom(
+        &mut self,
+        rng: &mut crate::matrix_game::logic::Rnd,
+        objs: &mut crate::matrix_game::map_static::Objects,
+    ) {
+        let (Some(self_id), Some(map)) = (self.self_id, crate::matrix_game::map::current_map())
+        else {
+            return;
+        };
+        use crate::matrix_game::effects::weapon::{
+            weapon_takt, WeaponEffect, WeaponHandler, WEAPON_BIGBOOM,
+        };
+        let mut w = WeaponEffect::new(WEAPON_BIGBOOM, 0, WeaponHandler::None);
+        w.set_owner(self_id, 0);
+        w.modify(self.core.geo_center, glam::Vec3::Z, glam::Vec3::ZERO);
+        let wid = objs.weapons.create(w);
+        if let Some(we) = objs.weapons.get_mut(wid) {
+            we.fire_begin(glam::Vec3::ZERO, Some(self_id));
+        }
+        weapon_takt(objs, wid, 1.0, map, rng);
+        if let Some(we) = objs.weapons.get_mut(wid) {
+            we.fire_end();
+        }
+        objs.weapons.release(wid);
     }
 }
 
@@ -593,6 +823,8 @@ impl MapStatic for MapObject {
         // commented below with line refs so the port can fill them in
         // when those subsystems land.
 
+        self.self_id = Some(self_id);
+
         // MatrixObject.cpp:105 — special (win-target) objects can only
         // be hit by the player.
         if attacker_side != PLAYER_SIDE && self.object_state & OBJECT_STATE_SPECIAL != 0 {
@@ -642,7 +874,11 @@ impl MapStatic for MapObject {
                 objs.add_lt(self_id);
             }
         }
-        if self.beh_flag == BehFlag::Break {
+        // Snapshot: `init` inside the BREAK death swaps `beh_flag` to the
+        // replacement row's behaviour; the C++ else-if chain dispatches
+        // on the pre-swap flag only, so the branches below must too.
+        let beh0 = self.beh_flag;
+        if beh0 == BehFlag::Break {
             // Port of BEHF_BREAK (MatrixObject.cpp:188-234). Uses the
             // damage-table lookup; decrements hp when the current
             // hp clears the per-weapon `mindamage` floor. Death drops
@@ -658,8 +894,13 @@ impl MapStatic for MapObject {
             if self.break_hit_point <= 0 {
                 if self.object_state & OBJECT_STATE_SPECIAL != 0 {
                     self.object_state &= !OBJECT_STATE_SPECIAL;
-                    // `--g_MatrixMap->m_BeforeWinCount` + side bookkeeping
-                    // — deferred: sides unported.
+                    // MatrixObject.cpp:206-212 — `--m_BeforeWinCount`,
+                    // player BUILDING_KILL credit, win check. The
+                    // counter / side-status half runs in MapLogic's
+                    // drain of `pending_special_deaths`.
+                    objs.inc_side_stat(PLAYER_SIDE, |s| s.building_kill += 1);
+                    objs.pending_special_deaths
+                        .push(crate::matrix_game::map_static::SpecialDeathKind::Target);
                 }
                 // `CreateExplosion(geo, ExplosionObject, true)` when
                 // BEHAVIOUR's 4th comma-field == "Explode"
@@ -672,16 +913,14 @@ impl MapStatic for MapObject {
                             fire: true,
                         });
                 }
-                // `Init(newtype)` to swap in the ruined variant
-                // (MatrixObject.cpp:233) — deferred: requires VO/skin
-                // reload + re-running apply_ids_row on the replacement
-                // type. Until that lands, mark the object BURNED so
-                // renderers that honour the flag can swap variants.
+                // `Init(temp.GetIntPar(1,L","))` — swap to the broken
+                // variant. behaviour = "Break,<newtype>,<hp>,<kind>"
+                // (MatrixObject.cpp:232-233).
                 self.object_state &= !OBJECT_STATE_SHADOW_SPECIAL;
-                self.object_state |= OBJECT_STATE_BURNED;
-                self.rchange |= MR_GRAPH;
+                let new_type = wstr::int_par(&self.behaviour, 1, ",");
+                self.init(new_type, objs);
             }
-        } else if self.beh_flag == BehFlag::Anim {
+        } else if beh0 == BehFlag::Anim {
             // Port of BEHF_ANIM (MatrixObject.cpp:235-289). Like BREAK
             // but on death transitions to a new anim state instead of
             // re-Init'ing. The `ApplyAnimState` call looks up the next
@@ -693,7 +932,11 @@ impl MapStatic for MapObject {
             if self.break_hit_point <= 0 {
                 if self.object_state & OBJECT_STATE_SPECIAL != 0 {
                     self.object_state &= !OBJECT_STATE_SPECIAL;
-                    // side / win-count — deferred.
+                    // MatrixObject.cpp:253-260 — same win-target
+                    // bookkeeping as the BREAK branch.
+                    objs.inc_side_stat(PLAYER_SIDE, |s| s.building_kill += 1);
+                    objs.pending_special_deaths
+                        .push(crate::matrix_game::map_static::SpecialDeathKind::Target);
                 }
                 // Walk the state table to find the transition for the
                 // current `anim_state`. Field index 3 is "next state"
@@ -721,7 +964,7 @@ impl MapStatic for MapObject {
         // BEHF_TERRON (MatrixObject.cpp:142-187). Pain animation /
         // sounds / progress bar / music-volume not ported; HP
         // depletion + the death flags are.
-        if self.beh_flag == BehFlag::Terron
+        if beh0 == BehFlag::Terron
             && self.object_state & crate::matrix_game::map_static::OBJECT_STATE_TERRON_EXPL == 0
         {
             if let Some(entry) = objs.object_damages.get(weap) {
@@ -730,13 +973,16 @@ impl MapStatic for MapObject {
                 }
             }
             if self.break_hit_point <= 0 {
-                // OBJECT_STATE_SPECIAL → MMFLAG_TERRON_DEAD win flag —
-                // the map-flags word isn't reachable from here; the
-                // win-condition scan reads the EXPL state instead.
+                // MatrixObject.cpp:168-172 — MMFLAG_TERRON_DEAD only
+                // when the terron is the special win target.
+                if self.object_state & OBJECT_STATE_SPECIAL != 0 {
+                    objs.terron_dead = true;
+                }
                 self.object_state |= crate::matrix_game::map_static::OBJECT_STATE_TERRON_EXPL;
                 // Death animation runs for 5s of ablaze TTL
                 // (MatrixObject.cpp:177).
                 self.ablaze_ttl = 5000;
+                self.next_time = 0;
             }
         }
 
@@ -758,6 +1004,18 @@ impl MapStatic for MapObject {
         use crate::matrix_game::common::TRACE_ROBOT;
         use crate::matrix_game::map_static::fit_to_mask as _fit_to_mask;
         let _ = _fit_to_mask; // keep import used even when SENS disabled
+
+        // Terron death sequence (MatrixObject.cpp:1235-1330): once
+        // OBJECT_STATE_TERRON_EXPL is set, the 5s ablaze TTL counts
+        // down through three phases — rolling building-boom pops,
+        // a real BIGBOOM at TTL<1000 and another at TTL<100 — and on
+        // expiry resolves the special-win bookkeeping + body swap.
+        if self.beh_flag == BehFlag::Terron
+            && self.object_state & crate::matrix_game::map_static::OBJECT_STATE_TERRON_EXPL != 0
+        {
+            self.terron_expl_takt(ms, _rng, objs);
+            return;
+        }
 
         if self.beh_flag == BehFlag::Sens {
             // Port of the BEHF_SENS branch (MatrixObject.cpp:1485-1532).
@@ -995,6 +1253,13 @@ struct MeshBatch {
     num_instances: u32,
     bind_group: wgpu::BindGroup,
     objects: Vec<ObjectInstance>,
+    /// Per-instance visibility — pre-registered break replacements start
+    /// hidden; `sync_break_swaps` flips entries when the arena object's
+    /// `type_id` diverges from this batch's type (the `Init` swap at
+    /// MatrixObject.cpp:233).
+    hidden: Vec<bool>,
+    /// VO type this batch renders — match target for the swap sync.
+    type_id: u32,
     center: [f32; 2],
     /// Index into `ObjectsRenderer::anims` (one `AnimState` per VO type). All
     /// surfaces belonging to the same type share one state so they advance in
@@ -1203,6 +1468,11 @@ pub struct ObjectsRenderer {
     shadow_pipeline: wgpu::RenderPipeline,
     batches: Vec<MeshBatch>,
     shadow_batches: Vec<ShadowBatch>,
+    /// Per-shadow owner: pos-key + the type whose mesh cast it. The swap
+    /// sync hides the shadow once the arena object's type diverges (the
+    /// C++ Init drops m_ShadowProj, MatrixObject.cpp:973-979).
+    shadow_keys: Vec<((i32, i32), u32)>,
+    shadow_visible: Vec<bool>,
     /// One animation runtime per VO type. `MeshBatch::anim_slot` references
     /// this vector so surfaces of the same type share one `vo_frame`.
     anims: Vec<AnimState>,
@@ -1236,9 +1506,49 @@ impl ObjectsRenderer {
 
         let cx = map.world_width() * 0.5;
         let cy = map.world_height() * 0.5;
-        let mut by_type: BTreeMap<u32, Vec<&ObjectInstance>> = BTreeMap::new();
+
+        // BREAK / terron replacement type from a row's BEHAVIOUR field —
+        // "Break,<newtype>,<hp>,<kind>" (MatrixObject.cpp:233, :1261).
+        let replacement_of = |type_id: u32| -> Option<u32> {
+            if type_id as usize >= strings.arrays_count() {
+                return None;
+            }
+            let row = strings.get_as_wstr(type_id as usize);
+            let beh = wstr::str_par(&row, OTP_BEHAVIOUR, "*");
+            let beh = beh.strip_prefix('+').unwrap_or(beh);
+            if !wstr::compare_first(beh, "Break") {
+                return None;
+            }
+            let r = wstr::int_par(beh, 1, ",");
+            (r >= 0).then_some(r as u32)
+        };
+
+        // Each breakable instance is pre-registered (hidden) under every
+        // type in its replacement chain so the death-time `Init` swap
+        // (MatrixObject.cpp:233) is a pure visibility flip — no runtime
+        // VO loading. `bool` = initially hidden.
+        let mut by_type: BTreeMap<u32, Vec<(ObjectInstance, bool)>> = BTreeMap::new();
         for obj in &map.objects {
-            by_type.entry(obj.type_id).or_default().push(obj);
+            by_type
+                .entry(obj.type_id)
+                .or_default()
+                .push((obj.clone(), false));
+            let mut seen = vec![obj.type_id];
+            let mut t = obj.type_id;
+            while let Some(r) = replacement_of(t) {
+                if seen.contains(&r) {
+                    break;
+                }
+                seen.push(r);
+                let mut clone = obj.clone();
+                clone.type_id = r;
+                // The CMAP-baked silhouette belongs to the original mesh;
+                // the replacement renders shadowless (the original drops
+                // its m_ShadowProj in Init, MatrixObject.cpp:973-979).
+                clone.shadow = None;
+                by_type.entry(r).or_default().push((clone, true));
+                t = r;
+            }
         }
 
         let [sr, sg, sb] = unpack_rgb(map.sky_color);
@@ -1300,6 +1610,7 @@ impl ObjectsRenderer {
 
         let mut batches = Vec::new();
         let mut shadow_batches = Vec::new();
+        let mut shadow_keys: Vec<((i32, i32), u32)> = Vec::new();
         let mut anims: Vec<AnimState> = Vec::new();
         let mut loaded_types = 0usize;
         let mut failed_types = 0usize;
@@ -1342,10 +1653,10 @@ impl ObjectsRenderer {
                     uv: v.uv,
                 })
                 .collect();
-            let inst_data: Vec<InstanceData> = instances
-                .iter()
-                .map(|obj| instance_matrix(obj, cx, cy, map, None))
-                .collect();
+            let type_objects: Vec<ObjectInstance> =
+                instances.iter().map(|(obj, _)| obj.clone()).collect();
+            let type_hidden: Vec<bool> = instances.iter().map(|(_, h)| *h).collect();
+            let inst_data = batch_instance_data(&type_objects, &type_hidden, cx, cy, map, None);
             let instance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("Objects Inst VB"),
                 contents: bytemuck::cast_slice(&inst_data),
@@ -1497,7 +1808,9 @@ impl ObjectsRenderer {
                     instance_buffer: instance_buffer.clone(),
                     num_instances: inst_data.len() as u32,
                     bind_group,
-                    objects: instances.iter().map(|obj| (*obj).clone()).collect(),
+                    objects: type_objects.clone(),
+                    hidden: type_hidden.clone(),
+                    type_id: *type_id,
                     center: [cx, cy],
                     anim_slot,
                 });
@@ -1525,7 +1838,8 @@ impl ObjectsRenderer {
             ) {
                 for obj in instances
                     .iter()
-                    .filter_map(|obj| obj.shadow.as_ref().map(|shadow| (&**obj, shadow)))
+                    .filter(|(_, hidden)| !hidden)
+                    .filter_map(|(obj, _)| obj.shadow.as_ref().map(|shadow| (obj, shadow)))
                 {
                     if let Some(batch) = build_shadow_batch(
                         device,
@@ -1544,6 +1858,7 @@ impl ObjectsRenderer {
                         paths.shadow.texture_size.max(32),
                     ) {
                         shadow_batches.push(batch);
+                        shadow_keys.push((pos_key(obj.0.x, obj.0.y), *type_id));
                     }
                 }
             }
@@ -1568,11 +1883,14 @@ impl ObjectsRenderer {
             animated_types
         );
 
+        let shadow_visible = vec![true; shadow_batches.len()];
         Some(Self {
             pipeline,
             shadow_pipeline,
             batches,
             shadow_batches,
+            shadow_keys,
+            shadow_visible,
             anims,
             uniform_buffer,
             shadow_uniform_buffer,
@@ -1617,14 +1935,78 @@ impl ObjectsRenderer {
         if revision != self.last_point_light_revision {
             for batch in &mut self.batches {
                 let [cx, cy] = batch.center;
-                let inst_data: Vec<InstanceData> = batch
-                    .objects
-                    .iter()
-                    .map(|obj| instance_matrix(obj, cx, cy, map, Some(point_lights)))
-                    .collect();
+                let inst_data = batch_instance_data(
+                    &batch.objects,
+                    &batch.hidden,
+                    cx,
+                    cy,
+                    map,
+                    Some(point_lights),
+                );
                 queue.write_buffer(&batch.instance_buffer, 0, bytemuck::cast_slice(&inst_data));
             }
             self.last_point_light_revision = revision;
+        }
+    }
+
+    /// Flip batch-instance visibility to follow runtime `MapObject::init`
+    /// type swaps (BREAK death MatrixObject.cpp:233, terron corpse :1261).
+    /// Arena objects are matched to render instances by position; an
+    /// instance shows only in the batch whose `type_id` matches the
+    /// arena object's current type. Called once per frame after the
+    /// logic takt (alongside the buildings sync).
+    pub fn sync_break_swaps(
+        &mut self,
+        queue: &wgpu::Queue,
+        objs: &Objects,
+        map: &GameMap,
+        point_lights: &PointLightSystem,
+    ) {
+        let mut live: HashMap<(i32, i32), i32> = HashMap::new();
+        for id in objs.iter_live() {
+            let Some(obj) = objs.get(id) else { continue };
+            if !matches!(obj.core().obj_type, ObjectType::MapObject) {
+                continue;
+            }
+            let mo = unsafe { &*(obj as *const dyn MapStatic as *const MapObject) };
+            if mo.ruin_graph.is_some() {
+                continue; // ruins render via the buildings renderer
+            }
+            let w = obj.core().matrix.w_axis;
+            live.insert(pos_key(w.x, w.y), mo.type_id);
+        }
+        if live.is_empty() {
+            return;
+        }
+        for batch in &mut self.batches {
+            let mut dirty = false;
+            for (i, obj) in batch.objects.iter().enumerate() {
+                let Some(&t) = live.get(&pos_key(obj.x, obj.y)) else {
+                    continue;
+                };
+                let want_hidden = t != batch.type_id as i32;
+                if batch.hidden[i] != want_hidden {
+                    batch.hidden[i] = want_hidden;
+                    dirty = true;
+                }
+            }
+            if dirty {
+                let [cx, cy] = batch.center;
+                let inst_data = batch_instance_data(
+                    &batch.objects,
+                    &batch.hidden,
+                    cx,
+                    cy,
+                    map,
+                    Some(point_lights),
+                );
+                queue.write_buffer(&batch.instance_buffer, 0, bytemuck::cast_slice(&inst_data));
+            }
+        }
+        for (i, (key, ty)) in self.shadow_keys.iter().enumerate() {
+            if let Some(&t) = live.get(key) {
+                self.shadow_visible[i] = t == *ty as i32;
+            }
         }
     }
 
@@ -1666,7 +2048,10 @@ impl ObjectsRenderer {
 
         if !self.shadow_batches.is_empty() {
             pass.set_pipeline(&self.shadow_pipeline);
-            for batch in &self.shadow_batches {
+            for (i, batch) in self.shadow_batches.iter().enumerate() {
+                if !self.shadow_visible.get(i).copied().unwrap_or(true) {
+                    continue;
+                }
                 pass.set_bind_group(0, &batch.bind_group, &[]);
                 pass.set_vertex_buffer(0, batch.vertex_buffer.slice(..));
                 pass.set_index_buffer(batch.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
@@ -2386,6 +2771,46 @@ fn instance_matrix(
     }
 }
 
+/// Degenerate transform for a hidden instance (pre-spawned break
+/// replacement / already-swapped original) — all vertices collapse to one
+/// point so nothing rasterizes.
+fn hidden_instance() -> InstanceData {
+    InstanceData {
+        row0: [0.0; 4],
+        row1: [0.0; 4],
+        row2: [0.0; 4],
+        row3: [0.0, 0.0, 0.0, 1.0],
+        terrain_color: [0.0; 4],
+    }
+}
+
+fn batch_instance_data(
+    objects: &[ObjectInstance],
+    hidden: &[bool],
+    cx: f32,
+    cy: f32,
+    map: &GameMap,
+    point_lights: Option<&PointLightSystem>,
+) -> Vec<InstanceData> {
+    objects
+        .iter()
+        .enumerate()
+        .map(|(i, obj)| {
+            if hidden.get(i).copied().unwrap_or(false) {
+                hidden_instance()
+            } else {
+                instance_matrix(obj, cx, cy, map, point_lights)
+            }
+        })
+        .collect()
+}
+
+/// Pos-derived identity shared between arena `MapObject`s and render
+/// instances (decorations never move; same keying as the buildings sync).
+fn pos_key(x: f32, y: f32) -> (i32, i32) {
+    ((x * 10.0) as i32, (y * 10.0) as i32)
+}
+
 fn object_rotation(obj: &ObjectInstance) -> Mat3 {
     let (sx, cxr) = obj.angle_x.sin_cos();
     let (sy, cyr) = obj.angle_y.sin_cos();
@@ -2655,13 +3080,29 @@ mod tests {
         assert_eq!(objs.get(id).unwrap().ablaze_ttl(), 15_000);
     }
 
+    /// Shared Ids table for the body-swap tests. Tests that set the
+    /// global table must all use this exact content — they run in
+    /// parallel within one process.
+    fn seed_test_ids() {
+        set_global_ids(vec![
+            String::new(),
+            "ruins*wreck*tex******Break,2,77,Normal".to_string(),
+            "ruins*husk*tex******Burn,Tex,Burn01".to_string(),
+            "ruins*corpse*tex".to_string(),
+        ]);
+    }
+
     #[test]
-    fn break_damage_decrements_hp_and_flips_burned_on_death() {
-        // BEHF_BREAK object with 500hp. WEAPON_GUN (idx=8) deals 100 /
-        // floor 0. Three hits leave 200, fourth kills.
+    fn break_death_re_inits_as_replacement_type() {
+        // BEHF_BREAK object with 500hp. WEAPON_GUN deals 100 / floor 0.
+        // Death calls `Init(temp.GetIntPar(1,L","))` (MatrixObject.cpp:
+        // 233): type_id swaps to the replacement row and that row
+        // re-seeds behaviour + hit points.
         use crate::matrix_game::config::WeaponDamage;
         use crate::matrix_game::effects::weapon::{weap_to_index, WEAPON_GUN};
         use crate::matrix_game::map_static::Objects;
+
+        seed_test_ids();
 
         let mut rng = Rnd::new(1);
         let mut o = MapObject::from_instance(&inst());
@@ -2691,10 +3132,11 @@ mod tests {
             let obj = objs.get(id).unwrap();
             let mo = unsafe { &*(obj as *const dyn MapStatic as *const MapObject) };
             assert_eq!(mo.break_hit_point, expected);
-            assert_eq!(mo.object_state() & OBJECT_STATE_BURNED, 0);
+            assert_eq!(mo.type_id, 0, "no swap before death");
         }
 
-        // 5th hit drops to ≤0 → BURNED flag, MR_Graph dirty.
+        // 5th hit kills → Init(1): type swap, Ids row 1 re-seeds the
+        // Break behaviour with 77hp, graph + shadows flagged dirty.
         objs.apply_damage(
             id,
             WEAPON_GUN,
@@ -2705,9 +3147,77 @@ mod tests {
         );
         let obj = objs.get(id).unwrap();
         let mo = unsafe { &*(obj as *const dyn MapStatic as *const MapObject) };
-        assert!(mo.break_hit_point <= 0);
-        assert_ne!(mo.object_state() & OBJECT_STATE_BURNED, 0);
+        assert_eq!(mo.type_id, 1);
+        assert_eq!(mo.uid, -1);
+        assert_eq!(mo.beh_flag, BehFlag::Break);
+        assert_eq!(mo.behaviour, "Break,2,77,Normal");
+        assert_eq!(mo.break_hit_point, 77, "Init re-seeds hp from new row");
+        assert_eq!(mo.break_hit_point_max, 77);
+        assert_eq!(
+            mo.object_state() & OBJECT_STATE_BURNED,
+            0,
+            "BURNED stand-in retired — the swap carries the visuals"
+        );
         assert_ne!(mo.rchange() & MR_GRAPH, 0);
+        assert_ne!(mo.rchange() & MR_SHADOW_STENCIL, 0);
+
+        // Chain: killing the wreck swaps again, to the Burn row.
+        objs.apply_damage(
+            id,
+            WEAPON_GUN,
+            glam::Vec3::ZERO,
+            glam::Vec3::Z,
+            PLAYER_SIDE,
+            None,
+        );
+        let obj = objs.get(id).unwrap();
+        let mo = unsafe { &*(obj as *const dyn MapStatic as *const MapObject) };
+        assert_eq!(mo.type_id, 2);
+        assert_eq!(mo.beh_flag, BehFlag::Burn);
+        assert_eq!(mo.behaviour, "Burn,Tex,Burn01");
+    }
+
+    #[test]
+    fn terron_corpse_swaps_type_after_death_countdown() {
+        // Terron death: 5s of OBJECT_STATE_TERRON_EXPL countdown, then
+        // `Init(temp.GetIntPar(1,L","))` (MatrixObject.cpp:1260-1262).
+        use crate::matrix_game::config::WeaponDamage;
+        use crate::matrix_game::effects::weapon::{weap_to_index, WEAPON_GUN};
+        use crate::matrix_game::logic::MapLogic;
+        use crate::matrix_game::map_static::OBJECT_STATE_TERRON_EXPL;
+
+        seed_test_ids();
+
+        let mut world = MapLogic::with_seed(1);
+        let mut o = MapObject::from_instance(&inst());
+        assert!(o.apply_ids_row("path*vo*tex******Break,3,100,Terron", &mut Rnd::new(1), || {},));
+        assert_eq!(o.beh_flag, BehFlag::Terron);
+        let id = world.objects.spawn(Box::new(o));
+        world.objects.add_lt(id);
+        world.objects.object_damages.table[weap_to_index(WEAPON_GUN).unwrap()] = WeaponDamage {
+            damage: 100,
+            mindamage: 0,
+            friend_damage: 0,
+        };
+
+        world.objects.apply_damage(
+            id,
+            WEAPON_GUN,
+            glam::Vec3::ZERO,
+            glam::Vec3::Z,
+            PLAYER_SIDE,
+            None,
+        );
+        let obj = world.objects.get(id).unwrap();
+        assert_ne!(obj.object_state() & OBJECT_STATE_TERRON_EXPL, 0);
+        let mo = unsafe { &*(obj as *const dyn MapStatic as *const MapObject) };
+        assert_eq!(mo.type_id, 0, "corpse swap waits for the countdown");
+
+        world.takt(5200);
+        let obj = world.objects.get(id).unwrap();
+        let mo = unsafe { &*(obj as *const dyn MapStatic as *const MapObject) };
+        assert_eq!(mo.type_id, 3, "corpse type from the BEHAVIOUR string");
+        assert_eq!(mo.beh_flag, BehFlag::Static, "corpse row has no behaviour");
     }
 
     #[test]

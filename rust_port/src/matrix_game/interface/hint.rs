@@ -72,26 +72,32 @@ pub const HINT_OTSTUP: i32 = 5;
 #[derive(Debug, Default, Clone)]
 pub struct TemplateLibrary {
     templates: HashMap<String, String>,
+    /// Every `(name, value)` param in file order — the dialog builder
+    /// needs the C++ multi-part scan (one hint per non-`|` part),
+    /// which the collapsed `templates` map can't reproduce.
+    raw: Vec<(String, String)>,
 }
 
 impl TemplateLibrary {
     pub fn load(storage: &Storage) -> Self {
         let mut templates: HashMap<String, String> = HashMap::new();
+        let mut raw: Vec<(String, String)> = Vec::new();
         let Some(rec) = storage.block_record("da", PAR_TEMPLATES) else {
             log::warn!("hint: no 'da/{PAR_TEMPLATES}' child — hints disabled");
-            return Self { templates };
+            return Self { templates, raw };
         };
         let Some(keys) = storage.get_buf(&rec, "0") else {
-            return Self { templates };
+            return Self { templates, raw };
         };
         let Some(values) = storage.get_buf(&rec, "1") else {
-            return Self { templates };
+            return Self { templates, raw };
         };
         let n = keys.arrays_count().min(values.arrays_count());
         let mut last_name: Option<String> = None;
         for i in 0..n {
             let name = keys.get_as_wstr(i);
             let value = values.get_as_wstr(i);
+            raw.push((name.clone(), value.clone()));
             let is_continuation =
                 value.starts_with('|') && last_name.as_deref() == Some(name.as_str());
             if is_continuation {
@@ -104,11 +110,35 @@ impl TemplateLibrary {
             last_name = Some(name);
         }
         log::info!("hint: loaded {} templates", templates.len());
-        Self { templates }
+        Self { templates, raw }
     }
 
     pub fn get(&self, name: &str) -> Option<&str> {
         self.templates.get(name).map(String::as_str)
+    }
+
+    /// Port of the template-assembly loop in `EnterDialogMode`
+    /// (MatrixMap.cpp:3465-3482): every param named `name` whose value
+    /// does NOT start with `'|'` opens a new hint; all later params of
+    /// the same name that DO start with `'|'` are appended to it. The
+    /// `Win` dialog ships two top-level parts (face portrait + text
+    /// box) — that's why this returns a Vec while [`get`] returns the
+    /// single hover-hint assembly.
+    pub fn dialog_templates(&self, name: &str) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for (i, (n, v)) in self.raw.iter().enumerate() {
+            if n != name || v.starts_with('|') {
+                continue;
+            }
+            let mut templ = v.clone();
+            for (n2, v2) in &self.raw[i + 1..] {
+                if n2 == name && v2.starts_with('|') {
+                    templ.push_str(v2);
+                }
+            }
+            out.push(templ);
+        }
+        out
     }
 }
 
@@ -615,6 +645,28 @@ enum Hem {
     CenterLeft {
         n: i32,
     },
+    /// `HEM_COPY` — zero-size marker; the NEXT element's resolved
+    /// position is recorded as a button anchor slot (`m_CopyPos`,
+    /// MatrixHint.cpp:391-418). Layout-wise it does nothing
+    /// (MatrixHint.cpp:120-123).
+    Copy,
+}
+
+/// `build_hint` output. The tuple grew past readability once
+/// `copy_pos` (the dialog-button anchor slots) joined it.
+#[derive(Debug, Clone)]
+pub struct BuiltHint {
+    pub parts: Vec<HintPart>,
+    pub otstup: [i32; 4],
+    pub total_w: i32,
+    pub total_h: i32,
+    pub border_id: i32,
+    /// `_WIDTH:N` wrap budget (0 = none).
+    pub wrap_width: i32,
+    /// `m_CopyPos` — positions (hint-local design px, border inset
+    /// included) of every element following a `_MOD:COPY` marker.
+    /// `EnterDialogMode` creates the hint buttons at these slots.
+    pub copy_pos: Vec<(i32, i32)>,
 }
 
 /// Parse one template into a laid-out `Hint`. Ports the two-pass
@@ -631,7 +683,7 @@ pub fn build_hint(
     replacer: &HintReplacer,
     atlas: &mut super::text::GlyphAtlas,
     bitmap_sizer: impl Fn(&str) -> Option<(i32, i32)>,
-) -> Option<(Vec<HintPart>, [i32; 4], i32, i32, i32, i32)> {
+) -> Option<BuiltHint> {
     let parts_iter: Vec<&str> = template.split('|').collect();
     if parts_iter.is_empty() {
         return None;
@@ -654,12 +706,18 @@ pub fn build_hint(
     struct Emitted {
         part: HintPart,
         hem: Hem,
+        /// Element directly follows a `_MOD:COPY` marker — its
+        /// resolved position becomes a `copy_pos` slot.
+        record_copy: bool,
     }
     let mut emitted: Vec<Emitted> = Vec::new();
     let mut cx: i32 = 0;
     let mut cy: i32 = 0;
     let mut cw: i32 = 0;
     let mut ch: i32 = 0;
+    // `copy = new_copy` tracker from MatrixHint.cpp:390-417 — armed by
+    // a HEM_COPY element, consumed by the very next element.
+    let mut copy_pending = false;
 
     // `new_coord_f`/`new_coord` — when set by `HEM_COORD`, the next
     // bitmap is placed at the absolute coord instead of (cx, cy).
@@ -742,6 +800,10 @@ pub fn build_hint(
         // 0×0 part and discard the resulting coordinate.
         if let Some(rest) = directive.strip_prefix("_MOD:") {
             let hem = parse_mod(rest);
+            if hem == Hem::Copy {
+                copy_pending = true;
+                continue;
+            }
             let _ = pass1_position(
                 hem,
                 &mut cx,
@@ -752,6 +814,9 @@ pub fn build_hint(
                 0,
                 &mut new_coord,
             );
+            // A zero-size `_MOD:` element still consumes the COPY
+            // marker (C++ resets `copy` after every element).
+            copy_pending = false;
             continue;
         }
         if let Some(rest) = directive.strip_prefix("_TEXTP:") {
@@ -798,6 +863,7 @@ pub fn build_hint(
                     name: name_trim,
                 },
                 hem: part_mod,
+                record_copy: std::mem::take(&mut copy_pending),
             });
             continue;
         }
@@ -885,6 +951,7 @@ pub fn build_hint(
                     color,
                 },
                 hem: modif,
+                record_copy: std::mem::take(&mut copy_pending),
             });
             continue;
         }
@@ -905,12 +972,31 @@ pub fn build_hint(
     let total_w = clw + ots[0] + ots[2];
     let total_h = clh + ots[1] + ots[3];
 
+    let mut copy_pos: Vec<(i32, i32)> = Vec::new();
     let parts = emitted
         .into_iter()
-        .map(|e| resolve_sentinel(e.part, e.hem, clw, ots[0], ots[1]))
+        .map(|e| {
+            let part = resolve_sentinel(e.part, e.hem, clw, ots[0], ots[1]);
+            if e.record_copy {
+                let (x, y) = match &part {
+                    HintPart::Text { x, y, .. } => (*x, *y),
+                    HintPart::Bitmap { x, y, .. } => (*x, *y),
+                };
+                copy_pos.push((x, y));
+            }
+            part
+        })
         .collect();
 
-    Some((parts, ots, total_w, total_h, border_id, h_width))
+    Some(BuiltHint {
+        parts,
+        otstup: ots,
+        total_w,
+        total_h,
+        border_id,
+        wrap_width: h_width,
+        copy_pos,
+    })
 }
 
 /// Pass 1: position a new part. `cx/cy/cw/ch` are borrowed-mut so we
@@ -1004,7 +1090,7 @@ fn pass1_position(
             (-1002, y)
         }
         Hem::Coord { x, y } => (x, y),
-        Hem::Down { .. } | Hem::Right { .. } => (0, 0),
+        Hem::Down { .. } | Hem::Right { .. } | Hem::Copy => (0, 0),
     }
 }
 
@@ -1071,7 +1157,8 @@ fn parse_mod(spec: &str) -> Hem {
         "T" => Hem::Tab {
             x: arg.unwrap_or(0),
         },
-        "B" | "" | "COPY" => Hem::Bitmap,
+        "COPY" => Hem::Copy,
+        "B" | "" => Hem::Bitmap,
         _ => Hem::Bitmap,
     }
 }
@@ -1086,6 +1173,29 @@ pub(super) fn measure_rich(atlas: &mut super::text::GlyphAtlas, font: &str, text
         .iter()
         .map(|run| atlas.measure(font, &run.text))
         .sum()
+}
+
+/// Centre every text part's glyph run inside its own `(x, w)` band.
+/// The C++ Rangers rasterizer centres text in its bitmap by default
+/// (`alignx = 1`, MatrixHint.cpp:590) so `_WIDTH:N`-forced bands come
+/// out centred; our renderer draws left-aligned, so dialog hints
+/// re-anchor here. Per-line: the longest line defines the shift.
+pub fn center_text_parts(parts: &mut [HintPart], atlas: &mut super::text::GlyphAtlas) {
+    for part in parts.iter_mut() {
+        if let HintPart::Text {
+            x, w, text, font, ..
+        } = part
+        {
+            let measured: i32 = text
+                .split('\n')
+                .map(|line| measure_rich(atlas, font, line) as i32)
+                .max()
+                .unwrap_or(0);
+            if measured < *w {
+                *x += (*w - measured) / 2;
+            }
+        }
+    }
 }
 
 fn wrap_plain_text(
@@ -1341,13 +1451,19 @@ impl HintSystem {
         local_repl.set_baserepl(&hov.elem_name);
         let border_default = ChromeBorder::default();
         let border = chrome.borders.get(&0).unwrap_or(&border_default);
-        let Some((parts, ots, total_w_design, total_h_design, border_id, _wrap)) =
-            build_hint(raw, border, &chrome.bitmaps, &local_repl, atlas, |path| {
-                bitmap_sizer(path)
-            })
-        else {
+        let Some(built) = build_hint(raw, border, &chrome.bitmaps, &local_repl, atlas, |path| {
+            bitmap_sizer(path)
+        }) else {
             return;
         };
+        let BuiltHint {
+            parts,
+            otstup: ots,
+            total_w: total_w_design,
+            total_h: total_h_design,
+            border_id,
+            ..
+        } = built;
         if parts.is_empty() {
             self.active_name = Some(hov.elem_name.clone());
             return;
@@ -1526,16 +1642,16 @@ mod tests {
         }
     }
 
-    fn layout(template: &str) -> Vec<HintPart> {
+    fn layout(template: &str) -> BuiltHint {
         let border = ChromeBorder::default();
-        let bitmaps = HashMap::new();
+        let mut bitmaps = HashMap::new();
+        bitmaps.insert("dot".to_string(), ChromeBitmap { path: "dot".into() });
         let repl = HintReplacer::default();
         let mut atlas = crate::matrix_game::interface::text::GlyphAtlas::new();
-        let (parts, ..) = build_hint(template, &border, &bitmaps, &repl, &mut atlas, |_| {
+        build_hint(template, &border, &bitmaps, &repl, &mut atlas, |_| {
             Some((10, 10))
         })
-        .unwrap();
-        parts
+        .unwrap()
     }
 
     /// `_MOD:L` is an immediate zero-size element (MatrixHint.cpp:
@@ -1543,7 +1659,7 @@ mod tests {
     /// next `_TEXT:`.
     #[test]
     fn mod_l_breaks_line_immediately() {
-        let parts = layout("0|_TEXT:ab|_MOD:L|_TEXT:cd");
+        let parts = layout("0|_TEXT:ab|_MOD:L|_TEXT:cd").parts;
         assert_eq!(parts.len(), 2);
         assert_eq!(part_pos(&parts[0]), (0, 0));
         let (x1, y1) = part_pos(&parts[1]);
@@ -1554,8 +1670,45 @@ mod tests {
     /// `_MOD:T:n` moves the cursor to absolute X = n immediately.
     #[test]
     fn mod_tab_moves_cursor_immediately() {
-        let parts = layout("0|_TEXT:ab|_MOD:T:50|_TEXT:cd");
+        let parts = layout("0|_TEXT:ab|_MOD:T:50|_TEXT:cd").parts;
         assert_eq!(parts.len(), 2);
         assert_eq!(part_pos(&parts[1]), (50, 0));
+    }
+
+    /// `_MOD:COPY` records the NEXT element's resolved position as a
+    /// button anchor slot (MatrixHint.cpp:390-417) without affecting
+    /// layout.
+    #[test]
+    fn mod_copy_records_next_element_position() {
+        let built = layout("0|_BITMAP:dot:B|_MOD:COPY|_BITMAP:dot:L|_MOD:COPY|_BITMAP:dot:B");
+        assert_eq!(built.parts.len(), 3);
+        assert_eq!(built.copy_pos.len(), 2);
+        // First marked bitmap sits after the 10-px-wide leading one.
+        assert_eq!(built.copy_pos[0], (10, 0));
+        // Second marked bitmap starts the next line (L broke it).
+        assert_eq!(built.copy_pos[1], (0, 10));
+    }
+
+    /// The dialog scan: one assembled template per non-`|` part, each
+    /// gathering the later `|` continuations of the same name
+    /// (MatrixMap.cpp:3465-3482).
+    #[test]
+    fn dialog_templates_multi_part() {
+        let lib = TemplateLibrary {
+            templates: HashMap::new(),
+            raw: vec![
+                ("Win".into(), "1|_BITMAP:face:B".into()),
+                ("Win".into(), "4|_TEXT:[_win]".into()),
+                ("Win".into(), "|_MOD:COPY".into()),
+            ],
+        };
+        let parts = lib.dialog_templates("Win");
+        assert_eq!(
+            parts,
+            vec![
+                "1|_BITMAP:face:B|_MOD:COPY".to_string(),
+                "4|_TEXT:[_win]|_MOD:COPY".to_string(),
+            ]
+        );
     }
 }

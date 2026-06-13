@@ -38,7 +38,7 @@ use crate::matrix_game::shadow::{ShadowBatch, ShadowMeshSurface, ShadowMeshVerte
 use crate::matrix_lib::three_g::texture::{
     create_solid_texture, create_texture_from_rgba, decode_texture_bytes,
 };
-use crate::matrix_lib::three_g::vector_object::{self, MaterialSpec, VoMesh};
+use crate::matrix_lib::three_g::vector_object::{self, AnimState, MaterialSpec, VoMesh};
 
 /// Port of `ECannonState` (MatrixObjectCannon.hpp). Drives whether
 /// the cannon is mid-construction (HP ramping, invulnerable) or live.
@@ -104,6 +104,9 @@ pub struct Cannon {
     pub invulnerable: bool,
     /// `m_ShowHitpointTime` — floating HP-bar visibility timer.
     pub show_hitpoint_time: i32,
+    /// `m_MiniMapFlashTime` (FLASH_PERIOD on non-friendly damage,
+    /// MatrixObjectCannon.cpp:1397-1398; decays in Takt :883-885).
+    pub mini_map_flash_time: i32,
 
     // ── Combat state (MatrixObjectCannon.hpp:120-160) ────────────────
     /// `m_Weapons[]` — created lazily on the first live logic takt
@@ -127,6 +130,10 @@ pub struct Cannon {
     pub next_time_ablaze: i64,
     pub next_time_shorted: i64,
     pub last_delay_damage_side: i32,
+    /// The SHAFT unit's `m_Graph` animation cursor — same pattern as
+    /// `Robot::chassis_anim`. Only Shaft{1,2}.vo carry Idle/Fire anims;
+    /// for the others the cursor just idles at frame 0.
+    pub shaft_anim: AnimState,
 }
 
 /// Aiming/fire timing constants (MatrixObjectCannon.hpp:14-18).
@@ -183,6 +190,7 @@ impl Cannon {
             state: CannonState::Idle,
             invulnerable: false,
             show_hitpoint_time: 0,
+            mini_map_flash_time: 0,
             weapons: Vec::new(),
             angle_x: 0.0,
             turret_angle: 0.0,
@@ -194,6 +202,7 @@ impl Cannon {
             next_time_ablaze: 0,
             next_time_shorted: 0,
             last_delay_damage_side: 0,
+            shaft_anim: AnimState::default(),
         }
     }
 
@@ -243,10 +252,21 @@ impl Cannon {
         self.turret_angle + self.angle
     }
 
+    /// The shaft mount in cannon-local space at the CURRENT yaw — the
+    /// `p` accumulator of `CMatrixCannon::RNeed` (MatrixObjectCannon.
+    /// cpp:320-327): `basis.matrix(20) + Rz(yaw)·turret.matrix(20)`.
+    /// The turret's matrix-20 offset orbits the yaw axis.
+    fn shaft_mount_local(&self) -> Vec3 {
+        let k = ((self.kind - 1).max(0) as usize).min(3);
+        let m20 = SHAFT_PIVOT[k] - BASIS_MOUNT;
+        let (st, ct) = self.turret_angle.sin_cos();
+        BASIS_MOUNT + Vec3::new(m20.x * ct - m20.y * st, m20.x * st + m20.y * ct, m20.z)
+    }
+
     /// Barrel pivot (`m_FireCenter`) — the shaft mount run through the
     /// cannon's base rotation.
     fn fire_center(&self) -> Vec3 {
-        let p2 = SHAFT_PIVOT[((self.kind - 1).max(0) as usize).min(3)];
+        let p2 = self.shaft_mount_local();
         let (sa, ca) = self.angle.sin_cos();
         Vec3::new(
             p2.x * ca - p2.y * sa + self.pos.x,
@@ -256,14 +276,14 @@ impl Cannon {
     }
 
     /// World position of a shaft-space point — the row-vector chain
-    /// `v · rotX(angle_x) · rotZ(turret) + pivot, then · rotZ(angle) +
+    /// `v · rotX(angle_x) · rotZ(turret) + mount, then · rotZ(angle) +
     /// pos` of `CMatrixCannon::RNeed` (MatrixObjectCannon.cpp:282-310).
     fn shaft_point_world(&self, bone: Vec3) -> Vec3 {
-        let k = ((self.kind - 1).max(0) as usize).min(3);
         let (sx, cx) = self.angle_x.sin_cos();
         let v = Vec3::new(bone.x, bone.y * cx - bone.z * sx, bone.y * sx + bone.z * cx);
         let (st, ct) = self.turret_angle.sin_cos();
-        let v = Vec3::new(v.x * ct - v.y * st, v.x * st + v.y * ct, v.z) + SHAFT_PIVOT[k];
+        let v =
+            Vec3::new(v.x * ct - v.y * st, v.x * st + v.y * ct, v.z) + self.shaft_mount_local();
         let (sa, ca) = self.angle.sin_cos();
         Vec3::new(
             v.x * ca - v.y * sa + self.pos.x,
@@ -337,6 +357,28 @@ impl Cannon {
             }
         }
         firewas
+    }
+
+    fn shaft_vo(&self) -> Option<std::sync::Arc<VoMesh>> {
+        vector_object::cannon_shaft_vo(((self.kind - 1).max(0) as usize).min(3))
+    }
+
+    /// `BeginFireAnimation` (MatrixObjectCannon.cpp:824-839): prefer
+    /// the looped FireLoop anim, else restart the one-shot Fire. The
+    /// shipped Shaft VOs carry no FireLoop, so in practice every shot
+    /// restarts `Fire` from frame 0 (Shaft{3,4} have neither → no-op).
+    pub fn begin_fire_animation(&mut self) {
+        let Some(vo) = self.shaft_vo() else { return };
+        if self.shaft_anim.set_anim_by_name_no_begin(&vo, "FireLoop") {
+            self.shaft_anim.set_anim_by_name(&vo, "Fire", false);
+        }
+    }
+
+    /// `EndFireAnimation` (MatrixObjectCannon.cpp:841-851): drop the
+    /// loop flag so a running FireLoop finishes and the `takt` idle
+    /// reset takes over.
+    pub fn end_fire_animation(&mut self) {
+        self.shaft_anim.set_anim_looped(false);
     }
 
     /// `FindTarget` (MatrixObjectCannon.cpp:789-821) — pick the enemy
@@ -558,6 +600,19 @@ impl MapStatic for Cannon {
             self.show_hitpoint_time = 1;
         } else if self.show_hitpoint_time > 0 {
             self.show_hitpoint_time = (self.show_hitpoint_time - cms).max(0);
+        }
+        // MatrixObjectCannon.cpp:883-885.
+        if self.mini_map_flash_time > 0 {
+            self.mini_map_flash_time -= cms;
+        }
+        // Graph step (`CMatrixCannon::Takt`, MatrixObjectCannon.cpp:
+        // 448-460): advance the shaft cursor; a finished one-shot
+        // anim falls back to Idle.
+        if let Some(vo) = self.shaft_vo() {
+            self.shaft_anim.takt(&vo, cms);
+            if self.shaft_anim.is_anim_end(&vo) {
+                self.shaft_anim.set_anim_by_name_data_looped(&vo, "Idle");
+            }
         }
     }
 
@@ -812,7 +867,10 @@ impl MapStatic for Cannon {
                     we.fire_begin(glam::Vec3::ZERO, self.self_id);
                 }
             }
-            let _firewas = self.weapons_logic(takt, map, objs, rng);
+            // :1334.
+            if self.weapons_logic(takt, map, objs, rng) {
+                self.begin_fire_animation();
+            }
 
             // Shoot-wide correction (:1342-1349): after a second
             // without confirmed hits, displace the aim point.
@@ -838,6 +896,7 @@ impl MapStatic for Cannon {
                             we.fire_end();
                         }
                     }
+                    self.end_fire_animation(); // :1078
                     self.null_target_time = 0;
                     return;
                 }
@@ -845,7 +904,10 @@ impl MapStatic for Cannon {
                 self.time_from_fire = CANNON_TIME_FROM_FIRE;
                 self.target_disp = glam::Vec3::ZERO;
             }
-            let _firewas = self.weapons_logic(takt, map, objs, rng);
+            // :1117.
+            if self.weapons_logic(takt, map, objs, rng) {
+                self.begin_fire_animation();
+            }
         }
     }
 
@@ -925,6 +987,10 @@ impl MapStatic for Cannon {
                     } else {
                         dmg.damage as f32
                     };
+                // MatrixObjectCannon.cpp:1397-1398.
+                if !friendly_fire {
+                    self.mini_map_flash_time = 1000; // FLASH_PERIOD
+                }
             }
 
             if weap == WEAPON_FLAMETHROWER {
@@ -1094,9 +1160,9 @@ impl Cannon {
         );
         let (s, c) = self.angle.sin_cos();
         let yaw = |v: Vec3| Vec3::new(v.x * c - v.y * s, v.x * s + v.y * c, v.z);
-        let k = ((self.kind - 1).max(0) as usize).min(3);
 
         let base_yaw = self.angle;
+        let shaft_mount = self.shaft_mount_local();
         let mut push = |pos: Vec3, part: CannonDipPart, flies: bool, vrng: &mut Rnd| {
             let (v, spins) = if flies {
                 (
@@ -1136,7 +1202,9 @@ impl Cannon {
             &mut vrng,
         );
         push(
-            origin + yaw(SHAFT_PIVOT[k]),
+            // Mount at the death-time yaw (the shaft orbits the yaw
+            // axis — same chain as `shaft_point_world`).
+            origin + yaw(shaft_mount),
             CannonDipPart::Shaft,
             true,
             &mut vrng,
@@ -1211,7 +1279,10 @@ struct CannonSurface {
 
 struct CannonMesh {
     vertex_buffer: wgpu::Buffer,
-    surfaces: Vec<CannonSurface>,
+    /// Per-VO-frame surface lists (animation pulls different index
+    /// subsets of the shared vertex buffer, like the robot chassis).
+    /// Only Shaft{1,2} have more than one frame.
+    frames: Vec<Vec<CannonSurface>>,
 }
 
 /// Per-cannon-kind GPU resources.
@@ -1254,11 +1325,12 @@ pub struct CannonsRenderer {
     shadow_color: u32,
     time_ms: f32,
     center: [f32; 2],
-    /// Per-(kind, sub-mesh) instance ranges computed each frame by
-    /// `sync_cannons` — each entry draws one sub-mesh (0 basis /
-    /// 1 turret / 2 shaft) over a contiguous instance range, so the
-    /// turret and barrel carry their own aim transforms.
-    draws: Vec<(usize, usize, u32, u32)>, // (kind idx, part, offset, count)
+    /// Per-(kind, sub-mesh, VO frame) instance ranges computed each
+    /// frame by `sync_cannons` — each entry draws one sub-mesh
+    /// (0 basis / 1 turret / 2 shaft) over a contiguous instance
+    /// range, so the turret and barrel carry their own aim transforms.
+    /// The VO frame is the shaft's fire-anim pose (0 for basis/turret).
+    draws: Vec<(usize, usize, usize, u32, u32)>, // (kind idx, part, vo frame, offset, count)
     /// Slot-marker draws — Basis-only stamps placed at `(offset, count)`
     /// in the instance buffer. Rendered separately from `draws` because
     /// they only emit the `Basis` sub-mesh (no Turret / Shaft).
@@ -1414,6 +1486,15 @@ impl CannonsRenderer {
             let shaft = {
                 let path = format!("Matrix/Cannon/Shaft{}.vo", kind);
                 read_texture(&path).and_then(|b| {
+                    // Publish the parsed VO so the game-object layer can
+                    // drive the fire/idle anim cursor (same pattern as
+                    // `set_chassis_vo` in the robots renderer).
+                    if let Ok(vo) = vector_object::parse_vo(&b) {
+                        vector_object::set_cannon_shaft_vo(
+                            kind as usize - 1,
+                            std::sync::Arc::new(vo),
+                        );
+                    }
                     load_mesh(
                         &b,
                         &path,
@@ -1532,10 +1613,13 @@ impl CannonsRenderer {
         let mut instance_data: Vec<InstanceData> = Vec::with_capacity(16);
         let mut dip_pieces: Vec<(usize, CannonDipPart, InstanceData)> = Vec::new();
 
-        // Group cannons by (kind, sub-mesh) so draws are contiguous;
-        // basis / turret / shaft each get their own transform so the
-        // turret visibly tracks `turret_angle` / `angle_x`.
-        let mut by_kind: [[Vec<InstanceData>; 3]; 4] = Default::default();
+        // Group cannons by (kind, sub-mesh, VO frame) so draws are
+        // contiguous; basis / turret / shaft each get their own
+        // transform so the turret visibly tracks `turret_angle` /
+        // `angle_x`. The shaft additionally splits by its anim frame
+        // (Fire pose) — basis / turret always sit at frame 0.
+        let mut by_kind: [[std::collections::BTreeMap<usize, Vec<InstanceData>>; 3]; 4] =
+            Default::default();
         let light_world = Vec3::new(
             map.light_main_dir[0],
             map.light_main_dir[1],
@@ -1601,8 +1685,22 @@ impl CannonsRenderer {
                 .get(k)
                 .map(|g| (g.turret_bake, g.shaft_bake))
                 .unwrap_or((Vec3::ZERO, Vec3::ZERO));
+            let shaft_frame_cnt = self
+                .kinds
+                .get(k)
+                .and_then(|g| g.shaft.as_ref())
+                .map(|m| m.frames.len())
+                .unwrap_or(1);
             for part in 0..3 {
-                by_kind[k][part].push(cannon_part_instance(c, cx, cy, part, tb, sb));
+                let frame = if part == 2 {
+                    c.shaft_anim.vo_frame.min(shaft_frame_cnt.saturating_sub(1))
+                } else {
+                    0
+                };
+                by_kind[k][part]
+                    .entry(frame)
+                    .or_default()
+                    .push(cannon_part_instance(c, cx, cy, part, tb, sb));
             }
 
             // Per-instance shadow: bake the silhouette using THIS cannon's
@@ -1676,25 +1774,27 @@ impl CannonsRenderer {
             let k = ((g.kind - 1).max(0) as usize).min(3);
             let inst = ghost_instance(&g, cx, cy);
             for part in 0..3 {
-                by_kind[k][part].push(inst);
+                by_kind[k][part].entry(0).or_default().push(inst);
             }
         }
 
         let mut offset: u32 = 0;
         'pack: for (k, parts) in by_kind.iter().enumerate() {
-            for (part, list) in parts.iter().enumerate() {
-                let count = list.len() as u32;
-                if count == 0 {
-                    continue;
+            for (part, frames) in parts.iter().enumerate() {
+                for (frame, list) in frames {
+                    let count = list.len() as u32;
+                    if count == 0 {
+                        continue;
+                    }
+                    if offset + count > self.instance_capacity {
+                        break 'pack;
+                    }
+                    for inst in list {
+                        instance_data.push(*inst);
+                    }
+                    self.draws.push((k, part, *frame, offset, count));
+                    offset += count;
                 }
-                if offset + count > self.instance_capacity {
-                    break 'pack;
-                }
-                for inst in list {
-                    instance_data.push(*inst);
-                }
-                self.draws.push((k, part, offset, count));
-                offset += count;
             }
         }
 
@@ -1775,7 +1875,7 @@ impl CannonsRenderer {
 
         pass.set_pipeline(&self.pipeline);
         pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
-        for (kind, part, offset, count) in &self.draws {
+        for (kind, part, frame, offset, count) in &self.draws {
             let Some(kgpu) = self.kinds.get(*kind) else {
                 continue;
             };
@@ -1785,8 +1885,11 @@ impl CannonsRenderer {
                 _ => &kgpu.basis,
             };
             let Some(mesh) = mesh.as_ref() else { continue };
+            let Some(surfaces) = mesh.frames.get(*frame).or_else(|| mesh.frames.first()) else {
+                continue;
+            };
             pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-            for surface in &mesh.surfaces {
+            for surface in surfaces {
                 pass.set_bind_group(0, &surface.bind_group, &[]);
                 pass.set_index_buffer(surface.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..surface.num_indices, 0, *offset..(*offset + *count));
@@ -1803,8 +1906,9 @@ impl CannonsRenderer {
                 CannonDipPart::Shaft => &kgpu.shaft,
             };
             let Some(mesh) = mesh.as_ref() else { continue };
+            let Some(surfaces) = mesh.frames.first() else { continue };
             pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-            for surface in &mesh.surfaces {
+            for surface in surfaces {
                 pass.set_bind_group(0, &surface.bind_group, &[]);
                 pass.set_index_buffer(surface.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..surface.num_indices, 0, *slot..(*slot + 1));
@@ -1825,8 +1929,11 @@ impl CannonsRenderer {
                     .iter()
                     .flat_map(|m| m.as_ref())
                 {
+                    let Some(surfaces) = mesh.frames.first() else {
+                        continue;
+                    };
                     pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-                    for surface in &mesh.surfaces {
+                    for surface in surfaces {
                         pass.set_bind_group(0, &surface.bind_group, &[]);
                         pass.set_index_buffer(
                             surface.index_buffer.slice(..),
@@ -1881,7 +1988,16 @@ fn cannon_part_instance(
                 * Mat4::from_translation(-turret_bake)
         }
         2 => {
-            base * Mat4::from_translation(shaft_bake)
+            // The shaft mount ORBITS the yaw axis: the C++ accumulates
+            // `p += Rz(yaw)·turret.matrix(20)` before placing the shaft
+            // unit (MatrixObjectCannon.cpp:320-327). `turret_bake` is
+            // the basis mount (the yaw axis); `shaft_bake - turret_bake`
+            // is the turret's matrix-20 offset in turret-local space.
+            let m20 = shaft_bake - turret_bake;
+            let (sy, cy) = c.turret_angle.sin_cos();
+            let mount = turret_bake
+                + Vec3::new(m20.x * cy - m20.y * sy, m20.x * sy + m20.y * cy, m20.z);
+            base * Mat4::from_translation(mount)
                 * Mat4::from_rotation_z(c.turret_angle)
                 * Mat4::from_rotation_x(c.angle_x)
                 * Mat4::from_translation(-shaft_bake)
@@ -2053,8 +2169,6 @@ fn load_mesh(
         usage: wgpu::BufferUsages::VERTEX,
     });
 
-    let frame = mesh.frames.first()?;
-    let mut surfaces = Vec::with_capacity(frame.surfaces.len());
     let shadow_vertices: Vec<ShadowMeshVertex> = vertices
         .iter()
         .map(|v| ShadowMeshVertex {
@@ -2064,111 +2178,122 @@ fn load_mesh(
         })
         .collect();
     let mut shadow_surfaces: Vec<ShadowMeshSurface> = Vec::new();
-    for surf in &frame.surfaces {
-        if surf.indices.is_empty() {
-            continue;
-        }
-        let mut material = MaterialSpec::default();
-        if let Some(spec) = surf.texture_ref.as_deref() {
-            material = vector_object::parse_material_spec_with_prefix(spec, vo_dir.as_deref());
-        }
+    let mut frames: Vec<Vec<CannonSurface>> = Vec::with_capacity(mesh.frames.len());
+    for (frame_index, frame) in mesh.frames.iter().enumerate() {
+        let mut surfaces = Vec::with_capacity(frame.surfaces.len());
+        for surf in &frame.surfaces {
+            if surf.indices.is_empty() {
+                continue;
+            }
+            let mut material = MaterialSpec::default();
+            if let Some(spec) = surf.texture_ref.as_deref() {
+                material = vector_object::parse_material_spec_with_prefix(spec, vo_dir.as_deref());
+            }
 
-        let (diffuse_view, alpha_test) =
-            resolve_diffuse(&material, device, queue, tex_cache, read_texture)
-                .unwrap_or_else(|| (fallback_tex.clone(), false));
-        shadow_surfaces.push(ShadowMeshSurface {
-            indices: surf.indices.clone(),
-            diffuse: diffuse_view.clone(),
-            alpha_test,
-        });
-        let gloss_view = resolve_texture(
-            material.gloss.as_ref(),
-            device,
-            queue,
-            tex_cache,
-            read_texture,
-        )
-        .unwrap_or_else(|| black_tex.clone());
-        let back_view = resolve_texture(
-            material.back.as_ref(),
-            device,
-            queue,
-            tex_cache,
-            read_texture,
-        )
-        .unwrap_or_else(|| black_tex.clone());
-        let mask_view = resolve_texture(
-            material.mask.as_ref(),
-            device,
-            queue,
-            tex_cache,
-            read_texture,
-        )
-        .unwrap_or_else(|| transparent_tex.clone());
+            let (diffuse_view, alpha_test) =
+                resolve_diffuse(&material, device, queue, tex_cache, read_texture)
+                    .unwrap_or_else(|| (fallback_tex.clone(), false));
+            // Silhouette bake uses the at-rest pose only.
+            if frame_index == 0 {
+                shadow_surfaces.push(ShadowMeshSurface {
+                    indices: surf.indices.clone(),
+                    diffuse: diffuse_view.clone(),
+                    alpha_test,
+                });
+            }
+            let gloss_view = resolve_texture(
+                material.gloss.as_ref(),
+                device,
+                queue,
+                tex_cache,
+                read_texture,
+            )
+            .unwrap_or_else(|| black_tex.clone());
+            let back_view = resolve_texture(
+                material.back.as_ref(),
+                device,
+                queue,
+                tex_cache,
+                read_texture,
+            )
+            .unwrap_or_else(|| black_tex.clone());
+            let mask_view = resolve_texture(
+                material.mask.as_ref(),
+                device,
+                queue,
+                tex_cache,
+                read_texture,
+            )
+            .unwrap_or_else(|| transparent_tex.clone());
 
-        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Cannons Mesh IB"),
-            contents: bytemuck::cast_slice(&surf.indices),
-            usage: wgpu::BufferUsages::INDEX,
-        });
-        let mat_uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Cannons Material UB"),
-            contents: bytemuck::bytes_of(&MaterialUniform {
-                flags: [
-                    material.gloss.is_some() as u32,
-                    material.back.is_some() as u32,
-                    material.mask.is_some() as u32,
-                    alpha_test as u32,
+            let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Cannons Mesh IB"),
+                contents: bytemuck::cast_slice(&surf.indices),
+                usage: wgpu::BufferUsages::INDEX,
+            });
+            let mat_uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Cannons Material UB"),
+                contents: bytemuck::bytes_of(&MaterialUniform {
+                    flags: [
+                        material.gloss.is_some() as u32,
+                        material.back.is_some() as u32,
+                        material.mask.is_some() as u32,
+                        alpha_test as u32,
+                    ],
+                    scroll: [material.scroll[0], material.scroll[1], 0.0, 0.0],
+                }),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Cannons BG"),
+                layout: bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: uniform_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&diffuse_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&gloss_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(&back_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::TextureView(&mask_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::Sampler(sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: mat_uniform.as_entire_binding(),
+                    },
                 ],
-                scroll: [material.scroll[0], material.scroll[1], 0.0, 0.0],
-            }),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Cannons BG"),
-            layout: bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: uniform_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&diffuse_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&gloss_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::TextureView(&back_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: wgpu::BindingResource::TextureView(&mask_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: wgpu::BindingResource::Sampler(sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: mat_uniform.as_entire_binding(),
-                },
-            ],
-        });
-        surfaces.push(CannonSurface {
-            index_buffer,
-            num_indices: surf.indices.len() as u32,
-            bind_group,
-        });
+            });
+            surfaces.push(CannonSurface {
+                index_buffer,
+                num_indices: surf.indices.len() as u32,
+                bind_group,
+            });
+        }
+        frames.push(surfaces);
+    }
+    if frames.is_empty() {
+        return None;
     }
 
     Some(LoadedMesh {
         mesh: CannonMesh {
             vertex_buffer,
-            surfaces,
+            frames,
         },
         shadow_vertices,
         shadow_surfaces,
@@ -2397,4 +2522,119 @@ fn create_pipeline(
         multiview_mask: None,
         cache: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::matrix_lib::three_g::vector_object::{
+        set_cannon_shaft_vo, VoAnimation, VoFrame, VoFrameRef,
+    };
+
+    /// Synthetic shaft VO: `frame_count` geometry frames + named anims
+    /// given as (name, frame durations) over sequential frame indices.
+    fn shaft_vo(frame_count: usize, anims: &[(&str, &[i32])]) -> VoMesh {
+        VoMesh {
+            vertices: Vec::new(),
+            surfaces: Vec::new(),
+            frames: vec![
+                VoFrame {
+                    bounds_min: [0.0; 3],
+                    bounds_max: [0.0; 3],
+                    geo_center: [0.0; 3],
+                    radius: 0.0,
+                    surfaces: Vec::new(),
+                };
+                frame_count
+            ],
+            animations: anims
+                .iter()
+                .enumerate()
+                .map(|(i, (name, times))| VoAnimation {
+                    name: name.to_string(),
+                    id: i as u32 + 1,
+                    frames: times
+                        .iter()
+                        .enumerate()
+                        .map(|(fi, &t)| VoFrameRef {
+                            frame_index: fi,
+                            time_ms: t,
+                        })
+                        .collect(),
+                })
+                .collect(),
+            matrices: Vec::new(),
+            all_matrices: Vec::new(),
+        }
+    }
+
+    fn cannon(kind: i32) -> Cannon {
+        Cannon::new(glam::Vec2::ZERO, 0.0, 0.0, 0, kind, None, 0)
+    }
+
+    // NB: each test uses its own kind so the global shaft-VO slots
+    // don't race across the parallel test runner.
+
+    #[test]
+    fn fire_anim_falls_back_to_one_shot_and_idles_out() {
+        // Matches the shipped Shaft{1,2}.vo data: Idle + Fire, no FireLoop.
+        set_cannon_shaft_vo(
+            3,
+            std::sync::Arc::new(shaft_vo(3, &[("Idle", &[30]), ("Fire", &[30, 30, 30])])),
+        );
+        let mut c = cannon(4);
+        assert_eq!(c.shaft_anim.anim, 0);
+        assert!(c.shaft_anim.looped);
+
+        c.begin_fire_animation();
+        assert_eq!(c.shaft_anim.anim, 1, "no FireLoop -> one-shot Fire");
+        assert!(!c.shaft_anim.looped);
+
+        // Past the anim's end the graphic takt resets to Idle
+        // (MatrixObjectCannon.cpp:455).
+        let mut rng = Rnd::new(1);
+        let mut objs = Objects::new();
+        c.takt(200, &mut rng, &mut objs);
+        assert_eq!(c.shaft_anim.anim, 0, "one-shot end -> Idle");
+        assert!(c.shaft_anim.looped, "Idle loopedness comes from data");
+    }
+
+    #[test]
+    fn fireloop_sets_loop_and_end_fire_clears_it() {
+        set_cannon_shaft_vo(
+            2,
+            std::sync::Arc::new(shaft_vo(2, &[("Idle", &[30]), ("FireLoop", &[30, 30])])),
+        );
+        let mut c = cannon(3);
+        c.begin_fire_animation();
+        assert_eq!(c.shaft_anim.anim, 1);
+        assert!(c.shaft_anim.looped);
+
+        // Re-trigger mid-anim must not restart (SetAnimByNameNoBegin).
+        let vo = c.shaft_vo().unwrap();
+        c.shaft_anim.takt(&vo, 35);
+        assert_eq!(c.shaft_anim.frame, 1);
+        c.begin_fire_animation();
+        assert_eq!(c.shaft_anim.frame, 1, "FireLoop must not restart");
+
+        c.end_fire_animation();
+        assert!(!c.shaft_anim.looped, "loop cleared on fire end");
+
+        // With the loop dropped the anim runs out; takt idles it out.
+        let mut rng = Rnd::new(1);
+        let mut objs = Objects::new();
+        c.takt(100, &mut rng, &mut objs);
+        assert_eq!(c.shaft_anim.anim, 0);
+        assert!(c.shaft_anim.looped);
+    }
+
+    #[test]
+    fn begin_fire_is_noop_without_fire_anims() {
+        // Matches Shaft{3,4}.vo: single unnamed anim, no Fire/FireLoop.
+        set_cannon_shaft_vo(1, std::sync::Arc::new(shaft_vo(1, &[("", &[100])])));
+        let mut c = cannon(2);
+        c.begin_fire_animation();
+        assert_eq!(c.shaft_anim.anim, 0);
+        assert!(c.shaft_anim.looped);
+    }
 }

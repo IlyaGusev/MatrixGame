@@ -190,6 +190,7 @@ fn main() {
         "Matrix/Textures/Billboard/zahspot",
         "Matrix/Textures/Billboard/Dust",
         "Matrix/Textures/Billboard/keelwater",
+        "Matrix/Textures/Billboard/moveto",
         "Matrix/Flyer/SH.VO",
         "Matrix/Flyer/AH.VO",
         "Matrix/Flyer/TH.VO",

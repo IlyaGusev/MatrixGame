@@ -51,7 +51,7 @@ Form, Helper, ShadowProj, ShadowStencil. (Math3D partial — CTrajectory.)
 | matrix_game/common.rs         | Common.hpp                        |
 | matrix_game/config.rs         | MatrixConfig.cpp (damage/radius/cooldown/overheat tables, cannon props, difficulty; gamma/keybind/sound deferred) |
 | matrix_game/form_game.rs      | MatrixFormGame.cpp (+ MatrixGame.cpp entry glue) |
-| matrix_game/map.rs            | MatrixMap.cpp (map data + `MapRenderer` draw orchestration)|
+| matrix_game/map.rs            | MatrixMap.cpp (map data + `MapRenderer` draw orchestration + DrawSky/skybox)|
 | matrix_game/map_group.rs      | MatrixMapGroup.cpp (BuildBottom + BuildWater — merged across groups by texture; see header) |
 | matrix_game/map_prepare.rs    | MatrixMapPrepare.cpp              |
 | matrix_game/map_static.rs     | MatrixMapStatic.{cpp,hpp} (base class + ProceedLogic driver + Objects arena) |
@@ -60,17 +60,22 @@ Form, Helper, ShadowProj, ShadowStencil. (Math3D partial — CTrajectory.)
 | matrix_game/object_building.rs| MatrixObjectBuilding.cpp          |
 | matrix_game/combat_tests.rs   | (test-only — weapon/damage behavior tests) |
 | matrix_game/object_robot.rs   | MatrixObjectRobot.cpp (chassis-only RNeed + per-frame instance sync) |
-| matrix_game/logic.rs          | MatrixLogic.cpp (CMatrixMapLogic: Takt driver, Place*/IsAbsenceWall helpers; also module root for Logic/ subsystems) |
+| matrix_game/logic.rs          | MatrixLogic.cpp (CMatrixMapLogic: Takt driver, Rnd (Park–Miller LCG), Place*/PlaceFindNearReturn/IsAbsenceWall, win/lose CheckStatus; also module root for Logic/ subsystems) |
 | matrix_game/map_trace.rs      | MatrixMapTrace.cpp (CMatrixMap::Trace hitscan + FindLocalPath A* + OptimizeMovePath) |
-| matrix_game/orders.rs         | MatrixRobot.hpp SOrder/OrderType/OrderPhase + AllocPlaceForOrderOnTop pool |
-| matrix_game/particles.rs      | (stub — will split across Effects/) |
+| matrix_game/particles.rs      | (empty stub — superseded by Effects/) |
+| matrix_game/flyer.rs          | MatrixFlyer.cpp (FO_GIVE_BOT delivery flyers + Damage/HP bar) |
+| matrix_game/multi_selection.rs| MatrixMultiSelection.cpp (marquee drag-select) |
+| matrix_game/object_cannon.rs  | MatrixObjectCannon.cpp (turrets: seek/aim/fire + fire animation, damage, DIP wrecks, renderer) |
+| matrix_game/pause_overlay.rs  | (no direct peer — dim quad behind the C++ pause hint) |
+| matrix_game/road_network.rs   | Logic/MatrixRoadNetwork.cpp (zones/roads graph, FindPathInZone) |
+| matrix_game/shadow.rs         | MatrixShadowManager.cpp (projected-shadow system) |
+| matrix_game/slot_marker.rs    | (no direct peer — turret-slot place markers, CreatePlacesShow visuals) |
 | matrix_game/progress_bar.rs   | MatrixProgressBar.cpp (3-segment bar + LIC color, atlas-backed) |
 | matrix_game/render_pipeline.rs| MatrixRenderPipeline.cpp          |
-| matrix_game/rnd.rs            | MatrixLogic.cpp `CMatrixMapLogic::Rnd` (Park–Miller LCG) |
-| matrix_game/side.rs           | MatrixSide.cpp (selection fields only — `m_ActiveObject`, `m_CurrSel`; resources/AI/stats deferred) |
-| matrix_game/sky.rs            | DrawSky in MatrixMap.cpp + skybox parts |
+| matrix_game/side.rs           | MatrixSide.cpp (CMatrixSideUnit data: selection, resources, statistics) |
+| matrix_game/side_player.rs    | MatrixSide.cpp player-side logic (TaktPL, PGOrder*, FirePL, underfire recalc, group placement) |
 | matrix_game/ter_surface.rs    | MatrixTerSurface.cpp              |
-| matrix_game/robot.rs          | MatrixRobot.cpp (CMatrixRobotAI — spawn flow + move-out + MoveTo + GetLost + SBotWeapon fire control / heat / Damage / ablaze-shorted DOT) |
+| matrix_game/robot.rs          | MatrixRobot.cpp (CMatrixRobotAI — full order pool (SOrder), spawn/move-out, MoveTo + collision callback + step-aside, GetLost, SBotWeapon fire control / heat / Damage / DOT) |
 | matrix_game/water.rs          | MatrixWater.cpp + BuildWater in MatrixMapGroup.cpp + WaterAlpha_t3 in MatrixRenderPipeline.cpp — will split in Stage 2 part 2 |
 
 N/A-by-design (D3D9 infrastructure replaced by the wgpu glue):
@@ -117,19 +122,23 @@ sites exist in the original — dead code).
 
 | Rust file                               | Original                                           |
 |-----------------------------------------|----------------------------------------------------|
-| matrix_game/interface/builder_preview.rs| CConstructor::Render (CConstructor.cpp:264-360) — preview viewport + directional light slice |
 | matrix_game/interface/constructor.rs    | CConstructor.{cpp,h} (+ folded CConstructorPanel)  |
 | matrix_game/interface/counter.rs        | CCounter.{cpp,h}                                   |
 | matrix_game/interface/history.rs        | CHistory.{cpp,h}                                   |
-| matrix_game/interface/iface_element.rs  | CIFaceElement.{cpp,h} (folds CIFaceButton / CIFaceImage / CIFaceStatic) |
-| matrix_game/interface/iface_list.rs     | CInterface.h::CIFaceList (panel container + events)|
+| matrix_game/interface/dialog.rs         | MatrixMap.cpp:3259-3575 dialog mode (menu/win/lose/stat dialogs, confirmations) + MatrixLogic.cpp:2527-2586 stat replacements |
+| matrix_game/interface/iface_button.rs   | CIFaceButton.{cpp,h} |
+| matrix_game/interface/iface_element.rs  | CIFaceElement.{cpp,h} |
+| matrix_game/interface/iface_image.rs    | CIFaceImage.{cpp,h} |
+| matrix_game/interface/iface_static.rs   | CIFaceStatic.{cpp,h} |
+| matrix_game/interface/iface_list.rs     | CInterface.h::CIFaceList (panel container + events + BeginBuildTurret placement state)|
 | matrix_game/interface/iface_menu.rs     | CIFaceMenu.{cpp,h}                                 |
 | matrix_game/interface/interface.rs      | CInterface.{cpp,h} (panel struct + `if/<Name>` loader) |
 | matrix_game/interface/renderer.rs       | (no C++ peer — wgpu 2D quad pipeline for the HUD)  |
 | matrix_game/interface/sound.rs          | (no direct peer — dispatch wrapper for CSound::Play UI calls; backend deferred) |
-| matrix_game/interface/turret_build.rs   | CInterface::BeginBuildTurret slice (CInterface.cpp:4650+ + placement state) |
+| matrix_game/interface/hint.rs           | MatrixHint.{cpp,hpp} (template build, chrome, copy-pos button anchors) |
+| matrix_game/interface/robot_icons.rs    | CInterface group/personal icon rows |
+| matrix_game/interface/text.rs           | (no direct peer — AFT bitmap-font parser + glyph renderer for the SR2 Rangers rasteriser) |
 
-Not yet ported: CAnimation → animation.rs, MatrixHint → hint.rs.
 
 ## matrix_game/logic/ (MatrixGame/src/Logic/)
 
@@ -172,11 +181,14 @@ not embedded as raw-string constants.
 | shaders/object_building.wgsl         | matrix_game/object_building.rs   |
 | shaders/object_shadow.wgsl           | matrix_game/object.rs            |
 | shaders/object_shadow_texture.wgsl   | matrix_game/object.rs            |
-| shaders/sky_gradient.wgsl            | matrix_game/sky.rs               |
-| shaders/sky_skybox.wgsl              | matrix_game/sky.rs               |
+| shaders/sky_gradient.wgsl            | matrix_game/map.rs (sky)         |
+| shaders/sky_skybox.wgsl              | matrix_game/map.rs (sky)         |
 | shaders/terrain.wgsl                 | matrix_game/map.rs (MapRenderer) |
 | shaders/terrain_gloss.wgsl           | matrix_game/map.rs (MapRenderer) |
 | shaders/water.wgsl                   | matrix_game/water.rs             |
 | shaders/water_inshore.wgsl           | matrix_game/water.rs             |
+| shaders/interface.wgsl               | matrix_game/interface/renderer.rs |
+| shaders/progress_bar.wgsl            | matrix_game/progress_bar.rs      |
+| shaders/selection_ring.wgsl          | matrix_game/effects/selection.rs |
 | shaders/billboard.wgsl               | matrix_game/effects/effects_renderer.rs |
 | shaders/effect_mesh.wgsl             | matrix_game/effects/effects_renderer.rs |

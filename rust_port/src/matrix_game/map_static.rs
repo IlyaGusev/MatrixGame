@@ -370,7 +370,10 @@ pub fn ray_sphere_pick(center: Vec3, radius: f32, origin: Vec3, dir: Vec3) -> Op
 /// Stable handle into [`Objects`]. A generational index so reused slots
 /// don't silently alias a freed id — equivalent to checking
 /// `core->m_Object != NULL` in the C++ ref-counted world.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Ordering is the Rust stand-in for the C++ heap-pointer tie-break
+/// (`DWORD(pCurrBot) < DWORD(data->robot)` in CollisionCallback) — an
+/// arbitrary but stable "only one of the pair yields" rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ObjectId {
     index: u32,
     generation: u32,
@@ -462,6 +465,25 @@ pub struct Objects {
     /// walk) finishes the job. Stands in for the C++
     /// `g_MatrixMap->StaticDelete(this)` calls from DIPTakt.
     pending_removals: Vec<ObjectId>,
+    /// Destroyed special (win-target) map objects this takt. MapLogic
+    /// drains these into `m_BeforeWinCount` / side-status bookkeeping
+    /// (MatrixObject.cpp:203-212, :249-260, :1244-1258 — the object
+    /// can't reach the map/sides from `damage`/`logic_takt`).
+    pub pending_special_deaths: Vec<SpecialDeathKind>,
+    /// `MMFLAG_TERRON_DEAD` (MatrixObject.cpp:171) — exempts the
+    /// player from the JUST_DEAD scan in CheckStatus.
+    pub terron_dead: bool,
+}
+
+/// Which special-object death path fired (the C++ branches differ:
+/// BREAK/ANIM only set SS_JUST_WIN once the win counter is exhausted,
+/// the terron sets it unconditionally).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpecialDeathKind {
+    /// BEHF_BREAK / BEHF_ANIM special target (MatrixObject.cpp:203, :249).
+    Target,
+    /// Terron explosion completed (MatrixObject.cpp:1244).
+    Terron,
 }
 
 /// One floating HP bar (`CMatrixProgressBar` placement). `anchor` is
@@ -484,11 +506,15 @@ pub struct ExplosionSpawn {
     pub fire: bool,
 }
 
-/// The kill-stat subset of `CMatrixSideUnit`'s statistics
-/// (MatrixSide.hpp `EStat`).
+/// The kill/build-stat subset of `CMatrixSideUnit`'s statistics
+/// (MatrixSide.hpp `EStat`). Accumulated here because the object code
+/// can't reach the sides; `MapLogic::sync_side_stats` mirrors these
+/// into each side's stat array every takt.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SideStats {
+    pub robot_build: i32,
     pub robot_kill: i32,
+    pub turret_build: i32,
     pub turret_kill: i32,
     pub building_kill: i32,
 }
@@ -519,6 +545,8 @@ impl Objects {
             debris_types: Vec::new(),
             pending_hit_notices: Vec::new(),
             pending_removals: Vec::new(),
+            pending_special_deaths: Vec::new(),
+            terron_dead: false,
         }
     }
 

@@ -86,6 +86,18 @@ struct AppState {
     /// Mirrors `g_MatrixMap->IsPaused()` (MatrixMap.hpp:640). Constructor
     /// open / close toggles this; logic takt is gated on it.
     is_paused: bool,
+    /// Dialog-mode state — port of `m_DialogModeName` +
+    /// `m_DialogModeHints` + MMFLAG_DIALOG_MODE (MatrixMap.cpp:
+    /// 3261-3574). While `Some`, the game is paused and mouse/keys
+    /// route to the hint buttons only.
+    dialog: Option<crate::matrix_game::interface::dialog::DialogState>,
+    /// `g_ExitState` — why the session ended (1 exit, 2 lose, 3 win,
+    /// 4 surrender). Logged on exit; the SR2 host consumed it.
+    exit_state: i32,
+    /// Keys whose press was consumed by `handle_game_key` — their
+    /// auto-repeats must not leak into the camera bindings (held `S`
+    /// would both issue a stop order and scroll the camera otherwise).
+    consumed_keys: std::collections::HashSet<winit::keyboard::KeyCode>,
     /// Effect-primitive renderer (billboards / beams / cones / shells)
     /// — the `CBillboard::SortEndDraw` + BBT texture table port.
     effects_renderer: crate::matrix_game::effects::effects_renderer::EffectsRenderer,
@@ -212,8 +224,7 @@ impl ApplicationHandler for App {
             );
             let marquee =
                 crate::matrix_game::multi_selection::MarqueeRenderer::new(&gfx.device, &gfx.config);
-            let move_to =
-                crate::matrix_game::effects::move_to::MoveToRenderer::new(&gfx.device, &gfx.config);
+            let move_to = crate::matrix_game::effects::move_to::MoveToRenderer::new();
 
             let iface_list =
                 crate::matrix_game::interface::IFaceList::load_default_panels(&matrix_data);
@@ -319,6 +330,9 @@ impl ApplicationHandler for App {
                 bb_queue: Default::default(),
                 mesh_queue: Default::default(),
                 is_paused: false,
+                dialog: None,
+                exit_state: 0,
+                consumed_keys: Default::default(),
                 fps_last_log: crate::platform::now_secs(),
                 fps_frames: 0,
             });
@@ -422,10 +436,7 @@ impl ApplicationHandler for App {
                     &gfx.device,
                     &gfx.config,
                 );
-                let move_to = crate::matrix_game::effects::move_to::MoveToRenderer::new(
-                    &gfx.device,
-                    &gfx.config,
-                );
+                let move_to = crate::matrix_game::effects::move_to::MoveToRenderer::new();
 
                 let iface_list =
                     crate::matrix_game::interface::IFaceList::load_default_panels(&matrix_data);
@@ -481,7 +492,7 @@ impl ApplicationHandler for App {
                         &read,
                     );
                 game.objects.debris_catalog_len = effect_meshes.debris_count();
-            game.objects.debris_types = effect_meshes.debris_types().to_vec();
+                game.objects.debris_types = effect_meshes.debris_types().to_vec();
                 *state_slot.borrow_mut() = Some(AppState {
                     window: win.clone(),
                     gfx,
@@ -515,6 +526,9 @@ impl ApplicationHandler for App {
                     bb_queue: Default::default(),
                     mesh_queue: Default::default(),
                     is_paused: false,
+                    dialog: None,
+                    exit_state: 0,
+                    consumed_keys: Default::default(),
                     fps_last_log: crate::platform::now_secs(),
                     fps_frames: 0,
                 });
@@ -564,6 +578,37 @@ impl ApplicationHandler for App {
                 let [cx, cy] = state.cursor;
                 let w = state.gfx.config.width as f32;
                 let h = state.gfx.config.height as f32;
+                // ── Dialog mode swallows all world + panel input; only
+                // the Hints-panel buttons stay live. The C++ reaches the
+                // same state via MMFLAG_DIALOG_MODE + Pause(true): world
+                // clicks die in `CMultiSelection::Begin`
+                // (MatrixMultiSelection.cpp:34) and the selection was
+                // dropped by PLDropAllActions, so the regular panels
+                // have nothing to press.
+                if state.dialog.is_some() {
+                    if button == MouseButton::Left {
+                        match btn_state {
+                            ElementState::Pressed => {
+                                let on_hints = state
+                                    .iface_list
+                                    .hit_test(cx, cy, w, h)
+                                    .map(|(pi, _)| state.iface_list.panels[pi].name == "Hints")
+                                    .unwrap_or(false);
+                                if on_hints {
+                                    state.iface_list.on_mouse_down(cx, cy, w, h);
+                                }
+                            }
+                            ElementState::Released => {
+                                if let Some(crate::matrix_game::interface::Click::Button(name)) =
+                                    state.iface_list.on_mouse_up(cx, cy, w, h)
+                                {
+                                    press_hint_button(state, &name);
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
                 if button == MouseButton::Middle {
                     let pressed = btn_state == ElementState::Pressed;
                     state.camera.on_rotate_button(pressed, cx, cy);
@@ -605,10 +650,9 @@ impl ApplicationHandler for App {
                         // minimap world position + red ping
                         // (MatrixSide.cpp:821-830).
                         if let Some(tgt) = state.minimap.click_to_world(cx, cy) {
-                            state.game.order_move_to_world(
-                                &state.map,
-                                glam::Vec2::new(tgt[0], tgt[1]),
-                            );
+                            state
+                                .game
+                                .order_move_to_world(&state.map, glam::Vec2::new(tgt[0], tgt[1]));
                             state
                                 .minimap
                                 .add_event(tgt[0], tgt[1], 0xffff0000, 0xffff0000);
@@ -901,6 +945,27 @@ impl ApplicationHandler for App {
                 use crate::matrix_game::camera::KeyAction;
                 use winit::keyboard::{KeyCode, PhysicalKey};
                 let pressed = event.state == winit::event::ElementState::Pressed;
+                // Game-key dispatch first (MatrixFormGame.cpp:1172-1560);
+                // a consumed key never reaches the camera bindings, and
+                // its auto-repeats are swallowed too — toggles (pause,
+                // auto-orders) fire once per physical press and a held
+                // `S` must not scroll the camera after stopping a group.
+                if let PhysicalKey::Code(code) = event.physical_key {
+                    if pressed {
+                        if event.repeat {
+                            if state.consumed_keys.contains(&code) {
+                                return;
+                            }
+                        } else if handle_game_key(state, code) {
+                            state.consumed_keys.insert(code);
+                            return;
+                        } else {
+                            state.consumed_keys.remove(&code);
+                        }
+                    } else {
+                        state.consumed_keys.remove(&code);
+                    }
+                }
                 let action =
                     match event.physical_key {
                         PhysicalKey::Code(KeyCode::ArrowUp) | PhysicalKey::Code(KeyCode::KeyW) => {
@@ -990,6 +1055,13 @@ impl ApplicationHandler for App {
                     for sp in pending {
                         state.spots.spawn(&state.map, &sp);
                     }
+                }
+
+                // Win/Loose end-of-game dialog — the deferred
+                // EnterDialogMode(TEMPLATE_DIALOG_WIN/LOOSE) call from
+                // MatrixLogic.cpp:2900-2906 (logic queues, UI executes).
+                if let Some(win) = state.game.pending_win_loose_dialog.take() {
+                    enter_dialog_mode(state, if win { "Win" } else { "Loose" });
                 }
 
                 // Reconcile + animate the selection-ring effect with
@@ -1195,11 +1267,11 @@ impl ApplicationHandler for App {
                             state
                                 .selection_ring
                                 .upload(&state.gfx.queue, vp, cr, cu, mc);
-                            state
-                                .move_to
-                                .upload(&state.gfx.queue, &state.map, vp, cr, cu, mc);
                             // ── Effect primitives (DrawEffects port) ──
                             state.bb_queue.clear();
+                            // Move-order pings — billboards with the
+                            // real `moveto` texture (SPointMoveTo::Draw).
+                            state.move_to.draw(&state.map, &mut state.bb_queue);
                             state.mesh_queue.draws.clear();
                             for e in &state.game.effects {
                                 e.draw(&mut state.bb_queue, &mut state.mesh_queue);
@@ -1221,8 +1293,60 @@ impl ApplicationHandler for App {
                                                 &*(o as *const dyn crate::matrix_game::map_static::MapStatic
                                                     as *const crate::matrix_game::robot::Robot)
                                             };
-                                            if r.state == crate::matrix_game::robot::RobotState::Dip {
+                                            if r.state == crate::matrix_game::robot::RobotState::Dip
+                                            {
                                                 r.draw_dip(&mut state.bb_queue);
+                                            } else if r.chassis
+                                                == crate::matrix_game::robot::ChassisKind::AntiGravity
+                                            {
+                                                // CMatrixEffectFireStream — the antigrav jet
+                                                // flames. Created per chassis at UnitInsert
+                                                // (MatrixObjectRobot.cpp:91-95), repositioned
+                                                // from chassis bones 10/11 each RNeed
+                                                // (:578-599), and drawn as ONE of the five
+                                                // fire-stream line billboards per frame
+                                                // (MatrixEffectSmokeAndFire.cpp:406-425;
+                                                // paused → fixed index 2).
+                                                use crate::matrix_lib::three_g::billboard::{
+                                                    TexRef, BBT_FIRESTREAM1,
+                                                };
+                                                let kidx = r.chassis.kind_index();
+                                                if let Some(vo) =
+                                                    crate::matrix_lib::three_g::vector_object::chassis_vo(kidx)
+                                                {
+                                                    let world =
+                                                        crate::matrix_game::object_robot::robot_world_uncentered(r);
+                                                    let frame = r.chassis_anim.vo_frame;
+                                                    for mid in [10u32, 11u32] {
+                                                        // Each jet is its own FireStream
+                                                        // effect in the C++ — independent
+                                                        // IRND(5) rolls per side.
+                                                        let idx = if state.is_paused {
+                                                            2
+                                                        } else {
+                                                            rng.range(0, 4) as usize
+                                                        };
+                                                        let Some(m) = vo
+                                                            .matrix_by_id(mid, frame)
+                                                            .or_else(|| vo.matrix_by_id(mid, 0))
+                                                        else {
+                                                            continue;
+                                                        };
+                                                        let bp = glam::Vec3::new(m[12], m[13], m[14]);
+                                                        let by = glam::Vec3::new(m[4], m[5], m[6]);
+                                                        let pos = world.transform_point3(bp);
+                                                        let dir =
+                                                            world.transform_vector3(-by).normalize_or_zero();
+                                                        // m_StreamLen = 10, FIRE_STREAM_WIDTH = 5.
+                                                        state.bb_queue.line(
+                                                            pos,
+                                                            pos + dir * 10.0,
+                                                            5.0,
+                                                            0xFFFF_FFFF,
+                                                            TexRef::Bbt(BBT_FIRESTREAM1 + idx),
+                                                        );
+                                                    }
+                                                }
                                             }
                                         }
                                         crate::matrix_game::map_static::ObjectType::Cannon => {
@@ -1319,11 +1443,6 @@ impl ApplicationHandler for App {
                             // Projectile / debris meshes (depth-write).
                             state.effect_meshes.render(&mut pass);
                             state.selection_ring.render(&mut pass);
-                            // Move-order ping — same color/depth target
-                            // as the selection ring (billboards are
-                            // additively blended + depth-tested against
-                            // terrain so they occlude behind geometry).
-                            state.move_to.render(&mut pass);
                             // Effect billboards (alpha bucket sorted,
                             // additive after) — `DrawEffects`.
                             state.effects_renderer.render(&mut pass);
@@ -1404,8 +1523,11 @@ impl ApplicationHandler for App {
                             // missing from `da/Templates`. Build BEFORE
                             // borrowing `iface_list.panels` because the
                             // builder needs `&mut iface_renderer`.
+                            // No pause hint while a dialog is up — the C++
+                            // gate at MatrixLogic.cpp:2609 includes
+                            // `!FLAG(m_Flags, MMFLAG_DIALOG_MODE)`.
                             let pause_hint_local: Option<crate::matrix_game::interface::Hint> =
-                                if pause_visible {
+                                if pause_visible && state.dialog.is_none() {
                                     build_pause_hint(state)
                                 } else {
                                     None
@@ -1415,12 +1537,22 @@ impl ApplicationHandler for App {
                             let hint_to_show = pause_hint_local
                                 .as_ref()
                                 .or_else(|| state.iface_list.hint_system.active());
+                            // Dialog-mode widgets (Menu / Win / Stat /
+                            // confirmation boxes) — drawn under the
+                            // Hints button panel, see the renderer's
+                            // two-pass comment.
+                            let dialog_hints: Vec<&crate::matrix_game::interface::Hint> = state
+                                .dialog
+                                .as_ref()
+                                .map(|d| d.hints.iter().collect())
+                                .unwrap_or_default();
                             state.iface_renderer.upload_with_popup_and_hint(
                                 &state.gfx.device,
                                 &state.gfx.queue,
                                 &panels,
                                 state.iface_list.popup.as_ref(),
                                 hint_to_show,
+                                &dialog_hints,
                                 Some(&state.iface_list.hint_chrome),
                                 state.gfx.config.width as f32,
                                 state.gfx.config.height as f32,
@@ -1441,16 +1573,19 @@ impl ApplicationHandler for App {
                                 occlusion_query_set: None,
                                 multiview_mask: None,
                             });
-                            state.iface_renderer.render(&mut pass);
+                            // Panels only — the popup / hints /
+                            // dialogs render after the constructor
+                            // preview (the C++ z-order draws
+                            // CConstructor::Render mid-interface,
+                            // CInterface.cpp:929-933).
+                            state.iface_renderer.render_base(&mut pass);
                         }
                         // Constructor 3D preview — one chassis drawn
                         // into the sub-viewport on the Base panel.
                         // Ports CConstructor::Render's viewport setup
                         // (CConstructor.cpp:264-360). Runs after the
-                        // UI pass so the panel backdrop is in place,
-                        // but before the progress-bar pass so the bar
-                        // can overlay the preview if they happen to
-                        // collide.
+                        // panel pass so the backdrop is in place, but
+                        // below popups/hints (render_overlay below).
                         let q_opt = builder_preview_query(state);
                         let robots_ok = state.terrain.robots().is_some();
                         {
@@ -1552,6 +1687,27 @@ impl ApplicationHandler for App {
                                     None,
                                 );
                             }
+                        }
+                        // Popup / hint / dialog overlay — above the
+                        // constructor preview.
+                        {
+                            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                label: Some("Interface Overlay Pass"),
+                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                    view: &view,
+                                    resolve_target: None,
+                                    depth_slice: None,
+                                    ops: wgpu::Operations {
+                                        load: wgpu::LoadOp::Load,
+                                        store: wgpu::StoreOp::Store,
+                                    },
+                                })],
+                                depth_stencil_attachment: None,
+                                timestamp_writes: None,
+                                occlusion_query_set: None,
+                                multiview_mask: None,
+                            });
+                            state.iface_renderer.render_overlay(&mut pass);
                         }
                         // Progress-bar overlay pass — on top of the UI.
                         {
@@ -3823,14 +3979,818 @@ fn bundle_url_from_query() -> Option<String> {
 
 /// Construct the "Pause" hint widget — port of MatrixLogic.cpp:2611:
 ///
-///     m_PauseHint = CMatrixHint::Build(TEMPLATE_PAUSE);
-///     m_PauseHint->Show(14, 62);
+/// ```text
+/// m_PauseHint = CMatrixHint::Build(TEMPLATE_PAUSE);
+/// m_PauseHint->Show(14, 62);
+/// ```
 ///
 /// The hint goes through the standard hint render path so it picks up
 /// the engine's chrome (border, background) and font choices baked
 /// into the `Pause` template in `da/Templates`. Returns `None` when
 /// the template is missing — older / stripped data files that don't
 /// ship `Pause` just won't show a label, only the dim tint.
+// ── Dialog mode — port of EnterDialogMode / LeaveDialogMode and the
+// hint-button handlers (MatrixMap.cpp:3261-3574) ─────────────────────
+
+/// Build one dialog hint widget from an assembled template. Returns
+/// the hint with `screen_x/y` unset (caller positions it) plus the
+/// copy positions (hint-local design px) for the button slots.
+fn build_dialog_hint(
+    state: &mut AppState,
+    raw: &str,
+) -> Option<(crate::matrix_game::interface::Hint, Vec<(i32, i32)>)> {
+    use crate::matrix_game::interface::hint::{build_hint, center_text_parts, ChromeBorder};
+
+    // First template field is the border id (MatrixHint.cpp:579) —
+    // resolve it ourselves since `build_hint` only reports it back.
+    let border_id: i32 = raw
+        .split('|')
+        .next()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+    let chrome = &state.iface_list.hint_chrome;
+    let border_default = ChromeBorder::default();
+    let border = chrome.borders.get(&border_id).unwrap_or(&border_default);
+
+    let mut sizes: std::collections::HashMap<String, (i32, i32)> = std::collections::HashMap::new();
+    for bmp in chrome.bitmaps.values() {
+        if let Some((w, h)) = state.iface_renderer.atlas_size(&bmp.path) {
+            sizes.insert(bmp.path.clone(), (w as i32, h as i32));
+        }
+    }
+    let sizer = |path: &str| sizes.get(path).copied();
+
+    let replacer = state.iface_list.hint_replacer.clone();
+    let atlas = state.iface_renderer.glyph_atlas_mut();
+    let built = build_hint(raw, border, &chrome.bitmaps, &replacer, atlas, sizer)?;
+    let crate::matrix_game::interface::hint::BuiltHint {
+        mut parts,
+        otstup,
+        total_w,
+        total_h,
+        copy_pos,
+        ..
+    } = built;
+    if parts.is_empty() {
+        return None;
+    }
+    center_text_parts(&mut parts, state.iface_renderer.glyph_atlas_mut());
+    Some((
+        crate::matrix_game::interface::Hint {
+            parts,
+            total_w,
+            total_h,
+            border_id,
+            otstup,
+            screen_x: 0.0,
+            screen_y: 0.0,
+        },
+        copy_pos,
+    ))
+}
+
+/// Port of `CMatrixMap::EnterDialogMode` (MatrixMap.cpp:3433-3574).
+fn enter_dialog_mode(state: &mut AppState, name: &str) {
+    use crate::matrix_game::interface::dialog::*;
+
+    // The C++ releases m_PauseHint here; ours rebuilds per frame and
+    // is gated on `dialog.is_none()`, so there's nothing to drop.
+    leave_dialog_mode(state);
+    state.is_paused = true; // Pause(true)
+
+    // PLDropAllActions (MatrixSide.cpp:1684-1698): cancel turret
+    // build + armed orders, close popup + constructor, deselect all.
+    if name != "Begin" {
+        state.iface_list.turret_build.cancel();
+        state.iface_list.pre_order = None;
+        state.iface_list.popup = None;
+        state.iface_list.popup_restore_pending = None;
+        if let Some(b) = state.game.player_side.builder.as_mut() {
+            b.deactivate();
+        }
+        state.game.select_nothing();
+    }
+
+    // StatD renders the same `Stat` template — only the OK handler
+    // differs (MatrixMap.cpp:3460-3463, 3522-3530).
+    let lookup = if name == "StatD" { "Stat" } else { name };
+    let templates = state.iface_list.hint_templates.dialog_templates(lookup);
+    if templates.is_empty() {
+        log::warn!("dialog: no '{lookup}' template in da/Templates");
+    }
+
+    let screen_w = state.gfx.config.width as f32;
+    let screen_h = state.gfx.config.height as f32;
+    let scale = (screen_h / crate::matrix_game::interface::interface::DESIGN_H).max(0.1);
+
+    let mut dialog = DialogState::new(name);
+    let mut ww = 20.0 * scale;
+    let hh = 62.0 * scale;
+    for raw in &templates {
+        let Some((mut hint, copy_pos)) = build_dialog_hint(state, raw) else {
+            continue;
+        };
+        let w_px = hint.total_w as f32 * scale;
+        let h_px = hint.total_h as f32 * scale;
+        if lookup == "Menu" || lookup == "Stat" {
+            // Centered with the 0.09*screen_h lift (MatrixMap.cpp:
+            // 3486-3497). The C++ keeps the Menu invisible until a
+            // camera fly-in ends (SetVisible(false) + the camera's
+            // CAM_NEED2END_DIALOG_MODE dance) — that animation isn't
+            // ported, so the Menu shows immediately.
+            hint.screen_x = (screen_w - w_px) / 2.0;
+            hint.screen_y = (screen_h - h_px) / 2.0 - (screen_h * 0.09).round();
+        } else {
+            hint.screen_x = ww;
+            hint.screen_y = hh;
+        }
+        // Hint-local copy pos → Hints-panel design coords (the panel
+        // origin resolves to (0,0): its design pos is 0/0).
+        let btn = |i: usize| -> Option<(f32, f32)> {
+            copy_pos.get(i).map(|&(x, y)| {
+                (
+                    hint.screen_x / scale + x as f32,
+                    hint.screen_y / scale + y as f32,
+                )
+            })
+        };
+        // Button table per dialog (MatrixMap.cpp:3505-3565).
+        let slot0: (&'static str, DialogAction) = match lookup {
+            "Menu" => (HINT_CONTINUE, DialogAction::LeaveDialog),
+            "Win" => (HINT_OK, DialogAction::OkWin),
+            "Loose" => (HINT_OK, DialogAction::OkLoose),
+            "Stat" if name == "StatD" => (HINT_OK, DialogAction::OkStatBack),
+            "Stat" => (HINT_OK, DialogAction::OkStatExit),
+            _ => (HINT_OK, DialogAction::LeaveDialog),
+        };
+        let slots: [(&'static str, DialogAction); 6] = [
+            slot0,
+            (HINT_RESET, DialogAction::ResetRequest),
+            // HelpRequestHandler (MatrixMap.cpp:3404-3426) leaves the
+            // dialog then spawns Manual.exe — there is no manual to
+            // launch in the port, so only the leave remains.
+            (HINT_HELP, DialogAction::LeaveDialog),
+            (HINT_SURRENDER, DialogAction::SurrenderRequest),
+            (HINT_EXIT, DialogAction::ExitRequest),
+            (HINT_CANCEL_MENU, DialogAction::LeaveDialog),
+        ];
+        for (i, (elem, action)) in slots.into_iter().enumerate() {
+            if let Some(pos) = btn(i) {
+                dialog.buttons.push(DialogButton {
+                    elem,
+                    action,
+                    pos,
+                    disabled: false,
+                });
+            }
+        }
+        ww += w_px + 20.0 * scale;
+        dialog.hints.push(hint);
+    }
+    log::info!(
+        "dialog: entered '{}' ({} hint(s), {} button(s))",
+        name,
+        dialog.hints.len(),
+        dialog.buttons.len()
+    );
+    state.dialog = Some(dialog);
+    sync_dialog_buttons(state);
+}
+
+/// Port of `CMatrixMap::LeaveDialogMode` (MatrixMap.cpp:3261-3283).
+/// SoundOut for the Menu is skipped — the UI sound backend is stubbed.
+fn leave_dialog_mode(state: &mut AppState) {
+    if state.dialog.take().is_none() {
+        return;
+    }
+    state.is_paused = false; // Pause(false)
+    sync_dialog_buttons(state); // HideHintButtons
+}
+
+/// Push the dialog's button set onto the `if/Hints` panel — the
+/// CreateHintButton / HideHintButtons / Disable-EnableMainMenuButton
+/// effects (CInterface.cpp:4208-4310) in one reconcile.
+fn sync_dialog_buttons(state: &mut AppState) {
+    use crate::matrix_game::interface::ElementState;
+    let buttons: Vec<(&'static str, (f32, f32), bool)> = state
+        .dialog
+        .as_ref()
+        .map(|d| {
+            d.buttons
+                .iter()
+                .map(|b| (b.elem, b.pos, b.disabled))
+                .collect()
+        })
+        .unwrap_or_default();
+    let active = state.dialog.is_some();
+    let Some(p) = state.iface_list.panel_mut("Hints") else {
+        return;
+    };
+    p.visible = active;
+    for e in p.elements.iter_mut() {
+        e.set_visible(false);
+    }
+    for (name, pos, disabled) in buttons {
+        if let Some(e) = p.elements.iter_mut().find(|e| e.name == name) {
+            e.pos_x = pos.0;
+            e.pos_y = pos.1;
+            e.set_visible(true);
+            e.cur_state = if disabled {
+                ElementState::Disabled
+            } else {
+                ElementState::Normal
+            };
+            e.def_state = e.cur_state;
+        }
+    }
+}
+
+/// Port of `CreateConfirmation` (MatrixMap.cpp:3359-3392).
+fn create_confirmation(
+    state: &mut AppState,
+    template: &str,
+    ok_action: crate::matrix_game::interface::dialog::DialogAction,
+) {
+    let Some(raw) = state
+        .iface_list
+        .hint_templates
+        .get(template)
+        .map(str::to_string)
+    else {
+        return;
+    };
+    let Some((mut hint, copy_pos)) = build_dialog_hint(state, &raw) else {
+        return;
+    };
+    let screen_w = state.gfx.config.width as f32;
+    let screen_h = state.gfx.config.height as f32;
+    let scale = (screen_h / crate::matrix_game::interface::interface::DESIGN_H).max(0.1);
+    hint.screen_x = (screen_w - hint.total_w as f32 * scale) / 2.0;
+    hint.screen_y = (screen_h - hint.total_h as f32 * scale) / 2.0 - (screen_h * 0.09).round();
+    let design: Vec<(f32, f32)> = copy_pos
+        .iter()
+        .map(|&(x, y)| {
+            (
+                hint.screen_x / scale + x as f32,
+                hint.screen_y / scale + y as f32,
+            )
+        })
+        .collect();
+    if let Some(d) = state.dialog.as_mut() {
+        d.open_confirmation(hint, &design, ok_action);
+    }
+    sync_dialog_buttons(state);
+}
+
+/// MMFLAG_STAT_DIALOG(/_D) consumption — port of MatrixLogic.cpp:
+/// 2527-2596: build the per-side stat replacements into the Replace
+/// set, then open the Stat (exit path) or StatD (back-to-game) dialog.
+fn enter_stat_dialog(state: &mut AppState, back_to_game: bool) {
+    use crate::matrix_game::interface::dialog::{build_stat_replacements, SideStatRow};
+    let mut rows = vec![SideStatRow {
+        prefix: "_p_".to_string(),
+        stats: state.game.player_side.statistic,
+    }];
+    for s in &state.game.other_sides {
+        let Some(prefix) = state.iface_list.side_prefixes.get(&s.id) else {
+            continue;
+        };
+        rows.push(SideStatRow {
+            prefix: prefix.clone(),
+            stats: s.statistic,
+        });
+    }
+    for (k, v) in build_stat_replacements(&rows) {
+        state.iface_list.hint_replacer.set(k, v);
+    }
+    enter_dialog_mode(state, if back_to_game { "StatD" } else { "Stat" });
+}
+
+/// `PressHintButton` (CInterface.cpp:4311-4323) — fire the stored
+/// handler of a named hint button (skips disabled buttons).
+fn press_hint_button(state: &mut AppState, elem: &str) {
+    let Some(action) = state.dialog.as_ref().and_then(|d| d.action_of(elem)) else {
+        return;
+    };
+    dispatch_dialog_action(state, action);
+}
+
+/// The dialog-button handler table (MatrixMap.cpp:3285-3431).
+fn dispatch_dialog_action(
+    state: &mut AppState,
+    action: crate::matrix_game::interface::dialog::DialogAction,
+) {
+    use crate::matrix_game::interface::dialog::DialogAction as A;
+    use crate::matrix_game::side::{SideStatus, Stat};
+    match action {
+        A::LeaveDialog => leave_dialog_mode(state),
+        A::ExitRequest => create_confirmation(state, "Exit", A::ConfirmExit),
+        A::ResetRequest => create_confirmation(state, "Reset", A::ConfirmReset),
+        A::SurrenderRequest => create_confirmation(state, "Surrender", A::ConfirmSurrender),
+        A::ConfirmCancel => {
+            if let Some(d) = state.dialog.as_mut() {
+                d.cancel_confirmation();
+            }
+            sync_dialog_buttons(state);
+        }
+        // The C++ Ok*Handlers set g_ExitState + MMFLAG_STAT_DIALOG and
+        // let the next logic takt build the stat dialog; we do it
+        // synchronously — same observable result without the flag hop.
+        A::ConfirmExit => {
+            leave_dialog_mode(state);
+            state.exit_state = 1;
+            enter_stat_dialog(state, false);
+        }
+        A::ConfirmReset => {
+            leave_dialog_mode(state);
+            restart_game();
+        }
+        A::ConfirmSurrender => {
+            leave_dialog_mode(state);
+            state.exit_state = 4;
+            // Negate every active non-player side's STAT_TIME so the
+            // stat dialog shows them green (MatrixMap.cpp:3322-3329).
+            for s in state.game.other_sides.iter_mut() {
+                if s.status == SideStatus::Active {
+                    let t = s.get_stat(Stat::Time);
+                    s.set_stat(Stat::Time, -t);
+                }
+            }
+            enter_stat_dialog(state, false);
+        }
+        A::OkWin => {
+            leave_dialog_mode(state);
+            state.exit_state = 3;
+            enter_stat_dialog(state, false);
+        }
+        A::OkLoose => {
+            leave_dialog_mode(state);
+            state.exit_state = 2;
+            enter_stat_dialog(state, false);
+        }
+        A::OkStatExit => {
+            leave_dialog_mode(state);
+            exit_game(state.exit_state);
+        }
+        A::OkStatBack => leave_dialog_mode(state),
+    }
+}
+
+/// `OkJustExitHandler` sets GFLAG_EXITLOOP and the host (SR2 / the
+/// standalone EXE shell) tears the session down. The port has no host
+/// to return to: on the web we reload the page for a fresh session,
+/// natively we exit the process.
+fn exit_game(exit_state: i32) {
+    log::info!("dialog: leaving game loop (g_ExitState={exit_state})");
+    #[cfg(target_arch = "wasm32")]
+    {
+        if let Some(w) = web_sys::window() {
+            let _ = w.location().reload();
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    std::process::exit(0);
+}
+
+/// `OkResetHandler` → `g_MatrixMap->Restart()` reloads the whole map
+/// in place. Recreating the session is equivalent: page reload on the
+/// web; on native we exit (simplest faithful option — an in-process
+/// restart would mean rebuilding the entire AppState).
+fn restart_game() {
+    log::info!("dialog: restart requested");
+    #[cfg(target_arch = "wasm32")]
+    {
+        if let Some(w) = web_sys::window() {
+            let _ = w.location().reload();
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    std::process::exit(0);
+}
+
+// ── In-scope keyboard map (MatrixFormGame.cpp:1172-1560, non-cheat,
+// non-arcade subset; default bindings MatrixConfig.cpp:252-319) ──────
+
+/// Count of live group members carrying `kind` — `GetBombersCnt` /
+/// `GetRepairsCnt` (MatrixAIGroup.cpp:387-424).
+fn group_weapon_count(state: &AppState, kind: crate::matrix_game::config::RobotUnitKind) -> i32 {
+    use crate::matrix_game::logic::robot_ref;
+    use crate::matrix_game::map_static::MapStatic;
+    let Some(g) = state.game.player_side.cur_group() else {
+        return 0;
+    };
+    g.objects
+        .iter()
+        .filter(|m| {
+            robot_ref(&state.game.objects, m.object)
+                .map(|r| r.is_live() && r.config.weapon.iter().any(|w| w.kind == kind))
+                .unwrap_or(false)
+        })
+        .count() as i32
+}
+
+/// KA_ORDER_ROBOT_SWITCH1/2 (`,` / `.`) — cycle the selection through
+/// the player's live robots (MatrixFormGame.cpp:1532-1560: walk the
+/// logic list prev/next from the single selected robot, wrap once).
+fn robot_switch(state: &mut AppState, forward: bool) {
+    use crate::matrix_game::logic::{get_world_pos, robot_ref};
+    use crate::matrix_game::map_static::MapStatic;
+    use crate::matrix_game::side::CurrSel;
+
+    let side_id = state.game.player_side.id;
+    let robots: Vec<crate::matrix_game::map_static::ObjectId> = state
+        .game
+        .objects
+        .iter_live()
+        .filter(|&id| {
+            robot_ref(&state.game.objects, id)
+                .map(|r| r.is_live() && r.side == side_id)
+                .unwrap_or(false)
+        })
+        .collect();
+    if robots.is_empty() {
+        return;
+    }
+    // Anchor: the single selected live robot, if any (the C++ gate at
+    // :1535 — cur group with exactly one live-robot member).
+    let anchor = state
+        .game
+        .player_side
+        .cur_group()
+        .filter(|g| g.objects_cnt() == 1)
+        .and_then(|g| g.objects.first().map(|m| m.object))
+        .and_then(|id| robots.iter().position(|&r| r == id));
+    let n = robots.len();
+    let next = match anchor {
+        Some(i) => {
+            if forward {
+                robots[(i + 1) % n]
+            } else {
+                robots[(i + n - 1) % n]
+            }
+        }
+        // No anchor: '.' walks forward from the list head → first;
+        // ',' walks backward, wraps once → last.
+        None => {
+            if forward {
+                robots[0]
+            } else {
+                robots[n - 1]
+            }
+        }
+    };
+    // CreateGroupFromCurrent + Select(ROBOT) + camera recenter.
+    state.game.player_side.selected = vec![next];
+    state.game.player_side.active_object = Some(next);
+    state.game.player_side.curr_sel = CurrSel::RobotsSelected;
+    state.game.sync_group_from_selection();
+    if let Some(p) = get_world_pos(&state.game.objects, next) {
+        state.camera.set_xy_strategy([p.x, p.y]);
+    }
+}
+
+/// Constructor quick-pick: digit row → (type, kind, pylon) per the
+/// focused pylon (MatrixFormGame.cpp:1421-1493). `key` is the typed
+/// digit (1..9, 0).
+fn constructor_quick_pick(state: &mut AppState, key: i32) -> bool {
+    use crate::matrix_game::config::RobotUnitKind;
+    use crate::matrix_game::object_robot::RobotUnitType;
+
+    let focused = state
+        .game
+        .player_side
+        .builder
+        .as_ref()
+        .filter(|b| b.active)
+        .and_then(|b| b.focused_element.clone());
+    let Some(focused) = focused else {
+        return false;
+    };
+
+    let mut ty = RobotUnitType::Empty;
+    let mut kind = 0i32; // RUK_UNKNOWN
+    let mut pilon = -1i32;
+    match focused.as_str() {
+        "pi1" | "pi2" | "pi3" | "pi4" => {
+            pilon = focused.as_bytes()[2] as i32 - b'1' as i32;
+            ty = RobotUnitType::Weapon;
+        }
+        "pi5" if key <= 2 => {
+            pilon = 4;
+            ty = RobotUnitType::Weapon;
+            kind = match key {
+                1 => RobotUnitKind::WEAPON_MORTAR.0,
+                2 => RobotUnitKind::WEAPON_BOMB.0,
+                _ => key,
+            };
+        }
+        "pihe" if key <= 4 => {
+            pilon = 0;
+            ty = RobotUnitType::Head;
+            kind = key;
+        }
+        "pihu" if key != 0 && key <= 6 => {
+            pilon = 0;
+            ty = RobotUnitType::Armor;
+            kind = if key == 1 { 6 } else { key - 1 };
+        }
+        "pich" if key != 0 && key <= 5 => {
+            pilon = 0;
+            ty = RobotUnitType::Chassis;
+            kind = key;
+        }
+        _ => {}
+    }
+    // Common-pylon weapon row skips mortar(5)/bomb(7): 5→laser(6),
+    // 6..8 → +2 (plasma/electric/repair). MatrixFormGame.cpp:1481-1491.
+    if ty == RobotUnitType::Weapon && pilon < 4 && key <= 8 {
+        kind = match key {
+            0 => 0,
+            5 => 6,
+            k if k > 5 => k + 2,
+            k => k,
+        };
+    }
+    if ty == RobotUnitType::Empty {
+        // A digit on a focused pylon is consumed even when it maps to
+        // nothing (the C++ falls through to SuperDjeans only on a
+        // valid type but never reaches other handlers).
+        return true;
+    }
+    if let Some(b) = state.game.player_side.builder.as_mut() {
+        b.super_djeans(ty, RobotUnitKind(kind), pilon, false);
+    }
+    reset_build_counter(state);
+    true
+}
+
+/// Strategy-mode keyboard dispatch. Returns true when the key was
+/// consumed (the camera bindings must not see it).
+fn handle_game_key(state: &mut AppState, code: winit::keyboard::KeyCode) -> bool {
+    use crate::matrix_game::config::RobotUnitKind;
+    use crate::matrix_game::interface::dialog::{DialogAction, HINT_OK};
+    use crate::matrix_game::interface::Click;
+    use crate::matrix_game::side::CurrSel;
+    use winit::keyboard::KeyCode as K;
+
+    // ── Dialog-mode keys (MatrixFormGame.cpp:1172-1264) ──
+    if let Some(d) = state.dialog.as_ref() {
+        let is_menu = d.is_menu();
+        let has_confirmation = d.has_confirmation();
+        match code {
+            K::Enter | K::NumpadEnter if d.enter_presses_ok() => {
+                press_hint_button(state, HINT_OK);
+            }
+            K::KeyE if is_menu && !has_confirmation => {
+                dispatch_dialog_action(state, DialogAction::ExitRequest);
+            }
+            K::KeyS if is_menu && !has_confirmation => {
+                dispatch_dialog_action(state, DialogAction::SurrenderRequest);
+            }
+            K::KeyR if is_menu && !has_confirmation => {
+                dispatch_dialog_action(state, DialogAction::ResetRequest);
+            }
+            K::Escape if is_menu => {
+                if has_confirmation {
+                    dispatch_dialog_action(state, DialogAction::ConfirmCancel);
+                } else {
+                    leave_dialog_mode(state);
+                }
+            }
+            _ => {}
+        }
+        // Everything else dies here. The C++ technically lets the
+        // game keys fall through (only ESC checks MMFLAG_DIALOG_MODE,
+        // :1239), but with the game paused and the selection dropped
+        // they are no-ops at best — swallow them.
+        return true;
+    }
+
+    match code {
+        // ESC → main menu dialog (MatrixFormGame.cpp:1263).
+        K::Escape => {
+            enter_dialog_mode(state, "Menu");
+            return true;
+        }
+        // KEY_PAUSE toggle (MatrixFormGame.cpp:1290-1292). Pause() is
+        // a no-op in dialog mode (MatrixMap.hpp:636) — unreachable
+        // here since the dialog branch above consumed the key.
+        K::Pause => {
+            state.is_paused = !state.is_paused;
+            return true;
+        }
+        _ => {}
+    }
+
+    let ordering =
+        state.iface_list.pre_order.is_some() || state.iface_list.turret_build.is_active();
+    let curr_sel = state.game.player_side.curr_sel;
+
+    if !ordering {
+        // ── Group selected (MatrixFormGame.cpp:1314-1380) ──
+        if curr_sel == CurrSel::RobotsSelected && state.game.player_side.cur_group().is_some() {
+            let (auto_cap, auto_atk, auto_def) = state.game.show_order_state();
+            match code {
+                // a"U"to attack toggle.
+                K::KeyU => {
+                    let no = state.game.sel_group_to_logic_group();
+                    if auto_atk {
+                        state.game.pg_order_stop(&state.map, no);
+                    } else {
+                        state.game.pg_order_auto_attack(&state.map, no);
+                    }
+                    return true;
+                }
+                // "C"apture toggle.
+                K::KeyC => {
+                    let no = state.game.sel_group_to_logic_group();
+                    if auto_cap {
+                        state.game.pg_order_stop(&state.map, no);
+                    } else {
+                        state.game.pg_order_auto_capture(&state.map, no);
+                    }
+                    return true;
+                }
+                // "D"efend toggle.
+                K::KeyD => {
+                    let no = state.game.sel_group_to_logic_group();
+                    if auto_def {
+                        state.game.pg_order_stop(&state.map, no);
+                    } else {
+                        state.game.pg_order_auto_defence(&state.map, no);
+                    }
+                    return true;
+                }
+                // "M"ove pre-order.
+                K::KeyM => {
+                    dispatch_ui_click(state, &Click::Button("ogo".into()));
+                    return true;
+                }
+                // "S"top (+ break orders, MatrixFormGame.cpp:1356-1359).
+                K::KeyS => {
+                    state.iface_list.pre_order = None;
+                    state.game.order_stop(&state.map);
+                    state.game.selected_group_break_orders();
+                    return true;
+                }
+                // Ta"K"e (capture) pre-order.
+                K::KeyK => {
+                    dispatch_ui_click(state, &Click::Button("oca".into()));
+                    return true;
+                }
+                // "P"atrol pre-order.
+                K::KeyP => {
+                    dispatch_ui_click(state, &Click::Button("opa".into()));
+                    return true;
+                }
+                // "E"xplode — only when the group has bombers.
+                K::KeyE if group_weapon_count(state, RobotUnitKind::WEAPON_BOMB) > 0 => {
+                    dispatch_ui_click(state, &Click::Button("obomb".into()));
+                    return true;
+                }
+                // "R"epair — only when the group has repairers.
+                K::KeyR if group_weapon_count(state, RobotUnitKind::WEAPON_REPAIR) > 0 => {
+                    dispatch_ui_click(state, &Click::Button("orep".into()));
+                    return true;
+                }
+                // "A"ttack pre-order.
+                K::KeyA => {
+                    dispatch_ui_click(state, &Click::Button("ofi".into()));
+                    return true;
+                }
+                _ => {}
+            }
+        } else if matches!(curr_sel, CurrSel::BaseSelected | CurrSel::BuildingSelected) {
+            // ── Building / base selected (MatrixFormGame.cpp:1381-1493) ──
+            let builder_active = state
+                .game
+                .player_side
+                .builder
+                .as_ref()
+                .map(|b| b.active)
+                .unwrap_or(false);
+            match code {
+                // "B"ase — open the robot constructor.
+                K::KeyB if curr_sel == CurrSel::BaseSelected && !builder_active => {
+                    dispatch_ui_click(state, &Click::Button("buro".into()));
+                    return true;
+                }
+                // "T"urret picker — same gate as the `buca` button
+                // (free slot + affordable + stack not full); the
+                // per-frame visibility refresh keeps the element state
+                // current, so read the gate off it.
+                K::KeyT => {
+                    let buca_enabled = state
+                        .iface_list
+                        .panel("Main")
+                        .and_then(|p| p.elements.iter().find(|e| e.name == "buca"))
+                        .map(|e| {
+                            !matches!(
+                                e.cur_state,
+                                crate::matrix_game::interface::ElementState::Disabled
+                            )
+                        })
+                        .unwrap_or(false);
+                    if buca_enabled {
+                        // The C++ also closes the constructor panel
+                        // (ResetGroupNClose, :1403) before flipping
+                        // PREORDER_BUILD_TURRET.
+                        if builder_active {
+                            if let Some(b) = state.game.player_side.builder.as_mut() {
+                                b.deactivate();
+                            }
+                            state.is_paused = false;
+                        }
+                        dispatch_ui_click(state, &Click::Button("buca".into()));
+                    }
+                    return true;
+                }
+                // "H"elp — call maintenance.
+                K::KeyH => {
+                    dispatch_ui_click(state, &Click::Button("bure".into()));
+                    return true;
+                }
+                // Digit quick-pick on the focused constructor pylon.
+                K::Digit1
+                | K::Digit2
+                | K::Digit3
+                | K::Digit4
+                | K::Digit5
+                | K::Digit6
+                | K::Digit7
+                | K::Digit8
+                | K::Digit9
+                | K::Digit0 => {
+                    let key = match code {
+                        K::Digit0 => 0,
+                        K::Digit1 => 1,
+                        K::Digit2 => 2,
+                        K::Digit3 => 3,
+                        K::Digit4 => 4,
+                        K::Digit5 => 5,
+                        K::Digit6 => 6,
+                        K::Digit7 => 7,
+                        K::Digit8 => 8,
+                        _ => 9,
+                    };
+                    if constructor_quick_pick(state, key) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+    } else {
+        // ── Ordering / turret-build mode (MatrixFormGame.cpp:1495-1524) ──
+        let picker_open = state.iface_list.turret_build.is_active()
+            && state.iface_list.turret_build.kind.is_none();
+        if picker_open {
+            // KA_TURRET_CANNON/GUN/LASER/ROCKET — C/G/L/R in the
+            // default bindings (MatrixConfig.cpp:316-319); the digit
+            // row is accepted too as a convenience alias.
+            let kind_n = match code {
+                K::KeyC | K::Digit1 => 1,
+                K::KeyG | K::Digit2 => 2,
+                K::KeyL | K::Digit3 => 3,
+                K::KeyR | K::Digit4 => 4,
+                _ => 0,
+            };
+            if kind_n > 0 {
+                dispatch_ui_click(state, &Click::Button(format!("tur{kind_n}")));
+                return true;
+            }
+        }
+        // KA_ORDER_CANCEL ("X") — cancel turret build / ordering mode.
+        if code == K::KeyX {
+            dispatch_ui_click(state, &Click::Button("ocan".into()));
+            return true;
+        }
+    }
+
+    // ── Common strategy keys (MatrixFormGame.cpp:1526-1560) ──
+    match code {
+        // KA_MINIMAP_ZOOMIN/OUT (VK_OEM_PLUS / VK_OEM_MINUS).
+        K::Equal | K::NumpadAdd => {
+            state.minimap.zoom_in();
+            true
+        }
+        K::Minus | K::NumpadSubtract => {
+            state.minimap.zoom_out();
+            true
+        }
+        // KA_ORDER_ROBOT_SWITCH1/2 ("," / ".").
+        K::Comma => {
+            robot_switch(state, false);
+            true
+        }
+        K::Period => {
+            robot_switch(state, true);
+            true
+        }
+        _ => false,
+    }
+}
+
 fn build_pause_hint(state: &mut AppState) -> Option<crate::matrix_game::interface::Hint> {
     use crate::matrix_game::interface::hint::{build_hint, ChromeBorder};
 
@@ -3857,8 +4817,15 @@ fn build_pause_hint(state: &mut AppState) -> Option<crate::matrix_game::interfac
 
     let replacer = state.iface_list.hint_replacer.clone();
     let atlas = state.iface_renderer.glyph_atlas_mut();
-    let (mut parts, otstup, total_w, total_h, border_id, _wrap) =
-        build_hint(&raw, border, &chrome.bitmaps, &replacer, atlas, sizer)?;
+    let built = build_hint(&raw, border, &chrome.bitmaps, &replacer, atlas, sizer)?;
+    let crate::matrix_game::interface::hint::BuiltHint {
+        mut parts,
+        otstup,
+        total_w,
+        total_h,
+        border_id,
+        ..
+    } = built;
     if parts.is_empty() {
         return None;
     }

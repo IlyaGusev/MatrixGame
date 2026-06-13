@@ -40,11 +40,16 @@ pub const GLOBAL_SCALE: f32 = 20.0;
 // The pointer is only ever set while the caller's `&GameMap`
 // borrow is live.
 
+use std::cell::Cell;
 use std::ptr;
-use std::sync::atomic::{AtomicPtr, Ordering};
 
-static CURRENT_MAP: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
-static CURRENT_ELAPSED_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+// Thread-local, NOT a process global: parallel unit tests each run
+// their own MapScope; a shared static would let one thread's drop
+// (or re-enter) dangle another thread's pointer mid-takt.
+thread_local! {
+    static CURRENT_MAP: Cell<*const GameMap> = const { Cell::new(ptr::null()) };
+    static CURRENT_ELAPSED_MS: Cell<i64> = const { Cell::new(0) };
+}
 
 /// RAII guard — sets `CURRENT_MAP` + `CURRENT_ELAPSED_MS` on
 /// construction, clears on drop. Use:
@@ -53,14 +58,14 @@ pub struct MapScope;
 
 impl MapScope {
     pub fn enter(map: &GameMap, elapsed_ms: i64) -> Self {
-        CURRENT_MAP.store(map as *const GameMap as *mut (), Ordering::Release);
-        CURRENT_ELAPSED_MS.store(elapsed_ms, Ordering::Release);
+        CURRENT_MAP.with(|c| c.set(map as *const GameMap));
+        CURRENT_ELAPSED_MS.with(|c| c.set(elapsed_ms));
         MapScope
     }
 }
 impl Drop for MapScope {
     fn drop(&mut self) {
-        CURRENT_MAP.store(ptr::null_mut(), Ordering::Release);
+        CURRENT_MAP.with(|c| c.set(ptr::null()));
     }
 }
 
@@ -72,7 +77,7 @@ impl Drop for MapScope {
 /// outermost `MapScope` drops. Used only from inside takt dispatch
 /// which always sits inside a scope.
 pub fn current_map<'a>() -> Option<&'a GameMap> {
-    let ptr = CURRENT_MAP.load(Ordering::Acquire) as *const GameMap;
+    let ptr = CURRENT_MAP.with(|c| c.get());
     if ptr.is_null() {
         None
     } else {
@@ -83,7 +88,7 @@ pub fn current_map<'a>() -> Option<&'a GameMap> {
 /// Game-time elapsed (ms) as registered by the active `MapScope`.
 /// Ports `g_MatrixMap->GetTime()`.
 pub fn current_elapsed_ms() -> i64 {
-    CURRENT_ELAPSED_MS.load(Ordering::Acquire)
+    CURRENT_ELAPSED_MS.with(|c| c.get())
 }
 
 /// Heightmap point from SCompilePoint (12 bytes, /Zp1 packed).
@@ -720,6 +725,16 @@ impl GameMap {
 
         let objects = load_objects(&stor, &points, &normals, size_x, size_y);
         log::info!("map: loaded {} decorative objects", objects.len());
+
+        // Publish the map's object-Ids table (g_MatrixMap->m_Ids) so the
+        // runtime `MapObject::init` body swap can look up replacement
+        // rows from the damage path (MatrixObject.cpp:985-1018).
+        if let Some(strings) = stor.get_buf("strings", "String") {
+            let rows: Vec<String> = (0..strings.arrays_count())
+                .map(|i| strings.get_as_wstr(i))
+                .collect();
+            super::object::set_global_ids(rows);
+        }
 
         // Ports MatrixMapPrepare.cpp:621-694 (RS_BUILDINGS step). We need the
         // per-cell units computed above so the floor-z fallback matches
@@ -3049,6 +3064,11 @@ impl MapRenderer {
     ) {
         if let Some(buildings) = &mut self.buildings {
             buildings.sync_building_animation(queue, objs, map, point_lights);
+        }
+        // Decorative-object body swaps (BREAK death / terron corpse) ride
+        // the same once-per-frame sync point.
+        if let Some(objects) = &mut self.objects {
+            objects.sync_break_swaps(queue, objs, map, point_lights);
         }
     }
 

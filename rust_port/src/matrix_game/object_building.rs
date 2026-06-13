@@ -349,6 +349,10 @@ impl BuildStack {
                 // ramp HP to 100%, drop invulnerability, flip to IDLE.
                 // Port of MatrixObjectBuilding.cpp:1779-1813.
                 ramp_turret_hp(objs, parent_self_id, slot, 1.0);
+                // STAT_TURRET_BUILD (MatrixObjectBuilding.cpp:1810).
+                if head.side != 0 {
+                    objs.inc_side_stat(head.side, |s| s.turret_build += 1);
+                }
                 log::debug!(
                     "build: turret completed (kind={} slot={}) side={}",
                     turret_kind,
@@ -1130,17 +1134,12 @@ impl MapStatic for Building {
         })
     }
 
-    /// Port of `CMatrixBuilding::LogicTakt` (MatrixObjectBuilding.cpp:495-891).
-    ///
-    /// Currently ported: under-attack + show-hitpoint countdown timers
-    /// (non-DIP branch), and the `m_BaseFloor` BASE_OPENING/CLOSING
-    /// animation for BUILDING_BASE (MatrixObjectBuilding.cpp:810-833).
-    ///
-    /// Deferred: capture / capture-rollback / capture-candidate loop,
-    /// per-side resource payouts, `m_BS.TickTimer` (build-stack), the
-    /// DIP explosion sequence (HP<0 → emit periodic explosions →
-    /// replace with ruins), `m_GGraph` per-unit matrix updates
-    /// (requires per-instance mesh state).
+    /// Port of `CMatrixBuilding::LogicTakt` (MatrixObjectBuilding.cpp:495-891):
+    /// build-stack tick, capture ring + rollback + candidate loop,
+    /// under-attack / show-hitpoint timers, the `m_BaseFloor`
+    /// BASE_OPENING/CLOSING animation, and the DIP explosion sequence
+    /// ending in the ruin swap. Per-side resource payouts are
+    /// centralised in `MapLogic::accrue_resources`.
     fn logic_takt(&mut self, cms: i32, _rng: &mut Rnd, objs: &mut Objects) {
         use crate::matrix_game::common::BASE_FLOOR_SPEED;
 
@@ -1166,6 +1165,10 @@ impl MapStatic for Building {
                 // platform starts rising with the robot on top.
                 self.object_state |= crate::matrix_game::map_static::OBJECT_STATE_BUILDING_SPAWNBOT;
                 self.open();
+                // STAT_ROBOT_BUILD (MatrixRobot.cpp:2224).
+                if self.side != 0 {
+                    objs.inc_side_stat(self.side, |s| s.robot_build += 1);
+                }
             }
         }
 
@@ -1332,9 +1335,11 @@ impl MapStatic for Building {
         // `m_HitPoint` counts down as a timer; explosions pop every
         // BUILDING_EXPLOSION_PERIOD (10ms) at random points within the
         // radius, 4% of them the bigger Boom2. A dying BASE finishes
-        // with a real WEAPON_BIGBOOM blast. (Ruin-mesh replacement is
-        // still deferred with the mesh-swap system.)
-        if self.state == BaseState::Dip {
+        // with a real WEAPON_BIGBOOM blast, then (like all kinds) the
+        // building swaps to ruin map-objects and StaticDeletes itself.
+        // The C++ keeps decrementing through BUILDING_DIP_EXPLODED
+        // (the `m_HitPoint < 0` branch at :762 isn't state-gated).
+        if matches!(self.state, BaseState::Dip | BaseState::DipExploded) {
             self.hit_point -= cms as f32;
             let now = crate::matrix_game::map::current_elapsed_ms();
             if self.next_explosion_time == 0 {
@@ -1398,7 +1403,10 @@ impl MapStatic for Building {
             } else {
                 -1000.0
             };
-            if self.kind == BuildingType::Base && self.hit_point < downtime + 100.0 {
+            if self.kind == BuildingType::Base
+                && self.state == BaseState::Dip
+                && self.hit_point < downtime + 100.0
+            {
                 // The base's final blast is a REAL bigboom (:681-687).
                 if let (Some(self_id), Some(map)) =
                     (self.self_id, crate::matrix_game::map::current_map())
@@ -1420,8 +1428,42 @@ impl MapStatic for Building {
                     objs.weapons.release(wid);
                 }
                 self.state = BaseState::DipExploded;
-            } else if self.hit_point < downtime {
-                self.state = BaseState::DipExploded;
+            }
+            if self.hit_point < downtime {
+                // Ruin swap + StaticDelete (MatrixObjectBuilding.cpp:
+                // 691-758). The S_EXPLOSION_BUILDING_BOOM3 pop for
+                // non-BASE kinds (:695) waits on the sound system.
+                use crate::matrix_game::object::MapObject;
+                let n = self.kind as i32;
+                let z = crate::matrix_game::map::current_map()
+                    .map(|m| m.get_z(self.pos.x, self.pos.y))
+                    .unwrap_or(self.core.matrix.w_axis.z);
+                // `OBJECT_PATH_BUILDINGS_RUINS + "b" + n` (:710-716);
+                // non-BASE kinds add the `b<n>p.vo` part rendered with
+                // the `?Trans` alpha-tested skin (:718-724).
+                let namet = format!("Matrix/Building/ruins/b{n}");
+                objs.spawn(Box::new(MapObject::init_as_base_ruins(
+                    self.pos,
+                    z,
+                    self.angle,
+                    &format!("{namet}.vo"),
+                )));
+                if n != 0 {
+                    objs.spawn(Box::new(MapObject::init_as_base_ruins(
+                        self.pos,
+                        z,
+                        self.angle,
+                        &format!("{namet}p.vo"),
+                    )));
+                }
+                // The 20-50 fire effect-spawners scattered over the ruin
+                // mesh (:726-755) need AddEffectSpawner — unported.
+                if let Some(id) = self.self_id {
+                    // `g_MatrixMap->StaticDelete(this)` (:757); deferred
+                    // because our box is checked out by the takt driver.
+                    objs.remove_deferred(id);
+                }
+                return;
             }
         }
 
@@ -1675,6 +1717,11 @@ struct MeshBatch {
     /// re-uploaded when point-light colors change (matches the terrain-tint
     /// refresh the object renderer does in its `takt`).
     buildings: Vec<BuildingInstance>,
+    /// Per-instance liveness: flips true once the arena `Building` was
+    /// StaticDelete'd at the end of its DIP sequence
+    /// (MatrixObjectBuilding.cpp:757) — the instance then collapses to a
+    /// degenerate transform and the ruin batch takes over.
+    hidden: Vec<bool>,
     center: [f32; 2],
     /// Kind of building this batch's mesh belongs to. Needed so the
     /// per-frame animation takt only touches BUILDING_BASE instances.
@@ -1686,9 +1733,42 @@ struct MeshBatch {
     unit_id: Option<i32>,
 }
 
+/// Preloaded ruin mesh (`Matrix\Building\ruins\b<n>[p].vo`,
+/// MatrixObjectBuilding.cpp:707-724). Instances start empty; the sync pass
+/// fills them from arena `MapObject`s whose `ruin_graph` matches `vo_path`.
+struct RuinBatch {
+    vertex_buffer: wgpu::Buffer,
+    index_buffer: wgpu::Buffer,
+    num_indices: u32,
+    instance_buffer: wgpu::Buffer,
+    /// Buffer slots — one per building of this kind on the map (every
+    /// DIP death produces at most one ruin pair).
+    capacity: u32,
+    num_instances: u32,
+    bind_group: wgpu::BindGroup,
+    vo_path: String,
+}
+
+/// Degenerate transform for a dead / not-yet-spawned instance — every
+/// vertex collapses to one point so nothing rasterizes.
+fn hidden_instance() -> InstanceData {
+    InstanceData {
+        row0: [0.0; 4],
+        row1: [0.0; 4],
+        row2: [0.0; 4],
+        row3: [0.0, 0.0, 0.0, 1.0],
+        terrain_color: [0.0; 4],
+        unit_offset: [0.0; 4],
+        side_color: [0.0; 4],
+    }
+}
+
 pub struct BuildingsRenderer {
     pipeline: wgpu::RenderPipeline,
     batches: Vec<MeshBatch>,
+    /// Ruin meshes per building kind on the map, preloaded so the DIP
+    /// death swap needs no runtime VO loading.
+    ruin_batches: Vec<RuinBatch>,
     uniform_buffer: wgpu::Buffer,
     fog_color: [f32; 4],
     ambient_color: [f32; 4],
@@ -1704,6 +1784,14 @@ pub struct BuildingsRenderer {
     /// One ground-projection mesh per building instance. Built once at spawn —
     /// buildings don't move, so the geometry doesn't need to refresh per frame.
     shadow_batches: Vec<ShadowBatch>,
+    /// Pos-key of the building owning each `shadow_batches` entry —
+    /// lets the sync hide the shadow when the building dies.
+    shadow_keys: Vec<(i32, i32)>,
+    shadow_visible: Vec<bool>,
+    /// Latched once the arena reports any live `Building`; before that the
+    /// "missing from arena ⇒ dead" rule must stay off (render-only flows
+    /// never spawn logic buildings).
+    logic_buildings_seen: bool,
 }
 
 impl BuildingsRenderer {
@@ -2015,6 +2103,7 @@ impl BuildingsRenderer {
                         num_instances: base_inst_data.len() as u32,
                         bind_group,
                         buildings: instances.iter().map(|b| (*b).clone()).collect(),
+                        hidden: vec![false; instances.len()],
                         center: [cx, cy],
                         kind: kind_enum,
                         unit_id: unit.id,
@@ -2023,6 +2112,137 @@ impl BuildingsRenderer {
             }
 
             loaded_kinds += 1;
+        }
+
+        // Ruin meshes for every kind present on the map — the DIP death
+        // sequence swaps the building for `ruins\b<n>.vo` (+ alpha-tested
+        // `b<n>p.vo` for non-BASE kinds) with the `ruins\b<n>` skin
+        // override (MatrixObjectBuilding.cpp:707-724). Preloading here
+        // keeps the swap a visibility flip — instance data arrives from
+        // arena ruin `MapObject`s in `sync_building_animation`.
+        let mut ruin_batches = Vec::new();
+        let ruins_dir = "Matrix/Building/ruins/";
+        for (kind, instances) in &by_kind {
+            let variants: &[&str] = if *kind == 0 { &[""] } else { &["", "p"] };
+            for variant in variants {
+                let vo_path = format!("{ruins_dir}b{kind}{variant}.vo");
+                let Some(vo_bytes) = read_texture(&vo_path) else {
+                    log::debug!("buildings: ruin VO not found: {}", vo_path);
+                    continue;
+                };
+                let mesh = match vector_object::parse_vo(&vo_bytes) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        log::warn!("buildings: parse ruin {} failed: {}", vo_path, e);
+                        continue;
+                    }
+                };
+                let Some(frame0) = mesh.frames.first() else {
+                    continue;
+                };
+                let indices: Vec<u32> = frame0
+                    .surfaces
+                    .iter()
+                    .flat_map(|s| s.indices.iter().copied())
+                    .collect();
+                if indices.is_empty() {
+                    continue;
+                }
+                let vertices: Vec<Vertex> = mesh
+                    .vertices
+                    .iter()
+                    .map(|v| Vertex {
+                        position: v.position,
+                        normal: v.normal,
+                        uv: v.uv,
+                    })
+                    .collect();
+                // The C++ passes "ruins\b<n>" (+ "?Trans" on the p-part)
+                // as a whole-skin texture override to LoadObject.
+                let spec = if variant.is_empty() {
+                    format!("b{kind}")
+                } else {
+                    format!("b{kind}?Trans")
+                };
+                let material = crate::matrix_lib::three_g::texture::parse_material_spec_with_prefix(
+                    &spec,
+                    Some(ruins_dir),
+                );
+                let (diffuse_view, alpha_test) =
+                    resolve_diffuse(&material, device, queue, &mut tex_cache, read_texture)
+                        .unwrap_or_else(|| (fallback_tex.clone(), false));
+                let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Ruins Mesh VB"),
+                    contents: bytemuck::cast_slice(&vertices),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+                let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Ruins Mesh IB"),
+                    contents: bytemuck::cast_slice(&indices),
+                    usage: wgpu::BufferUsages::INDEX,
+                });
+                let mat_uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Ruins Material UB"),
+                    contents: bytemuck::bytes_of(&MaterialUniform {
+                        flags: [0, 0, 0, alpha_test as u32],
+                        scroll: [0.0, 0.0, 0.0, 0.0],
+                    }),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+                let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("Ruins BG"),
+                    layout: &bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: uniform_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(&diffuse_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::TextureView(&black_tex),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::TextureView(&black_tex),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: wgpu::BindingResource::TextureView(&transparent_tex),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 5,
+                            resource: wgpu::BindingResource::Sampler(&sampler),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 6,
+                            resource: mat_uniform.as_entire_binding(),
+                        },
+                    ],
+                });
+                let capacity = instances.len() as u32;
+                let instance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Ruins Inst VB"),
+                    contents: bytemuck::cast_slice(&vec![hidden_instance(); capacity as usize]),
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                });
+                ruin_batches.push(RuinBatch {
+                    vertex_buffer,
+                    index_buffer,
+                    num_indices: indices.len() as u32,
+                    instance_buffer,
+                    capacity,
+                    num_instances: 0,
+                    bind_group,
+                    vo_path,
+                });
+            }
+        }
+        if !ruin_batches.is_empty() {
+            log::info!("buildings: {} ruin meshes preloaded", ruin_batches.len());
         }
 
         log::info!(
@@ -2046,6 +2266,7 @@ impl BuildingsRenderer {
         // building's `m_ShadowSize` (default 128, MatrixObjectBuilding.cpp:40).
         let shadow_system = ShadowSystem::new(device, config);
         let mut shadow_batches: Vec<ShadowBatch> = Vec::new();
+        let mut shadow_keys: Vec<(i32, i32)> = Vec::new();
         let light_world = Vec3::new(
             map.light_main_dir[0],
             map.light_main_dir[1],
@@ -2082,6 +2303,7 @@ impl BuildingsRenderer {
                 shadow_system.build_geometry(device, map, &proj, &tex, 10, [cx, cy])
             {
                 shadow_batches.push(batch);
+                shadow_keys.push(pos_key(b.x, b.y));
             }
         }
         log::info!(
@@ -2089,9 +2311,11 @@ impl BuildingsRenderer {
             shadow_batches.len()
         );
 
+        let shadow_visible = vec![true; shadow_batches.len()];
         Some(Self {
             pipeline,
             batches,
+            ruin_batches,
             uniform_buffer,
             fog_color,
             ambient_color,
@@ -2102,6 +2326,9 @@ impl BuildingsRenderer {
             last_point_light_revision: 0,
             shadow_system,
             shadow_batches,
+            shadow_keys,
+            shadow_visible,
+            logic_buildings_seen: false,
         })
     }
 
@@ -2124,7 +2351,14 @@ impl BuildingsRenderer {
                 let inst_data: Vec<InstanceData> = batch
                     .buildings
                     .iter()
-                    .map(|b| instance_matrix(b, cx, cy, map, Some(point_lights)))
+                    .enumerate()
+                    .map(|(i, b)| {
+                        if batch.hidden[i] {
+                            hidden_instance()
+                        } else {
+                            instance_matrix(b, cx, cy, map, Some(point_lights))
+                        }
+                    })
                     .collect();
                 queue.write_buffer(&batch.instance_buffer, 0, bytemuck::cast_slice(&inst_data));
             }
@@ -2158,18 +2392,114 @@ impl BuildingsRenderer {
             std::collections::HashMap::new();
         let mut side_by_pos: std::collections::HashMap<(i32, i32), u8> =
             std::collections::HashMap::new();
+        // Ruin map-objects spawned by finished DIP sequences, keyed by VO
+        // path → world placements (x, y, z, angle_z).
+        let mut ruins_by_vo: std::collections::HashMap<&str, Vec<(f32, f32, f32, f32)>> =
+            std::collections::HashMap::new();
         for id in objs.iter_live() {
             if let Some(obj) = objs.get(id) {
-                if !matches!(obj.core().obj_type, ObjectType::Building) {
-                    continue;
-                }
-                let b: &Building = unsafe { &*(obj as *const dyn MapStatic as *const Building) };
-                let key = ((b.pos.x * 10.0) as i32, (b.pos.y * 10.0) as i32);
-                side_by_pos.insert(key, b.side.clamp(0, 255) as u8);
-                if b.kind == BuildingType::Base {
-                    progress_by_pos.insert(key, b.base_floor_progress);
+                match obj.core().obj_type {
+                    ObjectType::Building => {
+                        let b: &Building =
+                            unsafe { &*(obj as *const dyn MapStatic as *const Building) };
+                        let key = pos_key(b.pos.x, b.pos.y);
+                        side_by_pos.insert(key, b.side.clamp(0, 255) as u8);
+                        if b.kind == BuildingType::Base {
+                            progress_by_pos.insert(key, b.base_floor_progress);
+                        }
+                    }
+                    ObjectType::MapObject => {
+                        let mo: &crate::matrix_game::object::MapObject = unsafe {
+                            &*(obj as *const dyn MapStatic
+                                as *const crate::matrix_game::object::MapObject)
+                        };
+                        if let Some(vo) = mo.ruin_graph.as_deref() {
+                            let w = mo.core().matrix.w_axis;
+                            ruins_by_vo
+                                .entry(vo)
+                                .or_default()
+                                .push((w.x, w.y, w.z, mo.angle_z));
+                        }
+                    }
+                    _ => {}
                 }
             }
+        }
+        if !side_by_pos.is_empty() {
+            self.logic_buildings_seen = true;
+        }
+
+        // Dead-building hide (`StaticDelete(this)` at the end of the DIP
+        // sequence, MatrixObjectBuilding.cpp:757): once logic buildings
+        // exist, any render instance missing from the arena collapses to
+        // a degenerate transform; ruin instances replace it below.
+        if self.logic_buildings_seen {
+            for batch in &mut self.batches {
+                let mut dirty = false;
+                for (i, b) in batch.buildings.iter().enumerate() {
+                    let dead = !side_by_pos.contains_key(&pos_key(b.x, b.y));
+                    if batch.hidden[i] != dead {
+                        batch.hidden[i] = dead;
+                        dirty = true;
+                    }
+                }
+                if dirty {
+                    let [cx, cy] = batch.center;
+                    let inst_data: Vec<InstanceData> = batch
+                        .buildings
+                        .iter()
+                        .enumerate()
+                        .map(|(i, b)| {
+                            if batch.hidden[i] {
+                                hidden_instance()
+                            } else {
+                                instance_matrix(b, cx, cy, map, Some(point_lights))
+                            }
+                        })
+                        .collect();
+                    queue.write_buffer(
+                        &batch.instance_buffer,
+                        0,
+                        bytemuck::cast_slice(&inst_data),
+                    );
+                }
+            }
+            for (i, key) in self.shadow_keys.iter().enumerate() {
+                self.shadow_visible[i] = side_by_pos.contains_key(key);
+            }
+        }
+
+        // Ruin instances. Count only grows (ruins are never removed), so
+        // a count change is a sufficient dirty signal.
+        let cx = map.world_width() * 0.5;
+        let cy = map.world_height() * 0.5;
+        for rb in &mut self.ruin_batches {
+            let placements = ruins_by_vo.get(rb.vo_path.as_str());
+            let count = placements.map(|p| p.len()).unwrap_or(0).min(rb.capacity as usize) as u32;
+            if count == rb.num_instances {
+                continue;
+            }
+            let mut inst_data: Vec<InstanceData> = Vec::with_capacity(count as usize);
+            if let Some(placements) = placements {
+                for &(x, y, z, angle_z) in placements.iter().take(count as usize) {
+                    let (s, c) = angle_z.sin_cos();
+                    let [tr, tg, tb] = unpack_rgb(
+                        map.static_object_color_with_lighting(x, y, Some(point_lights)),
+                    );
+                    let [sr, sg, sb] = crate::matrix_game::side::side_color_rgb(0);
+                    inst_data.push(InstanceData {
+                        row0: [c, -s, 0.0, x - cx],
+                        row1: [s, c, 0.0, y - cy],
+                        row2: [0.0, 0.0, 1.0, z],
+                        row3: [0.0, 0.0, 0.0, 1.0],
+                        terrain_color: [tr, tg, tb, 1.0],
+                        unit_offset: [0.0; 4],
+                        side_color: [sr, sg, sb, 1.0],
+                    });
+                }
+            }
+            queue.write_buffer(&rb.instance_buffer, 0, bytemuck::cast_slice(&inst_data));
+            rb.num_instances = count;
         }
 
         // Side re-tint on capture (CMatrixBuilding::Capture flips
@@ -2192,7 +2522,14 @@ impl BuildingsRenderer {
                 let inst_data: Vec<InstanceData> = batch
                     .buildings
                     .iter()
-                    .map(|b| instance_matrix(b, cx, cy, map, Some(point_lights)))
+                    .enumerate()
+                    .map(|(i, b)| {
+                        if batch.hidden[i] {
+                            hidden_instance()
+                        } else {
+                            instance_matrix(b, cx, cy, map, Some(point_lights))
+                        }
+                    })
                     .collect();
                 queue.write_buffer(&batch.instance_buffer, 0, bytemuck::cast_slice(&inst_data));
             }
@@ -2216,8 +2553,12 @@ impl BuildingsRenderer {
             let inst_data: Vec<InstanceData> = batch
                 .buildings
                 .iter()
-                .map(|b| {
-                    let key = ((b.x * 10.0) as i32, (b.y * 10.0) as i32);
+                .enumerate()
+                .map(|(i, b)| {
+                    if batch.hidden[i] {
+                        return hidden_instance();
+                    }
+                    let key = pos_key(b.x, b.y);
                     let p = progress_by_pos.get(&key).copied().unwrap_or(0.0);
                     let mut d = instance_matrix(b, cx, cy, map, Some(point_lights));
                     d.unit_offset = sub_unit_offset(uid, p);
@@ -2256,10 +2597,21 @@ impl BuildingsRenderer {
         // the original's per-frame order (MatrixMap.cpp:2283).
         self.shadow_system
             .update_view(queue, view_proj, self.shadow_color);
-        self.shadow_system.render(pass, &self.shadow_batches);
+        self.shadow_system
+            .render_visible(pass, &self.shadow_batches, &self.shadow_visible);
 
         pass.set_pipeline(&self.pipeline);
         for batch in &self.batches {
+            pass.set_bind_group(0, &batch.bind_group, &[]);
+            pass.set_vertex_buffer(0, batch.vertex_buffer.slice(..));
+            pass.set_vertex_buffer(1, batch.instance_buffer.slice(..));
+            pass.set_index_buffer(batch.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..batch.num_indices, 0, 0..batch.num_instances);
+        }
+        for batch in &self.ruin_batches {
+            if batch.num_instances == 0 {
+                continue;
+            }
             pass.set_bind_group(0, &batch.bind_group, &[]);
             pass.set_vertex_buffer(0, batch.vertex_buffer.slice(..));
             pass.set_vertex_buffer(1, batch.instance_buffer.slice(..));
@@ -2283,6 +2635,13 @@ fn building_cvo_path(kind: u8) -> Option<String> {
         _ => return None,
     };
     Some(format!("Matrix/Building/{name}.cvo"))
+}
+
+/// Shared pos-derived identity between arena `Building`s and the renderer's
+/// static `BuildingInstance` list (buildings never move; same convention as
+/// the side/animation sync below).
+fn pos_key(x: f32, y: f32) -> (i32, i32) {
+    ((x * 10.0) as i32, (y * 10.0) as i32)
 }
 
 /// World matrix for shadow geometry — uncentered (raw map coords). The shadow
@@ -2620,6 +2979,53 @@ mod tests {
         assert_eq!(b.state, BaseState::Closing);
         assert_eq!(b.base_floor, 0.2);
         assert_eq!(b.shadow_size, 128);
+    }
+
+    #[test]
+    fn dip_finish_spawns_ruins_and_static_deletes_building() {
+        // End of the DIP sequence (MatrixObjectBuilding.cpp:691-758):
+        // ruin map-objects (`ruins\b<n>.vo` + `b<n>p.vo` for non-BASE)
+        // spawn at the building's pos/angle and the building itself is
+        // StaticDelete'd.
+        use crate::matrix_game::logic::MapLogic;
+        use crate::matrix_game::object::MapObject;
+
+        let mut w = MapLogic::with_seed(1);
+        let mut b = Building::from_instance(&inst(1, 2)); // Titan
+        b.init_max_hitpoint(100.0);
+        b.state = BaseState::Dip;
+        b.hit_point = -1.0; // Damage's death transition seeds -1
+        let id = w.objects.spawn(Box::new(b));
+        {
+            let obj = w.objects.get_mut(id).unwrap();
+            let bm = unsafe { &mut *(obj as *mut dyn MapStatic as *mut Building) };
+            bm.self_id = Some(id);
+        }
+        w.objects.add_lt(id);
+
+        // downtime = -BUILDING_EXPLOSION_TIME = -1000 for non-BASE; the
+        // hit-point timer must cross it.
+        w.takt(1100);
+
+        assert!(w.objects.get(id).is_none(), "building StaticDelete'd");
+        let mut ruins: Vec<String> = Vec::new();
+        w.objects.for_each_live(|_, obj| {
+            if matches!(obj.core().obj_type, ObjectType::MapObject) {
+                let mo = unsafe { &*(obj as *const dyn MapStatic as *const MapObject) };
+                if let Some(g) = &mo.ruin_graph {
+                    ruins.push(g.clone());
+                }
+                assert_eq!(obj.core().matrix.w_axis.truncate().truncate(), glam::Vec2::new(100.0, 100.0));
+            }
+        });
+        ruins.sort();
+        assert_eq!(
+            ruins,
+            vec![
+                "Matrix/Building/ruins/b1.vo".to_string(),
+                "Matrix/Building/ruins/b1p.vo".to_string(),
+            ]
+        );
     }
 
     #[test]

@@ -9,16 +9,11 @@
 //!
 //! ## Differences from C++
 //!
-//! * The C++ renders each menu item as a **text label** (e.g.
-//!   "Machinegun", "Cannon", …) loaded from
-//!   `Labels.AllLabels.Items.*` and drawn with the SR2 "Rangers"
-//!   text-rasteriser. Our Rust port doesn't yet have a font/glyph
-//!   renderer, so we use **icon items** instead — each row is the
-//!   matching atlas sprite (`chas{N}` / `hull{N}` / `head{N}` / `weap{N}`)
-//!   already loaded by the Base panel. Visually different from the
-//!   original but functionally equivalent: hover highlights, click
-//!   commits the kind. Text labels can land later when the font
-//!   subsystem does.
+//! * Menu items render as **text labels** like the C++ (the catcher
+//!   pass of CIFaceMenu.cpp:312-341 lives in renderer.rs, drawn with
+//!   the AFT `Font.2Ranger` glyphs); `SMenuItemText.text` carries the
+//!   localised captions parsed from the `iw/ihu/ihe/ich{N}text`
+//!   element labels below.
 //! * The C++ uses a separate `m_MenuGraphics` panel (`if/CIFaceMenu`)
 //!   for the popup chrome (border / cursor). We render the popup
 //!   inline using the constructor template buttons, drawn on top of

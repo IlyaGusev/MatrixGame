@@ -230,6 +230,9 @@ pub struct IFaceList {
     /// (CInterface.h:291-294) plus the per-button hover-show gate at
     /// CIFaceButton.cpp:128-145.
     pub hint_system: HintSystem,
+    /// Side id → `_x_` stat-replacement prefix from the `Side` block
+    /// (MatrixLogic.cpp:2540-2543). Player uses `_p_` instead.
+    pub side_prefixes: std::collections::HashMap<i32, String>,
 }
 
 /// Outcome of a button click. The C++ dispatches via action arrays
@@ -277,6 +280,7 @@ impl IFaceList {
             hint_chrome: HintChromeLibrary::default(),
             hint_replacer: HintReplacer::default(),
             hint_system: HintSystem::default(),
+            side_prefixes: std::collections::HashMap::new(),
         }
     }
 
@@ -298,6 +302,7 @@ impl IFaceList {
         list.hint_templates = TemplateLibrary::load(matrix_data);
         list.hint_replacer = HintReplacer::from_storage(matrix_data);
         list.hint_chrome = HintChromeLibrary::load(matrix_data);
+        list.side_prefixes = super::dialog::load_side_prefixes(matrix_data);
         // CIFaceMenu::LoadMenuGraphics (CIFaceMenu.cpp:53-59) loads the
         // chrome (corners / edges / cursor / cursik) from `if/PopupMenu`
         // into a static panel `m_MenuGraphics`. We push it into the same

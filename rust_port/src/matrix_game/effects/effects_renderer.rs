@@ -32,7 +32,8 @@ pub const TEXTURE_PATH_GUN_BULLETS2: &str = "Matrix/Textures/Effects/gun_bullets
 /// `TEXTURE_PATH_KEELWATER` (StringConstants.hpp:137).
 pub const TEXTURE_PATH_KEELWATER: &str = "Matrix/Textures/Billboard/keelwater";
 
-const PATH_TEXTURES: [&str; 8] = [
+const PATH_TEXTURES: [&str; 9] = [
+    crate::matrix_game::effects::move_to::TEXTURE_PATH_MOVETO,
     TEXTURE_PATH_GUN_FIRE,
     TEXTURE_PATH_SPLASH,
     TEXTURE_PATH_BIGBOOM,

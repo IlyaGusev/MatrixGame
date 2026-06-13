@@ -73,6 +73,9 @@ pub struct Flyer {
 
     pub hit_point: f32,
     pub hit_point_max: f32,
+    /// `m_ShowHitpointTime` — hover sets it (MatrixMap.cpp:1176),
+    /// LogicTakt decays it (MatrixFlyer.cpp:1305-1308).
+    pub show_hitpoint_time: i32,
 
     trajectory: Option<Trajectory>,
     trajectory_pos: f32,
@@ -140,6 +143,7 @@ impl Flyer {
             vint_angle: 0.0,
             hit_point: hitpoint,
             hit_point_max: hitpoint,
+            show_hitpoint_time: 0,
             trajectory: Some(trajectory),
             trajectory_pos: 0.0,
             trajectory_len_rev: 1.0 / len,
@@ -258,8 +262,102 @@ impl MapStatic for Flyer {
     fn side(&self) -> i32 {
         self.side
     }
+    fn show_hitpoint(&mut self) {
+        // MatrixFlyer.hpp:342.
+        self.show_hitpoint_time = crate::matrix_game::common::HITPOINT_SHOW_TIME_MS;
+    }
+
+    /// MatrixFlyer.cpp:718-722 — bar centered above the body
+    /// (PB_FLYER_WIDTH = 100, lifted by FLYER_RADIUS*2).
     fn hitpoint_bar(&self, _map: &GameMap) -> Option<HpBar> {
-        None
+        if self.show_hitpoint_time <= 0 || self.hit_point <= 0.0 {
+            return None;
+        }
+        Some(HpBar {
+            anchor: self.pos,
+            width: 100.0,
+            fill: (self.hit_point / self.hit_point_max.max(1.0)).clamp(0.0, 1.0),
+            x_off: -50.0,
+            y_off: -30.0, // FLYER_RADIUS * 2
+        })
+    }
+
+    /// Port of `CMatrixFlyer::Damage` (MatrixFlyer.cpp:1782-1846).
+    /// Sounds and the FLYER_IN_SPAWN base-close branch are N/A here —
+    /// the delivery flyer never spawns from a base.
+    fn damage(
+        &mut self,
+        weap: crate::matrix_game::effects::weapon::Weapon,
+        pos: Vec3,
+        _dir: Vec3,
+        _attacker_side: i32,
+        _attacker: Option<ObjectId>,
+        self_id: ObjectId,
+        objs: &mut Objects,
+    ) -> bool {
+        use crate::matrix_game::effects::weapon::{
+            WEAPON_ABLAZE, WEAPON_CANNON2, WEAPON_FLAMETHROWER, WEAPON_LASER, WEAPON_LIGHTENING,
+            WEAPON_REPAIR, WEAPON_SHORTED,
+        };
+
+        if weap == WEAPON_REPAIR {
+            return false;
+        }
+
+        let cfg = crate::matrix_game::config::global();
+        if let Some(dmg) = cfg.flyer_damages.get(weap) {
+            if self.hit_point > dmg.mindamage as f32 {
+                self.hit_point -= dmg.damage as f32;
+            }
+        }
+
+        // WEAPON_LIGHTENING → FireEnd (:1806-1814). The delivery flyer
+        // carries no weapons, so there is nothing to cease.
+
+        if self.hit_point > 0.0 {
+            // Hit shake `m_Pitch += FSRND(0.1)` (:1821-1822) — visual-
+            // only randomness, local seeded stream like the robot's
+            // damage visuals.
+            if weap != WEAPON_LASER && weap != WEAPON_CANNON2 {
+                use crate::matrix_game::effects::smoke_and_fire::fsrnd;
+                let now = crate::matrix_game::map::current_elapsed_ms();
+                let mut vrng = crate::matrix_game::logic::Rnd::new(
+                    ((now as i32) ^ ((pos.x + pos.y) as i32)).max(1),
+                );
+                self.pitch += fsrnd(&mut vrng, 0.1);
+            }
+            if weap != WEAPON_ABLAZE
+                && weap != WEAPON_SHORTED
+                && weap != WEAPON_LIGHTENING
+                && weap != WEAPON_FLAMETHROWER
+            {
+                objs.pending_explosions
+                    .push(crate::matrix_game::map_static::ExplosionSpawn {
+                        pos,
+                        props: &crate::matrix_game::effects::explosion::EXPLOSION_ROBOT_HIT,
+                        fire: false,
+                    });
+            }
+            false
+        } else {
+            // Dead (:1829-1843): boom at the body, drop the cargo (the
+            // C++ leaves the carried robot dangling — the Falling state
+            // is the port's safe equivalent of losing the carrier), and
+            // despawn.
+            objs.pending_explosions
+                .push(crate::matrix_game::map_static::ExplosionSpawn {
+                    pos: self.pos,
+                    props: &crate::matrix_game::effects::explosion::EXPLOSION_ROBOT_BOOM,
+                    fire: false,
+                });
+            if let Some(rid) = self.carrying.take() {
+                if let Some(r) = crate::matrix_game::logic::robot_mut(objs, rid) {
+                    r.carry_release();
+                }
+            }
+            objs.remove_deferred(self_id);
+            true
+        }
     }
 
     fn takt(&mut self, cms: i32, rng: &mut Rnd, _objs: &mut Objects) {
@@ -277,6 +375,10 @@ impl MapStatic for Flyer {
         let Some(map) = crate::matrix_game::map::current_map() else {
             return;
         };
+        // HP-bar timer decay (MatrixFlyer.cpp:1305-1308).
+        if self.show_hitpoint_time > 0 {
+            self.show_hitpoint_time = (self.show_hitpoint_time - cms).max(0);
+        }
         let ms = cms as f32;
         let mul = (1.0 - 0.998f64.powf(ms as f64)) as f32;
 

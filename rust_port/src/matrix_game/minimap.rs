@@ -1239,18 +1239,47 @@ impl Minimap {
         for id in objects.iter_live() {
             let Some(obj) = objects.get(id) else { continue };
             let core = obj.core();
-            let (icon, radius) = match core.obj_type {
-                ObjectType::RobotAi => (self.icon_robot, robot_r),
-                ObjectType::Cannon => (self.icon_turret, cannon_r),
+            let (icon, radius, flash_time) = match core.obj_type {
+                ObjectType::RobotAi => {
+                    // `if (!ms->IsLiveRobot()) continue` (:690).
+                    if !obj.is_live() {
+                        continue;
+                    }
+                    let r: &crate::matrix_game::robot::Robot = unsafe {
+                        &*(obj as *const dyn crate::matrix_game::map_static::MapStatic
+                            as *const crate::matrix_game::robot::Robot)
+                    };
+                    (self.icon_robot, robot_r, r.mini_map_flash_time)
+                }
+                ObjectType::Cannon => {
+                    if !obj.is_live() {
+                        continue;
+                    }
+                    let c: &crate::matrix_game::object_cannon::Cannon = unsafe {
+                        &*(obj as *const dyn crate::matrix_game::map_static::MapStatic
+                            as *const crate::matrix_game::object_cannon::Cannon)
+                    };
+                    (self.icon_turret, cannon_r, c.mini_map_flash_time)
+                }
                 _ => continue,
             };
             let world_xy = [core.geo_center.x, core.geo_center.y];
             let pos = self.apply_rotation(self.world_to_map(world_xy[0], world_xy[1]));
-            let color = self
-                .side_colors
-                .get(obj.side() as usize)
-                .copied()
-                .unwrap_or([0.85, 0.85, 0.85, 1.0]);
+            // Recently-damaged player units blink white at 2× size
+            // (`flash`, MatrixMinimap.cpp:692-694 / :717-719, :734-740).
+            let flash = flash_time > 0
+                && ((self.time_ms as i64) & 128) == 0
+                && obj.side() == crate::matrix_game::common::PLAYER_SIDE;
+            let (radius, color) = if flash {
+                (radius * 2.0, [1.0, 1.0, 1.0, 1.0])
+            } else {
+                let color = self
+                    .side_colors
+                    .get(obj.side() as usize)
+                    .copied()
+                    .unwrap_or([0.85, 0.85, 0.85, 1.0]);
+                (radius, color)
+            };
             Self::push_marker(&mut markers, pos, radius, icon, color);
         }
         for ev in &self.events {

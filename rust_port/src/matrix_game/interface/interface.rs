@@ -792,7 +792,7 @@ impl CInterface {
                     hint_template: String::new(),
                     hint_offset_x: 0,
                     hint_offset_y: 0,
-                animation: None,
+                    animation: None,
                 });
             }
         }
@@ -885,7 +885,7 @@ impl CInterface {
                             hint_template: String::new(),
                             hint_offset_x: 0,
                             hint_offset_y: 0,
-                animation: None,
+                            animation: None,
                         });
                     }
                 }
@@ -940,7 +940,7 @@ impl CInterface {
                         hint_template: String::new(),
                         hint_offset_x: 0,
                         hint_offset_y: 0,
-                animation: None,
+                        animation: None,
                     });
                 }
 
@@ -988,7 +988,7 @@ impl CInterface {
                         hint_template: String::new(),
                         hint_offset_x: 0,
                         hint_offset_y: 0,
-                animation: None,
+                        animation: None,
                     });
                 }
             }
@@ -1743,7 +1743,7 @@ impl CInterface {
                         hint_template: String::new(),
                         hint_offset_x: 0,
                         hint_offset_y: 0,
-                animation: None,
+                        animation: None,
                     });
                 }
             }
@@ -2117,8 +2117,8 @@ fn load_element(stor: &Storage, rec: &str, kind: ElementKind) -> Option<IFaceEle
         let frames_cnt = nums[0].max(0) as usize;
         let period = nums[1].max(1);
         let (w, h) = (nums[2] as f32, nums[3] as f32);
-        let normal = images[crate::matrix_game::interface::iface_element::ElementState::Normal
-            as usize]
+        let normal = images
+            [crate::matrix_game::interface::iface_element::ElementState::Normal as usize]
             .as_ref()?;
         let mut frames = Vec::with_capacity(frames_cnt);
         for i in 0..frames_cnt {

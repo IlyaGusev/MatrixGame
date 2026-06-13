@@ -263,6 +263,12 @@ impl Info {
         self.bad_coords.contains(&coord)
     }
 
+    /// The accumulated bad-coord ring (`m_BadCoord` walk in
+    /// `PlaceFindNearReturn`, MatrixLogic.cpp:766-773).
+    pub fn bad_coords(&self) -> &[(i32, i32)] {
+        &self.bad_coords
+    }
+
     /// `CInfo::AddIgnore` — refresh if present, else reuse an expired
     /// slot, else append (16 cap with FIFO shift).
     pub fn add_ignore(&mut self, ms: ObjectId, now: i32) {

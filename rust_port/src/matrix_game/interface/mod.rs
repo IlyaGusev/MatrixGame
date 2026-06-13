@@ -5,6 +5,7 @@
 
 pub mod constructor;
 pub mod counter;
+pub mod dialog;
 pub mod hint;
 pub mod history;
 pub mod iface_button;
