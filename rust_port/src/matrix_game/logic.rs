@@ -2413,6 +2413,7 @@ const MINSTD_Q: i32 = 127_773; // 2^31-1 / A
 const MINSTD_R: i32 = 2_836; // 2^31-1 % A
 const MINSTD_M_MINUS_1: i32 = 2_147_483_647; // 2^31 - 1
 
+#[derive(Clone)]
 pub struct Rnd {
     /// Matches `m_Rnd` in CMatrixMapLogic (MatrixLogic.hpp:75).
     /// Must stay strictly positive; the step reseeds to +(2^31-1) when

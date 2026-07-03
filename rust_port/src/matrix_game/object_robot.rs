@@ -1237,7 +1237,7 @@ impl RobotsRenderer {
         // weapon kinds. Internally just calls render_preview_full.
         self.render_preview_full(
             queue, pass, chassis, None, None, &[None; 5], angle_rad, scissor_px, surface_w,
-            surface_h, None,
+            surface_h, None, None,
         );
     }
 
@@ -1270,6 +1270,7 @@ impl RobotsRenderer {
         surface_w: u32,
         surface_h: u32,
         icon_camera: Option<IconCamera>,
+        fx: Option<&'a crate::matrix_game::effects::effects_renderer::EffectsRenderer>,
     ) {
         let ck_idx = chassis_kind_index(chassis);
         let chassis_gpu = match self.chassis.get(ck_idx).and_then(|o| o.as_ref()) {
@@ -1590,6 +1591,98 @@ impl RobotsRenderer {
                 pass.set_index_buffer(surface.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..surface.num_indices, 0, instance_idx..instance_idx + 1);
             }
+        }
+
+        // Interface-draw effects (CMatrixRobot::Draw's IsInterfaceDraw
+        // branch, MatrixObjectRobot.cpp:1135-1171): antigrav jet
+        // streams + repair-gun glow, additive, inside the preview
+        // viewport.
+        if let Some(fx) = fx {
+            use crate::matrix_lib::three_g::billboard::{
+                expand_billboard, expand_line, QueuedBillboard, QueuedLine, TexRef,
+                BBT_FIRESTREAM1, BBT_REPGLOW, BBT_REPGLOWEND,
+            };
+            let cam_pos = eye;
+            let inv = view.inverse();
+            let cam_right = inv.x_axis.truncate().normalize_or_zero();
+            let cam_up = inv.y_axis.truncate().normalize_or_zero();
+            // The random flicker of the C++ (IRND texture pick, FRND
+            // alpha) driven off the renderer clock.
+            let flick = (self.time_ms / 60.0) as usize;
+            let mut quads: Vec<([glam::Vec3; 4], TexRef, u32)> = Vec::new();
+
+            if matches!(chassis, ChassisKind::AntiGravity) {
+                // FireStream jets at chassis bones 10/11
+                // (MatrixObjectRobot.cpp:91-95, :578-599).
+                let world = glam::Mat4::from_cols_array_2d(&chassis_world);
+                for (k, mid) in [10u32, 11u32].into_iter().enumerate() {
+                    let Some(m) = chassis_gpu.vo_mesh.matrix_by_id(mid, 0) else {
+                        continue;
+                    };
+                    let pos = world.transform_point3(glam::Vec3::new(m[12], m[13], m[14]));
+                    let dir = world
+                        .transform_vector3(-glam::Vec3::new(m[4], m[5], m[6]))
+                        .normalize_or_zero();
+                    let idx = (flick + k * 3) % 5;
+                    let l = QueuedLine {
+                        p0: pos,
+                        p1: pos + dir * 10.0, // m_StreamLen
+                        width: 5.0,           // FIRE_STREAM_WIDTH
+                        color: 0xFFFF_FFFF,
+                        tex: TexRef::Bbt(BBT_FIRESTREAM1 + idx),
+                    };
+                    quads.push((expand_line(&l, cam_pos), l.tex, l.color));
+                }
+            }
+
+            // Repair-gun glow — SWeaponRepairData (MatrixRobot.cpp:
+            // 24-73): glow line between weapon bones 1/2 + an end
+            // sprite on each, nudged 3 units toward the camera,
+            // alpha FRND(128)+128.
+            const REPAIR_IDX: usize = 9; // RUK_WEAPON_REPAIR - 1
+            for (pilon, w) in chain.weapons.iter().enumerate() {
+                let Some(wp) = w else { continue };
+                if wp.idx != REPAIR_IDX {
+                    continue;
+                }
+                let Some(g) = self.weapon.get(wp.idx).and_then(|o| o.as_ref()) else {
+                    continue;
+                };
+                let ww = glam::Mat4::from_cols_array_2d(&wp.world);
+                let (Some(m1), Some(m2)) = (
+                    g.vo_mesh.matrix_by_id(1, 0),
+                    g.vo_mesh.matrix_by_id(2, 0),
+                ) else {
+                    continue;
+                };
+                let mut p0 = ww.transform_point3(glam::Vec3::new(m1[12], m1[13], m1[14]));
+                let mut p1 = ww.transform_point3(glam::Vec3::new(m2[12], m2[13], m2[14]));
+                p0 += (cam_pos - p0).normalize_or_zero() * 3.0;
+                p1 += (cam_pos - p1).normalize_or_zero() * 3.0;
+                let a = 128 + ((flick.wrapping_mul(97).wrapping_add(pilon * 31)) % 128) as u32;
+                let color = (a << 24) | 0x00FF_FFFF;
+                let l = QueuedLine {
+                    p0,
+                    p1,
+                    width: 10.0,
+                    color,
+                    tex: TexRef::Bbt(BBT_REPGLOW),
+                };
+                quads.push((expand_line(&l, cam_pos), l.tex, l.color));
+                for (p, size) in [(p0, 5.0f32), (p1, 10.0)] {
+                    let b = QueuedBillboard {
+                        pos: p,
+                        scale: size,
+                        rot: glam::Vec2::new(1.0, 0.0),
+                        disp: glam::Vec2::ZERO,
+                        color,
+                        tex: TexRef::Bbt(BBT_REPGLOWEND),
+                    };
+                    quads.push((expand_billboard(&b, cam_right, cam_up), b.tex, b.color));
+                }
+            }
+
+            fx.draw_preview_quads(queue, pass, &quads, view_proj);
         }
 
         // Restore viewport + scissor to full surface so downstream
@@ -2063,6 +2156,7 @@ impl RobotsRenderer {
             // in centered render space — add the map center back.
             {
                 let mut mounts: [Option<crate::matrix_game::robot::WeaponMount>; 5] = [None; 5];
+                let mut glows: [Option<(glam::Vec3, glam::Vec3)>; 5] = [None; 5];
                 for (pilon, w) in chain.weapons.iter().enumerate() {
                     let Some(wp) = w else { continue };
                     let bone1 = self
@@ -2076,8 +2170,31 @@ impl RobotsRenderer {
                     let pos = glam::Vec3::new(m[3][0] + cx, m[3][1] + cy, m[3][2]);
                     let dir = glam::Vec3::new(m[1][0], m[1][1], m[1][2]).normalize_or_zero();
                     mounts[pilon] = Some(crate::matrix_game::robot::WeaponMount { pos, dir });
+                    // Repair-gun glow anchors — weapon bones 1/2 world
+                    // positions (SWeaponRepairData::Update,
+                    // MatrixRobot.cpp:63-73).
+                    if wp.idx == 9 {
+                        // RUK_WEAPON_REPAIR - 1
+                        if let Some(g) = self.weapon.get(wp.idx).and_then(|o| o.as_ref()) {
+                            if let (Some(m1), Some(m2)) = (
+                                g.vo_mesh.matrix_by_id(1, 0),
+                                g.vo_mesh.matrix_by_id(2, 0),
+                            ) {
+                                let ww = glam::Mat4::from_cols_array_2d(&wp.world);
+                                let off = glam::Vec3::new(cx, cy, 0.0);
+                                let p0 = ww
+                                    .transform_point3(glam::Vec3::new(m1[12], m1[13], m1[14]))
+                                    + off;
+                                let p1 = ww
+                                    .transform_point3(glam::Vec3::new(m2[12], m2[13], m2[14]))
+                                    + off;
+                                glows[pilon] = Some((p0, p1));
+                            }
+                        }
+                    }
                 }
                 robot.weapon_mounts = mounts;
+                robot.repair_glows = glows;
 
                 // Part origins for the death scatter (`m_Unit[i].m_Pos`
                 // seeds at MatrixRobot.cpp:2056-2107 read the unit

@@ -60,9 +60,13 @@ impl PkgArchive {
         Ok(Self { data, entries })
     }
 
-    /// List all file paths in the archive.
+    /// List all file paths in the archive, sorted. The backing map is
+    /// hash-ordered, which made "pick the first .CMAP" consumers
+    /// nondeterministic across runs.
     pub fn list_files(&self) -> Vec<&str> {
-        self.entries.keys().map(|s| s.as_str()).collect()
+        let mut v: Vec<&str> = self.entries.keys().map(|s| s.as_str()).collect();
+        v.sort_unstable();
+        v
     }
 
     /// Check if a path exists.

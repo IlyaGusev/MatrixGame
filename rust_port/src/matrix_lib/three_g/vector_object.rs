@@ -718,6 +718,107 @@ pub fn chassis_vo(idx: usize) -> Option<Arc<VoMesh>> {
     chassis_slot().read().unwrap().get(idx).cloned().flatten()
 }
 
+/// Local-space AABBs for pick tests — the C++ picks against the VO
+/// mesh (`CVectorObject::Pick`); a per-kind OBB from the real frame-0
+/// bounds is the port's stand-in, replacing the bounding-sphere
+/// approximation that made turret fire lines clip their own building
+/// and robot shots explode on ruin "air". Registered by the renderers
+/// at VO load; absent entries fall back to the sphere.
+static BUILDING_BOUNDS: OnceLock<RwLock<std::collections::HashMap<u8, Vec<([f32; 3], [f32; 3])>>>> =
+    OnceLock::new();
+static MAPOBJ_BOUNDS: OnceLock<RwLock<std::collections::HashMap<i32, ([f32; 3], [f32; 3])>>> =
+    OnceLock::new();
+
+fn building_bounds_slot(
+) -> &'static RwLock<std::collections::HashMap<u8, Vec<([f32; 3], [f32; 3])>>> {
+    BUILDING_BOUNDS.get_or_init(Default::default)
+}
+fn mapobj_bounds_slot() -> &'static RwLock<std::collections::HashMap<i32, ([f32; 3], [f32; 3])>> {
+    MAPOBJ_BOUNDS.get_or_init(Default::default)
+}
+
+/// Register a building kind's sub-VO AABBs. Kept per sub-VO — a
+/// UNION box would wall off the flat spawn platform (its pad spans
+/// the local +y half at z≈0 while the body towers at −y; the union
+/// is a phantom 76-unit wall over the platform mouth).
+pub fn set_building_boxes(kind: u8, boxes: Vec<([f32; 3], [f32; 3])>) {
+    building_bounds_slot().write().unwrap().insert(kind, boxes);
+}
+
+/// Nearest ray hit across the building kind's sub-VO boxes (local
+/// space). `None` when no boxes are registered OR the ray misses.
+/// Callers distinguish the two via [`has_building_boxes`].
+pub fn pick_building_boxes(kind: u8, origin: [f32; 3], dir: [f32; 3]) -> Option<f32> {
+    let g = building_bounds_slot().read().unwrap();
+    let boxes = g.get(&kind)?;
+    boxes
+        .iter()
+        .filter_map(|(mn, mx)| ray_aabb(origin, dir, *mn, *mx))
+        .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+}
+
+pub fn has_building_boxes(kind: u8) -> bool {
+    building_bounds_slot().read().unwrap().contains_key(&kind)
+}
+
+pub fn set_mapobj_bounds(type_id: i32, min: [f32; 3], max: [f32; 3]) {
+    mapobj_bounds_slot()
+        .write()
+        .unwrap()
+        .insert(type_id, (min, max));
+}
+pub fn mapobj_bounds(type_id: i32) -> Option<([f32; 3], [f32; 3])> {
+    mapobj_bounds_slot().read().unwrap().get(&type_id).copied()
+}
+
+/// Ruin MapObjects carry a graph path instead of a type id
+/// (`init_as_base_ruins`) — separate string-keyed registry.
+static RUIN_BOUNDS: OnceLock<RwLock<std::collections::HashMap<String, ([f32; 3], [f32; 3])>>> =
+    OnceLock::new();
+
+fn ruin_bounds_slot() -> &'static RwLock<std::collections::HashMap<String, ([f32; 3], [f32; 3])>>
+{
+    RUIN_BOUNDS.get_or_init(Default::default)
+}
+
+pub fn merge_ruin_bounds(name: &str, min: [f32; 3], max: [f32; 3]) {
+    let mut g = ruin_bounds_slot().write().unwrap();
+    let e = g.entry(name.to_string()).or_insert((min, max));
+    for i in 0..3 {
+        e.0[i] = e.0[i].min(min[i]);
+        e.1[i] = e.1[i].max(max[i]);
+    }
+}
+pub fn ruin_bounds(name: &str) -> Option<([f32; 3], [f32; 3])> {
+    ruin_bounds_slot().read().unwrap().get(name).copied()
+}
+
+/// Ray / AABB slab test. Returns the ray parameter of the nearest
+/// non-negative hit.
+pub fn ray_aabb(origin: [f32; 3], dir: [f32; 3], min: [f32; 3], max: [f32; 3]) -> Option<f32> {
+    let mut t0 = 0.0f32;
+    let mut t1 = f32::INFINITY;
+    for i in 0..3 {
+        if dir[i].abs() < 1e-10 {
+            if origin[i] < min[i] || origin[i] > max[i] {
+                return None;
+            }
+            continue;
+        }
+        let inv = 1.0 / dir[i];
+        let (mut ta, mut tb) = ((min[i] - origin[i]) * inv, (max[i] - origin[i]) * inv);
+        if ta > tb {
+            std::mem::swap(&mut ta, &mut tb);
+        }
+        t0 = t0.max(ta);
+        t1 = t1.min(tb);
+        if t0 > t1 {
+            return None;
+        }
+    }
+    Some(t0)
+}
+
 /// Same pattern for the cannon shaft VOs (`Matrix/Cannon/Shaft{1-4}.vo`),
 /// populated by `CannonsRenderer::new`. The cannon game object needs
 /// frame durations to drive the fire/idle shaft animation

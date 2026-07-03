@@ -704,6 +704,39 @@ impl MapStatic for MapObject {
     fn is_special(&self) -> bool {
         self.object_state & OBJECT_STATE_SPECIAL != 0
     }
+    /// Ray pick against the type's VO AABB in object space — ports the
+    /// mesh precision of `CVectorObject::Pick` so shots collide with
+    /// ruins/props where the C++ does (the old default was radius 0 =
+    /// unpickable, letting projectiles fly through ruins).
+    fn pick(&self, origin: glam::Vec3, dir: glam::Vec3) -> Option<f32> {
+        use crate::matrix_lib::three_g::vector_object::{mapobj_bounds, ray_aabb, ruin_bounds};
+        let bounds = match &self.ruin_graph {
+            Some(g) => ruin_bounds(g),
+            None => mapobj_bounds(self.type_id),
+        };
+        let Some((bmin, bmax)) = bounds else {
+            if self.core.radius <= 0.0 {
+                return None;
+            }
+            return crate::matrix_game::map_static::ray_sphere_pick(
+                self.core.geo_center,
+                self.core.radius,
+                origin,
+                dir,
+            );
+        };
+        // World → object-local via the full instance matrix (rotation
+        // × uniform scale + translation).
+        let inv = self.core.matrix.inverse();
+        let lo = inv.transform_point3(origin);
+        let ld = inv.transform_vector3(dir).normalize_or_zero();
+        if ld == glam::Vec3::ZERO {
+            return None;
+        }
+        let t = ray_aabb(lo.to_array(), ld.to_array(), bmin, bmax)?;
+        let hit_world = self.core.matrix.transform_point3(lo + ld * t);
+        Some((hit_world - origin).dot(dir))
+    }
     fn core_mut(&mut self) -> &mut ObjectCore {
         &mut self.core
     }
@@ -1750,6 +1783,11 @@ impl ObjectsRenderer {
                     continue;
                 }
             };
+            // Register the type-local AABB for logic-side pick tests
+            // (replaces the sphere approximation for ruins etc.).
+            if let Some(f0) = mesh.frames.first() {
+                vector_object::set_mapobj_bounds(*type_id as i32, f0.bounds_min, f0.bounds_max);
+            }
 
             let object_dir = paths
                 .vo_path

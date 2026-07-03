@@ -1078,6 +1078,32 @@ impl MapStatic for Building {
     fn core_mut(&mut self) -> &mut ObjectCore {
         &mut self.core
     }
+    /// Ray pick against the building's VO AABB rotated by the 90°-step
+    /// yaw — ports the mesh-precision of `CVectorObject::Pick` closely
+    /// enough that turret fire lines no longer clip the fat bounding
+    /// sphere of their own building. Sphere fallback when the renderer
+    /// hasn't registered bounds (headless sims).
+    fn pick(&self, origin: glam::Vec3, dir: glam::Vec3) -> Option<f32> {
+        use crate::matrix_lib::three_g::vector_object::{
+            has_building_boxes, pick_building_boxes,
+        };
+        if !has_building_boxes(self.kind as u8) {
+            return crate::matrix_game::map_static::ray_sphere_pick(
+                self.core.geo_center,
+                self.core.radius,
+                origin,
+                dir,
+            );
+        }
+        // World → building-local: untranslate, then rotate by -yaw.
+        let ang = (self.angle & 3) as f32 * std::f32::consts::FRAC_PI_2;
+        let (s, c) = ang.sin_cos();
+        let base = glam::Vec3::new(self.pos.x, self.pos.y, self.core.matrix.w_axis.z);
+        let to_local = |v: glam::Vec3| glam::Vec3::new(c * v.x + s * v.y, -s * v.x + c * v.y, v.z);
+        let lo = to_local(origin - base);
+        let ld = to_local(dir);
+        pick_building_boxes(self.kind as u8, lo.to_array(), ld.to_array())
+    }
     fn rchange(&self) -> u32 {
         self.rchange
     }
@@ -2060,6 +2086,7 @@ impl BuildingsRenderer {
                 .map(|b| instance_matrix(b, cx, cy, map, None))
                 .collect();
             let kind_enum = BuildingType::from_u8(*kind).unwrap_or(BuildingType::Base);
+            let mut pick_boxes: Vec<([f32; 3], [f32; 3])> = Vec::new();
 
             for unit in &group.units {
                 let Some(vo_bytes) = read_texture(&unit.model_path) else {
@@ -2089,6 +2116,9 @@ impl BuildingsRenderer {
                 let Some(frame0) = mesh.frames.first() else {
                     continue;
                 };
+                // Collect the sub-VO's local AABB for logic-side pick
+                // tests (replaces the sphere approximation).
+                pick_boxes.push((frame0.bounds_min, frame0.bounds_max));
 
                 // When the CVO unit declares no `Texture=…`, the original
                 // falls back to the VO's own embedded surface texture name —
@@ -2273,6 +2303,7 @@ impl BuildingsRenderer {
                 }
             }
 
+            vector_object::set_building_boxes(*kind, pick_boxes);
             loaded_kinds += 1;
         }
 
@@ -2302,6 +2333,13 @@ impl BuildingsRenderer {
                 let Some(frame0) = mesh.frames.first() else {
                     continue;
                 };
+                // Ruin-local AABB for logic-side pick tests, keyed by
+                // the exact `ruin_graph` path (init_as_base_ruins).
+                vector_object::merge_ruin_bounds(
+                    &vo_path,
+                    frame0.bounds_min,
+                    frame0.bounds_max,
+                );
                 let indices: Vec<u32> = frame0
                     .surfaces
                     .iter()

@@ -470,6 +470,35 @@ hint off-screen clip + COPY anchor, auto-order ON/OFF state.
 Verified no-op in the original: `buhe` build-flyer button — its PREORDER_BUILD_FLYER flag is set
 (CInterface.cpp:3492) but read nowhere in the C++; flyer building was cut from the shipping game.
 
+## DONE — round 15 (build+wasm+tests+3 sims green) — user-reported bug batch
+- Constructor 3D preview: antigrav chassis fire-jet streams (chassis bones 10/11, BBT_FIRESTREAM,
+  MatrixObjectRobot.cpp:1156-1171) + repair-gun glow now drawn in the preview viewport via a new
+  EffectsRenderer::draw_preview_quads mid-pass additive path (CMatrixRobot::Draw IsInterfaceDraw).
+- Repair-gun glow in-world: SWeaponRepairData port (MatrixRobot.cpp:24-73) — glow line between
+  weapon bones 1/2 + end sprites (BBT_REPGLOW/REPGLOWEND), flicker alpha 128-255 (240 paused),
+  nudged 3 toward camera; anchors written back by the robot renderer like weapon_mounts.
+- Pick precision (root cause of "laser turret doesn't shoot properly" + "robots fire into ruins"):
+  Building::pick and MapObject::pick now ray-test the real VO frame-0 AABB (registered by the
+  renderers at load; 90°-yaw OBB for buildings, full instance matrix for map objects) instead of
+  the fat bounding sphere / radius-0 defaults. Turret fire lines no longer terminate on their own
+  building's sphere; shots now collide with ruins/props exactly where the C++ mesh pick does
+  (previously radius 0 made ruins transparent to fire).
+- Base-capture descent: ROBOT_BASE_CAPTURE now rides the closing base's floor down
+  (roboz = GetFloorZ(), MatrixObjectRobot.cpp:364-381) — the robot visibly goes downstairs
+  before being consumed, mirroring the IN_SPAWN ride up.
+- Determinism: PkgArchive::list_files / Bundle::list_files were hash-ordered — "first .CMAP"
+  consumers (headless sims) loaded a different map per run. Now sorted.
+- New diagnostics: examples/laser_turret_probe.rs, examples/dead_turret_fire_probe.rs,
+  examples/dump_cannons.rs.
+
+## DONE — round 15b — building pick boxes split per sub-VO
+The round-15 building pick UNIONED every CVO sub-VO AABB into one box; the flat spawn
+platform (local +y half, z≈0) unioned with the tower body (local −y, z up to 76-83) produced
+a phantom full-height wall over the platform mouth — turret aim traces hit it, open_fire
+dropped, and lasers "stopped firing after some time". Buildings now pick against each sub-VO
+box separately (nearest hit wins): the platform stays a flat slab shots pass over, the body
+blocks only where the mesh actually stands.
+
 ## REMAINING — nothing to port
   - bigboom's own ring point light: the original's `CMatrixEffectBigBoom` guards it with `if(light!=0)`,
     and every `CreateBigBoom` caller (the 3 in WEAPON_BIGBOOM) passes `light = 0` — so in the shipping

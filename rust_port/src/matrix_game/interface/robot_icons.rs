@@ -242,6 +242,7 @@ fn render_to_texture(
             size,
             size,
             Some(IconCamera::CPP_DEFAULTS),
+            None,
         );
     }
     queue.submit(std::iter::once(encoder.finish()));

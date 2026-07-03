@@ -105,7 +105,16 @@ pub struct EffectsRenderer {
     spot_vb_cap: usize,
     spot_batches: Vec<Batch>,
     spot_vertices: Vec<Vertex>,
+    /// Constructor-preview overlay (antigrav jets + repair glow) —
+    /// own uniforms/vb so the mid-pass draw can't disturb the world
+    /// billboard state. Fixed capacity, see PREVIEW_VB_VERTS.
+    preview_uniform_buf: wgpu::Buffer,
+    preview_uniform_bg: wgpu::BindGroup,
+    preview_vb: wgpu::Buffer,
 }
+
+/// 32 quads is plenty: 2 jets + (line + 2 ends) × 5 repair guns = 17.
+const PREVIEW_VB_VERTS: usize = 32 * 6;
 
 impl EffectsRenderer {
     pub fn new(
@@ -242,6 +251,26 @@ impl EffectsRenderer {
                 binding: 0,
                 resource: uniform_buf.as_entire_binding(),
             }],
+        });
+        let preview_uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fx preview uniforms"),
+            size: std::mem::size_of::<Uniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let preview_uniform_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("fx preview uniforms bg"),
+            layout: &uniform_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: preview_uniform_buf.as_entire_binding(),
+            }],
+        });
+        let preview_vb = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fx preview vb"),
+            size: (PREVIEW_VB_VERTS * std::mem::size_of::<Vertex>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -422,6 +451,9 @@ impl EffectsRenderer {
             spot_vb_cap,
             spot_batches: Vec::new(),
             spot_vertices: Vec::new(),
+            preview_uniform_buf,
+            preview_uniform_bg,
+            preview_vb,
         }
     }
 
@@ -590,6 +622,62 @@ impl EffectsRenderer {
         }
         if !self.vertices.is_empty() {
             queue.write_buffer(&self.vb, 0, bytemuck::cast_slice(&self.vertices));
+        }
+    }
+
+    /// Mid-pass additive quad draw with a dedicated view-proj — the
+    /// constructor 3D preview's antigrav jets + repair-gun glow
+    /// (CMatrixRobot::Draw IsInterfaceDraw branch,
+    /// MatrixObjectRobot.cpp:1135-1171). Corners come pre-expanded
+    /// (the preview camera basis lives with the caller).
+    pub fn draw_preview_quads<'a>(
+        &'a self,
+        queue: &wgpu::Queue,
+        pass: &mut wgpu::RenderPass<'a>,
+        quads: &[([Vec3; 4], TexRef, u32)],
+        view_proj: Mat4,
+    ) {
+        if quads.is_empty() {
+            return;
+        }
+        queue.write_buffer(
+            &self.preview_uniform_buf,
+            0,
+            bytemuck::bytes_of(&Uniforms {
+                view_proj: view_proj.to_cols_array_2d(),
+            }),
+        );
+        let mut verts: Vec<Vertex> = Vec::with_capacity(quads.len() * 6);
+        let mut batches: Vec<(usize, u32, u32)> = Vec::new();
+        for (v, tex, color) in quads.iter().take(PREVIEW_VB_VERTS / 6) {
+            let (slot, uv, _) = self.resolve(*tex);
+            let col = argb_to_f32(*color);
+            let [u0, v0, u1, v1] = uv;
+            let vtx = |p: Vec3, u: f32, vv: f32| Vertex {
+                pos: p.to_array(),
+                color: col,
+                uv: [u, vv],
+            };
+            let q = [
+                vtx(v[0], u0, v1),
+                vtx(v[1], u0, v0),
+                vtx(v[2], u1, v1),
+                vtx(v[3], u1, v0),
+            ];
+            let first = verts.len() as u32;
+            verts.extend_from_slice(&[q[0], q[1], q[2], q[2], q[1], q[3]]);
+            match batches.last_mut() {
+                Some(b) if b.0 == slot => b.2 += 6,
+                _ => batches.push((slot, first, 6)),
+            }
+        }
+        queue.write_buffer(&self.preview_vb, 0, bytemuck::cast_slice(&verts));
+        pass.set_pipeline(&self.pipeline_add);
+        pass.set_bind_group(0, &self.preview_uniform_bg, &[]);
+        pass.set_vertex_buffer(0, self.preview_vb.slice(..));
+        for (slot, first, count) in batches {
+            pass.set_bind_group(1, &self.bind_groups[slot], &[]);
+            pass.draw(first..first + count, 0..1);
         }
     }
 

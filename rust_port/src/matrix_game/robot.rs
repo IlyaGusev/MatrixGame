@@ -353,6 +353,10 @@ pub struct Robot {
     /// fire control does (MatrixRobot.cpp:1390-1394). `pos` is the
     /// barrel-tip bone in world space, `dir` the barrel's Y axis.
     pub weapon_mounts: [Option<WeaponMount>; 5],
+    /// Repair-gun glow anchors (weapon VO bones 1/2 in world space),
+    /// renderer write-back like `weapon_mounts` — port of
+    /// `SWeaponRepairData::Update` (MatrixRobot.cpp:63-73).
+    pub repair_glows: [Option<(glam::Vec3, glam::Vec3)>; 5],
     /// Assembled-part world positions (renderer write-back, see
     /// [`DipPartSnapshot`]).
     pub part_snapshot: DipPartSnapshot,
@@ -543,6 +547,7 @@ impl Robot {
             dip_ttl: 0,
             dip_units: Vec::new(),
             weapon_mounts: [None; 5],
+            repair_glows: [None; 5],
             part_snapshot: DipPartSnapshot::default(),
         }
     }
@@ -3490,6 +3495,28 @@ impl MapStatic for Robot {
                     // CAPTURING consumed the robot (StaticDelete at
                     // MatrixRobot.cpp:1317) — bail before animation.
                     return;
+                }
+                // BASE_CAPTURE rides the closing base's floor down —
+                // `roboz = mu->m_Base->GetFloorZ()` (MatrixObjectRobot
+                // .cpp:364-381), same tracking as IN_SPAWN's ride up.
+                if self.state == RobotState::BaseCapture {
+                    let base = self
+                        .orders
+                        .top()
+                        .filter(|o| o.ty == OrderType::CaptureFactory)
+                        .and_then(|o| o.target)
+                        .and_then(|fid| objs.get(fid))
+                        .filter(|o| matches!(o.core().obj_type, ObjectType::Building))
+                        .map(|o| unsafe {
+                            &*(o as *const dyn MapStatic
+                                as *const crate::matrix_game::object_building::Building)
+                        });
+                    if let Some(b) = base {
+                        self.pos_z =
+                            b.build_z + (1.0 - b.base_floor_progress) * BASE_FLOOR_Z - 3.0 + 2.7;
+                        self.core.geo_center.z = self.pos_z + 9.0;
+                        self.rchange |= MR_MATRIX;
+                    }
                 }
             }
         }

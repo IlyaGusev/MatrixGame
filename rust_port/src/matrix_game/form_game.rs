@@ -1478,6 +1478,51 @@ impl ApplicationHandler for App {
                                                     }
                                                 }
                                             }
+                                            // Repair-gun glow — line between weapon
+                                            // bones 1/2 + end sprites, flickering
+                                            // alpha, nudged 3 toward the camera
+                                            // (SWeaponRepairData::Draw,
+                                            // MatrixRobot.cpp:24-61).
+                                            if r.state != crate::matrix_game::robot::RobotState::Dip
+                                            {
+                                                use crate::matrix_lib::three_g::billboard::{
+                                                    TexRef, BBT_REPGLOW, BBT_REPGLOWEND,
+                                                };
+                                                let cam = state.camera.eye_pos_world();
+                                                for (g0, g1) in r.repair_glows.iter().flatten() {
+                                                    let a: u32 = if state.is_paused {
+                                                        240
+                                                    } else {
+                                                        128 + rng.range(0, 127) as u32
+                                                    };
+                                                    let color = (a << 24) | 0x00FF_FFFF;
+                                                    let p0 = *g0
+                                                        + (cam - *g0).normalize_or_zero() * 3.0;
+                                                    let p1 = *g1
+                                                        + (cam - *g1).normalize_or_zero() * 3.0;
+                                                    state.bb_queue.line(
+                                                        p0,
+                                                        p1,
+                                                        10.0,
+                                                        color,
+                                                        TexRef::Bbt(BBT_REPGLOW),
+                                                    );
+                                                    state.bb_queue.billboard(
+                                                        p0,
+                                                        5.0,
+                                                        0.0,
+                                                        color,
+                                                        TexRef::Bbt(BBT_REPGLOWEND),
+                                                    );
+                                                    state.bb_queue.billboard(
+                                                        p1,
+                                                        10.0,
+                                                        0.0,
+                                                        color,
+                                                        TexRef::Bbt(BBT_REPGLOWEND),
+                                                    );
+                                                }
+                                            }
                                         }
                                         crate::matrix_game::map_static::ObjectType::Cannon => {
                                             let c: &crate::matrix_game::object_cannon::Cannon = unsafe {
@@ -1815,6 +1860,7 @@ impl ApplicationHandler for App {
                                     surface_w,
                                     surface_h,
                                     None,
+                                    Some(&state.effects_renderer),
                                 );
                             }
                         }

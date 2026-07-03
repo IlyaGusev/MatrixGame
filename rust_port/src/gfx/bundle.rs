@@ -102,6 +102,8 @@ impl AssetBundle {
     }
 
     pub fn list_files(&self) -> Vec<&str> {
-        self.files.keys().map(|s| s.as_str()).collect()
+        let mut v: Vec<&str> = self.files.keys().map(|s| s.as_str()).collect();
+        v.sort_unstable();
+        v
     }
 }
