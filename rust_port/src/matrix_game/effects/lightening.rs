@@ -145,14 +145,17 @@ impl Lightening {
     }
 
     pub fn draw(&self, q: &mut BillboardQueue) {
-        // GLOWBEAMEND cap at the source.
-        q.billboard(
-            self.pos0,
-            self.width * 0.5,
-            0.0,
-            self.color,
-            TexRef::Bbt(BBT_GLOWBEAMEND),
-        );
+        // GLOWBEAMEND cap at the source — shorted arcs pass bp=false and
+        // draw no cap (MatrixEffectLightening.cpp:186-190, :20-30).
+        if !self.shorted {
+            q.billboard(
+                self.pos0,
+                self.width * 0.5,
+                0.0,
+                self.color,
+                TexRef::Bbt(BBT_GLOWBEAMEND),
+            );
+        }
         for w in self.points.windows(2) {
             q.line(
                 w[0],

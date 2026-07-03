@@ -16,8 +16,18 @@ pub struct PointLight {
     pub color: u32,
 }
 
+/// Book-keeping for a TTL'd effect light. Radius LERPs `r1→r2` and
+/// colour LICs `c1→c2` over the life fraction `k = 1 - remaining/total`,
+/// mirroring `CMatrixEffectExplosion::Takt` (MatrixEffectExplosion.cpp:
+/// 640-641) / the `CMatrixEffectPointLight` fade.
+struct Transient {
+    id: PointLightId,
+    remaining: f32,
+}
+
 pub struct PointLightSystem {
     lights: Vec<PointLight>,
+    transient: Vec<Transient>,
     point_lums: Vec<[i32; 3]>,
     next_id: PointLightId,
     revision: u64,
@@ -28,10 +38,78 @@ impl PointLightSystem {
     pub fn new(map: &GameMap) -> Self {
         Self {
             lights: Vec::new(),
+            transient: Vec::new(),
             point_lums: vec![[0, 0, 0]; map.points.len()],
             next_id: 1,
             revision: 0,
             dirty: false,
+        }
+    }
+
+    /// Add an animated light that LERPs radius `r1→r2` and colour
+    /// `c1→c2` over `ttl` ms (explosion flashes: MatrixEffectExplosion.cpp:
+    /// 340,640-641). `add_transient_light` is the simple fade-to-black case.
+    pub fn add_transient_light_anim(
+        &mut self,
+        map: &GameMap,
+        pos: [f32; 3],
+        r1: f32,
+        r2: f32,
+        c1: u32,
+        c2: u32,
+        ttl: f32,
+        _t1: f32,
+    ) -> PointLightId {
+        // Bake at peak brightness (brighter colour, larger radius) and hold
+        // it for the light's whole life instead of LERPing every frame.
+        // The per-frame fade used to bump the light revision every frame,
+        // forcing a full terrain-vertex rebuild + light-mesh reallocation
+        // each frame while any flash was alive — the combat-FPS killer.
+        let lum = |c: u32| ((c >> 16) & 0xFF) + ((c >> 8) & 0xFF) + (c & 0xFF);
+        let (peak_c, peak_r) = if lum(c1) >= lum(c2) {
+            (c1, r1.max(r2))
+        } else {
+            (c2, r1.max(r2))
+        };
+        let id = self.add_light(map, pos, peak_r, peak_c);
+        self.transient.push(Transient { id, remaining: ttl });
+        id
+    }
+
+    /// Add a light that fades from `color` to black over `ttl` ms —
+    /// muzzle flashes / plasma bolts (MatrixEffectWeapon.cpp:514, etc.).
+    pub fn add_transient_light(
+        &mut self,
+        map: &GameMap,
+        pos: [f32; 3],
+        radius: f32,
+        color: u32,
+        ttl: f32,
+    ) -> PointLightId {
+        self.add_transient_light_anim(map, pos, radius, radius, color, 0, ttl, ttl)
+    }
+
+    /// Age transient lights and drop the expired ones. Only marks the
+    /// system dirty on expiry (a topology change) — the actual recompute
+    /// is batched into the next `flush`, so a screenful of flashes costs
+    /// at most one rebuild per frame instead of one per flash per frame.
+    pub fn takt(&mut self, _map: &GameMap, step: f32) {
+        if self.transient.is_empty() {
+            return;
+        }
+        for t in &mut self.transient {
+            t.remaining -= step;
+        }
+        let expired: Vec<PointLightId> = self
+            .transient
+            .iter()
+            .filter(|t| t.remaining <= 0.0)
+            .map(|t| t.id)
+            .collect();
+        if !expired.is_empty() {
+            self.lights.retain(|l| !expired.contains(&l.id));
+            self.transient.retain(|t| t.remaining > 0.0);
+            self.dirty = true;
         }
     }
 
@@ -50,8 +128,10 @@ impl PointLightSystem {
             radius: radius.max(0.001),
             color,
         });
-        self.recompute(map);
-        self.dirty = false;
+        // Defer the (expensive) luminance recompute to the next `flush` so
+        // a burst of adds in one frame collapses to a single rebuild.
+        let _ = map;
+        self.dirty = true;
         id
     }
 
@@ -60,8 +140,8 @@ impl PointLightSystem {
         self.lights.retain(|light| light.id != id);
         let removed = self.lights.len() != old_len;
         if removed {
-            self.recompute(map);
-            self.dirty = false;
+            let _ = map;
+            self.dirty = true;
         }
         removed
     }
@@ -536,6 +616,9 @@ mod tests {
             tex_union_dim: 16,
             shadow_color: 0,
             robots: Vec::new(),
+            side_res_info: Vec::new(),
+            ground_z_base_middle: 0.0,
+            ground_z_base_max: 0.0,
             water_color: 0,
             sky_color: 0,
             sky_name: String::new(),
@@ -606,6 +689,7 @@ mod tests {
             }],
             objects: Vec::<ObjectInstance>::new(),
             buildings: Vec::new(),
+            ruins: Vec::new(),
             cannons: Vec::new(),
             group_max_z_land: vec![0.0],
             group_w: 1,

@@ -376,6 +376,9 @@ impl EffectsRenderer {
             "Matrix/Textures/LandSpots/varonka",
             "Matrix/Textures/LandSpots/spot_hit",
             "Matrix/Textures/LandSpots/spot",
+            "Matrix/Textures/LandSpots/sole",
+            "Matrix/Textures/LandSpots/sole_w",
+            "Matrix/Textures/LandSpots/sole_p",
         ] {
             let slot = load_view(p)
                 .map(|(v, _, _)| make_bg(&v))

@@ -139,6 +139,19 @@ pub struct Robot {
     /// to the platform front.
     pub forward: glam::Vec2,
 
+    /// `m_ChassisData.m_LastSolePos` — last spot where a track/wheel
+    /// sole decal was stamped (MatrixRobot.cpp:737).
+    pub last_sole_pos: glam::Vec2,
+
+    /// `IsInPosition()` — set by the "terron" map easter egg when this
+    /// robot stands on the trigger cell (MatrixRobot.cpp:1952-1955).
+    pub in_position: bool,
+
+    /// Pneumatic foot-linking (`m_ChassisData.m_LinkPos`/`m_LinkPrevFrame`,
+    /// MatrixObjectRobot.cpp:1517-1590). `link_prev_frame < 0` = not linked.
+    pub link_pos: glam::Vec2,
+    pub link_prev_frame: i32,
+
     /// Port of `m_OrdersList[MAX_ORDERS]` + `m_OrdersInPool`
     /// (MatrixRobot.hpp:249-250). Top of the list is the active
     /// order dispatched each LogicTakt.
@@ -461,6 +474,10 @@ impl Robot {
             base_anchor_z: pos.z,
             chassis_dz: chassis.spawn_z_offset(),
             forward: glam::Vec2::new(0.0, -1.0),
+            last_sole_pos: glam::Vec2::new(-1.0e9, -1.0e9),
+            link_pos: glam::Vec2::ZERO,
+            link_prev_frame: -1,
+            in_position: false,
             orders: OrderList::new(),
             move_path: MovePath::default(),
             zone_cur: -1,
@@ -952,6 +969,12 @@ impl Robot {
     }
 
     /// Port of `IsDisableManual` (MatrixRobot.hpp:357).
+    /// `m_ObjectState & ROBOT_FLAG_COLLISION` — set by LowLevelMove when
+    /// the robot hit something this frame.
+    pub fn is_colliding(&self) -> bool {
+        self.object_state & crate::matrix_game::map_static::ROBOT_FLAG_COLLISION != 0
+    }
+
     pub fn is_disable_manual(&self) -> bool {
         (self.object_state & crate::matrix_game::map_static::ROBOT_FLAG_DISABLE_MANUAL) != 0
     }
@@ -962,6 +985,17 @@ impl Robot {
             objs.weapons
                 .get(bw.weapon)
                 .map(|we| we.weapon_type() == WEAPON_BIGBOOM)
+                .unwrap_or(false)
+        })
+    }
+
+    /// Active robot carries a repair weapon — gates the `orep` HUD
+    /// button (`FindWeapon(WEAPON_REPAIR)`, CInterface.cpp:1304).
+    pub fn have_repair(&self, objs: &Objects) -> bool {
+        self.weapons.iter().any(|bw| {
+            objs.weapons
+                .get(bw.weapon)
+                .map(|we| we.weapon_type() == WEAPON_REPAIR)
                 .unwrap_or(false)
         })
     }
@@ -1212,7 +1246,16 @@ impl Robot {
             return;
         }
         let sync_mul = (cms as f32) / 10.0;
-        let max_step = max_hull_speed * sync_mul;
+        // Near-reversals (hull-to-target angle >= 160°) turn at 3× the
+        // rate so the hull doesn't lag when the target is behind
+        // (MatrixRobot.cpp:2282-2285).
+        let cos3 = self.hull_forward.x * dest_dir_n.x + self.hull_forward.y * dest_dir_n.y;
+        let speed = if cos3 <= (160.0_f32).to_radians().cos() {
+            max_hull_speed * 3.0
+        } else {
+            max_hull_speed
+        };
+        let max_step = speed * sync_mul;
 
         // `Vec3Truncate(delta, max_step)` — keep delta as-is when its
         // length is below the cap, otherwise scale to `max_step`. Port
@@ -1981,6 +2024,44 @@ impl Robot {
         self.core.geo_center.y = self.pos_y;
         self.core.geo_center.z = self.pos_z + 9.0;
         self.rchange |= MR_MATRIX;
+
+        self.stamp_sole(map, objs);
+    }
+
+    /// Track / wheel tread decals (`soles`, MatrixRobot.cpp:732-772):
+    /// stamp a directional spot every ~10 units of travel on land.
+    /// Pneumatic footprints come from foot-linking, which isn't ported.
+    fn stamp_sole(&mut self, map: &GameMap, objs: &mut Objects) {
+        use crate::matrix_game::common::{trunc_float, CELLFLAG_BRIDGE, CELLFLAG_LAND};
+        use crate::matrix_game::effects::landscape_spot::{SpotKind, SpotSpawn};
+        if self.state == RobotState::InSpawn {
+            return;
+        }
+        let (kind, scale) = match self.chassis {
+            crate::matrix_game::robot::ChassisKind::Track => (SpotKind::SoleTrack, 2.0),
+            crate::matrix_game::robot::ChassisKind::Wheel => (SpotKind::SoleWheel, 3.0),
+            _ => return,
+        };
+        let gc = glam::Vec2::new(self.pos_x, self.pos_y);
+        if (self.last_sole_pos - gc).length_squared() <= 100.0 {
+            return;
+        }
+        self.last_sole_pos = gc;
+        let x = trunc_float(self.pos_x / crate::matrix_game::map::GLOBAL_SCALE) as i32;
+        let y = trunc_float(self.pos_y / crate::matrix_game::map::GLOBAL_SCALE) as i32;
+        let Some(flags) = map.unit_flags(x, y) else {
+            return;
+        };
+        if flags & CELLFLAG_LAND == 0 || flags & CELLFLAG_BRIDGE != 0 {
+            return;
+        }
+        let angle = (-self.forward.x).atan2(self.forward.y);
+        objs.pending_spots.push(SpotSpawn {
+            pos: gc,
+            angle,
+            scale,
+            kind,
+        });
     }
 
     /// Port of `CMatrixRobotAI::LowLevelMove` (MatrixRobot.cpp:2563-2653).
@@ -2008,7 +2089,7 @@ impl Robot {
         end_path: bool,
         back: bool,
     ) {
-        let _rotate = self.seek(cms, map, dest, end_path, back);
+        let rotate = self.seek(cms, map, dest, end_path, back);
         self.cols = 0;
 
         let sync_mul = (cms as f32) / 10.0;
@@ -2045,6 +2126,24 @@ impl Robot {
         self.pos_x += disp.x;
         self.pos_y += disp.y;
         self.rchange |= MR_MATRIX;
+
+        // Pneumatic collision flag (MatrixRobot.cpp:2621-2632): while the
+        // walker is rotating, being pushed by a collision, or arriving,
+        // suppress the foot-linking body-correction; the instant that
+        // clears, re-anchor `link_pos` (FirstLinkPneumatic) so the
+        // correction can't drag the body back into the obstacle. Without
+        // this, dropped robots get pinned inside the base building.
+        if matches!(self.chassis, ChassisKind::Pneumatic) {
+            let gsm = GameMap::GLOBAL_SCALE_MOVE;
+            let near_dest = end_path
+                && ((dest.x - self.pos_x).powi(2) + (dest.y - self.pos_y).powi(2)) < gsm * gsm;
+            if rotate || result_coll != glam::Vec2::ZERO || self.cols_weight2 != 0 || near_dest {
+                self.object_state |= crate::matrix_game::map_static::ROBOT_FLAG_COLLISION;
+            } else if self.is_colliding() {
+                self.object_state &= !crate::matrix_game::map_static::ROBOT_FLAG_COLLISION;
+                self.link_prev_frame = -1; // re-anchor == FirstLinkPneumatic
+            }
+        }
     }
 
     /// Port of `CMatrixRobotAI::Seek(dest, rotate, end_path, back)`
@@ -2394,9 +2493,11 @@ impl Robot {
                 ChassisKind::Hovercraft | ChassisKind::AntiGravity
             ) {
                 z = WATER_LEVEL;
+            } else if z < WATER_LEVEL - 100.0 {
+                // Sank into deep water — drown (MustDie,
+                // MatrixObjectRobot.cpp:286-290).
+                self.must_die = true;
             }
-            // C++ also calls `MustDie()` when `z < WATER_LEVEL - 100`
-            // (drowned). Skipped until damage flow is ported.
         } else {
             self.object_state &= !ROBOT_FLAG_ONWATER;
         }
@@ -2918,6 +3019,10 @@ impl MapStatic for Robot {
         }
         if self.cols_weight2 != 0 {
             self.cols_weight2 = (self.cols_weight2 - cms).max(0);
+        } else {
+            // Collisions stopped — forget accumulated step-aside cells
+            // (MatrixRobot.cpp:377).
+            self.env.clear_bad_coords();
         }
 
         // Keel-water / hovercraft dust (CMatrixRobot::Takt,
@@ -3502,6 +3607,12 @@ impl MapStatic for Robot {
         }
 
         // inst_death (MatrixRobot.cpp:1951-2116).
+        //
+        // Terron easter egg: an in-position robot's death permanently
+        // reveals the hidden portrets (MatrixRobot.cpp:1952-1955).
+        if self.in_position {
+            crate::matrix_game::map::show_portrets();
+        }
         //
         // Self-destruct bomb: enemy robots blow up when going down if
         // the blast favors them (danger > 0); the player's own robots

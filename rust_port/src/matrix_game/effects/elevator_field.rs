@@ -124,7 +124,9 @@ impl ElevatorField {
         let mut any_done = false;
         for tr in self.tracers.iter_mut() {
             tr.prev = Self::helix_point(&self.helices[tr.helix], tr.t.min(1.0));
-            tr.t += (0.01 + rng.float01() as f32 * 0.001) * (step_ms / 10.0);
+            // dt = FRND(0.01)+0.001 → [0.001, 0.011] (MatrixEffectElevatorField.cpp:207),
+            // frame-rate-normalised via step/10.
+            tr.t += (rng.float01() as f32 * 0.01 + 0.001) * (step_ms / 10.0);
             if tr.t > 1.0 {
                 any_done = true;
             }
@@ -140,12 +142,15 @@ impl ElevatorField {
     pub fn draw(&self, q: &mut BillboardQueue) {
         for tr in &self.tracers {
             let p = Self::helix_point(&self.helices[tr.helix], tr.t.min(1.0));
+            // Fixed 0.1-parameter trailing streak (CalcPoint(t-0.1)→CalcPoint(t),
+            // MatrixEffectElevatorField.cpp:163-165), not the previous frame.
+            let tail = Self::helix_point(&self.helices[tr.helix], (tr.t - 0.1).max(0.0));
             let alpha = ((tr.t / 0.2).clamp(0.0, 1.0) * 255.0) as u32;
             let color = (alpha << 24) | 0x00ff_ffff;
             // BBT_EFIELD — the tracer texture lives in the shared
             // billboard atlas (MatrixEffect.cpp:63).
             q.line(
-                tr.prev,
+                tail,
                 p,
                 BB_SIZE,
                 color,

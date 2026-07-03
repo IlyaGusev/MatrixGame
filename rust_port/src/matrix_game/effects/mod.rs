@@ -39,6 +39,7 @@ pub enum GameEffect {
     Smoke(smoke_and_fire::Smoke),
     Fire(smoke_and_fire::Fire),
     BillboardLine(billboard_fx::BillboardLineFx),
+    Score(billboard_fx::ScoreFx),
     Lightening(lightening::Lightening),
     Explosion(explosion::Explosion),
     FireAnim(explosion::FireAnim),
@@ -57,6 +58,7 @@ impl GameEffect {
             GameEffect::Smoke(e) => e.takt(step, rng),
             GameEffect::Fire(e) => e.takt(step, rng),
             GameEffect::BillboardLine(e) => e.takt(step),
+            GameEffect::Score(e) => e.takt(step),
             GameEffect::Lightening(e) => e.takt(step, rng),
             GameEffect::Explosion(e) => e.takt(step, map, rng),
             GameEffect::FireAnim(e) => e.takt(step),
@@ -92,6 +94,7 @@ impl GameEffect {
             GameEffect::Smoke(e) => e.draw(q),
             GameEffect::Fire(e) => e.draw(q),
             GameEffect::BillboardLine(e) => e.draw(q),
+            GameEffect::Score(e) => e.draw(q),
             GameEffect::Lightening(e) => e.draw(q),
             GameEffect::Explosion(e) => e.draw(q, meshes),
             GameEffect::FireAnim(e) => e.draw(q),
@@ -119,6 +122,24 @@ pub fn effects_takt(
         let e = explosion::Explosion::new(sp.pos, sp.props, map, rng, &objs.debris_types);
         let (voronka, scale) = e.voronka();
         objs.pending_effects.push(GameEffect::Explosion(e));
+        // Attached point-light flash (MatrixEffectExplosion.cpp:340,640-641).
+        if sp.props.light {
+            let z = map.get_z(sp.pos.x, sp.pos.y) + 10.0;
+            // C++ advances m_Time at DEBRIS_SPEED (1/100) per ms, so a
+            // light_time of T seconds spans T/DEBRIS_SPEED = T*100 ms
+            // (MatrixEffectExplosion.cpp:628,636,644).
+            const INV_DEBRIS_SPEED: f32 = 100.0;
+            objs.pending_point_lights
+                .push(crate::matrix_game::map_static::PendingLight {
+                    pos: [sp.pos.x, sp.pos.y, z],
+                    r1: sp.props.light_radius1,
+                    r2: sp.props.light_radius2,
+                    c1: sp.props.light_color1,
+                    c2: sp.props.light_color2,
+                    ttl: sp.props.light_time2 * INV_DEBRIS_SPEED,
+                    t1: sp.props.light_time1 * INV_DEBRIS_SPEED,
+                });
+        }
         if sp.fire {
             let z = map.get_z(sp.pos.x, sp.pos.y);
             objs.pending_effects
@@ -131,7 +152,10 @@ pub fn effects_takt(
             objs.pending_effects
                 .push(GameEffect::Smoke(explosion::explosion_fire_smoke(sp.pos)));
         }
-        if voronka != explosion::SpotType::None {
+        // Craters are suppressed on base pads (MatrixEffect.cpp:491-499).
+        if voronka != explosion::SpotType::None
+            && !crate::matrix_game::logic::is_on_base(objs, sp.pos.x, sp.pos.y)
+        {
             objs.pending_spots.push(landscape_spot::SpotSpawn {
                 pos: glam::Vec2::new(sp.pos.x, sp.pos.y),
                 angle: (rng.float01() as f32 * 2.0 - 1.0) * std::f32::consts::PI,

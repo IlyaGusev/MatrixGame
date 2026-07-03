@@ -134,11 +134,18 @@ impl MovingObject {
             let p = (newpos - self.cur_pos) * t + self.cur_pos;
             t += dt;
             if self.time < 200.0 {
+                // Bomb early-trail puff is 300; missile is 400
+                // (MatrixEffectMovingObject.cpp:423 vs :298).
+                let spawn = if matches!(self.kind, MoKind::Bomb { .. }) {
+                    300.0
+                } else {
+                    400.0
+                };
                 objs.pending_effects.push(GameEffect::Smoke(Smoke::new(
                     p,
                     300.0,
                     300.0,
-                    400.0,
+                    spawn,
                     0xFFFF_FFFF,
                     true,
                     0.04,

@@ -1009,6 +1009,8 @@ impl MapStatic for Cannon {
                         we.fire_end();
                     }
                 }
+                // Stop the shaft fire loop (MatrixObjectCannon.cpp:1454).
+                self.end_fire_animation();
             } else {
                 self.last_delay_damage_side = 0;
             }
@@ -1046,6 +1048,20 @@ impl MapStatic for Cannon {
                 props: &crate::matrix_game::effects::explosion::EXPLOSION_ROBOT_BOOM,
                 fire: true,
             });
+        // ReleaseMe (MatrixObjectCannon.cpp:1543-1573): free the parent's
+        // turret slot and decrement its live-turret count so the slot can
+        // be rebuilt and base-capture protection is recomputed correctly.
+        if let Some(parent) = self.parent {
+            if let Some(b) = crate::matrix_game::logic::building_mut(objs, parent) {
+                if let Some(place) = b.turret_places.get_mut(self.slot as usize) {
+                    place.cannon_type = -1;
+                }
+                if b.turrets_have > 0 {
+                    b.turrets_have -= 1;
+                }
+            }
+            self.parent = None;
+        }
         self.state = CannonState::Dip;
         self.init_dip_scatter();
         for w in self.weapons.drain(..) {
@@ -2565,6 +2581,7 @@ mod tests {
                 .collect(),
             matrices: Vec::new(),
             all_matrices: Vec::new(),
+            lights: Vec::new(),
         }
     }
 

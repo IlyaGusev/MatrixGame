@@ -25,6 +25,8 @@ struct FlamePuff {
     dir: Vec3,
     speed: Vec3,
     next_seek_time: f32,
+    /// Smoke-trail clock (`m_NextSmokeTime`, MatrixEffectFlame.cpp:145-156).
+    next_smoke_time: f32,
     scale: f32,
     /// Visuals: 10 trailing FLAME billboards + per-bill spin signs
     /// (MatrixEffectFlame.cpp:42-52, 228-262).
@@ -81,6 +83,7 @@ impl Flame {
                     dir: p.dir,
                     speed: p.speed,
                     next_seek_time: 0.0,
+                    next_smoke_time: 0.0,
                     scale: 0.0,
                     bills: [p.pos; FLAME_NUM_BILLS],
                     signs,
@@ -102,7 +105,9 @@ impl Flame {
                 p.time <= ttl
             };
             if !alive {
-                self.puffs.swap_remove(i);
+                // remove (not swap_remove) to keep spawn order — the
+                // FLAMELINE chain links each puff to its predecessor.
+                self.puffs.remove(i);
                 continue;
             }
             self.puff_takt(i, step, map, objs);
@@ -121,7 +126,14 @@ impl Flame {
             if let Some(w) = objs.weapons.get_mut(self.weapon) {
                 w.flame_alive = false;
             }
+            objs.pending_light_kill.push(self.weapon);
             return false;
+        }
+        // Flame glow following the leading puff (CreatePointLight,
+        // MatrixEffectFlame.cpp:31 — radius 20, white).
+        if let Some(p) = self.puffs.last() {
+            objs.pending_light_follow
+                .push((self.weapon, [p.pos.x, p.pos.y, p.pos.z], 20.0, 0x00FF_FFFF));
         }
         true
     }
@@ -133,6 +145,18 @@ impl Flame {
             let k = p.time * ttl_inv;
             let scale = k * FLAME_SCALE_FACTOR + 1.5;
             let mk = 1.0 - k;
+
+            // Smoke trail after 30% of puff life, one puff per 100ms
+            // (MatrixEffectFlame.cpp:143-156).
+            let mut smoke_count = 0u32;
+            if k > 0.3 {
+                while p.time > p.next_smoke_time {
+                    p.next_smoke_time += 100.0;
+                    smoke_count += 1;
+                }
+            } else {
+                p.next_smoke_time = p.time;
+            }
 
             let oldpos = p.pos;
             p.pos += p.speed * step + step * p.dir * mk * mk * FLAME_DIR_SPEED;
@@ -165,9 +189,20 @@ impl Flame {
             // Water push-back happens with the object push-back below;
             // stash z-norm in the seek pass through `norm_seed`.
             let _ = hit_env;
-            (p.pos, p.scale, (do_seek, norm_z))
+            (p.pos, p.scale, (do_seek, norm_z, smoke_count))
         };
-        let (do_seek, norm_seed_z) = do_seek;
+        let (do_seek, norm_seed_z, smoke_count) = do_seek;
+
+        // Emit the queued smoke puffs at the current position.
+        for _ in 0..smoke_count {
+            objs.pending_effects.push(
+                crate::matrix_game::effects::GameEffect::Smoke(
+                    crate::matrix_game::effects::smoke_and_fire::Smoke::new(
+                        pos, 300.0, 700.0, 400.0, 0x2F30_3030, false, 0.0,
+                    ),
+                ),
+            );
+        }
 
         // Water hit notification (MatrixEffectFlame.cpp:181-188).
         if norm_seed_z > 0.0 {
@@ -253,7 +288,22 @@ impl Flame {
     /// Draw — 10 FLAME billboards per puff with the blue-tinged tail
     /// gradient (MatrixEffectFlame.cpp:228-262).
     pub fn draw(&self, q: &mut crate::matrix_lib::three_g::billboard::BillboardQueue) {
-        use crate::matrix_lib::three_g::billboard::{TexRef, BBT_FLAME};
+        use crate::matrix_lib::three_g::billboard::{TexRef, BBT_FLAME, BBT_FLAMELINE};
+        // FLAMELINE connecting each puff to its predecessor, forming a
+        // continuous stream (MatrixEffectFlame.cpp:272-283). Alpha dims
+        // when the gap is under scale*2.
+        for w in self.puffs.windows(2) {
+            let (prev, cur) = (&w[0], &w[1]);
+            let width = cur.scale * 2.0;
+            let l = (prev.pos - cur.pos).length();
+            let a = if l < width && width > 1e-6 {
+                cur.cur_alpha * (l * 0.5 / cur.scale)
+            } else {
+                cur.cur_alpha
+            };
+            let color = ((a as u32) << 24) | 0x00FF_FFFF;
+            q.line(prev.pos, cur.pos, width, color, TexRef::Bbt(BBT_FLAMELINE));
+        }
         for p in &self.puffs {
             let angle_base = std::f32::consts::TAU / 1024.0 * ((p.time as i32 & 1023) as f32);
             for i in 0..FLAME_NUM_BILLS {

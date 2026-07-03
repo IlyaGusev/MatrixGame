@@ -998,7 +998,7 @@ impl MapStatic for MapObject {
     fn logic_takt(
         &mut self,
         ms: i32,
-        _rng: &mut Rnd,
+        rng: &mut Rnd,
         objs: &mut crate::matrix_game::map_static::Objects,
     ) {
         use crate::matrix_game::common::TRACE_ROBOT;
@@ -1013,7 +1013,7 @@ impl MapStatic for MapObject {
         if self.beh_flag == BehFlag::Terron
             && self.object_state & crate::matrix_game::map_static::OBJECT_STATE_TERRON_EXPL != 0
         {
-            self.terron_expl_takt(ms, _rng, objs);
+            self.terron_expl_takt(ms, rng, objs);
             return;
         }
 
@@ -1164,11 +1164,58 @@ impl MapStatic for MapObject {
             // additions.)
         }
 
+        // BEHF_SPAWNER (MatrixObject.cpp:1346-1483): when a player robot
+        // enters `m_SensRadius`, spawn a catalogue robot and order it to
+        // attack. The C++ stages the four `m_PrevStateRobotsInRadius`
+        // steps on spawn/return animations; map objects don't animate in
+        // the port, so we compress to detect → (cooldown) → spawn, driven
+        // by a timer on `ablaze_ttl`. The actual robot build + PGOrderAttack
+        // run in `MapLogic` (drained from `pending_spawner_bots`).
+        if self.beh_flag == BehFlag::Spawner {
+            use crate::matrix_game::map_static::{Control, SpawnerBotRequest};
+            use crate::matrix_lib::base::wstr;
+            let f1 = wstr::str_par(&self.behaviour, 1, ",");
+            let timing = wstr::int_par(f1, 1, ":").max(100);
+            let rmin = wstr::int_par(f1, 2, ":");
+            let rmax = wstr::int_par(f1, 3, ":");
+            const SPAWN_COOLDOWN_MS: i32 = 3000;
+            self.ablaze_ttl -= ms;
+            if self.prev_state_robots_in_radius <= 0 {
+                if self.ablaze_ttl <= 0 {
+                    self.ablaze_ttl = timing;
+                    let w = self.core.matrix.w_axis;
+                    let pos2 = glam::Vec2::new(w.x, w.y);
+                    let mut ids = Vec::new();
+                    objs.find_objects(pos2, self.sens_radius, 1.0, TRACE_ROBOT, None, |_, id| {
+                        ids.push(id);
+                        Control::Continue
+                    });
+                    let found = ids.iter().any(|&id| {
+                        objs.get(id).map(|o| o.side() == PLAYER_SIDE).unwrap_or(false)
+                    });
+                    if found {
+                        let number = rng.range(rmin, rmax);
+                        let pick = rng.next() as usize;
+                        objs.pending_spawner_bots.push(SpawnerBotRequest {
+                            pos: glam::Vec3::new(w.x, w.y, w.z),
+                            number,
+                            pick,
+                            sens_radius: self.sens_radius,
+                        });
+                        self.prev_state_robots_in_radius = 1;
+                        self.ablaze_ttl = SPAWN_COOLDOWN_MS;
+                    }
+                }
+            } else if self.ablaze_ttl <= 0 {
+                self.prev_state_robots_in_radius = 0;
+                self.ablaze_ttl = timing;
+            }
+        }
+
         // BEHF_STATIC: empty — subclass isn't on the logic-temp list.
         //
-        // BEHF_BREAK / BEHF_ANIM / BEHF_TERRON / BEHF_SPAWNER: bodies
-        // need progress bars / effects / sound / robot spawning.
-        // Each branch lands with its owning subsystem.
+        // BEHF_BREAK / BEHF_ANIM: bodies need progress bars / effects /
+        // sound and land with their owning subsystem.
     }
 }
 
@@ -1962,6 +2009,10 @@ impl ObjectsRenderer {
         map: &GameMap,
         point_lights: &PointLightSystem,
     ) {
+        // BEHF_PORTRET objects are hidden unless the terron easter egg has
+        // revealed them (MatrixObject.cpp:889-892).
+        let portrets_vis = crate::matrix_game::map::portrets_visible();
+        let mut portret_pos: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
         let mut live: HashMap<(i32, i32), i32> = HashMap::new();
         for id in objs.iter_live() {
             let Some(obj) = objs.get(id) else { continue };
@@ -1973,7 +2024,11 @@ impl ObjectsRenderer {
                 continue; // ruins render via the buildings renderer
             }
             let w = obj.core().matrix.w_axis;
-            live.insert(pos_key(w.x, w.y), mo.type_id);
+            let key = pos_key(w.x, w.y);
+            if mo.beh_flag == BehFlag::Portret {
+                portret_pos.insert(key);
+            }
+            live.insert(key, mo.type_id);
         }
         if live.is_empty() {
             return;
@@ -1981,10 +2036,12 @@ impl ObjectsRenderer {
         for batch in &mut self.batches {
             let mut dirty = false;
             for (i, obj) in batch.objects.iter().enumerate() {
-                let Some(&t) = live.get(&pos_key(obj.x, obj.y)) else {
+                let key = pos_key(obj.x, obj.y);
+                let Some(&t) = live.get(&key) else {
                     continue;
                 };
-                let want_hidden = t != batch.type_id as i32;
+                let want_hidden =
+                    t != batch.type_id as i32 || (!portrets_vis && portret_pos.contains(&key));
                 if batch.hidden[i] != want_hidden {
                     batch.hidden[i] = want_hidden;
                     dirty = true;

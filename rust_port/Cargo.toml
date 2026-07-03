@@ -38,5 +38,6 @@ console_log                 = "1"
 console_error_panic_hook    = "0.1"
 
 [profile.release]
-opt-level = "z"
+opt-level = 3
 lto       = true
+codegen-units = 1

@@ -120,6 +120,10 @@ pub struct MapLogic {
     /// win-target objects destroyed; exempts the player from the
     /// JUST_DEAD scan (MatrixLogic.cpp:2866).
     pub special_broken: bool,
+    /// `MMFLAG_SHOWPORTRETS` / `MMFLAG_ROBOT_IN_POSITION` — terron easter
+    /// egg (MatrixLogic.cpp:2775-2803, MatrixObject.cpp:889-892).
+    pub show_portrets: bool,
+    pub robot_in_position: bool,
     /// `m_MaintenanceTime` (MatrixMap.hpp:434) — countdown until the
     /// next supply drop may be called.
     pub maintenance_time: i32,
@@ -164,6 +168,8 @@ impl MapLogic {
             moveto_clear_pending: false,
             win_flag: false,
             special_broken: false,
+            show_portrets: false,
+            robot_in_position: false,
             maintenance_time: 0,
             maintenance_prc: 100,
         }
@@ -214,6 +220,22 @@ impl MapLogic {
         for sid in ids {
             if self.side_by_id(sid).is_none() {
                 self.other_sides.push(Side::new(sid));
+            }
+        }
+    }
+
+    /// Seed each side's starting resources + base income multiplier from
+    /// the map `SideResInfo` property (MatrixMapPrepare.cpp:464-493).
+    /// Call once after sides exist; overrides the pre-map defaults.
+    pub fn apply_side_resources(&mut self, map: &GameMap) {
+        for &(id, res, fu) in &map.side_res_info {
+            if let Some(su) = self.side_by_id_mut(id) {
+                for (k, &amt) in res.iter().enumerate() {
+                    // Plain assignment — C++ SetResourceAmount does not
+                    // clamp (MatrixSide.hpp:440); only AddResourceAmount does.
+                    su.resources[k] = amt;
+                }
+                su.set_resource_force_up(fu);
             }
         }
     }
@@ -294,6 +316,8 @@ impl MapLogic {
                 &mut self.objects,
                 &mut self.rng,
             );
+            // BEHF_SPAWNER robots queued by object logic_takt this frame.
+            self.drain_spawner_bots(map);
         }
         // Port of the per-building `m_ResourcePeriod` tick at
         // MatrixObjectBuilding.cpp:605-667. The C++ advances the
@@ -443,6 +467,83 @@ impl MapLogic {
                 self.win_flag = true;
             }
         }
+
+        self.terron_egg_check();
+    }
+
+    /// The "terron" map easter egg (MatrixLogic.cpp:2775-2803): if exactly
+    /// one full-HP bomb-carrying player robot stands on the trigger cell
+    /// (and it's the only robot within 160), reveal the hidden portrets.
+    fn terron_egg_check(&mut self) {
+        use crate::matrix_game::common::{PLAYER_SIDE, TRACE_ROBOT};
+        use crate::matrix_game::map_static::Control;
+
+        if crate::matrix_game::map::map_name_is_terron() {
+            let center = glam::Vec2::new(3833.8, 2298.1);
+            // Egg1: score robots within radius 50; mark the one that keeps
+            // the running count at exactly 1.
+            let mut ids50 = Vec::new();
+            self.objects
+                .find_objects(center, 50.0, 1.0, TRACE_ROBOT, None, |_, id| {
+                    ids50.push(id);
+                    Control::Continue
+                });
+            let mut egg1 = 0i32;
+            let mut mark: Option<ObjectId> = None;
+            for id in ids50 {
+                let Some(r) = robot_ref(&self.objects, id) else {
+                    continue;
+                };
+                if !r.is_live() {
+                    continue;
+                }
+                egg1 += 1;
+                if r.side() != PLAYER_SIDE {
+                    egg1 += 100;
+                }
+                let bad = !r.have_bomb(&self.objects) || (r.hit_point_max - r.hit_point).abs() > 1.0;
+                if bad && !r.in_position {
+                    egg1 += 100;
+                }
+                if egg1 == 1 {
+                    mark = Some(id);
+                }
+            }
+            if let Some(mid) = mark {
+                if let Some(r) = robot_mut(&mut self.objects, mid) {
+                    r.in_position = true;
+                }
+            }
+            let mut in_pos = false;
+            if egg1 == 1 {
+                let mut egg2 = 0i32;
+                let mut ids160 = Vec::new();
+                self.objects
+                    .find_objects(center, 160.0, 1.0, TRACE_ROBOT, None, |_, id| {
+                        ids160.push(id);
+                        Control::Continue
+                    });
+                for id in ids160 {
+                    if robot_ref(&self.objects, id).map(|r| r.is_live()).unwrap_or(false) {
+                        egg2 += 1;
+                    }
+                }
+                in_pos = egg2 == 1;
+            }
+            self.robot_in_position = in_pos;
+            if !in_pos {
+                // "oblom" — nobody in position: clear every robot's flag.
+                let all: Vec<_> = self.objects.iter_live().collect();
+                for id in all {
+                    if let Some(r) = robot_mut(&mut self.objects, id) {
+                        r.in_position = false;
+                    }
+                }
+            }
+        } else {
+            self.robot_in_position = false;
+        }
+        crate::matrix_game::map::set_portrets_in_position(self.robot_in_position);
     }
 
     /// Port of `CMatrixMapLogic::GatherInfo` (MatrixLogic.cpp:115-134)
@@ -733,6 +834,9 @@ impl MapLogic {
         config::set_give_bot_config(
             config::GiveBotConfig::from_matrix_data(matrix_data).unwrap_or_default(),
         );
+        config::set_robot_spawn_config(
+            config::RobotSpawnConfig::from_matrix_data(matrix_data).unwrap_or_default(),
+        );
         let turrets_labels =
             config::TurretLabels::from_matrix_data(matrix_data).unwrap_or_default();
         config::set_global_strings(StringTables {
@@ -800,6 +904,155 @@ impl MapLogic {
 
     /// Populate the arena with one [`Building`] per starting base /
     /// turret. Ports `CMatrixMap::LoadBuildings` + `Building::OnLoad`.
+    /// Spawn pre-placed decorative base ruins (`side == 255` records) as
+    /// ruin-mesh `MapObject`s (MatrixMapPrepare.cpp:648-668). Mirrors the
+    /// runtime building→ruin swap in `Building::logic_takt`.
+    pub fn spawn_ruins(&mut self, map: &GameMap) {
+        use crate::matrix_game::object::MapObject;
+        for r in &map.ruins {
+            let pos = glam::Vec2::new(r.x, r.y);
+            let namet = format!("Matrix/Building/ruins/b{}", r.kind);
+            self.objects.spawn(Box::new(MapObject::init_as_base_ruins(
+                pos,
+                r.build_z,
+                r.angle,
+                &format!("{namet}.vo"),
+            )));
+            if r.kind != 0 {
+                self.objects.spawn(Box::new(MapObject::init_as_base_ruins(
+                    pos,
+                    r.build_z,
+                    r.angle,
+                    &format!("{namet}p.vo"),
+                )));
+            }
+        }
+    }
+
+    /// Drain BEHF_SPAWNER requests: build each robot from the `RobotSpawn`
+    /// catalogue, spawn it, and order it to attack the nearest player robot
+    /// (MatrixObject.cpp:1383-1465). Runs at MapLogic level because the
+    /// object layer can't reach the side/order code.
+    pub fn drain_spawner_bots(&mut self, map: &GameMap) {
+        use crate::matrix_game::interface::constructor::{ArmorUnit, RobotConfig, Unit};
+        use crate::matrix_game::map::default_weapon_matrix;
+        use crate::matrix_game::object_building::chassis_from_kind;
+        use crate::matrix_game::object_robot::{RobotUnitType, MAX_WEAPON_CNT};
+        use crate::matrix_game::robot::Robot;
+        use crate::matrix_game::config::RobotUnitKind;
+        use crate::matrix_game::common::float2int;
+
+        let reqs: Vec<_> = self.objects.pending_spawner_bots.drain(..).collect();
+        if reqs.is_empty() {
+            return;
+        }
+        let cat = crate::matrix_game::config::robot_spawn_config();
+        for req in reqs {
+            let Some(bot) = cat.choose(req.number, req.pick) else {
+                continue;
+            };
+            let Some(chassis) = chassis_from_kind(RobotUnitKind(bot.chassis)) else {
+                continue;
+            };
+            let mut cfg = RobotConfig::new();
+            cfg.chassis = Unit {
+                ty: RobotUnitType::Chassis,
+                kind: RobotUnitKind(bot.chassis),
+                price: Default::default(),
+            };
+            cfg.hull = ArmorUnit {
+                max_common_weapon_cnt: 0,
+                max_extra_weapon_cnt: 0,
+                unit: Unit {
+                    ty: RobotUnitType::Armor,
+                    kind: RobotUnitKind(bot.armor),
+                    price: Default::default(),
+                },
+            };
+            cfg.head = Unit {
+                ty: RobotUnitType::Head,
+                kind: RobotUnitKind(bot.head),
+                price: Default::default(),
+            };
+            let matrix = default_weapon_matrix(RobotUnitKind(bot.armor));
+            let mut placed = [Unit {
+                ty: RobotUnitType::Weapon,
+                kind: RobotUnitKind(0),
+                price: Default::default(),
+            }; MAX_WEAPON_CNT];
+            for &w in &bot.weapons {
+                if w == 0 {
+                    continue;
+                }
+                if let Some(pos) = matrix.find_pylon_for(RobotUnitKind(w), &placed) {
+                    placed[pos] = Unit {
+                        ty: RobotUnitType::Weapon,
+                        kind: RobotUnitKind(w),
+                        price: Default::default(),
+                    };
+                }
+            }
+            cfg.weapon = placed;
+
+            let spawn_pos = glam::Vec3::new(req.pos.x, req.pos.y, map.get_z(req.pos.x, req.pos.y));
+            let mut robot = Robot::new(spawn_pos, bot.side, chassis);
+            robot.config = cfg;
+            robot.pos_z = spawn_pos.z;
+            if bot.hitpoint > 0.0 {
+                robot.hit_point_max = bot.hitpoint;
+                robot.hit_point = bot.hitpoint;
+            }
+            let rid = self.objects.spawn(Box::new(robot));
+            if let Some(r) = robot_mut(&mut self.objects, rid) {
+                r.self_id = Some(rid);
+            }
+            self.objects.add_lt(rid);
+
+            // Attack the nearest live player robot (FindOnlyPlayerRobotsTgt),
+            // else advance on the spawn point.
+            let mut target: Option<ObjectId> = None;
+            let mut best = f32::MAX;
+            for id in self.objects.iter_live() {
+                if id == rid {
+                    continue;
+                }
+                let Some(o) = self.objects.get(id) else { continue };
+                if o.side() != PLAYER_SIDE
+                    || !matches!(o.core().obj_type, ObjectType::RobotAi)
+                    || !o.is_live()
+                {
+                    continue;
+                }
+                let d = (o.core().geo_center.truncate() - req.pos.truncate()).length_squared();
+                // FindObjects bounds the search to the spawner's sensor
+                // radius (MatrixObject.cpp:1442); no target → advance on
+                // the spawn point.
+                if d <= req.sens_radius * req.sens_radius && d < best {
+                    best = d;
+                    target = Some(id);
+                }
+            }
+            let tp_world = target
+                .and_then(|id| self.objects.get(id).map(|o| o.core().geo_center.truncate()))
+                .unwrap_or_else(|| req.pos.truncate());
+            // C++ dispatches the order on the spawned robot's OWN side
+            // (`GetSideById(r->GetSide())->PGOrderAttack(...)`,
+            // MatrixObject.cpp:1452-1455). Only the player side's logic
+            // groups are modelled here, so route player-side bots through
+            // it and leave enemy-side bots to the (unported) enemy AI —
+            // routing them through player_side would clobber real player
+            // command groups.
+            if bot.side == self.player_side.id {
+                let gsm = GameMap::GLOBAL_SCALE_MOVE;
+                let tp = (float2int(tp_world.x / gsm), float2int(tp_world.y / gsm));
+                self.sound_order_attack_disable = true;
+                let no = self.robot_to_logic_group(rid);
+                self.pg_order_attack(map, no, tp, target);
+                self.sound_order_attack_disable = false;
+            }
+        }
+    }
+
     pub fn spawn_buildings(&mut self, map: &GameMap) -> Vec<ObjectId> {
         let mut ids = Vec::with_capacity(map.buildings.len());
         for inst in &map.buildings {
@@ -1446,66 +1699,99 @@ impl MapLogic {
             })
             .collect();
 
-        let player_id = self.player_side.id;
-        let fu = self.player_side.get_resource_force_up();
         for id in ids {
-            let Some(obj) = self.objects.get_mut(id) else {
-                continue;
-            };
-            // SAFETY: filtered to ObjectType::Building above.
-            let b: &mut Building = unsafe { &mut *(obj as *mut dyn MapStatic as *mut Building) };
-            if matches!(
-                b.state,
-                crate::matrix_game::object_building::BaseState::Dip
-                    | crate::matrix_game::object_building::BaseState::DipExploded
-            ) {
-                continue;
-            }
-            if b.side == 0 {
-                continue; // neutral / unclaimed — C++ guards on `m_Side`.
-            }
-            b.resource_period += cms;
-
-            // Per-kind threshold lookup.
-            let (threshold, payout): (i32, Payout) = match b.kind {
-                BuildingType::Titan => (
-                    timings.resource_titan,
-                    Payout::Single(Resource::Titan, RESOURCES_INCOME),
-                ),
-                BuildingType::Electronic => (
-                    timings.resource_electronics,
-                    Payout::Single(Resource::Electronics, RESOURCES_INCOME),
-                ),
-                BuildingType::Energy => (
-                    timings.resource_energy,
-                    Payout::Single(Resource::Energy, RESOURCES_INCOME),
-                ),
-                BuildingType::Plasma => (
-                    timings.resource_plasma,
-                    Payout::Single(Resource::Plasma, RESOURCES_INCOME),
-                ),
-                BuildingType::Base => {
-                    let ra = RESOURCES_INCOME_BASE * fu / 100;
-                    (timings.resource_base, Payout::All(ra))
+            // Per-kind threshold + payout kind; side captured for the
+            // credit below. Every owned building generates income for its
+            // side (MatrixObjectBuilding.cpp:597-668), not just the player.
+            let (bside, bkind, threshold): (i32, BuildingType, i32);
+            let bpos;
+            {
+                let Some(obj) = self.objects.get_mut(id) else {
+                    continue;
+                };
+                // SAFETY: filtered to ObjectType::Building above.
+                let b: &mut Building =
+                    unsafe { &mut *(obj as *mut dyn MapStatic as *mut Building) };
+                bpos = glam::Vec3::new(b.pos.x, b.pos.y, b.build_z);
+                if matches!(
+                    b.state,
+                    crate::matrix_game::object_building::BaseState::Dip
+                        | crate::matrix_game::object_building::BaseState::DipExploded
+                ) {
+                    continue;
                 }
-                BuildingType::Repair => continue,
+                if b.side == 0 {
+                    continue; // neutral / unclaimed — C++ guards on `m_Side`.
+                }
+                b.resource_period += cms;
+                let th = match b.kind {
+                    BuildingType::Titan => timings.resource_titan,
+                    BuildingType::Electronic => timings.resource_electronics,
+                    BuildingType::Energy => timings.resource_energy,
+                    BuildingType::Plasma => timings.resource_plasma,
+                    BuildingType::Base => timings.resource_base,
+                    BuildingType::Repair => continue,
+                };
+                if th <= 0 || b.resource_period < th {
+                    continue;
+                }
+                b.resource_period = 0;
+                bside = b.side;
+                bkind = b.kind;
+                threshold = th;
+            }
+            let _ = threshold;
+            let is_player = bside == PLAYER_SIDE;
+            let Some(su) = self.side_by_id_mut(bside) else {
+                continue;
             };
-            if threshold <= 0 || b.resource_period < threshold {
-                continue;
-            }
-            b.resource_period = 0;
-            if b.side != player_id {
-                // Non-player sides have no Side struct yet; timer still
-                // resets so future per-side accrual starts in phase.
-                continue;
-            }
-            match payout {
-                Payout::Single(res, amt) => self.player_side.add_resource_amount(res, amt),
-                Payout::All(amt) => {
-                    for r in Resource::ALL {
-                        self.player_side.add_resource_amount(r, amt);
+            // Floating "+N" income label for the player's buildings
+            // (MatrixObjectBuilding.cpp:355-389). Icon char + amount digits:
+            // t/p/e/b factories = "10"; base = "a<amount>".
+            let mut score: Option<String> = None;
+            match bkind {
+                BuildingType::Titan => {
+                    su.add_resource_amount(Resource::Titan, RESOURCES_INCOME);
+                    if is_player {
+                        score = Some("t10".into());
                     }
                 }
+                BuildingType::Electronic => {
+                    su.add_resource_amount(Resource::Electronics, RESOURCES_INCOME);
+                    if is_player {
+                        score = Some("e10".into());
+                    }
+                }
+                BuildingType::Energy => {
+                    su.add_resource_amount(Resource::Energy, RESOURCES_INCOME);
+                    if is_player {
+                        score = Some("b10".into());
+                    }
+                }
+                BuildingType::Plasma => {
+                    su.add_resource_amount(Resource::Plasma, RESOURCES_INCOME);
+                    if is_player {
+                        score = Some("p10".into());
+                    }
+                }
+                BuildingType::Base => {
+                    let ra = RESOURCES_INCOME_BASE * su.get_resource_force_up() / 100;
+                    for r in Resource::ALL {
+                        su.add_resource_amount(r, ra);
+                    }
+                    if is_player {
+                        score = Some(format!("a{ra}"));
+                    }
+                }
+                BuildingType::Repair => {}
+            }
+            if let Some(s) = score {
+                let pos = glam::Vec3::new(bpos.x, bpos.y, bpos.z + 40.0);
+                self.objects.pending_effects.push(
+                    crate::matrix_game::effects::GameEffect::Score(
+                        crate::matrix_game::effects::billboard_fx::ScoreFx::new(&s, pos),
+                    ),
+                );
             }
         }
     }
@@ -1540,14 +1826,6 @@ impl MapLogic {
             }
         }
     }
-}
-
-/// Shape of one per-kind income emission. Internal to `accrue_resources`.
-enum Payout {
-    /// Factory — single resource type.
-    Single(Resource, i32),
-    /// Base — same amount to all four resources.
-    All(i32),
 }
 
 /// Intersect the view ray at `(sx, sy)` with the terrain heightmap.
@@ -1651,6 +1929,10 @@ pub fn place_is_empty(
             continue;
         }
         let r: &Robot = unsafe { &*(obj as *const dyn MapStatic as *const Robot) };
+        // DIP corpses don't block placement (PlaceIsEmpty, MatrixLogic.cpp:886).
+        if !r.is_live() {
+            continue;
+        }
 
         let dx = cx - r.pos_x;
         let dy = cy - r.pos_y;
@@ -3119,6 +3401,34 @@ pub fn flyer_mut(
     Some(unsafe { &mut *(obj as *mut dyn MapStatic as *mut crate::matrix_game::flyer::Flyer) })
 }
 
+/// True when `(x, y)` lies on a BASE building's 3×3 terrain-cell
+/// footprint — the cells a base marks as `m_Base`
+/// (MatrixObjectBuilding.cpp:1065-1077). Used to suppress explosion
+/// craters on base pads (`!g->IsBaseOn()`, MatrixEffect.cpp:491-499).
+pub fn is_on_base(objs: &Objects, x: f32, y: f32) -> bool {
+    use crate::matrix_game::common::float2int;
+    use crate::matrix_game::object_building::{Building, BuildingType};
+    let gs = crate::matrix_game::map::GLOBAL_SCALE;
+    let cx = float2int(x / gs);
+    let cy = float2int(y / gs);
+    for id in objs.iter_live() {
+        let Some(obj) = objs.get(id) else { continue };
+        if !matches!(obj.core().obj_type, ObjectType::Building) {
+            continue;
+        }
+        let b: &Building = unsafe { &*(obj as *const dyn MapStatic as *const Building) };
+        if b.kind != BuildingType::Base {
+            continue;
+        }
+        let px = float2int((b.pos.x - gs / 2.0) / gs) - 1;
+        let py = float2int((b.pos.y - gs / 2.0) / gs) - 1;
+        if cx >= px && cx <= px + 2 && cy >= py && cy <= py + 2 {
+            return true;
+        }
+    }
+    false
+}
+
 pub fn building_ref(
     objs: &Objects,
     id: ObjectId,
@@ -3325,7 +3635,7 @@ pub fn find_near_place(map: &GameMap, mm: u8, mappos: (i32, i32)) -> i32 {
     find_near_place_impl(&rn, map, mm, mappos)
 }
 
-fn find_near_place_impl(
+pub(crate) fn find_near_place_impl(
     rn: &crate::matrix_game::road_network::RoadNetwork,
     map: &GameMap,
     mm: u8,

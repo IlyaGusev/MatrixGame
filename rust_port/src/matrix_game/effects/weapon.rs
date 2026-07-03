@@ -645,6 +645,9 @@ impl WeaponEffect {
                     )));
             }
             WEAPON_VOLCANO => {
+                // CVolcano muzzle visual stays live while firing
+                // (MatrixEffectWeapon.cpp:315-327); draw() renders it.
+                self.volcano_on = true;
                 // Hit-scan (MatrixEffectWeapon.cpp:311-366).
                 let (s, hitpos) = trace(
                     map,
@@ -671,6 +674,58 @@ impl WeaponEffect {
                     if dead {
                         s = TraceStop::None;
                     }
+                } else if s == TraceStop::Water {
+                    // Water splash konus (MatrixEffectWeapon.cpp:348).
+                    objs.pending_effects.push(GameEffect::Konus(
+                        crate::matrix_game::effects::konus::Konus::new_splash(
+                            hitpos,
+                            Vec3::Z,
+                            10.0,
+                            5.0,
+                            fsrnd(rng, std::f32::consts::PI),
+                            1000.0,
+                            true,
+                            crate::matrix_lib::three_g::billboard::TexRef::Path(
+                                crate::matrix_game::effects::effects_renderer::TEXTURE_PATH_SPLASH,
+                            ),
+                        ),
+                    ));
+                } else {
+                    // Landscape spark konus pair (MatrixEffectWeapon.cpp:355-357).
+                    let n = map.get_normal(hitpos.x, hitpos.y, false);
+                    let splash = Vec3::new(n[0], n[1], n[2]);
+                    for (r, h, tex) in [
+                        (5.0, 10.0, crate::matrix_game::effects::effects_renderer::TEXTURE_PATH_GUN_BULLETS1),
+                        (5.0, 5.0, crate::matrix_game::effects::effects_renderer::TEXTURE_PATH_GUN_BULLETS2),
+                    ] {
+                        objs.pending_effects.push(GameEffect::Konus(
+                            crate::matrix_game::effects::konus::Konus::new(
+                                hitpos,
+                                splash,
+                                r,
+                                h,
+                                fsrnd(rng, std::f32::consts::PI),
+                                300.0,
+                                true,
+                                crate::matrix_lib::three_g::billboard::TexRef::Path(tex),
+                            ),
+                        ));
+                    }
+                }
+                // 10% chance tracer line (MatrixEffectWeapon.cpp:359-361).
+                if frnd(rng, 1.0) < 0.1 {
+                    use crate::matrix_game::effects::billboard_fx::BillboardLineFx;
+                    objs.pending_effects.push(GameEffect::BillboardLine(BillboardLineFx::new(
+                        self.pos,
+                        hitpos,
+                        0.5,
+                        0x80FF_FFFF,
+                        0x0000_0000,
+                        100.0,
+                        crate::matrix_lib::three_g::billboard::TexRef::Bbt(
+                            crate::matrix_lib::three_g::billboard::BBT_TRASSA,
+                        ),
+                    )));
                 }
                 dispatch_fire_end_handler(objs, self.handler, s, hitpos, FEHF_LASTHIT);
             }
@@ -901,12 +956,29 @@ impl WeaponEffect {
                 });
             }
             WEAPON_BIGBOOM => {
-                // skip=None intentionally (MatrixEffectWeapon.cpp:663
+                // Damage ring — skip=None intentionally (MatrixEffectWeapon.cpp:663
                 // passes NULL): the blast hurts its own owner too.
                 objs.weapons.add_ref(self_id);
                 objs.pending_effects.push(GameEffect::BigBoom(BigBoom::new(
                     self.pos, dist, 300.0, TRACE_ALL, None, self_id,
                 )));
+                // Two purely-visual rings at the raw weapon dist
+                // (MatrixEffectWeapon.cpp:664-665): ttl 350 white, ttl 400
+                // tinted 0xFFAFAF40. tracetype 0 → no damage.
+                let mut ring = BigBoom::new(self.pos, self.weapon_dist, 350.0, 0, None, self_id);
+                ring.deals_damage = false;
+                objs.pending_effects.push(GameEffect::BigBoom(ring));
+                let mut ring = BigBoom::new(self.pos, self.weapon_dist, 400.0, 0, None, self_id);
+                ring.deals_damage = false;
+                ring.color_rgb = 0x00AF_AF40;
+                objs.pending_effects.push(GameEffect::BigBoom(ring));
+                // Central detonation flash (MatrixEffectWeapon.cpp:666).
+                objs.pending_explosions
+                    .push(crate::matrix_game::map_static::ExplosionSpawn {
+                        pos: self.pos,
+                        props: &crate::matrix_game::effects::explosion::EXPLOSION_BIG_BOOM,
+                        fire: true,
+                    });
             }
             WEAPON_REPAIR => {
                 self.repair_fire(map, objs, rng);
@@ -1023,6 +1095,17 @@ impl WeaponEffect {
                 1000.0,
                 bb::TexRef::Bbt(tex),
             )));
+        // Muzzle point-light flash (MatrixEffectWeapon.cpp:514).
+        objs.pending_point_lights
+            .push(crate::matrix_game::map_static::PendingLight {
+                pos: [self.pos.x, self.pos.y, self.pos.z],
+                r1: 60.0,
+                r2: 60.0,
+                c1: 0x0030_3030,
+                c2: 0,
+                ttl: 1000.0,
+                t1: 1000.0,
+            });
     }
 
     /// Weapon-owned visuals — CLaser / CVolcano / lightening bolt /

@@ -16,6 +16,12 @@
       transition: opacity 280ms ease;
     }
     #loading.fade { opacity: 0; pointer-events: none; }
+    #fps {
+      position: fixed; top: 6px; right: 8px; z-index: 20;
+      font-family: ui-monospace, Menlo, Consolas, monospace;
+      font-size: 13px; color: #7cff7c; text-shadow: 0 0 3px #000, 0 0 3px #000;
+      pointer-events: none; user-select: none;
+    }
     #loading .spinner {
       width: 42px; height: 42px; margin-bottom: 18px;
       border: 3px solid rgba(200, 212, 224, 0.18);
@@ -29,17 +35,21 @@
 </head>
 <body>
   <canvas id="game-canvas"></canvas>
+  <div id="fps"></div>
   <div id="loading">
     <div class="spinner"></div>
     <div class="label">Loading…</div>
   </div>
 
   <script type="module">
-    import init from "./pkg/matrixgame_rs.js?v=269";
+    import init from "./pkg/matrixgame_rs.js?v=285";
 
 
 
-    const MAX = 2048; // WebGL max texture dimension
+    // Render-resolution cap. GPU cost is ~linear in pixel count, so we
+    // render at most RENDER_MAX px on the long edge and let CSS upscale the
+    // canvas to fill the window. Lower = faster. (WebGL hard limit is 2048.)
+    const RENDER_MAX = 1600;
     const canvas = document.getElementById("game-canvas");
 
     function resize() {
@@ -48,7 +58,7 @@
       // displayed canvas (square content becomes a rectangle).
       const iw = window.innerWidth;
       const ih = window.innerHeight;
-      const s = Math.min(1, MAX / Math.max(iw, ih));
+      const s = Math.min(1, RENDER_MAX / Math.max(iw, ih));
       canvas.width  = Math.max(1, Math.floor(iw * s));
       canvas.height = Math.max(1, Math.floor(ih * s));
     }

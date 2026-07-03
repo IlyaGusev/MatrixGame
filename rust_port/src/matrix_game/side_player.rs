@@ -335,6 +335,251 @@ impl MapLogic {
 
     /// Port of `CMatrixSideUnit::TaktPL` (MatrixSide.cpp:6033-6829).
     /// `onlygroup < 0` services every group.
+    /// Port of `CMatrixSideUnit::EscapeFromBomb` (MatrixSide.cpp:2090-2255).
+    /// Player-side automation: auto-ordered robots retreat from nearby
+    /// bomb-carrying robots (friendly or enemy) so they aren't caught in
+    /// the blast; robots covering a friendly bomb-carrier stay put.
+    fn escape_from_bomb(&mut self, map: &GameMap) {
+        use crate::matrix_game::common::float2int;
+        use crate::matrix_game::road_network::Point;
+        use crate::matrix_game::side::PlayerOrder;
+
+        const ESCAPE_RADIUS: f32 = 250.0 * 1.2;
+        let esc_r2 = ESCAPE_RADIUS * ESCAPE_RADIUS;
+        let gsm = GameMap::GLOBAL_SCALE_MOVE;
+        let escape_dist = float2int(ESCAPE_RADIUS / gsm) + 4;
+        let escape_dist2 = (escape_dist as i64) * (escape_dist as i64);
+        let my_id = self.player_side.id;
+        let auto_cap = PlayerOrder::AutoCapture as u8;
+        let is_manual = |gl: i32, ps: &crate::matrix_game::side::Side| -> bool {
+            gl >= 0 && (ps.player_groups[gl as usize].order as u8) < auto_cap
+        };
+
+        // Pass 1: bomb robots (any side) with enemies nearby.
+        // (id, world_pos, side, min_enemy_dist2, map_cell)
+        let mut rb: Vec<(ObjectId, glam::Vec2, i32, f32, (i32, i32))> = Vec::new();
+        for id in self.objects.iter_live() {
+            let Some(r) = robot_ref(&self.objects, id) else {
+                continue;
+            };
+            if !r.is_live() || !r.have_bomb(&self.objects) || r.env.enemy_cnt() <= 0 {
+                continue;
+            }
+            let Some(mp) = get_world_pos(&self.objects, id) else {
+                continue;
+            };
+            let mut mde = 1e20f32;
+            for e in &r.env.enemies {
+                if let Some(ep) = get_world_pos(&self.objects, e.enemy) {
+                    mde = mde.min((ep - mp).length_squared());
+                }
+            }
+            rb.push((id, mp, r.side(), mde, (r.map_x, r.map_y)));
+        }
+        if rb.is_empty() {
+            return;
+        }
+
+        let mine: Vec<ObjectId> = self
+            .objects
+            .iter_live()
+            .filter(|&id| {
+                robot_ref(&self.objects, id)
+                    .map(|r| r.is_live() && r.side() == my_id)
+                    .unwrap_or(false)
+            })
+            .collect();
+
+        // Pass 2: the covering robot nearest an ENEMY bomb-carrier is exempt.
+        let mut skip_normal: Option<ObjectId> = None;
+        let mut skip_withbomb: Option<ObjectId> = None;
+        let (mut sn_dist, mut sw_dist) = (0.0f32, 0.0f32);
+        for &id in &mine {
+            let (gl, has_bomb) = {
+                let r = robot_ref(&self.objects, id).unwrap();
+                (r.group_logic, r.have_bomb(&self.objects))
+            };
+            if is_manual(gl, &self.player_side) {
+                continue;
+            }
+            let Some(rp) = get_world_pos(&self.objects, id) else {
+                continue;
+            };
+            let mut mdist = 1e20f32;
+            for &(bid, bp, bside, _, _) in &rb {
+                if bid == id || bside == my_id {
+                    continue;
+                }
+                let d = (rp - bp).length_squared();
+                if d < esc_r2 {
+                    mdist = mdist.min(d);
+                }
+            }
+            if mdist > 1e19 {
+                continue;
+            }
+            if !has_bomb {
+                if skip_normal.is_none() || mdist < sn_dist {
+                    skip_normal = Some(id);
+                    sn_dist = mdist;
+                }
+            } else if skip_withbomb.is_none() || mdist < sw_dist {
+                skip_withbomb = Some(id);
+                sw_dist = mdist;
+            }
+        }
+        if skip_withbomb.is_some() {
+            skip_normal = None;
+        }
+
+        // Pass 3: retreat via a place-graph wave to a spot far from every
+        // bomb robot. One road-network lock guards the whole pass.
+        let Some(rn_lock) = map.road_network.as_ref() else {
+            return;
+        };
+        let mut rn = rn_lock.lock().unwrap();
+        for &id in &mine {
+            if Some(id) == skip_normal || Some(id) == skip_withbomb {
+                continue;
+            }
+            let (gl, has_return, mm, mapx, mapy, mde, rp) = {
+                let r = robot_ref(&self.objects, id).unwrap();
+                let Some(rp) = get_world_pos(&self.objects, id) else {
+                    continue;
+                };
+                let mut mde = 1e20f32;
+                for e in &r.env.enemies {
+                    if let Some(ep) = get_world_pos(&self.objects, e.enemy) {
+                        mde = mde.min((ep - rp).length_squared());
+                    }
+                }
+                (
+                    r.group_logic,
+                    r.return_coords().is_some(),
+                    chassis_bit(r),
+                    r.map_x,
+                    r.map_y,
+                    mde,
+                    rp,
+                )
+            };
+            if is_manual(gl, &self.player_side) || has_return {
+                continue;
+            }
+            // Near a bomb robot we don't cover?
+            let mut near = false;
+            for &(bid, bp, bside, min_de, _) in &rb {
+                if bid == id {
+                    continue;
+                }
+                if bside == my_id && mde < min_de {
+                    continue; // covering the friendly bomb — hold position
+                }
+                if (rp - bp).length_squared() < esc_r2 {
+                    near = true;
+                    break;
+                }
+            }
+            if !near {
+                continue;
+            }
+            let start = crate::matrix_game::logic::find_near_place_impl(&rn, map, mm, (mapx, mapy));
+            if start < 0 {
+                continue;
+            }
+
+            // Mark places already claimed by other units (data|2) so the
+            // wave doesn't send everyone to the same spot.
+            let mut touched: Vec<i32> = Vec::new();
+            for oid in self.objects.iter_live() {
+                if oid == id {
+                    continue;
+                }
+                if let Some(orr) = robot_ref(&self.objects, oid) {
+                    if !orr.is_live() {
+                        continue;
+                    }
+                    if let Some((tx, ty)) = orr.move_to_coords() {
+                        let np = rn.find_in_pl(&Point { x: tx, y: ty });
+                        if np >= 0 {
+                            rn.places[np as usize].data |= 2;
+                            touched.push(np);
+                        }
+                    }
+                    let ep = orr.env.place;
+                    if ep >= 0 && (ep as usize) < rn.places.len() {
+                        rn.places[ep as usize].data |= 2;
+                        touched.push(ep);
+                    }
+                } else if let Some(c) = crate::matrix_game::logic::cannon_ref(&self.objects, oid) {
+                    let np = rn.find_in_pl(&Point {
+                        x: float2int(c.pos.x / gsm),
+                        y: float2int(c.pos.y / gsm),
+                    });
+                    if np >= 0 {
+                        rn.places[np as usize].data |= 2;
+                        touched.push(np);
+                    }
+                }
+            }
+
+            // Breadth-first wave from `start` over unblocked near-links.
+            let sme_start = touched.len();
+            rn.places[start as usize].data |= 1;
+            touched.push(start);
+            let mut sme = sme_start;
+            let mut chosen: Option<(i32, i32)> = None;
+            while sme < touched.len() {
+                let rp_i = touched[sme];
+                sme += 1;
+                let place_pos = rn.places[rp_i as usize].pos;
+                if rn.places[rp_i as usize].data & 2 == 0 {
+                    let far = rb.iter().all(|&(bid, _, _, _, (bx, by))| {
+                        if bid == id {
+                            return true;
+                        }
+                        let dx = (place_pos.x - bx) as i64;
+                        let dy = (place_pos.y - by) as i64;
+                        dx * dx + dy * dy >= escape_dist2
+                    });
+                    if far {
+                        chosen = Some((place_pos.x, place_pos.y));
+                        break;
+                    }
+                }
+                let near_cnt = rn.places[rp_i as usize].near.len();
+                for k in 0..near_cnt {
+                    let np = rn.places[rp_i as usize].near[k];
+                    if np < 0 || (np as usize) >= rn.places.len() {
+                        continue;
+                    }
+                    if rn.places[np as usize].data & 1 != 0 {
+                        continue;
+                    }
+                    if rn.places[rp_i as usize].near_move[k] & mm != 0 {
+                        continue; // link blocked for this chassis
+                    }
+                    rn.places[np as usize].data |= 1;
+                    touched.push(np);
+                }
+            }
+            for &t in &touched {
+                rn.places[t as usize].data = 0;
+            }
+
+            if let Some((tx, ty)) = chosen {
+                if let Some(r) = robot_mut(&mut self.objects, id) {
+                    if let Some((rx, ry)) = r.move_to_coords() {
+                        r.move_return(rx, ry);
+                    } else {
+                        r.move_return(r.map_x, r.map_y);
+                    }
+                    r.move_to(tx, ty);
+                }
+            }
+        }
+    }
+
     pub fn takt_pl(&mut self, map: &GameMap, onlygroup: i32) {
         let now = self.elapsed_ms as i32;
 
@@ -344,7 +589,9 @@ impl MapLogic {
         }
         self.player_side.last_takt_pl = now;
 
-        // CalcStrength + EscapeFromBomb are AI-side (out of scope).
+        // Player robots dodge bomb blasts (MatrixSide.cpp:6051). CalcStrength
+        // is refreshed per-frame in GatherInfo instead.
+        self.escape_from_bomb(map);
 
         if self.player_side.last_takt_underfire == 0
             || now - self.player_side.last_takt_underfire > 500
@@ -1406,11 +1653,10 @@ impl MapLogic {
                         r.env
                             .target
                             .filter(|&t| {
-                                let live = if war {
-                                    is_live_unit(&self.objects, t)
-                                } else {
-                                    self.objects.get(t).map(|o| o.is_live()).unwrap_or(false)
-                                };
+                                // Both FirePL and WarPL gate on IsLiveUnit —
+                                // buildings are never auto-repair targets
+                                // (MatrixSide.cpp:7199,7812).
+                                let live = is_live_unit(&self.objects, t);
                                 live && self
                                     .objects
                                     .get(t)
@@ -1431,12 +1677,7 @@ impl MapLogic {
                             if oid == rid {
                                 continue;
                             }
-                            let live = if war {
-                                is_live_unit(&self.objects, oid)
-                            } else {
-                                self.objects.get(oid).map(|o| o.is_live()).unwrap_or(false)
-                            };
-                            if !live {
+                            if !is_live_unit(&self.objects, oid) {
                                 continue;
                             }
                             let Some(obj) = self.objects.get(oid) else {
@@ -4107,10 +4348,15 @@ impl MapLogic {
             if !r.is_live() || r.group_logic < 0 {
                 continue;
             }
-            match self.player_side.player_groups[r.group_logic as usize].order {
-                PlayerOrder::AutoCapture => auto.0 = true,
-                PlayerOrder::AutoAttack => auto.1 = true,
-                PlayerOrder::AutoDefence => auto.2 = true,
+            match self
+                .player_side
+                .player_groups
+                .get(r.group_logic as usize)
+                .map(|g| g.order)
+            {
+                Some(PlayerOrder::AutoCapture) => auto.0 = true,
+                Some(PlayerOrder::AutoAttack) => auto.1 = true,
+                Some(PlayerOrder::AutoDefence) => auto.2 = true,
                 _ => {}
             }
         }

@@ -1144,10 +1144,12 @@ impl MapStatic for Building {
         use crate::matrix_game::common::BASE_FLOOR_SPEED;
 
         // Build-stack tick — port of `m_BS.TickTimer(cms)` call at
-        // MatrixObjectBuilding.cpp:605. Advances the build timer and
-        // produces the head item when it expires.
+        // MatrixObjectBuilding.cpp:601-605: only for a live, owned
+        // building (a dying/DIP factory must not finish its queue).
         let parent_pos = glam::Vec3::new(self.pos.x, self.pos.y, self.build_z);
-        if let Some(parent_id) = self.self_id {
+        let can_build = self.side != 0
+            && !matches!(self.state, BaseState::Dip | BaseState::DipExploded);
+        if let Some(parent_id) = self.self_id.filter(|_| can_build) {
             if let Some(spawned) = self
                 .build_stack
                 .tick_timer(cms, objs, parent_id, self.state, parent_pos, self.angle)

@@ -51,6 +51,40 @@ thread_local! {
     static CURRENT_ELAPSED_MS: Cell<i64> = const { Cell::new(0) };
 }
 
+/// Loaded map name (the CMAP path) — drives the "terron" easter-egg check
+/// (MatrixLogic.cpp:2776). Set once at load.
+static MAP_NAME: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+// BEHF_PORTRET map objects are hidden unless `MMFLAG_SHOWPORTRETS` (permanent,
+// set when an in-position robot dies) or `MMFLAG_ROBOT_IN_POSITION` (per-frame,
+// terron trigger held) is set (MatrixObject.cpp:889-892). Both off by default.
+static PORTRETS_SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static PORTRETS_IN_POS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+use std::sync::atomic::Ordering as PortretOrd;
+
+pub fn set_map_name(name: &str) {
+    *MAP_NAME.lock().unwrap() = name.to_string();
+    // A fresh map load resets the reveal flags.
+    PORTRETS_SHOWN.store(false, PortretOrd::Relaxed);
+    PORTRETS_IN_POS.store(false, PortretOrd::Relaxed);
+}
+
+pub fn map_name_is_terron() -> bool {
+    MAP_NAME.lock().unwrap().to_lowercase().contains("terron")
+}
+
+/// `ShowPortrets()` — permanently reveal (MatrixMap.cpp:3598-3601).
+pub fn show_portrets() {
+    PORTRETS_SHOWN.store(true, PortretOrd::Relaxed);
+}
+
+pub fn set_portrets_in_position(v: bool) {
+    PORTRETS_IN_POS.store(v, PortretOrd::Relaxed);
+}
+
+pub fn portrets_visible() -> bool {
+    PORTRETS_SHOWN.load(PortretOrd::Relaxed) || PORTRETS_IN_POS.load(PortretOrd::Relaxed)
+}
+
 /// RAII guard — sets `CURRENT_MAP` + `CURRENT_ELAPSED_MS` on
 /// construction, clears on drop. Use:
 /// `let _scope = MapScope::enter(&map, elapsed_ms); world.takt(ms);`.
@@ -210,6 +244,14 @@ pub struct GameMap {
     pub sky_angle: f32,
     pub water_name: String,
     pub water_normal_len: f32,
+    /// Per-side starting economy from the map `SideResInfo` property
+    /// (MatrixMapPrepare.cpp:464-493): `(side_id, [res;4], force_up)`.
+    pub side_res_info: Vec<(i32, [i32; 4], i32)>,
+    /// Camera terrain-follow clamp bounds from building floor heights
+    /// (`m_GroundZBaseMiddle` = mean build_z, `m_GroundZBaseMax` = max;
+    /// MatrixMapPrepare.cpp:623-690).
+    pub ground_z_base_middle: f32,
+    pub ground_z_base_max: f32,
     pub light_main_color: u32,
     pub light_main_color_obj: u32,
     pub light_main_dir: [f32; 3],
@@ -241,6 +283,8 @@ pub struct GameMap {
     /// time via the building's `EBuildingType` → `Matrix\Building\bN.cvo`
     /// mapping (MatrixObjectBuilding.cpp:158-163).
     pub buildings: Vec<BuildingInstance>,
+    /// Pre-placed decorative base ruins (`side == 255` records).
+    pub ruins: Vec<RuinInstance>,
     /// All cannon records from the `cannons/*` CMAP table
     /// (MatrixMapPrepare.cpp:776-885). One entry per record regardless
     /// of `prop`: prop=0 standalone cannons, prop=1 factory cannons
@@ -336,6 +380,9 @@ impl GameMap {
             sky_angle: 0.0,
             water_name: String::new(),
             water_normal_len: 1.0,
+            side_res_info: Vec::new(),
+            ground_z_base_middle: 0.0,
+            ground_z_base_max: 0.0,
             light_main_color: 0,
             light_main_color_obj: 0,
             light_main_dir: [0.0, 0.0, -1.0],
@@ -353,6 +400,7 @@ impl GameMap {
             units,
             objects: Vec::new(),
             buildings: Vec::new(),
+            ruins: Vec::new(),
             cannons: Vec::new(),
             robots: Vec::new(),
             group_max_z_land: Vec::new(),
@@ -413,6 +461,18 @@ pub struct ObjectShadow {
 pub struct ObjectShadowVertex {
     pub position: [f32; 3],
     pub uv: [f32; 2],
+}
+
+/// A pre-placed decorative base ruin (`side == 255` building record,
+/// MatrixMapPrepare.cpp:648-668): spawned as ruin-mesh `MapObject`s
+/// rather than a live building.
+#[derive(Debug, Clone, Copy)]
+pub struct RuinInstance {
+    pub x: f32,
+    pub y: f32,
+    pub build_z: f32,
+    pub angle: i32,
+    pub kind: i32,
 }
 
 /// A starting-building placement — ports the per-row fields of DATA_BUILDINGS
@@ -574,6 +634,12 @@ impl GameMap {
             .map(|idx| prop_values.get_as_wstr(idx))
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| "water_blue".to_string());
+        // Per-side starting resources / base income multiplier.
+        let side_res_info = prop_names
+            .find_as_wstr("SideResInfo")
+            .map(|idx| prop_values.get_as_wstr(idx))
+            .map(|s| parse_side_res_info(&s))
+            .unwrap_or_default();
         let water_normal_len =
             find_property_float(prop_names, prop_values, "WaterNormLen").unwrap_or(1.0);
         let light_main_color =
@@ -739,9 +805,21 @@ impl GameMap {
         // Ports MatrixMapPrepare.cpp:621-694 (RS_BUILDINGS step). We need the
         // per-cell units computed above so the floor-z fallback matches
         // `CMatrixBuilding::OnLoad`'s `GetZ` lookup.
-        let mut buildings = load_buildings(&stor, &units, size_x, size_y);
+        let mut ruins = Vec::new();
+        let mut buildings = load_buildings(&stor, &units, size_x, size_y, &mut ruins);
         let cannons = load_cannons(&stor, &mut buildings);
         let robots = load_robots(&stor, &units, size_x, size_y);
+        // Camera-follow clamp bounds (mean / max building floor z).
+        let (ground_z_base_middle, ground_z_base_max) = if buildings.is_empty() {
+            (0.0, 0.0)
+        } else {
+            let sum: f32 = buildings.iter().map(|b| b.build_z).sum();
+            let max = buildings.iter().map(|b| b.build_z).fold(0.0f32, f32::max);
+            // C++ divides by the TOTAL building-record count including
+            // side==255 ruins (MatrixMapPrepare.cpp:643,691) — ruins are
+            // split into their own vec here, so add them back.
+            (sum / (buildings.len() + ruins.len()) as f32, max)
+        };
         log::info!(
             "map: loaded {} starting buildings, {} cannon records, {} initial robots",
             buildings.len(),
@@ -761,7 +839,10 @@ impl GameMap {
 
         let road_network = wrap_road_network(load_road_network(&stor, size_move_x, size_move_y)?);
 
-        let inshore_prespawns = load_inshore_prespawns(&stor, group_w, group_h);
+        let disable_inshore =
+            find_property_int(prop_names, prop_values, "DisableInshore").unwrap_or(0) != 0;
+        let inshore_prespawns =
+            load_inshore_prespawns(&stor, group_w, group_h, disable_inshore);
         let total_inshores: usize = inshore_prespawns.iter().map(|v| v.len()).sum();
         log::info!(
             "map: loaded {} inshore wave spawn points across {} groups",
@@ -781,6 +862,10 @@ impl GameMap {
             sky_angle,
             water_name,
             water_normal_len,
+            side_res_info,
+            ground_z_base_middle,
+            ground_z_base_max,
+            ruins,
             light_main_color,
             light_main_color_obj,
             light_main_dir,
@@ -840,11 +925,18 @@ impl GameMap {
         let tx = fx - gx0 as f32;
         let ty = fy - gy0 as f32;
 
+        // Clamp each group-z to [m_GroundZBaseMiddle, m_GroundZBaseMax]
+        // (MatrixMap.cpp:445-446,455-456) when those bounds are valid.
+        let (lo, hi) = (self.ground_z_base_middle, self.ground_z_base_max);
+        let clamp_base = hi > lo;
         let sample = |gx: i32, gy: i32| -> f32 {
             if gx < 0 || gy < 0 || gx >= self.group_w as i32 || gy >= self.group_h as i32 {
                 return 0.0;
             }
-            let v = self.group_max_z_land[gy as usize * self.group_w + gx as usize];
+            let mut v = self.group_max_z_land[gy as usize * self.group_w + gx as usize];
+            if clamp_base {
+                v = v.clamp(lo, hi);
+            }
             v.min(ceiling)
         };
         let a = sample(gx0, gy0);
@@ -1604,9 +1696,15 @@ fn load_inshore_prespawns(
     stor: &Storage,
     group_w: usize,
     group_h: usize,
+    disable: bool,
 ) -> Vec<Vec<InshorePreSpawn>> {
     let total = group_w * group_h;
     let empty = vec![Vec::new(); total];
+    // `DisableInshore` map property suppresses shoreline foam even when
+    // the CMAP still carries baked spawn data (MatrixMapPrepare.cpp:1379-1387).
+    if disable {
+        return empty;
+    }
     let (Some(bx), Some(by), Some(bnx), Some(bny)) = (
         stor.get_buf("inshores", "X"),
         stor.get_buf("inshores", "Y"),
@@ -1754,6 +1852,7 @@ fn load_buildings(
     units: &[MapUnit],
     size_x: usize,
     size_y: usize,
+    ruins: &mut Vec<RuinInstance>,
 ) -> Vec<BuildingInstance> {
     let (Some(cx), Some(cy), Some(cside), Some(ckind), Some(cshadow), Some(cshsz), Some(cang)) = (
         stor.get_buf("buildings", "X"),
@@ -1808,14 +1907,21 @@ fn load_buildings(
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
         let side = *sides.get(i).unwrap_or(&0);
-        if side == 255 {
-            // Ruin replacement (MatrixMapPrepare.cpp:648-668) — not a live
-            // building, skip for now.
-            continue;
-        }
         let x = xs[i];
         let y = ys[i];
         let build_z = get_z(x, y).max(0.0);
+        if side == 255 {
+            // Decorative pre-placed ruin (MatrixMapPrepare.cpp:648-668):
+            // spawned as ruin-mesh objects, not a live building.
+            ruins.push(RuinInstance {
+                x,
+                y,
+                build_z,
+                angle: *angles.get(i).unwrap_or(&0) as i32,
+                kind: *kinds.get(i).unwrap_or(&0) as i32,
+            });
+            continue;
+        }
         out.push(BuildingInstance {
             x,
             y,
@@ -2258,6 +2364,25 @@ fn blend_color(a: u32, b: u32, t: f32) -> u32 {
     let bg = (b >> 8) & 0xFF;
     let bb = b & 0xFF;
     (lerp(ar, br) << 16) | (lerp(ag, bg) << 8) | lerp(ab, bb)
+}
+
+/// Parse the `SideResInfo` property: `|`-separated per-side entries,
+/// each `id,res0,res1,res2,res3[,forceUp]` (MatrixMapPrepare.cpp:471-493).
+fn parse_side_res_info(s: &str) -> Vec<(i32, [i32; 4], i32)> {
+    let mut out = Vec::new();
+    for entry in s.split('|') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let f: Vec<i32> = entry.split(',').map(|p| p.trim().parse().unwrap_or(0)).collect();
+        if f.len() < 5 {
+            continue;
+        }
+        let force_up = if f.len() > 5 { f[5] } else { 100 };
+        out.push((f[0], [f[1], f[2], f[3], f[4]], force_up));
+    }
+    out
 }
 
 fn find_property_int(
@@ -3197,6 +3322,12 @@ impl MapRenderer {
         let visible = visible_groups_mask(camera, map);
         let overlay_visible = |groups: &[u32]| -> bool {
             if groups.is_empty() {
+                // Surfaces with no group association (e.g. turret-place
+                // foundation pads baked into the terrain) must still be
+                // drawn — they render unconditionally. The port doesn't
+                // always populate per-surface group indices the way the
+                // C++ group-marking pass does, so gating them off hides
+                // legitimate terrain overlays.
                 return true;
             }
             groups

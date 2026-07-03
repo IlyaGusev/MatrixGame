@@ -1566,6 +1566,89 @@ impl GiveBotConfig {
     }
 }
 
+/// One entry of the `RobotSpawn` catalogue — a BEHF_SPAWNER bot loadout
+/// (MatrixObject.cpp:1383-1408). `number` is the child-block name.
+#[derive(Debug, Clone)]
+pub struct RobotSpawnBot {
+    pub number: i32,
+    pub chassis: i32,
+    pub armor: i32,
+    pub head: i32,
+    pub weapons: Vec<i32>,
+    pub side: i32,
+    pub hitpoint: f32,
+}
+
+/// Port of `g_MatrixData->BlockGet("RobotSpawn")` — the spawner-object
+/// bot catalogue keyed by robot number.
+#[derive(Debug, Clone, Default)]
+pub struct RobotSpawnConfig {
+    pub bots: Vec<RobotSpawnBot>,
+}
+
+impl RobotSpawnConfig {
+    pub fn from_matrix_data(stor: &Storage) -> Option<Self> {
+        let rs = stor.block_record("da", "RobotSpawn")?;
+        let mut out = Self { bots: Vec::new() };
+        for (name, rec) in stor.block_records(&rs) {
+            let number = name.trim().parse::<i32>().unwrap_or(-1);
+            let pi = |k: &str| -> i32 {
+                stor.block_param(&rec, k)
+                    .and_then(|s| s.trim().parse::<i32>().ok())
+                    .unwrap_or(0)
+            };
+            let weapons: Vec<i32> = stor
+                .block_params(&rec, "BotWeapon")
+                .iter()
+                .filter_map(|s| s.trim().parse::<i32>().ok())
+                .collect();
+            out.bots.push(RobotSpawnBot {
+                number,
+                chassis: pi("BotChassis"),
+                armor: pi("BotArmor"),
+                head: pi("BotHead"),
+                weapons,
+                side: pi("BotSide"),
+                hitpoint: stor
+                    .block_param(&rec, "BotHitpoint")
+                    .and_then(|s| s.trim().parse::<f32>().ok())
+                    .unwrap_or(0.0),
+            });
+        }
+        Some(out)
+    }
+
+    /// Pick the bot with `number`, else a pseudo-random one (mirrors
+    /// `BlockGetNE(number)` with the `BlockGet(Rnd(...))` fallback,
+    /// MatrixObject.cpp:1387-1391). `pick` selects the fallback index.
+    pub fn choose(&self, number: i32, pick: usize) -> Option<&RobotSpawnBot> {
+        if let Some(b) = self.bots.iter().find(|b| b.number == number) {
+            return Some(b);
+        }
+        if self.bots.is_empty() {
+            return None;
+        }
+        self.bots.get(pick % self.bots.len())
+    }
+}
+
+static ROBOT_SPAWN_CONFIG: std::sync::OnceLock<std::sync::RwLock<std::sync::Arc<RobotSpawnConfig>>> =
+    std::sync::OnceLock::new();
+
+pub fn robot_spawn_config() -> std::sync::Arc<RobotSpawnConfig> {
+    ROBOT_SPAWN_CONFIG
+        .get_or_init(|| std::sync::RwLock::new(std::sync::Arc::new(RobotSpawnConfig::default())))
+        .read()
+        .unwrap()
+        .clone()
+}
+
+pub fn set_robot_spawn_config(c: RobotSpawnConfig) {
+    let slot = ROBOT_SPAWN_CONFIG
+        .get_or_init(|| std::sync::RwLock::new(std::sync::Arc::new(RobotSpawnConfig::default())));
+    *slot.write().unwrap() = std::sync::Arc::new(c);
+}
+
 static GIVE_BOT_CONFIG: std::sync::OnceLock<std::sync::RwLock<std::sync::Arc<GiveBotConfig>>> =
     std::sync::OnceLock::new();
 

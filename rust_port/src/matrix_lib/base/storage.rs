@@ -213,6 +213,35 @@ impl Storage {
         Some(values.get_as_wstr(idx))
     }
 
+    /// All values for a (possibly repeated) parameter key — mirrors the
+    /// C++ `ParCount`/`ParGet(name, i)` enumeration (e.g. multiple
+    /// `BotWeapon` params in a `RobotSpawn` bot block).
+    pub fn block_params(&self, record: &str, key: &str) -> Vec<String> {
+        let (Some(keys), Some(values)) = (self.get_buf(record, "0"), self.get_buf(record, "1"))
+        else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for i in 0..keys.arrays_count() {
+            if keys.get_as_wstr(i) == key {
+                out.push(values.get_as_wstr(i));
+            }
+        }
+        out
+    }
+
+    /// All child BlockPars as `(name, record)` — mirrors `BlockCount` +
+    /// `BlockGet(i)` iteration used for the `RobotSpawn` catalogue.
+    pub fn block_records(&self, record: &str) -> Vec<(String, String)> {
+        let (Some(names), Some(records)) = (self.get_buf(record, "2"), self.get_buf(record, "3"))
+        else {
+            return Vec::new();
+        };
+        (0..names.arrays_count())
+            .map(|i| (names.get_as_wstr(i), records.get_as_wstr(i)))
+            .collect()
+    }
+
     /// Fetch the first child BlockPar's `(name, record)`, mirroring the
     /// fallback behaviour the original uses when a named lookup fails
     /// (e.g. MatrixMapPrepare.cpp:1218 `m_WaterName = BlockGet(PAR_...)

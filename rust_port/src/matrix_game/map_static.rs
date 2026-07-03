@@ -446,6 +446,23 @@ pub struct Objects {
     /// Deferred explosion spawns — `CreateExplosion` calls from damage
     /// paths (which carry no RNG/map); built in `effects_takt`.
     pub pending_explosions: Vec<ExplosionSpawn>,
+    /// Deferred effect point-light spawns (`CreatePointLight`) — drained
+    /// by the app loop into the terrain `PointLightSystem`.
+    pub pending_point_lights: Vec<PendingLight>,
+    /// Move-or-create commands for effect lights that follow a moving
+    /// source (plasma bolt / flame), keyed by the owning weapon:
+    /// `(key, pos, radius, color)`. Killed via `pending_light_kill`.
+    pub pending_light_follow: Vec<(
+        crate::matrix_game::effects::weapon::WeaponId,
+        [f32; 3],
+        f32,
+        u32,
+    )>,
+    pub pending_light_kill: Vec<crate::matrix_game::effects::weapon::WeaponId>,
+    /// BEHF_SPAWNER robot-spawn requests — object logic_takt can't reach
+    /// the side/order layer, so MapLogic drains these (build robot from
+    /// the `RobotSpawn` catalogue, spawn, order attack).
+    pub pending_spawner_bots: Vec<SpawnerBotRequest>,
     /// Size of the debris mesh catalog (set by the renderer at init;
     /// 0 = no mesh debris, e.g. in tests).
     pub debris_catalog_len: usize,
@@ -506,6 +523,32 @@ pub struct ExplosionSpawn {
     pub fire: bool,
 }
 
+/// A BEHF_SPAWNER robot-spawn request (MatrixObject.cpp:1383-1465).
+#[derive(Clone, Copy)]
+pub struct SpawnerBotRequest {
+    pub pos: glam::Vec3,
+    pub number: i32,
+    pub pick: usize,
+    /// Spawner's `m_SensRadius` — bounds the attack-target search
+    /// (MatrixObject.cpp:1442, `FindObjects(pos, m_SensRadius, …)`).
+    pub sens_radius: f32,
+}
+
+/// A queued `CreatePointLight` call: over phase 1 (`t1` ms) radius LERPs
+/// `r1→r2` and colour LICs `c1→c2`; over the remainder (`ttl-t1`) radius
+/// holds `r2` and colour fades to black. Single-phase lights (muzzle
+/// flashes, plasma) set `t1==ttl`, so the whole life is one LERP.
+#[derive(Clone, Copy)]
+pub struct PendingLight {
+    pub pos: [f32; 3],
+    pub r1: f32,
+    pub r2: f32,
+    pub c1: u32,
+    pub c2: u32,
+    pub ttl: f32,
+    pub t1: f32,
+}
+
 /// The kill/build-stat subset of `CMatrixSideUnit`'s statistics
 /// (MatrixSide.hpp `EStat`). Accumulated here because the object code
 /// can't reach the sides; `MapLogic::sync_side_stats` mirrors these
@@ -541,6 +584,10 @@ impl Objects {
             side_stats: [SideStats::default(); 9],
             pending_spots: Vec::new(),
             pending_explosions: Vec::new(),
+            pending_point_lights: Vec::new(),
+            pending_light_follow: Vec::new(),
+            pending_light_kill: Vec::new(),
+            pending_spawner_bots: Vec::new(),
             debris_catalog_len: 0,
             debris_types: Vec::new(),
             pending_hit_notices: Vec::new(),

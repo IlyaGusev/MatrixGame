@@ -445,6 +445,8 @@ pub struct Hint {
     pub otstup: [i32; 4],
     pub screen_x: f32,
     pub screen_y: f32,
+    /// `m_SoundOut` — fired when this hint is hidden.
+    pub sound_out: Option<String>,
 }
 
 /// One quad to emit as part of the 9-slice border or a tile repeat.
@@ -667,6 +669,9 @@ pub struct BuiltHint {
     /// included) of every element following a `_MOD:COPY` marker.
     /// `EnterDialogMode` creates the hint buttons at these slots.
     pub copy_pos: Vec<(i32, i32)>,
+    /// `m_SoundIn`/`m_SoundOut` — sound names fired on show/hide.
+    pub sound_in: Option<String>,
+    pub sound_out: Option<String>,
 }
 
 /// Parse one template into a laid-out `Hint`. Ports the two-pass
@@ -719,6 +724,10 @@ pub fn build_hint(
     // a HEM_COPY element, consumed by the very next element.
     let mut copy_pending = false;
 
+    // `m_SoundIn`/`m_SoundOut` (MatrixHint.cpp:622-627) — fired on show/hide.
+    let mut sound_in: Option<String> = None;
+    let mut sound_out: Option<String> = None;
+
     // `new_coord_f`/`new_coord` — when set by `HEM_COORD`, the next
     // bitmap is placed at the absolute coord instead of (cx, cy).
     let mut new_coord: Option<(i32, i32)> = None;
@@ -761,19 +770,27 @@ pub fn build_hint(
             h_height = rest.trim().parse().unwrap_or(0);
             continue;
         }
-        if directive.starts_with("_ALIGN:")
-            || directive.starts_with("_SOUNDIN:")
-            || directive.starts_with("_SOUNDOUT:")
-            || directive.starts_with("_BORDER:")
-        {
+        if let Some(rest) = directive.strip_prefix("_SOUNDIN:") {
+            sound_in = Some(rest.trim().to_string());
+            continue;
+        }
+        if let Some(rest) = directive.strip_prefix("_SOUNDOUT:") {
+            sound_out = Some(rest.trim().to_string());
+            continue;
+        }
+        if directive.starts_with("_ALIGN:") || directive.starts_with("_BORDER:") {
             continue; // scalar-ish; we don't use them for text hints.
         }
         // _POS:X:Y → set absolute coord for next bitmap.
+        // These zero-size positioning directives also count as an
+        // "element" in the C++, so they clear a pending `_MOD:COPY` anchor
+        // (MatrixHint.cpp:391-417).
         if let Some(rest) = directive.strip_prefix("_POS:") {
             let p: Vec<i32> = rest.split(':').filter_map(|s| s.parse().ok()).collect();
             if p.len() >= 2 {
                 new_coord = Some((p[0], p[1]));
             }
+            copy_pending = false;
             continue;
         }
         if let Some(rest) = directive.strip_prefix("_DOWN:") {
@@ -782,6 +799,7 @@ pub fn build_hint(
             if cy > ch {
                 ch = cy;
             }
+            copy_pending = false;
             continue;
         }
         if let Some(rest) = directive.strip_prefix("_RIGHT:") {
@@ -790,6 +808,7 @@ pub fn build_hint(
             if cx > cw {
                 cw = cx;
             }
+            copy_pending = false;
             continue;
         }
         // _MOD:M — the C++ emits an immediate ZERO-SIZE element with
@@ -970,7 +989,12 @@ pub fn build_hint(
     let clw = cw;
     let clh = ch;
     let total_w = clw + ots[0] + ots[2];
-    let total_h = clh + ots[1] + ots[3];
+    let mut total_h = clh + ots[1] + ots[3];
+    // Round the height up so the center border slice tiles a whole number
+    // of times (h_delta = center slice height; MatrixHint.cpp:305-313).
+    let h_delta = border.slices[SLICE_C].h.max(1);
+    let delta = (total_h - border.slices[SLICE_T].h - border.slices[SLICE_B].h).max(0);
+    total_h += ((delta + h_delta - 1) / h_delta) * h_delta - delta;
 
     let mut copy_pos: Vec<(i32, i32)> = Vec::new();
     let parts = emitted
@@ -996,6 +1020,8 @@ pub fn build_hint(
         border_id,
         wrap_width: h_width,
         copy_pos,
+        sound_in,
+        sound_out,
     })
 }
 
@@ -1394,14 +1420,25 @@ impl HintSystem {
         );
         if !same {
             self.timer_ms = 0.0;
+            self.fire_sound_out();
             self.active = None;
             self.active_name = None;
         }
         self.hovered = target;
     }
 
+    /// SoundOut when a hint is hidden (SetVisible(false), MatrixHint.hpp:134).
+    fn fire_sound_out(&self) {
+        if let Some(h) = &self.active {
+            if let Some(s) = &h.sound_out {
+                super::sound::play_hint_sound(s);
+            }
+        }
+    }
+
     pub fn clear(&mut self) {
         self.hovered = None;
+        self.fire_sound_out();
         self.active = None;
         self.active_name = None;
         self.timer_ms = 0.0;
@@ -1457,13 +1494,24 @@ impl HintSystem {
             return;
         };
         let BuiltHint {
-            parts,
+            mut parts,
             otstup: ots,
             total_w: total_w_design,
             total_h: total_h_design,
             border_id,
+            sound_in,
+            sound_out,
             ..
         } = built;
+        // SoundIn on show (MatrixHint SetVisible(true), MatrixHint.hpp:134).
+        if let Some(s) = &sound_in {
+            super::sound::play_hint_sound(s);
+        }
+        // `_TEXT:` is always laid out with alignx=1 (centred) in the
+        // original (MatrixHint.cpp:590,715) — the dialog path already does
+        // this; apply it to hover hints too so multi-line / _WIDTH-padded
+        // tooltips centre their lines.
+        center_text_parts(&mut parts, atlas);
         if parts.is_empty() {
             self.active_name = Some(hov.elem_name.clone());
             return;
@@ -1508,6 +1556,7 @@ impl HintSystem {
             otstup: ots,
             screen_x: sx,
             screen_y: sy,
+            sound_out,
         });
         self.active_name = Some(hov.elem_name.clone());
     }
@@ -1590,18 +1639,14 @@ pub fn correct_coordinates(
     } else if x < 0.0 {
         x = pad;
     }
-    if x + width + pad > screen_w {
-        return None; // can't fit horizontally
-    }
     if y + height + pad > screen_h {
         let overflow = y + height + pad - screen_h;
         y -= overflow;
     } else if y < 0.0 {
         y = pad;
     }
-    if y + height + pad > screen_h {
-        return None;
-    }
+    // The C++ ignores CorrectCoordinates' failure return and shows the
+    // hint anyway (clipped by the viewport) — CIFaceButton.cpp:140-141.
     Some((x, y))
 }
 

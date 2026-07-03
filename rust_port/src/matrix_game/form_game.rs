@@ -20,6 +20,11 @@ struct AppState {
     gfx: GfxContext,
     map: Arc<GameMap>,
     point_lights: PointLightSystem,
+    /// Live follow-light handles keyed by owning weapon (plasma/flame glow).
+    light_follow_map: std::collections::HashMap<
+        crate::matrix_game::effects::weapon::WeaponId,
+        crate::matrix_game::effects::point_light::PointLightId,
+    >,
     terrain: MapRenderer,
     minimap: Minimap,
     camera: Camera,
@@ -203,10 +208,12 @@ impl ApplicationHandler for App {
             let mut game = MapLogic::new();
             game.load_config(&matrix_data);
             let building_ids = game.spawn_buildings(&map);
+            game.spawn_ruins(&map);
             log::info!("world: spawned {} buildings", building_ids.len());
             let robot_ids = game.spawn_robots(&map);
             log::info!("world: spawned {} initial robots", robot_ids.len());
             game.ensure_sides_from_objects();
+            game.apply_side_resources(&map);
             let (_ids, stats) = game.spawn_map_objects(&map, &stor);
             log::info!(
                 "world: spawned {} map objects (static={}, burn={}, break={}, anim={}, sens={}, spawner={}, terron={}, portret={}, special={})",
@@ -303,6 +310,7 @@ impl ApplicationHandler for App {
                 gfx,
                 map,
                 point_lights,
+                light_follow_map: std::collections::HashMap::new(),
                 terrain,
                 minimap,
                 camera,
@@ -412,10 +420,12 @@ impl ApplicationHandler for App {
                 let mut game = MapLogic::new();
                 game.load_config(&matrix_data);
                 let building_ids = game.spawn_buildings(&map);
+                game.spawn_ruins(&map);
                 log::info!("world: spawned {} buildings", building_ids.len());
                 let robot_ids = game.spawn_robots(&map);
                 log::info!("world: spawned {} initial robots", robot_ids.len());
                 game.ensure_sides_from_objects();
+                game.apply_side_resources(&map);
                 let (_ids, stats) = game.spawn_map_objects(&map, &stor);
                 log::info!(
                     "world: spawned {} map objects (static={}, burn={}, break={}, anim={}, sens={}, spawner={}, terron={}, portret={}, special={})",
@@ -498,6 +508,7 @@ impl ApplicationHandler for App {
                     gfx,
                     map,
                     point_lights,
+                    light_follow_map: std::collections::HashMap::new(),
                     terrain,
                     minimap,
                     camera,
@@ -881,6 +892,25 @@ impl ApplicationHandler for App {
                             let w = state.gfx.config.width as f32;
                             let h = state.gfx.config.height as f32;
                             state.marquee.set_rect(&state.gfx.queue, rect, w, h);
+                            // Live re-selection each move so boxed units
+                            // highlight during the drag (CMultiSelection::
+                            // Update, MatrixFormGame.cpp:564). Skipped while
+                            // Shift is held so the additive union is applied
+                            // once at release against the original selection.
+                            if !state.shift_down {
+                                let rmin = [ax.min(cx), ay.min(cy)];
+                                let rmax = [ax.max(cx), ay.max(cy)];
+                                crate::matrix_game::multi_selection::marquee_select(
+                                    &mut state.game,
+                                    &state.camera,
+                                    rmin,
+                                    rmax,
+                                    w,
+                                    h,
+                                    false,
+                                );
+                                state.game.sync_group_from_selection();
+                            }
                         }
                     }
                 }
@@ -1014,12 +1044,14 @@ impl ApplicationHandler for App {
                 state.fps_frames += 1;
                 let fps_elapsed = now - state.fps_last_log;
                 if fps_elapsed >= 1.0 {
+                    let fps = state.fps_frames as f64 / fps_elapsed;
                     log::info!(
                         "fps: {:.1} ({} frames / {:.2}s)",
-                        state.fps_frames as f64 / fps_elapsed,
+                        fps,
                         state.fps_frames,
                         fps_elapsed,
                     );
+                    crate::platform::set_fps_text(&format!("{fps:.0} FPS"));
                     state.fps_last_log = now;
                     state.fps_frames = 0;
                 }
@@ -1055,6 +1087,41 @@ impl ApplicationHandler for App {
                     for sp in pending {
                         state.spots.spawn(&state.map, &sp);
                     }
+                    // Effect point-lights: register new flashes, then age
+                    // the transient ones (CreatePointLight + fade).
+                    let pending_lights: Vec<_> =
+                        state.game.objects.pending_point_lights.drain(..).collect();
+                    for pl in pending_lights {
+                        state.point_lights.add_transient_light_anim(
+                            &state.map, pl.pos, pl.r1, pl.r2, pl.c1, pl.c2, pl.ttl, pl.t1,
+                        );
+                    }
+                    // Follow-lights (plasma bolt / flame glow): move an
+                    // existing keyed light or create it; kill on effect death.
+                    let follows: Vec<_> =
+                        state.game.objects.pending_light_follow.drain(..).collect();
+                    for (key, pos, radius, color) in follows {
+                        if let Some(&id) = state.light_follow_map.get(&key) {
+                            state.point_lights.set_pos(&state.map, id, pos);
+                            state.point_lights.set_radius(&state.map, id, radius);
+                            state.point_lights.set_color(&state.map, id, color);
+                        } else {
+                            let id = state.point_lights.add_light(&state.map, pos, radius, color);
+                            state.light_follow_map.insert(key, id);
+                        }
+                    }
+                    let kills: Vec<_> = state.game.objects.pending_light_kill.drain(..).collect();
+                    for key in kills {
+                        if let Some(id) = state.light_follow_map.remove(&key) {
+                            state.point_lights.remove_light(&state.map, id);
+                        }
+                    }
+                    if !state.is_paused {
+                        state.point_lights.takt(&state.map, step_ms as f32);
+                    }
+                    // Single batched recompute after all light adds/moves/
+                    // expiries this frame (no-op when nothing is dirty).
+                    state.point_lights.flush(&state.map);
                 }
 
                 // Win/Loose end-of-game dialog — the deferred
@@ -1269,6 +1336,10 @@ impl ApplicationHandler for App {
                                 .upload(&state.gfx.queue, vp, cr, cu, mc);
                             // ── Effect primitives (DrawEffects port) ──
                             state.bb_queue.clear();
+                            // Robot on-mesh emissive lights (DrawLights).
+                            if let Some(r) = state.terrain.robots() {
+                                r.emit_light_billboards(&mut state.bb_queue);
+                            }
                             // Move-order pings — billboards with the
                             // real `moveto` texture (SPointMoveTo::Draw).
                             state.move_to.draw(&state.map, &mut state.bb_queue);
@@ -2041,28 +2112,51 @@ fn dispatch_ui_click(state: &mut AppState, click: &crate::matrix_game::interface
             return;
         }
         // Auto-order toggles act immediately (CInterface.cpp:3480-3499).
+        // Auto-order toggles: the `_ON` variant (shown while active)
+        // cancels via PGOrderStop; the `_OFF` variant arms the auto order
+        // (CInterface.cpp:3409-3445). The `AUTO_*_ON` flag tracks the state
+        // and drives which variant is shown.
         "oacapn" | "oacapf" => {
             let no = state.game.sel_group_to_logic_group();
-            state.game.pg_order_auto_capture(&state.map, no);
+            if name == "oacapn" {
+                state.game.pg_order_stop(&state.map, no);
+            } else {
+                state.game.pg_order_auto_capture(&state.map, no);
+            }
             return;
         }
         "oafrn" | "oafrf" | "oafron" | "oafrof" => {
             let no = state.game.sel_group_to_logic_group();
-            state.game.pg_order_auto_attack(&state.map, no);
+            if name == "oafrn" || name == "oafron" {
+                state.game.pg_order_stop(&state.map, no);
+            } else {
+                state.game.pg_order_auto_attack(&state.map, no);
+            }
             return;
         }
         "oafcn" | "oafcf" => {
             let no = state.game.sel_group_to_logic_group();
-            state.game.pg_order_auto_defence(&state.map, no);
+            if name == "oafcn" {
+                state.game.pg_order_stop(&state.map, no);
+            } else {
+                state.game.pg_order_auto_defence(&state.map, no);
+            }
             return;
         }
-        // IF_BUILD_REPAIR — the base "call maintenance" button
-        // (CInterface.cpp:3501-3508).
-        "bure" => {
+        // IF_CALL_FROM_HELL — reinforcements / maintenance supply drop
+        // (CInterface.cpp:3505-3508). `bure` (IF_BUILD_REPAIR) is a
+        // separate build-repair placement pre-order, not modelled here.
+        "callhell" => {
             if let Some(b) = state.game.active_object() {
                 state.game.building_maintenance(&state.map, b);
                 log::debug!("maintenance: requested");
             }
+            return;
+        }
+        // IF_MAIN_MENU_BUTTON — open the in-game menu dialog
+        // (CInterface.cpp:3407-3408).
+        "mm" => {
+            enter_dialog_mode(state, "Menu");
             return;
         }
         _ => {}
@@ -3249,12 +3343,38 @@ fn refresh_progress_bars(state: &mut AppState) {
 /// stack state to decide which `if/Main` elements should show this
 /// frame. Other panels don't have their dispatch ported yet; they
 /// stay hidden.
+/// Context-sensitive gameplay cursor (CInterface.cpp:2978-3010). The
+/// original selects distinct `cross_red/cross_blue/star/arrow` bitmaps;
+/// we map them onto the platform cursor (crosshair for the targeting
+/// crosses, move for the edge-scroll star, arrow otherwise), consistent
+/// with the port's OS-cursor substitution for the default arrow.
+fn update_os_cursor(state: &AppState) {
+    use winit::window::CursorIcon;
+    let [mx, my] = state.cursor;
+    let w = state.gfx.config.width as f32;
+    let h = state.gfx.config.height as f32;
+    const EDGE: f32 = 8.0;
+    let icon = if mx < 0.0 {
+        CursorIcon::Default
+    } else if mx < EDGE || mx > w - EDGE || my < EDGE || my > h - EDGE {
+        CursorIcon::Move // CURSOR_STAR — screen-edge scroll band
+    } else if state.iface_list.pre_order.is_some()
+        || state.iface_list.turret_build.is_active()
+    {
+        CursorIcon::Crosshair // CURSOR_CROSS_* — an order/placement is armed
+    } else {
+        CursorIcon::Default // CURSOR_ARROW
+    };
+    state.window.set_cursor(icon);
+}
+
 fn refresh_interface_visibility(state: &mut AppState) {
     use crate::matrix_game::interface::MainVisibilityCtx;
     use crate::matrix_game::map_static::{MapStatic, ObjectType};
     use crate::matrix_game::object_building::{Building, BuildingType};
     use crate::matrix_game::side::CurrSel;
 
+    update_os_cursor(state);
     let curr_sel = state.game.player_side.curr_sel;
     let player_side_id = state.game.player_side.id;
     // Pull building context when the selection is a Building. Also
@@ -3536,6 +3656,45 @@ fn refresh_interface_visibility(state: &mut AppState) {
     if state.iface_list.pre_order.is_some() && !matches!(curr_sel, CurrSel::RobotsSelected) {
         state.iface_list.pre_order = None;
     }
+    // Active-robot weapon check for the obomb/orep buttons
+    // (bomber_sel/repairer_sel, CInterface.cpp:1302-1305).
+    let (has_bomber, has_repairer) = match state
+        .game
+        .player_side
+        .get_cur_sel_object()
+        .and_then(|id| crate::matrix_game::logic::robot_ref(&state.game.objects, id))
+    {
+        Some(r) => (
+            r.have_bomb(&state.game.objects),
+            r.have_repair(&state.game.objects),
+        ),
+        None => (false, false),
+    };
+    // Auto-order toggle state for the current group (AUTO_*_ON).
+    let (auto_cap, auto_atk, auto_def) = state.game.show_order_state();
+    // Order-glow index for the active group's current manual order.
+    let order_glow = if curr_sel == CurrSel::RobotsSelected {
+        use crate::matrix_game::side::PlayerOrder;
+        state
+            .game
+            .player_side
+            .get_cur_sel_object()
+            .and_then(|id| crate::matrix_game::logic::robot_ref(&state.game.objects, id))
+            .map(|r| r.group_logic)
+            .filter(|&gl| gl >= 0)
+            .and_then(|gl| state.game.player_side.player_groups.get(gl as usize))
+            .and_then(|g| match g.order {
+                PlayerOrder::Stop => Some(0),
+                PlayerOrder::MoveTo => Some(1),
+                PlayerOrder::Patrol => Some(2),
+                PlayerOrder::Attack => Some(3),
+                PlayerOrder::Capture => Some(4),
+                PlayerOrder::Bomb | PlayerOrder::Repair => Some(5),
+                _ => None,
+            })
+    } else {
+        None
+    };
     let ctx = MainVisibilityCtx {
         curr_sel,
         building_kind: kind,
@@ -3552,6 +3711,12 @@ fn refresh_interface_visibility(state: &mut AppState) {
         building_stack_turret_kinds: stack_kinds,
         building_stack_robot_atlas_keys: stack_robot_keys,
         robot_panel: robot_panel.clone(),
+        has_bomber,
+        has_repairer,
+        auto_frobot_on: auto_atk,
+        auto_protect_on: auto_def,
+        auto_capture_on: auto_cap,
+        order_glow,
     };
     if let Some(p) = state.iface_list.panel_mut("Main") {
         p.refresh_main_visibility(&ctx);
@@ -3782,7 +3947,10 @@ fn sync_selection_ring(state: &mut AppState, step_ms: f32) {
                 let _ = BuildingType::Base; // keep import live
                 (glam::Vec3::new(c.x, c.y, z), r)
             } else {
-                (obj.core().geo_center, obj.core().radius.max(12.0))
+                // Fixed ring size — ROBOT_SELECTION_SIZE / FLYER_SELECTION_SIZE
+                // are both 20 in the original (MatrixRobot.hpp:42,
+                // MatrixFlyer.hpp:51), independent of collision radius.
+                (obj.core().geo_center, 20.0)
             }
         });
         if let Some((c, r)) = placement {
@@ -3877,6 +4045,7 @@ fn load_map() -> (
         .unwrap_or_else(|e| panic!("failed to read {}: {}", mapname, e));
     let stor = Storage::from_bytes(&cmap_data).expect("failed to parse map CStorage");
     let map = GameMap::from_cmap_bytes(&cmap_data).expect("failed to parse CMAP");
+    crate::matrix_game::map::set_map_name(&mapname);
 
     (map, stor, matrix_data, pkg)
 }
@@ -3929,7 +4098,7 @@ async fn load_map_async() -> (
         // Bump this whenever `pack_bundle.rs` changes the set of
         // packed keys, so the browser refetches instead of serving
         // a stale cached response.
-        format!("{bundle_url}?bv=8")
+        format!("{bundle_url}?bv=10")
     };
     log::info!("loading bundle: {}", bundle_url);
     let bundle_data = crate::gfx::loader::load_bytes(&bundle_url)
@@ -3943,6 +4112,7 @@ async fn load_map_async() -> (
         .to_vec();
     let stor = Storage::from_bytes(&cmap_data).expect("failed to parse CStorage");
     let map = GameMap::from_cmap_bytes(&cmap_data).expect("failed to parse CMAP");
+    crate::matrix_game::map::set_map_name("map.cmap");
 
     // robots.dat is required here too — see the native loader comment.
     let dat_bytes = bundle
@@ -4044,6 +4214,7 @@ fn build_dialog_hint(
             otstup,
             screen_x: 0.0,
             screen_y: 0.0,
+            sound_out: None,
         },
         copy_pos,
     ))
@@ -4873,6 +5044,7 @@ fn build_pause_hint(state: &mut AppState) -> Option<crate::matrix_game::interfac
         otstup,
         screen_x,
         screen_y,
+        sound_out: None,
     })
 }
 

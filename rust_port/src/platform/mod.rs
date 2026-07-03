@@ -16,3 +16,18 @@ pub fn now_secs() -> f64 {
 pub fn now_secs() -> f64 {
     web_sys::window().unwrap().performance().unwrap().now() / 1000.0
 }
+
+/// Update the on-screen FPS overlay (`#fps` div in index.html). No-op on
+/// native (the FPS is logged to the console there instead).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn set_fps_text(_text: &str) {}
+
+#[cfg(target_arch = "wasm32")]
+pub fn set_fps_text(text: &str) {
+    if let Some(el) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.get_element_by_id("fps"))
+    {
+        el.set_inner_html(text);
+    }
+}

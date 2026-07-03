@@ -457,6 +457,40 @@ pub fn marquee_select(
             }
         }
     }
+    // No robots boxed → admit a player building (TRACE_ROBOT|TRACE_BUILDING;
+    // MatrixMultiSelection.cpp:228-253, MatrixFormGame.cpp:731-737).
+    if hits.is_empty() {
+        for id in logic.objects.iter_live() {
+            let Some(obj) = logic.objects.get(id) else {
+                continue;
+            };
+            if !matches!(obj.core().obj_type, ObjectType::Building) {
+                continue;
+            }
+            if logic.object_side(id) != logic.player_side.id {
+                continue;
+            }
+            let c = obj.core().geo_center;
+            let clip = vp * glam::Vec4::new(c.x - map_cx, c.y - map_cy, c.z, 1.0);
+            if clip.w <= 0.0 {
+                continue;
+            }
+            let sx = (clip.x / clip.w * 0.5 + 0.5) * screen_w;
+            let sy = (1.0 - (clip.y / clip.w * 0.5 + 0.5)) * screen_h;
+            if sx >= rect_min[0] && sx <= rect_max[0] && sy >= rect_min[1] && sy <= rect_max[1] {
+                let is_base = crate::matrix_game::logic::building_ref(&logic.objects, id)
+                    .map(|b| b.kind == crate::matrix_game::object_building::BuildingType::Base)
+                    .unwrap_or(false);
+                let sel = if is_base {
+                    CurrSel::BaseSelected
+                } else {
+                    CurrSel::BuildingSelected
+                };
+                logic.player_side.select_single(id, sel);
+                return 1;
+            }
+        }
+    }
     let n = hits.len();
     let primary = hits.last().copied();
     logic

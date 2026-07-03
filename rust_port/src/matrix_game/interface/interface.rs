@@ -166,6 +166,20 @@ pub struct MainVisibilityCtx {
     /// `CreateGroupIcons` + `CreateGroupSelection` (CInterface.cpp:3550,
     /// 3658, 3773).
     pub robot_panel: Option<RobotPanelCtx>,
+    /// Active selected robot carries a BIGBOOM / REPAIR weapon — gates
+    /// the `obomb` / `orep` HUD buttons (`bomber_sel` / `repairer_sel`,
+    /// CInterface.cpp:1302-1305, 1687-1691).
+    pub has_bomber: bool,
+    pub has_repairer: bool,
+    /// Auto-order toggle state (`AUTO_*_ON`), selecting the `_ON`/`_OFF`
+    /// button variant for the current group.
+    pub auto_frobot_on: bool,
+    pub auto_protect_on: bool,
+    pub auto_capture_on: bool,
+    /// Active group's order → order-glow index 0..5 (stop/move/patrol/
+    /// fire/capture/bomb-repair), lighting the `osel` icon with id
+    /// ORDERS_GLOW_ID+index (CInterface.cpp:1663-1677). `None` = no glow.
+    pub order_glow: Option<i32>,
 }
 
 /// Per-frame snapshot driving the robot selection panel — populated
@@ -214,6 +228,9 @@ pub const MAX_STACK_ICONS: usize = 6;
 /// from prior frames (`IS_STACK_ICON(x)` at CInterface.h:84 spans
 /// `[STACK_ICON, STACK_ICON+9)`).
 pub const STACK_ICON_BASE: i32 = 100;
+/// `ORDERS_GLOW_ID` (CInterface.h:65) — base id of the 6 `osel` order-glow
+/// icons (850..855).
+pub const ORDERS_GLOW_ID: i32 = 850;
 
 impl CInterface {
     /// Port of `CInterface::Load(bp, name)` (CInterface.cpp:146 onward).
@@ -512,18 +529,12 @@ impl CInterface {
                             e.def_state = ElementState::Normal;
                         }
                     }
-                    // Reinforcements ("call from hell") is visible for
-                    // any selected building UNLESS we're in turret-
-                    // build mode (CInterface.cpp:1607 — `&& !bld_tu`).
-                    // State goes DISABLED while maintenance is off or
-                    // the cooldown hasn't elapsed (CInterface.cpp:
-                    // 1609-1613). We don't yet model maintenance, so
-                    // it renders DISABLED always when shown.
-                    "callhell" if !bld_tu => {
-                        e.set_visible(true);
-                        e.cur_state = ElementState::Disabled;
-                        e.def_state = ElementState::Disabled;
-                    }
+                    // Reinforcements ("call from hell") is visible and
+                    // clickable for any selected building unless we're in
+                    // turret-build mode (CInterface.cpp:1607). The C++
+                    // cooldown/disabled gating (:1609-1613) isn't modelled,
+                    // so it stays enabled — matching the common case.
+                    "callhell" if !bld_tu => e.set_visible(true),
                     "baseln" => e.set_visible(true),
                     "zagl1" => e.set_visible(true),
                     // Resource-income readout — shown while the build
@@ -556,9 +567,35 @@ impl CInterface {
         // their subsystems, so only the working set is exposed.
         if ctx.curr_sel == CurrSel::RobotsSelected && !ctx.turret_build_active {
             for e in &mut self.elements {
+                if ctx.ordering {
+                    match e.name.as_str() {
+                        "ocan" | "zagl1" => e.set_visible(true),
+                        _ => {}
+                    }
+                    continue;
+                }
+                // Robot-group order panel (CInterface.cpp:1637-1692).
+                // stop/move/patrol/fire/capture + programs are always
+                // shown; bomb/repair gate on the active robot's weapons.
                 match e.name.as_str() {
-                    "ost" | "ogo" | "ofi" if !ctx.ordering => e.set_visible(true),
-                    "ocan" | "zagl1" if ctx.ordering => e.set_visible(true),
+                    "ost" | "ogo" | "opa" | "ofi" | "oca" | "prog" => e.set_visible(true),
+                    "obomb" if ctx.has_bomber => e.set_visible(true),
+                    "orep" if ctx.has_repairer => e.set_visible(true),
+                    // Auto-order toggle pairs — show the variant matching
+                    // the AUTO_*_ON flag (CInterface.cpp:1647-1661).
+                    "oafrn" if ctx.auto_frobot_on => e.set_visible(true),
+                    "oafrf" if !ctx.auto_frobot_on => e.set_visible(true),
+                    "oafcn" if ctx.auto_protect_on => e.set_visible(true),
+                    "oafcf" if !ctx.auto_protect_on => e.set_visible(true),
+                    "oacapn" if ctx.auto_capture_on => e.set_visible(true),
+                    "oacapf" if !ctx.auto_capture_on => e.set_visible(true),
+                    // Order glow: light the osel icon for the active order
+                    // (ids ORDERS_GLOW_ID..+5, CInterface.cpp:1663-1677).
+                    "osel" => {
+                        if ctx.order_glow == Some(e.id - ORDERS_GLOW_ID) {
+                            e.set_visible(true);
+                        }
+                    }
                     _ => {}
                 }
             }

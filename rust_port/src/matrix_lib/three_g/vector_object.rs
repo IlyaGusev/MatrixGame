@@ -39,6 +39,97 @@ pub struct VoMesh {
     /// matrix lives at `matrices[i].start + frame` into this array.
     /// Stored in D3D row-major layout (same 16 floats as on disk).
     pub all_matrices: Vec<[f32; 16]>,
+    /// On-mesh emissive lights (`$`-named bones, `InitLights`,
+    /// VectorObject.cpp:1769-1858): billboard lights whose colour animates
+    /// over the interval table.
+    pub lights: Vec<VoLight>,
+}
+
+/// One `$`-bone light: a billboard at bone `matid` whose colour LERPs
+/// through `intervals` (sorted by time) over `period` ms.
+#[derive(Clone, Debug)]
+pub struct VoLight {
+    pub matid: u32,
+    pub radius: f32,
+    pub period: i32,
+    /// `(time1, time2, c1, c2)` — colour LICs `c1→c2` over `[time1,time2]`.
+    pub intervals: Vec<(i32, i32, u32, u32)>,
+}
+
+impl VoLight {
+    /// Colour at animation time `t_ms` (LIC within the active interval).
+    pub fn color_at(&self, t_ms: i32) -> u32 {
+        if self.intervals.is_empty() {
+            return 0xFFFF_FFFF;
+        }
+        let t = if self.period > 0 { t_ms.rem_euclid(self.period) } else { 0 };
+        for &(t1, t2, c1, c2) in &self.intervals {
+            if t >= t1 && t <= t2 {
+                let span = (t2 - t1).max(1) as f32;
+                let k = ((t - t1) as f32 / span).clamp(0.0, 1.0);
+                let ch = |sh: u32| {
+                    let a = ((c1 >> sh) & 0xFF) as f32;
+                    let b = ((c2 >> sh) & 0xFF) as f32;
+                    (a + (b - a) * k) as u32
+                };
+                return (ch(24) << 24) | (ch(16) << 16) | (ch(8) << 8) | ch(0);
+            }
+        }
+        self.intervals[0].2
+    }
+}
+
+/// Parse the `$`-named light bones from the VO property table
+/// (`InitLights`, VectorObject.cpp:1769-1858).
+fn parse_vo_lights(stor: &Storage, matrices: &[VoMatrix]) -> Vec<VoLight> {
+    use crate::matrix_lib::base::wstr;
+    let (Some(pn), Some(pv)) = (
+        stor.get_buf("properties", "name"),
+        stor.get_buf("properties", "value"),
+    ) else {
+        return Vec::new();
+    };
+    let mut lights = Vec::new();
+    for m in matrices.iter().filter(|m| m.name.starts_with('$')) {
+        let Some(idx) = pn.find_as_wstr(&m.name) else {
+            continue;
+        };
+        let info = pv.get_as_wstr(idx);
+        let radius = wstr::double_par(&info, 0, ",") as f32;
+        let cnt = wstr::count_par(&info, ",");
+        let mut pts: Vec<(i32, u32)> = Vec::new();
+        for pa in 1..cnt {
+            let par = wstr::str_par(&info, pa, ":");
+            let _ = par;
+            let field = wstr::str_par(&info, pa, ",");
+            let time = wstr::int_par(field, 0, ":");
+            let hex = wstr::str_par(field, 1, ":");
+            let color = 0xFF00_0000 | u32::from_str_radix(hex.trim(), 16).unwrap_or(0);
+            pts.push((time, color));
+        }
+        pts.sort_by_key(|p| p.0);
+        let mut intervals = Vec::new();
+        let period;
+        if pts.is_empty() {
+            intervals.push((0, 0, 0xFFFF_FFFF, 0xFFFF_FFFF));
+            period = 0;
+        } else if pts.len() == 1 {
+            intervals.push((pts[0].0, pts[0].0, pts[0].1, pts[0].1));
+            period = 0;
+        } else {
+            period = pts.last().unwrap().0;
+            for w in pts.windows(2) {
+                intervals.push((w[0].0, w[1].0, w[0].1, w[1].1));
+            }
+        }
+        lights.push(VoLight {
+            matid: m.id,
+            radius,
+            period,
+            intervals,
+        });
+    }
+    lights
 }
 
 /// Port of `SVOMatrix` (VectorObject.hpp:227). `start` is the offset
@@ -172,6 +263,7 @@ pub fn parse_vo(data: &[u8]) -> Result<VoMesh> {
         .map(|f| f.surfaces.clone())
         .unwrap_or_default();
 
+    let lights = parse_vo_lights(&stor, &matrices);
     Ok(VoMesh {
         vertices,
         surfaces,
@@ -179,6 +271,7 @@ pub fn parse_vo(data: &[u8]) -> Result<VoMesh> {
         animations,
         matrices,
         all_matrices,
+        lights,
     })
 }
 

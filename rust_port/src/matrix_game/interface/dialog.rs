@@ -313,6 +313,7 @@ mod tests {
                 otstup: [0; 4],
                 screen_x: 0.0,
                 screen_y: 0.0,
+                sound_out: None,
             }],
             buttons,
             confirm_buttons: 0,

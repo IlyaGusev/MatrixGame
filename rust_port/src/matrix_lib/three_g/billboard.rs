@@ -200,6 +200,26 @@ impl BillboardQueue {
         });
     }
 
+    /// Billboard with an in-plane screen-space displacement (`DisplaceTo`,
+    /// used to lay out score-digit glyphs side by side).
+    pub fn billboard_disp(
+        &mut self,
+        pos: Vec3,
+        scale: f32,
+        color: u32,
+        tex: TexRef,
+        disp: Vec2,
+    ) {
+        self.billboards.push(QueuedBillboard {
+            pos,
+            scale,
+            rot: Vec2::new(1.0, 0.0),
+            disp,
+            color,
+            tex,
+        });
+    }
+
     /// Flat ground-aligned quad — the `CMatrixEffectBillboard` shape
     /// (MatrixEffectBillboard.cpp:30-33 + 50-60): unit XY-plane quad
     /// scaled by `radius`, world matrix = identity + translation. Used

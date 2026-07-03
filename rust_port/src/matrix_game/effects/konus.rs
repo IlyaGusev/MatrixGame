@@ -78,6 +78,9 @@ impl Konus {
             radius,
             pos,
         });
+        // Ctor `Takt(0)` (MatrixEffectKonus.hpp:108) — seed the sin-curve
+        // pose so the splash doesn't pop at full size on its first frame.
+        k.takt(0.0);
         k
     }
 

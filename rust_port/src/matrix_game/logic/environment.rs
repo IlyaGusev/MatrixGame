@@ -263,6 +263,12 @@ impl Info {
         self.bad_coords.contains(&coord)
     }
 
+    /// Reset the step-aside bad-coord ring (`m_BadCoordCnt=0`) once a
+    /// robot stops colliding (MatrixRobot.cpp:377).
+    pub fn clear_bad_coords(&mut self) {
+        self.bad_coords.clear();
+    }
+
     /// The accumulated bad-coord ring (`m_BadCoord` walk in
     /// `PlaceFindNearReturn`, MatrixLogic.cpp:766-773).
     pub fn bad_coords(&self) -> &[(i32, i32)] {

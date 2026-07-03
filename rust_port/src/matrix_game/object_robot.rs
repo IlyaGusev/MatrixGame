@@ -19,6 +19,7 @@ use wgpu::util::DeviceExt;
 
 use crate::matrix_game::camera::Camera;
 use crate::matrix_game::common::{unpack_rgb, FOG_END, FOG_START};
+use crate::matrix_game::effects::landscape_spot::{SpotKind, SpotSpawn};
 use crate::matrix_game::effects::point_light::PointLightSystem;
 use crate::matrix_game::map::GameMap;
 use crate::matrix_game::map_static::{MapStatic, ObjectId, ObjectType, Objects};
@@ -255,16 +256,20 @@ struct WeaponPart {
 fn compute_part_chain(
     chassis_world: &[[f32; 4]; 4],
     chassis_gpu: &ChassisGpu,
+    chassis_frame: usize,
     armor_gpus: &[Option<ChassisGpu>],
     armor_kind: Option<i32>,
     head_kind: Option<i32>,
     weapon_kinds: &[Option<i32>; 5],
     hull_forward: glam::Vec2,
 ) -> PartChain {
-    // Chassis bone-1 mount (MatrixObjectRobot.cpp:490-492).
+    // Chassis bone-1 mount at the chassis's live animation frame — the
+    // C++ reads GetMatrixById at m_VOFrame (MatrixObjectRobot.cpp:490-492,
+    // VectorObject.hpp:539) so armor/head/weapons ride the animated hull
+    // (pneumatic bob, idle hover sway) instead of the rest pose.
     let chassis_bone1 = chassis_gpu
         .vo_mesh
-        .matrix_by_id(1, 0)
+        .matrix_by_id(1, chassis_frame)
         .map(flat_to_rows)
         .unwrap_or(IDENTITY_MAT);
     let mut p = row_translate(&chassis_bone1);
@@ -492,6 +497,9 @@ pub struct RobotsRenderer {
     /// hardcoded constant.
     shadow_color: u32,
     time_ms: f32,
+    /// On-mesh emissive light billboards (`DrawLights`) collected each
+    /// `sync_robots` and flushed into the effects billboard queue.
+    light_bbs: Vec<(glam::Vec3, f32, u32)>,
     /// World-center offset applied to every instance so local-
     /// frame vertices share the terrain renderer's origin
     /// (matches the pattern `BuildingsRenderer` uses).
@@ -1181,6 +1189,7 @@ impl RobotsRenderer {
             light_dir,
             shadow_color: map.shadow_color,
             time_ms: 0.0,
+            light_bbs: Vec::new(),
             center: [cx, cy],
             preview_instance_buffer,
             shadow_system,
@@ -1188,6 +1197,18 @@ impl RobotsRenderer {
             shadow_batches: Vec::new(),
             shadow_cache: HashMap::new(),
         })
+    }
+
+    /// Flush this frame's on-mesh light billboards into the shared effects
+    /// billboard queue (`DrawLights` → `SortIntense`).
+    pub fn emit_light_billboards(
+        &self,
+        q: &mut crate::matrix_lib::three_g::billboard::BillboardQueue,
+    ) {
+        use crate::matrix_lib::three_g::billboard::{TexRef, BBT_POINTLIGHT};
+        for &(pos, radius, color) in &self.light_bbs {
+            q.billboard(pos, radius, 0.0, color, TexRef::Bbt(BBT_POINTLIGHT));
+        }
     }
 
     /// Port of `CConstructor::Render` (CConstructor.cpp:264-360) — draws
@@ -1467,6 +1488,7 @@ impl RobotsRenderer {
         let chain = compute_part_chain(
             &chassis_world,
             chassis_gpu,
+            0, // preview is the rest pose
             &self.armor,
             armor_kind,
             head_kind,
@@ -1619,6 +1641,11 @@ impl RobotsRenderer {
         // Snapshot the live ids first so we can mutate robots as we
         // iterate (need &mut for anim advance).
         let ids: Vec<_> = objs.iter_live().collect();
+        // Pneumatic footprint spawns collected here (can't push to `objs`
+        // while a robot is checked out) and drained after the loop.
+        let mut pneumatic_decals: Vec<SpotSpawn> = Vec::new();
+        // On-mesh emissive light billboards (DrawLights), rebuilt each frame.
+        let mut light_bbs_local: Vec<(glam::Vec3, f32, u32)> = Vec::new();
         for id in ids {
             let Some(obj) = objs.get_mut(id) else {
                 continue;
@@ -1796,6 +1823,10 @@ impl RobotsRenderer {
             let vo_mesh = chassis_gpu.vo_mesh.as_ref();
             let now_ms = crate::matrix_game::map::current_elapsed_ms() as f64;
             do_chassis_animation(robot, vo_mesh, now_ms, cms);
+            // Pneumatic walkers plant their feet (no slide) + leave prints.
+            if robot.chassis == ChassisKind::Pneumatic {
+                link_pneumatic(robot, vo_mesh, map, &mut pneumatic_decals);
+            }
             // BeginMove → Move chaining (MatrixObjectRobot.cpp:1414).
             if robot.animation == Animation::BeginMove && robot.chassis_anim.is_anim_end(vo_mesh) {
                 robot.animation = Animation::Move;
@@ -1863,6 +1894,19 @@ impl RobotsRenderer {
             // before transpose-pack so the bone chain helper can
             // multiply it as a parent matrix).
             let chassis_world = robot_world_d3d_rowmajor(robot, cx, cy);
+
+            // On-mesh emissive lights (`DrawLights`, MatrixObjectRobot.cpp:
+            // 1081-1090). Chassis lights collected here; armor/head/weapon
+            // parts add theirs below once the part chain is built.
+            collect_part_lights(
+                &chassis_world,
+                chassis_gpu.vo_mesh.as_ref(),
+                vo_frame,
+                cx,
+                cy,
+                self.time_ms,
+                &mut light_bbs_local,
+            );
 
             // Projected chassis shadow. The geometry rebuild allocates
             // 2 GPU buffers + 1 bind group per call (`shadow.rs:510-537`),
@@ -1959,12 +2003,57 @@ impl RobotsRenderer {
             let chain = compute_part_chain(
                 &chassis_world,
                 chassis_gpu,
+                robot.chassis_anim.vo_frame,
                 &self.armor,
                 non_zero_kind(armor_kind_i),
                 non_zero_kind(head_kind_i),
                 &weapon_kinds,
                 robot.hull_forward,
             );
+
+            // Armor / head / weapon on-mesh lights (same DrawLights pass as
+            // the chassis; each part uses its own world matrix + anim frame).
+            if let Some((aidx, aworld)) = chain.armor {
+                if let Some(g) = self.armor.get(aidx).and_then(|o| o.as_ref()) {
+                    collect_part_lights(
+                        &aworld,
+                        g.vo_mesh.as_ref(),
+                        robot.armor_anim.vo_frame,
+                        cx,
+                        cy,
+                        self.time_ms,
+                        &mut light_bbs_local,
+                    );
+                }
+            }
+            if let Some((hidx, hworld)) = chain.head {
+                if let Some(g) = self.head.get(hidx).and_then(|o| o.as_ref()) {
+                    collect_part_lights(
+                        &hworld,
+                        g.vo_mesh.as_ref(),
+                        robot.head_anim.vo_frame,
+                        cx,
+                        cy,
+                        self.time_ms,
+                        &mut light_bbs_local,
+                    );
+                }
+            }
+            for (pilon, w) in chain.weapons.iter().enumerate() {
+                if let Some(wp) = w {
+                    if let Some(g) = self.weapon.get(wp.idx).and_then(|o| o.as_ref()) {
+                        collect_part_lights(
+                            &wp.world,
+                            g.vo_mesh.as_ref(),
+                            robot.weapon_anims[pilon].vo_frame,
+                            cx,
+                            cy,
+                            self.time_ms,
+                            &mut light_bbs_local,
+                        );
+                    }
+                }
+            }
 
             // Write the weapon muzzle transforms back to the game
             // object — the renderer is the only place the real part
@@ -2171,6 +2260,8 @@ impl RobotsRenderer {
                 }
             }
         }
+        objs.pending_spots.append(&mut pneumatic_decals);
+        self.light_bbs = light_bbs_local;
 
         if !instance_data.is_empty() {
             queue.write_buffer(
@@ -2456,6 +2547,229 @@ fn chassis_kind_index(c: ChassisKind) -> usize {
     // `m_Kind - 1` per MatrixConfig.hpp:39-43 — the .vo file index
     // too (Chassis4.vo = Hovercraft, Chassis5.vo = Antigravity).
     c.kind_index()
+}
+
+/// Collect a part's `$`-bone light billboards (`DrawLights`). `world` is the
+/// part's centred world matrix; the map centre is added back to reach the
+/// effects billboard-queue's (uncentred) world space.
+fn collect_part_lights(
+    world: &[[f32; 4]; 4],
+    vo: &vector_object::VoMesh,
+    frame: usize,
+    cx: f32,
+    cy: f32,
+    time_ms: f32,
+    out: &mut Vec<(glam::Vec3, f32, u32)>,
+) {
+    for light in &vo.lights {
+        if let Some(bm) = vo.matrix_by_id(light.matid, frame) {
+            let (lx, ly, lz) = (bm[12], bm[13], bm[14]);
+            let wx = lx * world[0][0] + ly * world[1][0] + lz * world[2][0] + world[3][0] + cx;
+            let wy = lx * world[0][1] + ly * world[1][1] + lz * world[2][1] + world[3][1] + cy;
+            let wz = lx * world[0][2] + ly * world[1][2] + lz * world[2][2] + world[3][2];
+            out.push((
+                glam::Vec3::new(wx, wy, wz),
+                light.radius,
+                light.color_at(time_ms as i32),
+            ));
+        }
+    }
+}
+
+// ── Pneumatic (walker) foot-linking ─────────────────────────────────────
+// Port of `SPneumaticData` + `BuildPneumaticData` / `LinkPneumatic`
+// (MatrixObjectRobot.cpp:1508-1821). The chassis animation plants a foot
+// each cycle; the body is nudged so the planted foot stays put (no slide),
+// and a `SPOT_SOLE_PNEUMATIC` footprint is stamped when a new foot lands.
+
+#[derive(Clone, Copy, Default)]
+struct PneumaticFrame {
+    foot: (f32, f32),
+    other_foot: (f32, f32),
+    newlink: bool,
+}
+
+struct PneumaticTable {
+    fcnt: usize,
+    /// `[0..fcnt)` = Move (forward), `[fcnt..2*fcnt)` = MoveBack.
+    frames: Vec<PneumaticFrame>,
+}
+
+static PNEUMATIC_TABLE: std::sync::OnceLock<Option<PneumaticTable>> = std::sync::OnceLock::new();
+
+/// `BuildPneumaticData` — analyse the Move/MoveBack anims' left/right foot
+/// bones (ids 2 and 3) to find, per frame, which foot is planted.
+fn build_pneumatic_table(vo: &vector_object::VoMesh) -> Option<PneumaticTable> {
+    let bone = |frame_idx: usize, id: u32| -> Option<(f32, f32)> {
+        // Row-major D3DXMATRIX: _41 = [12], _42 = [13].
+        vo.matrix_by_id(id, frame_idx).map(|m| (m[12], m[13]))
+    };
+    let move_anim = vo
+        .animations
+        .iter()
+        .find(|a| a.name.eq_ignore_ascii_case("Move"))?;
+    let fcnt = move_anim.frames.len();
+    if fcnt == 0 {
+        return None;
+    }
+    let mut frames = vec![PneumaticFrame::default(); fcnt * 2];
+
+    // Forward pass: the planted foot at frame i is the one furthest ahead
+    // (max bone _42); `newlink` marks where the planted foot switches.
+    let fill = |frames: &mut [PneumaticFrame],
+                anim: &vector_object::VoAnimation,
+                base: usize,
+                forward: bool|
+     -> Option<()> {
+        let (mut leftf, mut ritef) = (0i32, 0i32);
+        let (mut maxl, mut maxr) = if forward { (-1e30f32, -1e30f32) } else { (1e30f32, 1e30f32) };
+        for i in 0..fcnt {
+            let fr = anim.frames.get(i)?.frame_index;
+            let (ml, mr) = (bone(fr, 2)?, bone(fr, 3)?);
+            if (forward && ml.1 > maxl) || (!forward && ml.1 < maxl) {
+                maxl = ml.1;
+                leftf = i as i32;
+            }
+            if (forward && mr.1 > maxr) || (!forward && mr.1 < maxr) {
+                maxr = mr.1;
+                ritef = i as i32;
+            }
+        }
+        let mut prev = if leftf < ritef { 3 } else { 2 };
+        for i in 0..fcnt {
+            let fr = anim.frames[i].frame_index;
+            let (ml, mr) = (bone(fr, 2)?, bone(fr, 3)?);
+            let newv = if i as i32 == leftf {
+                2
+            } else if i as i32 == ritef {
+                3
+            } else {
+                prev
+            };
+            let e = &mut frames[base + i];
+            if newv == 2 {
+                e.newlink = prev != newv;
+                prev = newv;
+                if e.newlink {
+                    e.other_foot = ml;
+                    e.foot = mr;
+                } else {
+                    e.foot = ml;
+                }
+            } else {
+                e.newlink = prev != 3;
+                prev = newv;
+                if e.newlink {
+                    e.other_foot = mr;
+                    e.foot = ml;
+                } else {
+                    e.foot = mr;
+                }
+            }
+        }
+        Some(())
+    };
+
+    fill(&mut frames, move_anim, 0, true)?;
+    if let Some(back) = vo
+        .animations
+        .iter()
+        .find(|a| a.name.eq_ignore_ascii_case("MoveBack"))
+    {
+        if back.frames.len() == fcnt {
+            let _ = fill(&mut frames, back, fcnt, false);
+        }
+    }
+    Some(PneumaticTable { fcnt, frames })
+}
+
+fn pneumatic_table(vo: &vector_object::VoMesh) -> Option<&'static PneumaticTable> {
+    PNEUMATIC_TABLE
+        .get_or_init(|| build_pneumatic_table(vo))
+        .as_ref()
+}
+
+/// `LinkPneumatic` — stamp footprints on new plants and nudge the body so
+/// the planted foot doesn't slide. Uses a flat up-vector (decals/plants sit
+/// on near-level ground); the correction is clamped so a mis-built table
+/// can never teleport the robot.
+fn link_pneumatic(robot: &mut Robot, vo: &vector_object::VoMesh, map: &GameMap, decals: &mut Vec<SpotSpawn>) {
+    use crate::matrix_game::common::{trunc_float, CELLFLAG_BRIDGE, CELLFLAG_LAND};
+    use crate::matrix_game::map::GLOBAL_SCALE;
+
+    let is_move = robot.animation == Animation::Move;
+    let is_back = robot.animation == Animation::MoveBack;
+    if !is_move && !is_back {
+        robot.link_prev_frame = -1;
+        return;
+    }
+    let Some(table) = pneumatic_table(vo) else {
+        return;
+    };
+    let g_fcnt = table.fcnt as i32;
+    if g_fcnt <= 0 {
+        return;
+    }
+    let vof_add = if is_back { g_fcnt } else { 0 };
+    let vof = robot.chassis_anim.frame.clamp(0, g_fcnt - 1);
+
+    let fwd = robot.forward.normalize_or_zero();
+    let fwd3 = glam::Vec3::new(fwd.x, fwd.y, 0.0);
+    let side = fwd3.cross(glam::Vec3::Z).normalize_or_zero();
+    let tmp_fwd = glam::Vec3::Z.cross(side).normalize_or_zero();
+    let xf = |lp: (f32, f32), px: f32, py: f32| -> (f32, f32) {
+        (
+            lp.0 * side.x + lp.1 * tmp_fwd.x + px,
+            lp.0 * side.y + lp.1 * tmp_fwd.y + py,
+        )
+    };
+
+    if robot.link_prev_frame < 0 {
+        // FirstLinkPneumatic — anchor the planted foot.
+        let f = table.frames[(vof + vof_add) as usize].foot;
+        let (wx, wy) = xf(f, robot.pos_x, robot.pos_y);
+        robot.link_pos = glam::Vec2::new(wx, wy);
+        robot.link_prev_frame = vof;
+        return;
+    }
+
+    let mut guard = 0;
+    while robot.link_prev_frame != vof && guard < g_fcnt {
+        guard += 1;
+        let e = table.frames[(robot.link_prev_frame + vof_add) as usize];
+        if e.newlink {
+            let (wx, wy) = xf(e.other_foot, robot.pos_x, robot.pos_y);
+            robot.link_pos = glam::Vec2::new(wx, wy);
+            let cx = trunc_float(wx / GLOBAL_SCALE) as i32;
+            let cy = trunc_float(wy / GLOBAL_SCALE) as i32;
+            if let Some(fl) = map.unit_flags(cx, cy) {
+                if fl & CELLFLAG_LAND != 0 && fl & CELLFLAG_BRIDGE == 0 {
+                    decals.push(SpotSpawn {
+                        pos: glam::Vec2::new(wx, wy),
+                        angle: (-fwd.x).atan2(fwd.y),
+                        scale: 1.0,
+                        kind: SpotKind::SolePneumatic,
+                    });
+                }
+            }
+        }
+        robot.link_prev_frame += 1;
+        if robot.link_prev_frame >= g_fcnt {
+            robot.link_prev_frame = 0;
+        }
+    }
+
+    // Body correction: shift so the current planted foot lands on link_pos.
+    if robot.state != crate::matrix_game::robot::RobotState::Carrying && !robot.is_colliding() {
+        let f = table.frames[(vof + vof_add) as usize].foot;
+        let (cx, cy) = xf(f, robot.pos_x, robot.pos_y);
+        let (dx, dy) = (cx - robot.link_pos.x, cy - robot.link_pos.y);
+        let lim = 2.0 * GLOBAL_SCALE;
+        if dx * dx + dy * dy < lim * lim {
+            robot.pos_x -= dx;
+            robot.pos_y -= dy;
+        }
+    }
 }
 
 /// Returns `Some(k)` for `k >= 1`, else `None`. Convenience for

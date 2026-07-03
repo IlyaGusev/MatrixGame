@@ -75,6 +75,7 @@ const MINIMAP_BUILDING_BASE_R: f32 = 8.0;
 /// Per-object marker radii from `MatrixMinimap.hpp:25-29` —
 /// `MINIMAP_ROBOT_R / MINIMAP_FLYER_R / MINIMAP_CANNON_R`.
 const MINIMAP_ROBOT_R: f32 = 8.0;
+const MINIMAP_FLYER_R: f32 = 8.0;
 const MINIMAP_CANNON_R: f32 = 8.0;
 
 /// Water plane Z — from `renderer/water.rs`, matches `WATER_LEVEL` in the
@@ -1261,6 +1262,8 @@ impl Minimap {
                     };
                     (self.icon_turret, cannon_r, c.mini_map_flash_time)
                 }
+                // Flyers always blip (MatrixMinimap.cpp:696-699); no flash.
+                ObjectType::Flyer => (self.icon_flyer, MINIMAP_FLYER_R * ui_scale, 0),
                 _ => continue,
             };
             let world_xy = [core.geo_center.x, core.geo_center.y];

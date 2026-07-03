@@ -22,6 +22,12 @@ pub enum SpotKind {
     PlasmaHit,
     /// `SPOT_CONSTANT` — black burn mark, 15s.
     Constant,
+    /// `SPOT_SOLE_TRACK` — tracked-chassis tread mark, 30s.
+    SoleTrack,
+    /// `SPOT_SOLE_WHEEL` — wheeled-chassis tyre mark, 30s.
+    SoleWheel,
+    /// `SPOT_SOLE_PNEUMATIC` — walker-chassis footprint, 30s.
+    SolePneumatic,
 }
 
 impl SpotKind {
@@ -30,6 +36,7 @@ impl SpotKind {
             SpotKind::Voronka => 30_000.0,
             SpotKind::PlasmaHit => 3_000.0,
             SpotKind::Constant => 15_000.0,
+            SpotKind::SoleTrack | SpotKind::SoleWheel | SpotKind::SolePneumatic => 30_000.0,
         }
     }
     pub fn texture(self) -> TexRef {
@@ -37,6 +44,9 @@ impl SpotKind {
             SpotKind::Voronka => TexRef::Path("Matrix/Textures/LandSpots/varonka"),
             SpotKind::PlasmaHit => TexRef::Path("Matrix/Textures/LandSpots/spot_hit"),
             SpotKind::Constant => TexRef::Path("Matrix/Textures/LandSpots/spot"),
+            SpotKind::SoleTrack => TexRef::Path("Matrix/Textures/LandSpots/sole"),
+            SpotKind::SoleWheel => TexRef::Path("Matrix/Textures/LandSpots/sole_w"),
+            SpotKind::SolePneumatic => TexRef::Path("Matrix/Textures/LandSpots/sole_p"),
         }
     }
 }
@@ -73,10 +83,19 @@ impl Spot {
         let ext = SPOT_SIZE * s.scale;
         let xc = ext * ca;
         let xs = ext * sa;
+        // LSFLAG_SCALE_BY_NORMAL (only SPOT_PLASMA_HIT): compress the quad
+        // per-axis on sloped terrain (MatrixEffectLandscapeSpot.cpp:239-248).
+        let (nsx, nsy) = if s.kind == SpotKind::PlasmaHit {
+            let n = map.get_normal(s.pos.x, s.pos.y, false);
+            let f = 2.0 / std::f32::consts::PI;
+            (n[0].abs().acos() * f, n[1].abs().acos() * f)
+        } else {
+            (1.0, 1.0)
+        };
         // Quad corners (parallelogram) — :222-256.
-        let c0 = s.pos + Vec2::new(-xc + xs, -xs - xc);
-        let c1 = s.pos + Vec2::new(xc + xs, xs - xc);
-        let c3 = s.pos + Vec2::new(-xc - xs, -xs + xc);
+        let c0 = s.pos + Vec2::new((-xc + xs) * nsx, (-xs - xc) * nsy);
+        let c1 = s.pos + Vec2::new((xc + xs) * nsx, (xs - xc) * nsy);
+        let c3 = s.pos + Vec2::new((-xc - xs) * nsx, (-xs + xc) * nsy);
         let ex = c1 - c0;
         let ey = c3 - c0;
         let ex2 = ex.length_squared().max(1e-6);
@@ -153,6 +172,11 @@ impl Spot {
             SpotKind::Constant => {
                 let a = if k < 0.1 { k / 0.1 * 255.0 } else { 255.0 } as u32;
                 a << 24 // black texture modulated by alpha
+            }
+            // SpotTaktConstant fade, white-modulated (color 0xFFFFFFFF).
+            SpotKind::SoleTrack | SpotKind::SoleWheel | SpotKind::SolePneumatic => {
+                let a = if k < 0.1 { k / 0.1 * 255.0 } else { 255.0 } as u32;
+                (a << 24) | 0x00FF_FFFF
             }
             SpotKind::Voronka => {
                 let a = if k > 0.97 {

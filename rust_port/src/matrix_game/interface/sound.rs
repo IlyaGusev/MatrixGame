@@ -39,6 +39,15 @@ pub fn play(sound: UiSound) {
     log::trace!("ui sound: {:?}", sound);
 }
 
+/// Fire a hint's `_SOUNDIN:`/`_SOUNDOUT:` sound by name (MatrixHint.hpp:
+/// 134-158). Silent like the rest of the sound layer until a host backend
+/// is attached, but the dispatch site is present.
+pub fn play_hint_sound(name: &str) {
+    if !name.is_empty() {
+        log::trace!("hint sound: {name}");
+    }
+}
+
 /// Pick the right sound for an `LB-down on PUSH_BUTTON` event, matching
 /// the C++ name-based dispatch at CIFaceButton.cpp:44-50.
 pub fn for_push_button_down(name: &str) -> UiSound {

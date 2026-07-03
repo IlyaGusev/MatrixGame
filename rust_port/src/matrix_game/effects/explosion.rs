@@ -3,9 +3,10 @@
 //! kinetics, plus `CMatrixEffectFireAnim` (the 8-frame flame loop
 //! `CreateExplosion(..., fire=true)` adds).
 //!
-//! The per-preset point-light flash is not ported (the terrain
-//! point-light system has no dynamic per-frame lights yet); sounds
-//! are likewise deferred with the audio backend.
+//! The per-preset point-light flash is ported via
+//! `PointLightSystem::add_transient_light_anim` (queued through
+//! `Objects::pending_point_lights`); sounds are deferred with the audio
+//! backend.
 
 use glam::Vec3;
 
@@ -41,6 +42,17 @@ pub struct ExplosionProps {
     pub deb_type: i32,
     pub voronka: SpotType,
     pub voronka_scale: f32,
+    /// Attached point light (MatrixEffectExplosion.cpp preset `light*`
+    /// fields): phase 1 (`m_Time < light_time1`) LERPs radius `r1→r2` and
+    /// colour `c1→c2`; phase 2 holds radius `r2` and fades colour→black
+    /// over `(light_time2-light_time1)/DEBRIS_SPEED` ms (:636-646).
+    pub light: bool,
+    pub light_radius1: f32,
+    pub light_radius2: f32,
+    pub light_color1: u32,
+    pub light_color2: u32,
+    pub light_time1: f32,
+    pub light_time2: f32,
 }
 
 /// The preset instances (MatrixEffectExplosion.cpp:13-304).
@@ -58,6 +70,13 @@ pub const EXPLOSION_NORMAL: ExplosionProps = ExplosionProps {
     deb_type: 0,
     voronka: SpotType::Voronka,
     voronka_scale: 20.0,
+    light: false,
+    light_radius1: 0.0,
+    light_radius2: 0.0,
+    light_color1: 0x00000000,
+    light_color2: 0x00000000,
+    light_time1: 0.0,
+    light_time2: 0.0,
 };
 pub const EXPLOSION_MISSILE: ExplosionProps = ExplosionProps {
     min_speed: 0.0,
@@ -73,6 +92,13 @@ pub const EXPLOSION_MISSILE: ExplosionProps = ExplosionProps {
     deb_type: 1,
     voronka: SpotType::None,
     voronka_scale: 0.0,
+    light: true,
+    light_radius1: 10.0,
+    light_radius2: 100.0,
+    light_color1: 0x00000000,
+    light_color2: 0xFFFF6F33,
+    light_time1: 1.5,
+    light_time2: 8.0,
 };
 pub const EXPLOSION_ROBOT_HIT: ExplosionProps = ExplosionProps {
     min_speed: 0.0,
@@ -88,6 +114,13 @@ pub const EXPLOSION_ROBOT_HIT: ExplosionProps = ExplosionProps {
     deb_type: 1,
     voronka: SpotType::None,
     voronka_scale: 0.0,
+    light: false,
+    light_radius1: 2.0,
+    light_radius2: 30.0,
+    light_color1: 0xFFFFFFFF,
+    light_color2: 0x11FFFF11,
+    light_time1: 1.5,
+    light_time2: 3.0,
 };
 pub const EXPLOSION_LASER_HIT: ExplosionProps = ExplosionProps {
     min_speed: 0.0,
@@ -103,6 +136,13 @@ pub const EXPLOSION_LASER_HIT: ExplosionProps = ExplosionProps {
     deb_type: 0,
     voronka: SpotType::None,
     voronka_scale: 0.0,
+    light: true,
+    light_radius1: 2.0,
+    light_radius2: 10.0,
+    light_color1: 0xFFFFFFFF,
+    light_color2: 0x11200505,
+    light_time1: 1.5,
+    light_time2: 3.0,
 };
 pub const EXPLOSION_BUILDING_BOOM: ExplosionProps = ExplosionProps {
     min_speed: 0.0,
@@ -118,6 +158,13 @@ pub const EXPLOSION_BUILDING_BOOM: ExplosionProps = ExplosionProps {
     deb_type: 1,
     voronka: SpotType::None,
     voronka_scale: 0.0,
+    light: false,
+    light_radius1: 2.0,
+    light_radius2: 10.0,
+    light_color1: 0xFFFFFFFF,
+    light_color2: 0x11FF3111,
+    light_time1: 1.5,
+    light_time2: 3.0,
 };
 pub const EXPLOSION_BUILDING_BOOM2: ExplosionProps = ExplosionProps {
     min_speed: 10.0,
@@ -133,6 +180,13 @@ pub const EXPLOSION_BUILDING_BOOM2: ExplosionProps = ExplosionProps {
     deb_type: 1,
     voronka: SpotType::None,
     voronka_scale: 0.0,
+    light: false,
+    light_radius1: 2.0,
+    light_radius2: 10.0,
+    light_color1: 0xFFFFFFFF,
+    light_color2: 0x11FF3111,
+    light_time1: 1.5,
+    light_time2: 3.0,
 };
 pub const EXPLOSION_ROBOT_BOOM: ExplosionProps = ExplosionProps {
     min_speed: 0.0,
@@ -148,6 +202,13 @@ pub const EXPLOSION_ROBOT_BOOM: ExplosionProps = ExplosionProps {
     deb_type: 1,
     voronka: SpotType::None,
     voronka_scale: 0.0,
+    light: true,
+    light_radius1: 10.0,
+    light_radius2: 70.0,
+    light_color1: 0x00000000,
+    light_color2: 0xFFFF6F33,
+    light_time1: 1.5,
+    light_time2: 8.0,
 };
 pub const EXPLOSION_ROBOT_BOOM_SMALL: ExplosionProps = ExplosionProps {
     min_speed: 0.0,
@@ -163,6 +224,13 @@ pub const EXPLOSION_ROBOT_BOOM_SMALL: ExplosionProps = ExplosionProps {
     deb_type: 1,
     voronka: SpotType::None,
     voronka_scale: 0.0,
+    light: true,
+    light_radius1: 10.0,
+    light_radius2: 50.0,
+    light_color1: 0x00000000,
+    light_color2: 0xFFFF6F33,
+    light_time1: 1.5,
+    light_time2: 8.0,
 };
 pub const EXPLOSION_BIG_BOOM: ExplosionProps = ExplosionProps {
     min_speed: 0.0,
@@ -178,6 +246,13 @@ pub const EXPLOSION_BIG_BOOM: ExplosionProps = ExplosionProps {
     deb_type: 1,
     voronka: SpotType::Voronka,
     voronka_scale: 12.0,
+    light: true,
+    light_radius1: 10.0,
+    light_radius2: 70.0,
+    light_color1: 0x00000000,
+    light_color2: 0xFFFF6F33,
+    light_time1: 1.5,
+    light_time2: 8.0,
 };
 pub const EXPLOSION_OBJECT: ExplosionProps = ExplosionProps {
     min_speed: 0.0,
@@ -193,6 +268,13 @@ pub const EXPLOSION_OBJECT: ExplosionProps = ExplosionProps {
     deb_type: 1,
     voronka: SpotType::Voronka,
     voronka_scale: 10.0,
+    light: true,
+    light_radius1: 10.0,
+    light_radius2: 70.0,
+    light_color1: 0x00000000,
+    light_color2: 0xFFFF6F33,
+    light_time1: 1.5,
+    light_time2: 8.0,
 };
 
 /// Constants (MatrixEffectExplosion.hpp:15-21).

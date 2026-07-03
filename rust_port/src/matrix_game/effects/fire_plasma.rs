@@ -108,8 +108,14 @@ impl FirePlasma {
                     )));
                 }
             }
+            // Kill the follow light (MatrixEffectFirePlasma.cpp Kill on hit).
+            objs.pending_light_kill.push(self.weapon);
             return false;
         }
+        // Bolt glow that follows the projectile (CreatePointLight,
+        // MatrixEffectFirePlasma.cpp:29 — radius 20, colour 0x202030).
+        objs.pending_light_follow
+            .push((self.weapon, [self.pos.x, self.pos.y, self.pos.z], 20.0, 0x0020_2030));
         true
     }
 
