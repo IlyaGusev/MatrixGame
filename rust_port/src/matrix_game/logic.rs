@@ -83,6 +83,13 @@ pub struct MapLogic {
     pub gather_info_last: i64,
     /// `m_PrevTimeCheckStatus` (MatrixMap.hpp:421) — 1s win/lose gate.
     pub prev_time_check_status: i64,
+    /// Fractional-ms carry for the side-LogicTakt pacing (`m_TaktNext`,
+    /// MatrixLogic.cpp:2737-2745).
+    side_takt_carry: i32,
+    /// Author-placed ambient effect spawners (CEffectSpawner,
+    /// MatrixEffect.cpp:105-190), ticked each takt like
+    /// `CMatrixMap::Takt`'s spawner loop (MatrixMap.cpp:2522-2527).
+    ambient_spawners: Vec<AmbientSpawner>,
     /// `m_BeforeWinLooseDialogCount` (MatrixMap.hpp:422).
     pub before_win_loose_dialog_count: i32,
     /// `m_BeforeWinCount` (MatrixMap.hpp:309) — outstanding special
@@ -155,7 +162,11 @@ impl MapLogic {
             player_side: Side::new(PLAYER_SIDE),
             other_sides: Vec::new(),
             gather_info_last: 0,
-            prev_time_check_status: 0,
+            // C++ seeds -1500 (MatrixMap.cpp:41) so the first win/lose
+            // check runs on the first takt, not ~1 s in.
+            prev_time_check_status: -1500,
+            side_takt_carry: 0,
+            ambient_spawners: Vec::new(),
             before_win_loose_dialog_count: 0,
             before_win_count: 0,
             game_over: None,
@@ -222,12 +233,103 @@ impl MapLogic {
                 self.other_sides.push(Side::new(sid));
             }
         }
+        // `SetStatus(SS_ACTIVE)` for every side owning a live base or
+        // robot (MatrixMapPrepare.cpp:1690-1697, 1713-1719). Sides
+        // owning only turrets/factories stay SS_NONE and are exempt
+        // from the death scan — matching the C++.
+        let mut active: Vec<i32> = Vec::new();
+        for id in self.objects.iter_live() {
+            let Some(obj) = self.objects.get(id) else {
+                continue;
+            };
+            let side = obj.side();
+            if side == 0 || active.contains(&side) {
+                continue;
+            }
+            let owns = match obj.core().obj_type {
+                ObjectType::RobotAi => obj.is_live(),
+                ObjectType::Building => {
+                    obj.is_live()
+                        && building_ref(&self.objects, id)
+                            .map(|b| b.is_base())
+                            .unwrap_or(false)
+                }
+                _ => false,
+            };
+            if owns {
+                active.push(side);
+            }
+        }
+        for sid in active {
+            if let Some(s) = self.side_by_id_mut(sid) {
+                s.status = crate::matrix_game::side::SideStatus::Active;
+            }
+        }
+    }
+
+    /// Build the runtime ambient-spawner list from the map's
+    /// RS_EFFECTS records (`AddEffectSpawner`, MatrixMap.cpp:3112-3168).
+    /// Smoke/fire specs are parsed; sound (silent layer) and paired
+    /// lightening spawners are skipped.
+    pub fn init_effect_spawners(&mut self, map: &GameMap) {
+        self.ambient_spawners.clear();
+        for (pos, spec) in &map.effect_spawners {
+            let parts: Vec<&str> = spec.split(',').map(|s| s.trim()).collect();
+            if parts.len() < 3 {
+                continue;
+            }
+            let pint = |i: usize| parts.get(i).and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
+            let pf = |i: usize| {
+                parts
+                    .get(i)
+                    .and_then(|s| s.parse::<f32>().ok())
+                    .unwrap_or(0.0)
+            };
+            let pbool =
+                |i: usize| matches!(parts.get(i).map(|s| s.to_ascii_lowercase()), Some(ref s) if s == "true" || s == "1");
+            let ty = pint(0);
+            let min_period = pint(1).max(1);
+            let max_period = pint(2).max(min_period);
+            // EST_SMOKE=1 / EST_FIRE=2 (MatrixEffect.hpp:492-497).
+            if ty != 1 && ty != 2 {
+                continue;
+            }
+            let next_time = self.rng.range(min_period, max_period) as i64;
+            self.ambient_spawners.push(AmbientSpawner {
+                pos: glam::Vec3::new(pos[0], pos[1], pos[2]),
+                is_fire: ty == 2,
+                min_period,
+                max_period,
+                next_time,
+                ttl: pf(3),
+                puff_ttl: pf(4),
+                spawn_time: pf(5),
+                intense: pbool(6),
+                speed: pf(7),
+                // Smoke: [8]=hex color; fire: [8]=dispfactor.
+                color: parts
+                    .get(8)
+                    .and_then(|s| u32::from_str_radix(s, 16).ok())
+                    .unwrap_or(0xFFFF_FFFF),
+                disp_factor: pf(8),
+            });
+        }
+        if !self.ambient_spawners.is_empty() {
+            log::info!(
+                "map: {} ambient effect spawners active",
+                self.ambient_spawners.len()
+            );
+        }
     }
 
     /// Seed each side's starting resources + base income multiplier from
-    /// the map `SideResInfo` property (MatrixMapPrepare.cpp:464-493).
+    /// the map `SideResInfo` property (MatrixMapPrepare.cpp:464-493),
+    /// plus the maintenance percentage + initial reinforcement cooldown
+    /// from the same RS_SIDEAI step (MatrixMapPrepare.cpp:411-418).
     /// Call once after sides exist; overrides the pre-map defaults.
     pub fn apply_side_resources(&mut self, map: &GameMap) {
+        self.maintenance_prc = map.maintenance_prc;
+        self.init_maintenance_time();
         for &(id, res, fu) in &map.side_res_info {
             if let Some(su) = self.side_by_id_mut(id) {
                 for (k, &amt) in res.iter().enumerate() {
@@ -247,9 +349,13 @@ impl MapLogic {
         if step_ms <= 0 {
             return;
         }
-        // Maintenance countdown (MatrixLogic.cpp:2655-2663).
+        // Maintenance countdown (MatrixLogic.cpp:2655-2663);
+        // S_MAINTENANCE_ON when the timer runs out.
         if self.maintenance_time > 0 {
             self.maintenance_time = (self.maintenance_time - step_ms).max(0);
+            if self.maintenance_time == 0 {
+                self.objects.queue_snd("s_maintenance_on");
+            }
         }
         // GatherInfo every >100ms (MatrixLogic.cpp:2713-2718), before
         // the logic portions like the C++ Takt.
@@ -265,16 +371,22 @@ impl MapLogic {
             self.objects
                 .proceed_logic(LOGIC_TAKT_PERIOD_MS, &mut self.rng);
             self.tick += 1;
-            // `m_Side[i].LogicTakt(LOGIC_TAKT_PERIOD)` — player side
-            // only (enemy-AI sides excluded by scope),
-            // MatrixLogic.cpp:2737-2745.
-            if let Some(map) = crate::matrix_game::map::current_map() {
-                self.side_logic_takt(map);
-            }
         }
         let rem = step_ms - full * LOGIC_TAKT_PERIOD_MS;
         if rem > 0 {
             self.objects.proceed_logic(rem, &mut self.rng);
+        }
+        // `m_Side[i].LogicTakt(LOGIC_TAKT_PERIOD)` — player side only
+        // (enemy-AI sides excluded by scope). The C++ paces these on
+        // the `m_TaktNext += 10` accumulator (MatrixLogic.cpp:2737-
+        // 2745), so fractional frame remainders carry over and the
+        // side gets exactly 100 takts per game-second at any FPS.
+        self.side_takt_carry += step_ms;
+        while self.side_takt_carry >= LOGIC_TAKT_PERIOD_MS {
+            self.side_takt_carry -= LOGIC_TAKT_PERIOD_MS;
+            if let Some(map) = crate::matrix_game::map::current_map() {
+                self.side_logic_takt(map);
+            }
         }
         // Special win-target deaths queued by map objects this takt
         // (MatrixObject.cpp:203-212 / :249-260 / :1244-1258).
@@ -292,12 +404,77 @@ impl MapLogic {
                         }
                     }
                     SpecialDeathKind::Terron => {
-                        // SS_ACTIVE → SS_JUST_WIN + MMFLAG_WIN,
-                        // unconditional (MatrixObject.cpp:1251-1258).
+                        // SS_ACTIVE → SS_JUST_WIN + MMFLAG_WIN +
+                        // MMFLAG_TERRON_DEAD, unconditional
+                        // (MatrixObject.cpp:1251-1258). The dead flag
+                        // exempts the player from the attrition-death
+                        // scan in the same check_status pass.
                         self.win_flag = true;
+                        self.objects.terron_dead = true;
                         self.player_side.status = SideStatus::JustWin;
                     }
                 }
+            }
+        }
+        // Cancelled build-queue refunds (CBuildStack::DeleteItem →
+        // ReturnRobotResources / ReturnTurretResources).
+        if !self.objects.pending_refunds.is_empty() {
+            let refunds: Vec<(i32, [i32; 4])> = self.objects.pending_refunds.drain(..).collect();
+            for (side, res) in refunds {
+                if let Some(s) = self.side_by_id_mut(side) {
+                    for (i, &amt) in res.iter().enumerate() {
+                        if amt != 0 {
+                            s.add_resource_amount(
+                                crate::matrix_game::config::Resource::ALL[i],
+                                amt,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // Ambient effect spawners (CEffectSpawner::Takt,
+        // MatrixEffect.cpp:169-190): each fires its smoke/fire effect
+        // every rnd(min,max) ms.
+        for i in 0..self.ambient_spawners.len() {
+            if self.elapsed_ms <= self.ambient_spawners[i].next_time {
+                continue;
+            }
+            let delay = {
+                let s = &self.ambient_spawners[i];
+                self.rng.range(s.min_period, s.max_period) as i64
+            };
+            let s = &mut self.ambient_spawners[i];
+            s.next_time = self.elapsed_ms + delay;
+            use crate::matrix_game::effects::smoke_and_fire::{Fire, Smoke};
+            use crate::matrix_game::effects::GameEffect;
+            if s.is_fire {
+                self.objects.pending_effects.push(GameEffect::Fire(Fire::new(
+                    s.pos,
+                    s.ttl,
+                    s.puff_ttl,
+                    s.spawn_time,
+                    s.disp_factor,
+                    s.intense,
+                    s.speed,
+                )));
+            } else {
+                self.objects.pending_effects.push(GameEffect::Smoke(Smoke::new(
+                    s.pos,
+                    s.ttl,
+                    s.puff_ttl,
+                    s.spawn_time,
+                    s.color,
+                    s.intense,
+                    s.speed,
+                )));
+            }
+        }
+        // Fresh player robots rally to a place near their base
+        // (RobotSpawn, MatrixRobot.cpp:2216-2221).
+        if !self.objects.pending_spawn_rallies.is_empty() {
+            if let Some(map) = crate::matrix_game::map::current_map() {
+                self.drain_spawn_rallies(map);
             }
         }
         // Win/lose CheckStatus once per second (MatrixLogic.cpp:2773+).
@@ -331,6 +508,9 @@ impl MapLogic {
         // NULL in the original) — drain the queued sound events each
         // frame so the dispatch surface can't grow unboundedly. A
         // future host backend consumes them here instead.
+        for (name, pos) in self.objects.pending_sounds.drain(..) {
+            log::trace!("world sound: {name} at {pos:?}");
+        }
         self.sound_queue.clear();
         self.elapsed_ms += step_ms as i64;
     }
@@ -1101,7 +1281,7 @@ impl MapLogic {
                 let z = map.get_z(c.x, c.y).max(0.0);
                 (None, z)
             };
-            let cannon = crate::matrix_game::object_cannon::Cannon::new(
+            let mut cannon = crate::matrix_game::object_cannon::Cannon::new(
                 glam::Vec2::new(c.x, c.y),
                 build_z + c.add_h,
                 c.angle,
@@ -1110,6 +1290,10 @@ impl MapLogic {
                 parent_id,
                 c.parent_slot,
             );
+            // `CalcCannonPlace` (MatrixLogic.cpp:3175-3186): the RN
+            // place under the turret, marked occupied by every
+            // place-selection pass.
+            cannon.place = cannon_rn_place(map, c.x, c.y);
             let cid = self.objects.spawn(Box::new(cannon));
             if let Some(obj) = self.objects.get_mut(cid) {
                 let c: &mut crate::matrix_game::object_cannon::Cannon = unsafe {
@@ -1266,6 +1450,9 @@ impl MapLogic {
                     &mut *(obj as *mut dyn MapStatic as *mut crate::matrix_game::robot::Robot)
                 };
                 r.self_id = Some(id);
+                // MatrixMapPrepare.cpp:1721 — seed map coords at load so
+                // gather_info / radio regions don't read cell (0,0).
+                r.map_pos_calc(map);
             }
             self.objects.add_lt(id);
             ids.push(id);
@@ -1365,9 +1552,10 @@ impl MapLogic {
                 Some(id)
             }
             None => {
-                if !shift {
-                    self.player_side.clear();
-                }
+                // C++ keeps the current selection when the click folds
+                // to nothing (empty terrain or a non-player object) —
+                // none of the count branches at MatrixFormGame.cpp:674-
+                // 741 fire on an empty sel-group.
                 None
             }
         }
@@ -1453,7 +1641,7 @@ impl MapLogic {
         let hit = self.objects.pick_object(origin, dir, TRACE_ANYOBJECT, None);
 
         if let Some((id, _)) = hit {
-            let (side, is_building, is_unit_live) = {
+            let (side, is_building, is_unit_live, is_special) = {
                 let Some(obj) = self.objects.get(id) else {
                     return;
                 };
@@ -1461,6 +1649,7 @@ impl MapLogic {
                     obj.side(),
                     matches!(obj.core().obj_type, ObjectType::Building) && obj.is_live(),
                     is_live_unit(&self.objects, id),
+                    obj.is_special(),
                 )
             };
             if is_building && side != self.player_side.id {
@@ -1469,8 +1658,9 @@ impl MapLogic {
                 self.pg_order_capture(map, no, id);
                 return;
             }
-            if is_unit_live && side != self.player_side.id {
-                // Attack (MatrixSide.cpp:841-843).
+            if (is_unit_live && side != self.player_side.id) || is_special {
+                // Attack (MatrixSide.cpp:841-843) — special win-target
+                // scenery is attackable regardless of side.
                 if let Some(tp) = get_map_pos(&self.objects, id) {
                     let no = self.sel_group_to_logic_group();
                     self.pg_order_attack(map, no, tp, Some(id));
@@ -1507,7 +1697,7 @@ impl MapLogic {
         let (origin, dir) = camera.screen_to_world_ray(sx, sy, screen_w, screen_h);
         let hit = self.objects.pick_object(origin, dir, TRACE_ANYOBJECT, None);
         match hit {
-            Some((id, _)) if self.objects.get(id).map(|o| o.is_live()).unwrap_or(false) => {
+            Some((id, _)) if is_live_or_special(&self.objects, id) => {
                 let tp = get_map_pos(&self.objects, id)?;
                 let no = self.sel_group_to_logic_group();
                 self.pg_order_attack(map, no, tp, Some(id));
@@ -1571,7 +1761,9 @@ impl MapLogic {
             if !matches!(obj.core().obj_type, ObjectType::RobotAi) {
                 continue;
             }
-            if obj.side() == side_id {
+            // `m_CurrState != ROBOT_DIP` (MatrixSide.cpp:591) — dying
+            // robots don't count toward the cap.
+            if obj.side() == side_id && obj.is_live() {
                 n += 1;
             }
         }
@@ -1712,7 +1904,10 @@ impl MapLogic {
                 // SAFETY: filtered to ObjectType::Building above.
                 let b: &mut Building =
                     unsafe { &mut *(obj as *mut dyn MapStatic as *mut Building) };
-                bpos = glam::Vec3::new(b.pos.x, b.pos.y, b.build_z);
+                // Score billboards rise from the building's geo-center
+                // top (`GeoCenter().z + 40`, MatrixObjectBuilding.cpp:
+                // 360-369), not the floor.
+                bpos = glam::Vec3::new(b.pos.x, b.pos.y, b.core().geo_center.z);
                 if matches!(
                     b.state,
                     crate::matrix_game::object_building::BaseState::Dip
@@ -2514,7 +2709,14 @@ mod tests {
         w.takt(10);
         assert_eq!(w.before_win_count, 4);
         assert!(w.win_flag);
-        assert_eq!(w.player_side.status, SideStatus::JustWin);
+        // check_status runs on the first takt (prev seeded -1500 like
+        // MatrixMap.cpp:41) and consumes JUST_WIN into the win-dialog
+        // countdown (MatrixLogic.cpp:2893-2898).
+        assert!(
+            w.player_side.status == SideStatus::JustWin
+                || w.before_win_loose_dialog_count >= 1
+                || w.game_over == Some(true)
+        );
     }
 
     // ── Economy / robot-limit tests ───────────────────────────────
@@ -3458,6 +3660,40 @@ pub fn building_mut(
 /// Port of `IsLiveUnit` (MatrixSide.cpp:9358-9363): live robot, or a
 /// cannon that is neither DIP nor under construction. Anything else
 /// (buildings included) is not a "unit".
+/// One runtime `CEffectSpawner` (MatrixEffect.hpp:602-626): a fixed
+/// world position firing a smoke or fire effect every
+/// `rnd(min_period, max_period)` ms.
+struct AmbientSpawner {
+    pos: glam::Vec3,
+    is_fire: bool,
+    min_period: i32,
+    max_period: i32,
+    next_time: i64,
+    ttl: f32,
+    puff_ttl: f32,
+    spawn_time: f32,
+    intense: bool,
+    speed: f32,
+    color: u32,
+    disp_factor: f32,
+}
+
+/// `m_RN.FindInPL` from a cannon's world position — the place index
+/// stored in `m_Place` (MatrixSide.cpp:563, MatrixLogic.cpp:3181).
+pub fn cannon_rn_place(map: &GameMap, wx: f32, wy: f32) -> i32 {
+    use crate::matrix_game::common::float2int;
+    let gsm = GameMap::GLOBAL_SCALE_MOVE;
+    map.road_network
+        .as_ref()
+        .map(|rn| {
+            rn.lock().unwrap().find_in_pl(&crate::matrix_game::road_network::Point {
+                x: float2int(wx / gsm),
+                y: float2int(wy / gsm),
+            })
+        })
+        .unwrap_or(-1)
+}
+
 pub fn is_live_unit(objs: &Objects, id: ObjectId) -> bool {
     use crate::matrix_game::object_cannon::CannonState;
     let Some(obj) = objs.get(id) else {
@@ -3469,6 +3705,21 @@ pub fn is_live_unit(objs: &Objects, id: ObjectId) -> bool {
             .map(|c| !matches!(c.state, CannonState::Dip | CannonState::UnderConstruction))
             .unwrap_or(false),
         _ => false,
+    }
+}
+
+/// Port of `IsLive() || IsSpecial()` — the attack-target validity the
+/// C++ order paths use (MatrixSide.cpp:704, 729, 841). `IsLive()` is
+/// live robot / cannon / building only (MatrixMapStatic.hpp:385);
+/// scenery qualifies only when flagged special (win-target objects).
+pub fn is_live_or_special(objs: &Objects, id: ObjectId) -> bool {
+    let Some(obj) = objs.get(id) else {
+        return false;
+    };
+    match obj.core().obj_type {
+        ObjectType::RobotAi | ObjectType::Building => obj.is_live(),
+        ObjectType::Cannon => is_live_unit(objs, id),
+        _ => obj.is_special(),
     }
 }
 

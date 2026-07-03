@@ -48,6 +48,13 @@ pub fn play_hint_sound(name: &str) {
     }
 }
 
+/// Fire an interface-layer sound by its Sounds-block key — the
+/// `CSound::Play(S_*, SL_*)` sites outside the button dispatch
+/// (minimap zoom, selection voices, ...).
+pub fn play_named(name: &str) {
+    log::trace!("ui sound: {name}");
+}
+
 /// Pick the right sound for an `LB-down on PUSH_BUTTON` event, matching
 /// the C++ name-based dispatch at CIFaceButton.cpp:44-50.
 pub fn for_push_button_down(name: &str) -> UiSound {

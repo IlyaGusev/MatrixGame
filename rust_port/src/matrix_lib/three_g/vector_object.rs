@@ -788,8 +788,10 @@ impl AnimState {
         self.frame = 0;
         let (idx, time) = anim_frame(vo, self.anim, 0).unwrap_or((0, 0));
         self.vo_frame = idx;
-        // Clamp to min 1ms — see takt() for why.
-        self.time_next_ms = self.time_ms + (time as i64).max(1);
+        // `GetAnimFrameTime` = abs(time) (VectorObject.hpp:389) — the
+        // sign encodes loopedness, not a negative duration. Clamp to
+        // min 1ms — see takt() for why.
+        self.time_next_ms = self.time_ms + (time as i64).abs().max(1);
     }
 
     /// Port of `SetAnimByName(name)` (VectorObject.hpp:524). Returns
@@ -893,7 +895,9 @@ impl AnimState {
                 break;
             }
             let (_, t) = anim_frame(vo, self.anim, self.frame).unwrap_or((0, 0));
-            self.time_next_ms += (t as i64).max(1);
+            // abs(): negative authored durations encode loopedness
+            // (GetAnimFrameTime, VectorObject.hpp:389).
+            self.time_next_ms += (t as i64).abs().max(1);
         }
         // If we hit the iteration cap (i.e. the data itself is
         // pathological — all-zero frame times or similar), forcibly
@@ -953,14 +957,15 @@ impl AnimState {
             self.frame += 1;
         } else {
             // Last frame of a non-looped anim — return its
-            // duration and don't advance.
+            // duration and don't advance. abs(): the sign encodes
+            // loopedness (VectorObject.hpp:389).
             return anim_frame(vo, self.anim, self.frame)
-                .map(|(_, t)| t)
+                .map(|(_, t)| t.abs())
                 .unwrap_or(0);
         }
         let (idx, t) = anim_frame(vo, self.anim, self.frame).unwrap_or((0, 0));
         self.vo_frame = idx;
-        t
+        t.abs()
     }
 }
 

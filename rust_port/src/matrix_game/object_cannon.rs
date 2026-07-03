@@ -80,6 +80,12 @@ pub struct Cannon {
     /// Slot index on the parent (0..turrets_max-1). Drives the
     /// geometric offset from the base centre.
     pub slot: i32,
+    /// Road-network place index under the turret (`m_Place`,
+    /// MatrixObjectCannon.hpp) — set from `FindInPL` at build/load
+    /// (MatrixSide.cpp:563, MatrixLogic.cpp:3175-3186). Occupancy
+    /// passes mark it so robots don't get assigned places under
+    /// turrets. -1 when off the network.
+    pub place: i32,
 
     /// Hit points — seeded from `g_Config.m_CannonsProps[kind-1].m_Hitpoint`
     /// at spawn time (MatrixObjectCannon.cpp:201-202). When the cannon
@@ -102,6 +108,10 @@ pub struct Cannon {
     /// (MatrixObjectCannon.cpp:1486+ / MatrixSide.cpp:631). Damage paths
     /// must early-return while this is true.
     pub invulnerable: bool,
+    /// `m_UnderAttackTime` (MatrixObjectCannon.cpp:900-904) — throttles
+    /// the "side under attack" warning after enemy hits on player
+    /// turrets; sound dispatch itself is the silent layer.
+    pub under_attack_time: i32,
     /// `m_ShowHitpointTime` — floating HP-bar visibility timer.
     pub show_hitpoint_time: i32,
     /// `m_MiniMapFlashTime` (FLASH_PERIOD on non-friendly damage,
@@ -183,12 +193,14 @@ impl Cannon {
             kind,
             parent,
             slot,
+            place: -1,
             hit_point: hp,
             hit_point_max: hp,
             self_id: None,
             dip_units: Vec::new(),
             state: CannonState::Idle,
             invulnerable: false,
+            under_attack_time: 0,
             show_hitpoint_time: 0,
             mini_map_flash_time: 0,
             weapons: Vec::new(),
@@ -196,7 +208,10 @@ impl Cannon {
             turret_angle: 0.0,
             target: None,
             target_disp: glam::Vec3::ZERO,
-            fire_next_think_time: 0,
+            // `GetTime() + CANNON_FIRE_THINK_PERIOD` at construction
+            // (MatrixObjectCannon.cpp:90) — first seek deferred 100 ms.
+            fire_next_think_time: crate::matrix_game::map::current_elapsed_ms()
+                + CANNON_FIRE_THINK_PERIOD as i64,
             null_target_time: 0,
             time_from_fire: 0,
             next_time_ablaze: 0,
@@ -605,6 +620,10 @@ impl MapStatic for Cannon {
         if self.mini_map_flash_time > 0 {
             self.mini_map_flash_time -= cms;
         }
+        // m_UnderAttackTime decay (MatrixObjectCannon.cpp:900-904).
+        if self.under_attack_time > 0 {
+            self.under_attack_time = (self.under_attack_time - cms).max(0);
+        }
         // Graph step (`CMatrixCannon::Takt`, MatrixObjectCannon.cpp:
         // 448-460): advance the shaft cursor; a finished one-shot
         // anim falls back to Idle.
@@ -668,13 +687,21 @@ impl MapStatic for Cannon {
         if self.state == CannonState::UnderConstruction {
             return;
         }
-        // Parent-building side sync (MatrixObjectCannon.cpp:887-898,
-        // minus the per-robot env scrub — env isn't ported).
+        // Parent-building side sync + per-robot env scrub so freshly
+        // flipped turrets stop being shot at (MatrixObjectCannon.cpp:887-898).
         if let Some(parent) = self.parent {
             if let Some(p) = objs.get(parent) {
                 let pside = p.side();
                 if pside != self.side {
                     self.side = pside;
+                    if let Some(me) = self.self_id {
+                        let others: Vec<ObjectId> = objs.iter_live().collect();
+                        for oid in others {
+                            if let Some(r) = crate::matrix_game::logic::robot_mut(objs, oid) {
+                                r.env.remove_from_list(me);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -719,6 +746,28 @@ impl MapStatic for Cannon {
                 self.next_time_shorted += 50; // OBJECT_SHORTED_PERIOD
                 let pos = self.core.geo_center;
                 let side = self.last_delay_damage_side;
+                // Electric arc between two random points on the body
+                // (MatrixObjectCannon.cpp:975-993) — same visual the
+                // robots spawn.
+                {
+                    use crate::matrix_game::effects::lightening::Lightening;
+                    use crate::matrix_game::effects::smoke_and_fire::{frnd, fsrnd};
+                    let mut vrng = crate::matrix_game::logic::Rnd::new(
+                        ((now as i32) ^ ((pos.x * 3.0 + pos.y) as i32)).max(1),
+                    );
+                    let r = self.core.radius;
+                    let d1 = pos + glam::Vec3::new(fsrnd(&mut vrng, r), fsrnd(&mut vrng, r), fsrnd(&mut vrng, r));
+                    let d2 = pos + glam::Vec3::new(fsrnd(&mut vrng, r), fsrnd(&mut vrng, r), fsrnd(&mut vrng, r));
+                    objs.pending_effects
+                        .push(crate::matrix_game::effects::GameEffect::Lightening(
+                            Lightening::new_shorted(
+                                d1,
+                                d2,
+                                frnd(&mut vrng, 400.0) + 100.0,
+                                0xFFFF_FFFF,
+                            ),
+                        ));
+                }
                 if self.damage(
                     WEAPON_SHORTED,
                     pos,
@@ -993,6 +1042,17 @@ impl MapStatic for Cannon {
                 }
             }
 
+            // "Side under attack" voice, throttled by the idle timer
+            // (MatrixObjectCannon.cpp:1407-1417).
+            if self.side == crate::matrix_game::common::PLAYER_SIDE && !friendly_fire {
+                if self.under_attack_time == 0 {
+                    let pick = (self.pos.x as i32 ^ self.hit_point as i32).rem_euclid(3) + 1;
+                    objs.queue_snd(&format!("s_side_attacked_{pick}"));
+                }
+                self.under_attack_time =
+                    crate::matrix_game::object_building::UNDER_ATTACK_IDLE_TIME_MS;
+            }
+
             if weap == WEAPON_FLAMETHROWER {
                 self.object_state |= OBJECT_STATE_ABLAZE;
                 self.last_delay_damage_side = attacker_side;
@@ -1067,7 +1127,14 @@ impl MapStatic for Cannon {
         for w in self.weapons.drain(..) {
             objs.weapons.release(w);
         }
-        let _ = self_id;
+        // ReleaseMe env scrub (MatrixObjectCannon.cpp:1600-1610): every
+        // robot forgets the dead turret so war groups retarget instantly.
+        let others: Vec<ObjectId> = objs.iter_live().collect();
+        for oid in others {
+            if let Some(r) = crate::matrix_game::logic::robot_mut(objs, oid) {
+                r.env.remove_from_list(self_id);
+            }
+        }
         true
     }
 }
@@ -1119,6 +1186,7 @@ impl Cannon {
                 match o {
                     TraceStop::Water => {
                         if map.get_z(hitpos.x, hitpos.y) < WATER_LEVEL {
+                            objs.queue_snd_at("splash", hitpos);
                             objs.pending_effects.push(GameEffect::Konus(Konus::new_splash(
                                 hitpos,
                                 Vec3::Z,

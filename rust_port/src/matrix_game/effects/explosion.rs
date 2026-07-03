@@ -53,6 +53,9 @@ pub struct ExplosionProps {
     pub light_color2: u32,
     pub light_time1: f32,
     pub light_time2: f32,
+    /// Sounds-block key of the preset's `sound` field
+    /// (MatrixEffectExplosion.cpp:13-304); empty = S_NONE.
+    pub sound: &'static str,
 }
 
 /// The preset instances (MatrixEffectExplosion.cpp:13-304).
@@ -77,6 +80,7 @@ pub const EXPLOSION_NORMAL: ExplosionProps = ExplosionProps {
     light_color2: 0x00000000,
     light_time1: 0.0,
     light_time2: 0.0,
+    sound: "expl_norm",
 };
 pub const EXPLOSION_MISSILE: ExplosionProps = ExplosionProps {
     min_speed: 0.0,
@@ -99,6 +103,7 @@ pub const EXPLOSION_MISSILE: ExplosionProps = ExplosionProps {
     light_color2: 0xFFFF6F33,
     light_time1: 1.5,
     light_time2: 8.0,
+    sound: "expl_missile",
 };
 pub const EXPLOSION_ROBOT_HIT: ExplosionProps = ExplosionProps {
     min_speed: 0.0,
@@ -121,6 +126,7 @@ pub const EXPLOSION_ROBOT_HIT: ExplosionProps = ExplosionProps {
     light_color2: 0x11FFFF11,
     light_time1: 1.5,
     light_time2: 3.0,
+    sound: "expl_rh",
 };
 pub const EXPLOSION_LASER_HIT: ExplosionProps = ExplosionProps {
     min_speed: 0.0,
@@ -143,6 +149,7 @@ pub const EXPLOSION_LASER_HIT: ExplosionProps = ExplosionProps {
     light_color2: 0x11200505,
     light_time1: 1.5,
     light_time2: 3.0,
+    sound: "expl_lh",
 };
 pub const EXPLOSION_BUILDING_BOOM: ExplosionProps = ExplosionProps {
     min_speed: 0.0,
@@ -165,6 +172,7 @@ pub const EXPLOSION_BUILDING_BOOM: ExplosionProps = ExplosionProps {
     light_color2: 0x11FF3111,
     light_time1: 1.5,
     light_time2: 3.0,
+    sound: "",
 };
 pub const EXPLOSION_BUILDING_BOOM2: ExplosionProps = ExplosionProps {
     min_speed: 10.0,
@@ -187,6 +195,7 @@ pub const EXPLOSION_BUILDING_BOOM2: ExplosionProps = ExplosionProps {
     light_color2: 0x11FF3111,
     light_time1: 1.5,
     light_time2: 3.0,
+    sound: "expl_bb2",
 };
 pub const EXPLOSION_ROBOT_BOOM: ExplosionProps = ExplosionProps {
     min_speed: 0.0,
@@ -209,6 +218,7 @@ pub const EXPLOSION_ROBOT_BOOM: ExplosionProps = ExplosionProps {
     light_color2: 0xFFFF6F33,
     light_time1: 1.5,
     light_time2: 8.0,
+    sound: "expl_rb",
 };
 pub const EXPLOSION_ROBOT_BOOM_SMALL: ExplosionProps = ExplosionProps {
     min_speed: 0.0,
@@ -231,6 +241,7 @@ pub const EXPLOSION_ROBOT_BOOM_SMALL: ExplosionProps = ExplosionProps {
     light_color2: 0xFFFF6F33,
     light_time1: 1.5,
     light_time2: 8.0,
+    sound: "expl_rbs",
 };
 pub const EXPLOSION_BIG_BOOM: ExplosionProps = ExplosionProps {
     min_speed: 0.0,
@@ -253,6 +264,7 @@ pub const EXPLOSION_BIG_BOOM: ExplosionProps = ExplosionProps {
     light_color2: 0xFFFF6F33,
     light_time1: 1.5,
     light_time2: 8.0,
+    sound: "expl_bigboom",
 };
 pub const EXPLOSION_OBJECT: ExplosionProps = ExplosionProps {
     min_speed: 0.0,
@@ -275,6 +287,7 @@ pub const EXPLOSION_OBJECT: ExplosionProps = ExplosionProps {
     light_color2: 0xFFFF6F33,
     light_time1: 1.5,
     light_time2: 8.0,
+    sound: "expl_obj",
 };
 
 /// Constants (MatrixEffectExplosion.hpp:15-21).
@@ -299,12 +312,19 @@ fn calc_gradient(t: f32, g: &[(f32, f32)]) -> f32 {
     g.last().map(|&(v, _)| v).unwrap_or(0.0)
 }
 
+/// Follow-light key allocator for fire-debris embers (synthetic
+/// WeaponId space; see `WeaponId::synthetic`).
+static EMBER_KEY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 enum Deb {
     Fire {
         fire: Fire,
         pos: Vec3,
         v: Vec3,
         ttl: f32,
+        /// Terrain ember glow following the piece (r 20, 0x22222202,
+        /// MatrixEffectExplosion.cpp:362/794).
+        light_key: u32,
     },
     Intense {
         ttm: f32,
@@ -394,7 +414,10 @@ impl Explosion {
             let r = rnd_range(rng, props.min_speed, props.max_speed);
             let a = fsrnd(rng, std::f32::consts::PI);
             debs.push(Deb::Fire {
-                fire: Fire::new(pos, 1_000_000.0, 1000.0, 50.0, 5.0, false, 0.04),
+                // Default FIRE_SPEED = 0.02 (MatrixEffect.hpp:139,
+                // MatrixEffectExplosion.cpp:361) — 0.04 rose 2× too fast.
+                fire: Fire::new(pos, 1_000_000.0, 1000.0, 50.0, 5.0, false, 0.02),
+                light_key: EMBER_KEY.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                 pos,
                 v: Vec3::new(
                     a.sin() * r * 0.5,
@@ -476,7 +499,13 @@ impl Explosion {
 
     /// `Takt` (MatrixEffectExplosion.cpp:625-810). Returns false when
     /// all debris expired.
-    pub fn takt(&mut self, step: f32, map: &GameMap, rng: &mut Rnd) -> bool {
+    pub fn takt(
+        &mut self,
+        step: f32,
+        map: &GameMap,
+        rng: &mut Rnd,
+        objs: &mut crate::matrix_game::map_static::Objects,
+    ) -> bool {
         let dtime = DEBRIS_SPEED * step;
         self.time += dtime;
 
@@ -493,16 +522,35 @@ impl Explosion {
                         *ttl < 0.0
                     }
                 }
-                Deb::Fire { ttl, fire, .. } => {
-                    *ttl -= step;
+                Deb::Fire {
+                    ttl,
+                    fire,
+                    light_key,
+                    ..
+                } => {
                     fire.takt(step, rng);
-                    if *ttl < 0.0 {
-                        // Wind the emitter down (SetTTL(1000) + Kill on
-                        // the light in RemoveDebris).
-                        fire.set_ttl(1000.0);
-                        true
-                    } else {
+                    if *ttl >= 0.0 {
+                        *ttl -= step;
+                        if *ttl < 0.0 {
+                            // Wind the emitter down instead of popping:
+                            // the C++ detaches it with SetTTL(1000)
+                            // (MatrixEffectExplosion.cpp:476-487) so
+                            // live puffs finish naturally. We linger
+                            // 1000 ms more (marked by ttl ∈ [-1000, 0)).
+                            fire.set_ttl(1000.0);
+                            *ttl = -0.001;
+                            // Ember glow dies with the emitter
+                            // (RemoveDebris light kill, :794).
+                            objs.pending_light_kill.push(
+                                crate::matrix_game::effects::weapon::WeaponId::synthetic(
+                                    *light_key,
+                                ),
+                            );
+                        }
                         false
+                    } else {
+                        *ttl -= step;
+                        *ttl < -1000.0
                     }
                 }
                 Deb::Spark { ttl, .. } | Deb::Mesh { ttl, .. } => {
@@ -536,8 +584,12 @@ impl Explosion {
                         let t = 1.0 - *ttl / INTENSE_TTL;
                         let df = if t > 0.05 { 1.0 } else { t * 20.0 };
                         *disp = glam::Vec2::new(v.x * df, v.y * df);
-                        *scale = INTENSE_INIT_SIZE
-                            * (1.0 + (INTENSE_END_SIZE / INTENSE_INIT_SIZE - 1.0) * df);
+                        // `SetScale(1 + (60/4 - 1)*df)` OVERWRITES the
+                        // billboard scale — absolute 1→15
+                        // (MatrixEffectExplosion.cpp:716,
+                        // CBillboard.hpp:163), not a multiplier on the
+                        // initial size.
+                        *scale = 1.0 + (INTENSE_END_SIZE / INTENSE_INIT_SIZE - 1.0) * df;
                         let a = ((1.0 - kscale(t, 0.0, 1.0)) * 255.0) as u32;
                         let r = calc_gradient(t, &[(150.0, 0.0), (100.0, 0.5), (0.0, 1.01)]) as u32;
                         let g = calc_gradient(
@@ -551,14 +603,34 @@ impl Explosion {
                         *color = (a << 24) | (r << 16) | (g << 8) | b;
                     }
                 }
-                Deb::Fire { fire, pos, v, ttl } => {
-                    v.z -= 1.1 * dtime;
-                    *pos += *v * dtime;
-                    if ground_hit(map, pos, v, ttl, rng) {
-                        // splash spawned by caller via pending list —
-                        // handled in `effects_takt` glue.
+                Deb::Fire {
+                    fire,
+                    pos,
+                    v,
+                    ttl,
+                    light_key,
+                } => {
+                    // Winding-down emitters (ttl < 0) hold still.
+                    if *ttl >= 0.0 {
+                        v.z -= 1.1 * dtime;
+                        *pos += *v * dtime;
+                        if ground_hit(map, pos, v, ttl, rng) {
+                            debris_splash(objs, *pos);
+                        } else if crate::matrix_game::logic::is_on_base(objs, pos.x, pos.y) {
+                            // Debris landing on a base footprint dies
+                            // (m_Base cells, MatrixEffectExplosion.cpp:784-788).
+                            *ttl = 1.0;
+                        }
+                        fire.set_pos(*pos);
+                        // Ember terrain glow follows the piece
+                        // (r 20, 0x22222202, MatrixEffectExplosion.cpp:362).
+                        objs.pending_light_follow.push((
+                            crate::matrix_game::effects::weapon::WeaponId::synthetic(*light_key),
+                            [pos.x, pos.y, pos.z],
+                            20.0,
+                            0x2222_2202,
+                        ));
                     }
-                    fire.set_pos(*pos);
                 }
                 Deb::Spark {
                     pos,
@@ -569,7 +641,11 @@ impl Explosion {
                 } => {
                     v.z -= 1.1 * dtime;
                     *pos += *v * dtime;
-                    ground_hit(map, pos, v, ttl, rng);
+                    if ground_hit(map, pos, v, ttl, rng) {
+                        debris_splash(objs, *pos);
+                    } else if crate::matrix_game::logic::is_on_base(objs, pos.x, pos.y) {
+                        *ttl = 1.0;
+                    }
                     let k = *ttl * *unttl;
                     let len = 5.0 * k * k + 1.0;
                     let delta = *pos - *prepos;
@@ -581,7 +657,11 @@ impl Explosion {
                 Deb::Mesh { pos, v, ttl, .. } => {
                     v.z -= 1.1 * dtime;
                     *pos += *v * dtime;
-                    ground_hit(map, pos, v, ttl, rng);
+                    if ground_hit(map, pos, v, ttl, rng) {
+                        debris_splash(objs, *pos);
+                    } else if crate::matrix_game::logic::is_on_base(objs, pos.x, pos.y) {
+                        *ttl = 1.0;
+                    }
                 }
             }
         }
@@ -665,6 +745,11 @@ impl Explosion {
 /// caller spawns the splash).
 fn ground_hit(map: &GameMap, pos: &mut Vec3, v: &mut Vec3, ttl: &mut f32, _rng: &mut Rnd) -> bool {
     use crate::matrix_game::common::WATER_LEVEL;
+    // Off-map debris dies immediately (MatrixEffectExplosion.cpp:784-788).
+    if pos.x < 0.0 || pos.y < 0.0 || pos.x >= map.world_width() || pos.y >= map.world_height() {
+        *ttl = 1.0;
+        return false;
+    }
     let z = map.get_z(pos.x, pos.y);
     if pos.z < WATER_LEVEL && z <= WATER_LEVEL {
         *ttl = 1.0;
@@ -677,6 +762,26 @@ fn ground_hit(map: &GameMap, pos: &mut Vec3, v: &mut Vec3, ttl: &mut f32, _rng: 
         *v *= 0.7;
     }
     false
+}
+
+/// Water-splash konus for a drowned debris piece
+/// (`CreateKonusSplash`, MatrixEffectExplosion.cpp:770).
+fn debris_splash(objs: &mut crate::matrix_game::map_static::Objects, pos: Vec3) {
+    use crate::matrix_game::effects::konus::Konus;
+    use crate::matrix_game::effects::GameEffect;
+    // S_SPLASH rides along with the konus (MatrixEffect.cpp:803).
+    objs.queue_snd_at("splash", pos);
+    let ang = ((pos.x * 3.1 + pos.y * 1.7).abs() % std::f32::consts::TAU) - std::f32::consts::PI;
+    objs.pending_effects.push(GameEffect::Konus(Konus::new_splash(
+        pos,
+        Vec3::Z,
+        10.0,
+        5.0,
+        ang,
+        1000.0,
+        true,
+        TexRef::Path(crate::matrix_game::effects::effects_renderer::TEXTURE_PATH_SPLASH),
+    )));
 }
 
 /// Port of `CMatrixEffectFireAnim` — the looping 8-frame flame sprite
@@ -699,7 +804,10 @@ impl FireAnim {
             w2,
             ttl,
             ttl0: ttl,
-            time: 0.0,
+            // `m_Frame = IRND(8)` — random start frame
+            // (MatrixEffectSmokeAndFire.cpp:442). Derive from pos so
+            // neighbours desync without RNG plumbing.
+            time: ((pos.x * 13.7 + pos.y * 7.3).abs() % 8.0) * 100.0,
         }
     }
 
@@ -710,18 +818,29 @@ impl FireAnim {
     }
 
     pub fn draw(&self, q: &mut BillboardQueue) {
-        // 8 FLAMEFRAME textures cycling at ~50ms per frame; the sprite
-        // grows w1 → w2 and fades out over the last third of its TTL.
-        let frame = (self.time / 50.0) as usize % 8;
-        let k = 1.0 - self.ttl / self.ttl0;
-        let scale = self.w1 + (self.w2 - self.w1) * k;
-        let a = ((1.0 - kscale(k, 0.66, 1.0)) * 255.0) as u32;
-        let color = (a << 24) | 0x00FF_FFFF;
-        q.billboard(
-            self.pos + Vec3::new(0.0, 0.0, scale * 0.5),
-            scale * 0.5,
-            0.0,
-            color,
+        // CMatrixEffectFireAnim (MatrixEffectSmokeAndFire.cpp:431-509):
+        // a vertical billboard-LINE, width w1 × height w2, at constant
+        // full alpha. Grows 0→full over the first 10% of TTL
+        // (FIREFRAME_TTL_POROG 0.9) then shrinks to 0 over the rest;
+        // 8 FLAMEFRAME textures at 100 ms/frame from a random start.
+        let frame = (self.time / 100.0) as usize % 8;
+        let k = (self.ttl / self.ttl0).clamp(0.0, 1.0); // 1 → 0
+        const POROG: f32 = 0.9;
+        let (w, h) = if k < POROG {
+            let kk = k / POROG;
+            (self.w1 * kk, self.w2 * kk)
+        } else {
+            let kk = (k - POROG) / (1.0 - POROG); // 1 at birth → 0
+            (self.w1 * (1.0 - kk), self.w2 * (1.0 - kk))
+        };
+        if w <= 0.0 || h <= 0.0 {
+            return;
+        }
+        q.line(
+            self.pos,
+            self.pos + Vec3::new(0.0, 0.0, h),
+            w,
+            0xFFFF_FFFF,
             TexRef::Bbt(BBT_FLAMEFRAME0 + frame),
         );
     }

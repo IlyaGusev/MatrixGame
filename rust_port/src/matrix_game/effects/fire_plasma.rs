@@ -122,9 +122,14 @@ impl FirePlasma {
     /// Bolt sprites (MatrixEffectFirePlasma.cpp:15-36, 132-136):
     /// PLASMA1 line down the axis + 4 PLASMA2 pulses along it.
     pub fn draw(&self, q: &mut crate::matrix_lib::three_g::billboard::BillboardQueue) {
-        use crate::matrix_lib::three_g::billboard::{TexRef, BBT_PLASMA1, BBT_PLASMA2};
+        use crate::matrix_lib::three_g::billboard::{
+            TexRef, BBT_PLASMA1, BBT_PLASMA2, BBT_POINTLIGHT,
+        };
         const FIRE_PLASMA_W: f32 = 3.0;
         const FIRE_PLASMA_L: f32 = 7.0;
+        // Glow sprite riding the bolt (BBT_POINTLIGHT r=20, 0x80202030,
+        // MatrixEffectFirePlasma.cpp:29).
+        q.billboard(self.pos, 20.0, 0.0, 0x8020_2030, TexRef::Bbt(BBT_POINTLIGHT));
         q.line(
             self.pos - self.dir * FIRE_PLASMA_L * 0.7,
             self.pos + self.dir * FIRE_PLASMA_L * 0.7,

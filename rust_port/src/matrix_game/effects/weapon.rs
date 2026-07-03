@@ -175,6 +175,65 @@ pub struct WeaponId {
     generation: u32,
 }
 
+impl WeaponId {
+    /// Synthetic key for the follow-light registry — non-weapon light
+    /// owners (fire debris embers) key with the high bit set, a space
+    /// real slab handles never reach.
+    pub fn synthetic(n: u32) -> Self {
+        Self {
+            index: n | 0x8000_0000,
+            generation: u32::MAX,
+        }
+    }
+}
+
+/// Canonical Sounds-block key for a weapon's FIRE sound (`m_SoundType`,
+/// MatrixEffectWeapon.cpp:90-137 → MatrixSoundManager.cpp:130-144).
+pub fn fire_sound_key(w: Weapon) -> &'static str {
+    match w {
+        WEAPON_PLASMA => "wplasma",
+        WEAPON_VOLCANO => "wvolcano",
+        WEAPON_HOMING_MISSILE => "wmissile",
+        WEAPON_BOMB => "wbomb",
+        WEAPON_FLAMETHROWER => "wflame",
+        WEAPON_BIGBOOM => "wbigboom",
+        WEAPON_LIGHTENING => "wlightening",
+        WEAPON_LASER => "wlaser",
+        WEAPON_GUN => "wgun",
+        WEAPON_REPAIR => "wrepair",
+        WEAPON_CANNON0 => "wcannon0",
+        WEAPON_CANNON1 => "wcannon1",
+        WEAPON_CANNON2 => "wcannon2",
+        WEAPON_CANNON3 => "wcannon3",
+        _ => "",
+    }
+}
+
+/// Canonical key for a weapon's HIT sound (`SoundHit`,
+/// MatrixEffectWeapon.cpp:846 → MatrixSoundManager.cpp:146-163).
+pub fn hit_sound_key(w: Weapon) -> &'static str {
+    match w {
+        WEAPON_PLASMA => "whplasma",
+        WEAPON_VOLCANO => "whvolcano",
+        WEAPON_HOMING_MISSILE => "whmissile",
+        WEAPON_BOMB => "whbomb",
+        WEAPON_FLAMETHROWER => "whflame",
+        WEAPON_BIGBOOM => "whbigboom",
+        WEAPON_LIGHTENING => "whlightening",
+        WEAPON_LASER => "whlaser",
+        WEAPON_GUN => "whgun",
+        WEAPON_REPAIR => "whrepair",
+        WEAPON_ABLAZE => "whablaze",
+        WEAPON_SHORTED => "whshorted",
+        WEAPON_DEBRIS => "whdebris",
+        WEAPON_CANNON0 => "whcannon0",
+        WEAPON_CANNON1 => "whcannon1",
+        WEAPON_CANNON2 => "whcannon2",
+        WEAPON_CANNON3 => "whcannon3",
+        _ => "",
+    }
+}
+
 struct WSlot {
     generation: u32,
     /// `m_Ref` (MatrixEffectWeapon.hpp:216).
@@ -335,6 +394,10 @@ pub struct WeaponEffect {
     // module doc).
     pub pending_puffs: Vec<FlamePuffSpawn>,
     pub flame_alive: bool,
+    /// Set at FireEnd for the flamethrower — the flame effect marks
+    /// its newest puff as a burst boundary (`Break()`,
+    /// MatrixEffectWeapon.cpp:810-814).
+    pub flame_break_pending: bool,
 
     // Repair beam state (replaces the C++ `m_Repair` effect pointer;
     // the seek logic from MatrixEffectRepair.cpp:177-250 runs inline
@@ -349,12 +412,22 @@ pub struct WeaponEffect {
     pub beam: Option<(Vec3, Vec3)>,
     /// CVolcano muzzle visual active (drawn from pos/dir).
     pub volcano_on: bool,
+    /// Plasma muzzle-cone birth time + angle — the cone is weapon-owned
+    /// so `Modify(pos, dir)` re-aims it while the barrel moves
+    /// (MatrixEffectWeapon.cpp:236-241); drawn live like the volcano.
+    plasma_muzzle: Option<(i64, f32)>,
     /// CMatrixEffectLightening owned by the electric weapon.
     pub bolt: Option<crate::matrix_game::effects::lightening::Lightening>,
     /// Traveling repair-beam glow billboards: (t, dt) pairs
     /// (MatrixEffectRepair.cpp:420-436).
     pub repair_bb: Vec<(f32, f32)>,
     repair_next_spawn: f32,
+    /// `m_OffTargetAmp` — growing seek wobble amplitude, capped at
+    /// seek_radius·0.2 (MatrixEffectRepair.cpp:164-173).
+    repair_off_amp: f32,
+    /// `m_ChangeTime` countdown for the beam-shape morph when a
+    /// patient is acquired (REPAIR_CHANGE_TIME 500 ms).
+    repair_change: f32,
 }
 
 impl WeaponEffect {
@@ -393,14 +466,18 @@ impl WeaponEffect {
             handler: WeaponHandler::None,
             pending_puffs: Vec::new(),
             flame_alive: false,
+            flame_break_pending: false,
             repair_target: None,
             repair_time: 0.0,
             repair_next_seek: 0.0,
             beam: None,
             volcano_on: false,
+            plasma_muzzle: None,
             bolt: None,
             repair_bb: Vec::new(),
             repair_next_spawn: 0.0,
+            repair_off_amp: 0.0,
+            repair_change: 0.0,
         }
         .with_handler(handler)
     }
@@ -484,6 +561,9 @@ impl WeaponEffect {
             return;
         }
         self.flags &= !WEAPFLAGS_FIRE;
+        if self.weapon_type == WEAPON_FLAMETHROWER {
+            self.flame_break_pending = true;
+        }
         if self.weapon_type == WEAPON_REPAIR {
             // The C++ destroys the repair effect here; the next burst
             // creates a fresh one whose first takt seeks immediately.
@@ -524,6 +604,12 @@ impl WeaponEffect {
         }
         if self.weapon_type == WEAPON_REPAIR {
             self.repair_time += step;
+            // Seek wobble amplitude grows to seek_radius·0.2
+            // (MatrixEffectRepair.cpp:164-173); the shape-morph
+            // countdown runs whenever active (:141-158).
+            let lim = self.weapon_dist() * 0.2;
+            self.repair_off_amp = (self.repair_off_amp + 0.001 * step).min(lim);
+            self.repair_change = (self.repair_change - step).max(0.0);
         }
         if self.is_fire() && self.cool_down > 0.0 {
             while self.time >= 0.0 {
@@ -614,25 +700,21 @@ impl WeaponEffect {
         self.fire_count += 1;
         let dist = self.weapon_dist();
 
+        // Per-shot fire sound (`m_SoundType` at the muzzle,
+        // MatrixEffectWeapon.cpp:291-294).
+        let snd = fire_sound_key(self.weapon_type);
+        if !snd.is_empty() {
+            objs.queue_snd_at(snd, self.pos);
+        }
+
         let now = crate::matrix_game::map::current_elapsed_ms();
         let muzzle_ang = std::f32::consts::TAU / 4096.0 * ((now & 4095) as f32);
         match self.weapon_type {
             WEAPON_PLASMA => {
-                // Muzzle cone (MatrixEffectWeapon.cpp:305-306).
-                objs.pending_effects.push(GameEffect::Konus(
-                    crate::matrix_game::effects::konus::Konus::new(
-                        self.pos,
-                        self.dir,
-                        10.0,
-                        10.0,
-                        muzzle_ang,
-                        300.0,
-                        true,
-                        crate::matrix_lib::three_g::billboard::TexRef::Path(
-                            crate::matrix_game::effects::effects_renderer::TEXTURE_PATH_GUN_FIRE,
-                        ),
-                    ),
-                ));
+                // Muzzle cone (MatrixEffectWeapon.cpp:305-306) —
+                // weapon-owned so it re-aims with the barrel
+                // (Modify, :236-241); drawn in `draw()`.
+                self.plasma_muzzle = Some((now, muzzle_ang));
                 objs.weapons.add_ref(self_id);
                 objs.pending_effects
                     .push(GameEffect::FirePlasma(FirePlasma::new(
@@ -676,6 +758,7 @@ impl WeaponEffect {
                     }
                 } else if s == TraceStop::Water {
                     // Water splash konus (MatrixEffectWeapon.cpp:348).
+                    objs.queue_snd_at("splash", hitpos);
                     objs.pending_effects.push(GameEffect::Konus(
                         crate::matrix_game::effects::konus::Konus::new_splash(
                             hitpos,
@@ -932,7 +1015,10 @@ impl WeaponEffect {
                             100.0,
                             1400.0,
                             10.0,
-                            0x00FF_FFFF | 0xFF00_0000,
+                            // C++ passes 0x00FFFFFF — alpha 0, the steam
+                            // plume is intentionally invisible
+                            // (MatrixEffectWeapon.cpp:625).
+                            0x00FF_FFFF,
                             false,
                             0.04,
                         ),
@@ -963,14 +1049,15 @@ impl WeaponEffect {
                     self.pos, dist, 300.0, TRACE_ALL, None, self_id,
                 )));
                 // Two purely-visual rings at the raw weapon dist
-                // (MatrixEffectWeapon.cpp:664-665): ttl 350 white, ttl 400
-                // tinted 0xFFAFAF40. tracetype 0 → no damage.
+                // (MatrixEffectWeapon.cpp:664-665). The 0xFFAFAF40 on
+                // the third call is the LIGHT argument (dead — light=0
+                // path); the shell itself is always white
+                // (MatrixEffectBigBoom.cpp:31). tracetype 0 → no damage.
                 let mut ring = BigBoom::new(self.pos, self.weapon_dist, 350.0, 0, None, self_id);
                 ring.deals_damage = false;
                 objs.pending_effects.push(GameEffect::BigBoom(ring));
                 let mut ring = BigBoom::new(self.pos, self.weapon_dist, 400.0, 0, None, self_id);
                 ring.deals_damage = false;
-                ring.color_rgb = 0x00AF_AF40;
                 objs.pending_effects.push(GameEffect::BigBoom(ring));
                 // Central detonation flash (MatrixEffectWeapon.cpp:666).
                 objs.pending_explosions
@@ -1018,7 +1105,7 @@ impl WeaponEffect {
                 1.0,
                 TRACE_ROBOT | TRACE_BUILDING | TRACE_CANNON,
                 self.skip,
-                |fpos, id| {
+                |_fpos, id| {
                     let Some(o) = objs.get(id) else {
                         return Control::Continue;
                     };
@@ -1029,8 +1116,12 @@ impl WeaponEffect {
                     if (wpos - gc).length_squared() > wdist2 {
                         return Control::Continue;
                     }
-                    let dist = (Vec3::new(fpos.x, fpos.y, 0.0) - Vec3::new(gc.x, gc.y, 0.0))
-                        .length_squared();
+                    // C++ FindPatient ranks by distance from the search
+                    // CENTER (the fpos FindObjects passes through,
+                    // MatrixMap.cpp:2716) — our find_objects hands the
+                    // callback the candidate's own center, so use the
+                    // seek center directly (MatrixEffectRepair.cpp:105).
+                    let dist = (center3 - gc).length_squared();
                     let is_robot = matches!(o.core().obj_type, ObjectType::RobotAi);
                     match tgt {
                         Some((_, best, best_robot)) => {
@@ -1043,7 +1134,13 @@ impl WeaponEffect {
                     Control::Continue
                 },
             );
-            self.repair_target = tgt.map(|(id, _, _)| id);
+            let new_target = tgt.map(|(id, _, _)| id);
+            if new_target != self.repair_target && new_target.is_some() {
+                // ERF_FOUND_TARGET — 500 ms morph from the straight
+                // seek spline onto the wrap-around one (:141-147).
+                self.repair_change = 500.0;
+            }
+            self.repair_target = new_target;
         }
         // Drop dead targets (the `m_Target->m_Object == NULL` check).
         if let Some(t) = self.repair_target {
@@ -1091,17 +1188,32 @@ impl WeaponEffect {
                 self.pos + self.dir * len,
                 width,
                 0xFFFF_FFFF,
-                0x00FF_FFFF,
+                // LIC lerps ALL channels to 0 — muzzle streaks dim to
+                // black as they fade (MatrixEffectWeapon.cpp:523-527),
+                // not stay hot white.
+                0x0000_0000,
                 1000.0,
                 bb::TexRef::Bbt(tex),
             )));
-        // Muzzle point-light flash (MatrixEffectWeapon.cpp:514).
+        // Muzzle point-light flash — gun r=60 (MatrixEffectWeapon.cpp:
+        // 514), turret cannons r=40 (:725). Alpha must be opaque
+        // (0xFF303030): the light-mesh shader multiplies by color.a,
+        // so alpha 0 drew nothing.
+        let r = if self.weapon_type() == WEAPON_CANNON0
+            || self.weapon_type() == WEAPON_CANNON1
+            || self.weapon_type() == WEAPON_CANNON2
+            || self.weapon_type() == WEAPON_CANNON3
+        {
+            40.0
+        } else {
+            60.0
+        };
         objs.pending_point_lights
             .push(crate::matrix_game::map_static::PendingLight {
                 pos: [self.pos.x, self.pos.y, self.pos.z],
-                r1: 60.0,
-                r2: 60.0,
-                c1: 0x0030_3030,
+                r1: r,
+                r2: r,
+                c1: 0xFF30_3030,
                 c2: 0,
                 ttl: 1000.0,
                 t1: 1000.0,
@@ -1129,6 +1241,30 @@ impl WeaponEffect {
             let color = (a << 24) | 0x00FF_FFFF;
             q.line(p0, p1, 10.0, color, bb::TexRef::Bbt(bb::BBT_LASER));
             q.billboard(p0, 5.0, 0.0, color, bb::TexRef::Bbt(bb::BBT_LASEREND));
+        }
+        if let Some((born, ang)) = self.plasma_muzzle {
+            // Plasma muzzle cone, re-aimed to the live pos/dir each
+            // frame (Konus::Modify, MatrixEffectWeapon.cpp:236-241).
+            let now = crate::matrix_game::map::current_elapsed_ms();
+            let age = (now - born) as f32;
+            if age >= 300.0 {
+                // Cone expired — clear so the borrow below is free.
+            } else {
+                let mut k = crate::matrix_game::effects::konus::Konus::new(
+                    self.pos,
+                    self.dir,
+                    10.0,
+                    10.0,
+                    ang,
+                    300.0,
+                    true,
+                    bb::TexRef::Path(
+                        crate::matrix_game::effects::effects_renderer::TEXTURE_PATH_GUN_FIRE,
+                    ),
+                );
+                let _ = k.takt(age);
+                k.draw(q);
+            }
         }
         if self.volcano_on && self.is_fire() {
             // CVolcano::Draw — cone + one of three GUNFIRE lines.
@@ -1162,33 +1298,91 @@ impl WeaponEffect {
             bolt.draw(q);
         }
         if self.is_fire() && self.weapon_type == WEAPON_REPAIR && !self.repair_bb.is_empty() {
-            // Repair beam — Catmull-Rom from the muzzle toward the
-            // patient (or straight out when seeking), REPGLOW lines +
-            // traveling REPGLOWEND glints.
-            let target = self
-                .repair_target
-                .and_then(|t| objs.get(t))
-                .map(|o| o.core().geo_center)
-                .unwrap_or(self.pos + self.dir * self.weapon_dist());
-            let wob = (self.repair_time * 0.005).sin() * self.weapon_dist() * 0.06;
-            let d = target - self.pos;
-            let perp = d.cross(Vec3::Z).normalize_or_zero();
-            let pts = [
-                self.pos,
-                self.pos + d / 3.0 + perp * wob,
-                self.pos + d * 2.0 / 3.0 - perp * wob,
-                target,
+            // Repair beam — the C++ 10-phase wobble sine bank
+            // (MatrixEffectRepair.cpp:270-281).
+            let tm = self.repair_time;
+            let sins: [f32; 10] = [
+                (tm * 0.005 + 0.9).sin(),
+                (tm * 0.007 + 0.2).sin(),
+                (tm * 0.0073 + 0.3).sin(),
+                (tm * 0.0013).sin(),
+                (tm * 0.0022 + 0.2).sin(),
+                (tm * 0.0017 + 0.8).sin(),
+                (tm * 0.0028 + 0.3).sin(),
+                (tm * 0.0051 + 0.9).sin(),
+                (tm * 0.003 + 0.01).sin(),
+                (tm * 0.001 + 0.93).sin(),
             ];
-            let spline = crate::matrix_lib::three_g::math3d::Trajectory::new(&pts);
-            let mut prev = spline.calc_point(0.0);
-            for i in 1..=12 {
-                let p = spline.calc_point(i as f32 / 12.0);
-                q.line(prev, p, 4.0, 0xB0FF_FFFF, bb::TexRef::Bbt(bb::BBT_REPGLOW));
-                prev = p;
-            }
+            let seek = self.weapon_dist();
+            let amp = self.repair_off_amp;
+            // Straight seek spline with growing wobble (p4, :286-303).
+            let p4 = [
+                self.pos,
+                self.pos + self.dir * (seek / 3.0),
+                self.pos
+                    + self.dir * (seek * 2.0 / 3.0)
+                    + Vec3::new(
+                        0.4 * amp * sins[3],
+                        0.4 * amp * sins[7],
+                        0.4 * amp * sins[9],
+                    ),
+                self.pos + self.dir * seek + Vec3::new(amp * sins[1], amp * sins[4], amp * sins[8]),
+            ];
+            let straight = crate::matrix_lib::three_g::math3d::Trajectory::new(&p4);
+            // Wrap-around spline (p9, :305-357): out to the patient,
+            // around it (front·1.4 → side → back → −side → front·1.4,
+            // each wobbled by disp = len·0.01), and back to the muzzle.
+            let wrap = self.repair_target.and_then(|t| objs.get(t)).map(|o| {
+                let gc = o.core().geo_center;
+                let radius = o.core().radius;
+                let len = (self.pos - gc).length();
+                let disp = len * 0.01;
+                let p1 = self.pos + self.dir * (len / 3.0);
+                let td = (p1 - gc).normalize_or_zero();
+                let side = td.cross(Vec3::Z).normalize_or_zero();
+                let w = |a: usize, b: usize, c: usize| {
+                    Vec3::new(disp * sins[a], disp * sins[b], disp * sins[c])
+                };
+                let p9 = [
+                    self.pos,
+                    p1,
+                    gc + td * radius * 1.4 + w(0, 1, 2),
+                    gc + side * radius + w(2, 3, 4),
+                    gc - td * radius + w(4, 5, 6),
+                    gc - side * radius + w(6, 7, 8),
+                    gc + td * radius * 1.4 + w(3, 6, 9),
+                    p1,
+                    self.pos,
+                ];
+                p9
+            });
+            // 500 ms found-morph between the two shapes (:359-395);
+            // losing the patient snaps back to the seek spline (the
+            // C++ also morphs out — its target core outlives the loss,
+            // ours doesn't, so the out-morph is skipped).
+            let spline = match wrap {
+                Some(p9) => {
+                    let k = (self.repair_change / 500.0).clamp(0.0, 1.0);
+                    if k > 0.0 {
+                        let mut blended = [Vec3::ZERO; 9];
+                        for (i, b) in blended.iter_mut().enumerate() {
+                            let t = i as f32 / 8.0;
+                            let s = straight.calc_point(t);
+                            *b = s + (p9[i] - s) * (1.0 - k);
+                        }
+                        crate::matrix_lib::three_g::math3d::Trajectory::new(&blended)
+                    } else {
+                        crate::matrix_lib::three_g::math3d::Trajectory::new(&p9)
+                    }
+                }
+                None => straight,
+            };
+            // The C++ draws ONLY the traveling glints — there is no
+            // persistent solid beam (MatrixEffectRepair.cpp:60-67);
+            // glint tails span t-0.06 (:388-395).
             for (t, _) in &self.repair_bb {
                 let a = ((t / 0.2).clamp(0.0, 1.0) * 255.0) as u32;
-                let p0 = spline.calc_point((t - 0.02).max(0.0));
+                let p0 = spline.calc_point((t - 0.06).max(0.0));
                 let p1 = spline.calc_point(*t);
                 q.line(
                     p0,
@@ -1198,6 +1392,16 @@ impl WeaponEffect {
                     bb::TexRef::Bbt(bb::BBT_REPGLOWEND),
                 );
             }
+            // Muzzle glow (SWeaponRepairData, MatrixRobot.cpp:55-84) —
+            // a small pulsing sprite at the emitter.
+            let pulse = 4.0 + (tm * 0.01).sin().abs() * 2.0;
+            q.billboard(
+                self.pos,
+                pulse,
+                0.0,
+                0xB0FF_FFFF,
+                bb::TexRef::Bbt(bb::BBT_REPGLOWEND),
+            );
             let _ = fsrnd;
         }
     }
@@ -1282,6 +1486,7 @@ pub fn weapon_hit(
     // Water splash (MatrixEffectWeapon.cpp:50-53).
     if hiti == TraceStop::Water && wtype != WEAPON_FLAMETHROWER && wtype != WEAPON_BIGBOOM {
         let ang = (pos.x + pos.y).fract() * std::f32::consts::PI;
+        objs.queue_snd_at("splash", pos);
         objs.pending_effects
             .push(crate::matrix_game::effects::GameEffect::Konus(
                 crate::matrix_game::effects::konus::Konus::new_splash(
@@ -1343,7 +1548,12 @@ pub fn dispatch_fire_end_handler(
                     &mut *(boxed.as_mut() as *mut dyn MapStatic
                         as *mut crate::matrix_game::robot::Robot)
                 };
-                r.hit_to(hit_info, pos, objs);
+                // `m_CurrState != ROBOT_DIP` gate (robot_weapon_hit,
+                // MatrixRobot.cpp:4011-4023) — dead shooters don't
+                // update their env from in-flight shots landing.
+                if r.state != crate::matrix_game::robot::RobotState::Dip {
+                    r.hit_to(hit_info, pos, objs);
+                }
             }
             objs.put_obj(id, boxed);
         }

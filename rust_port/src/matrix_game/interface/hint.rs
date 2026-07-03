@@ -93,21 +93,20 @@ impl TemplateLibrary {
             return Self { templates, raw };
         };
         let n = keys.arrays_count().min(values.arrays_count());
-        let mut last_name: Option<String> = None;
         for i in 0..n {
             let name = keys.get_as_wstr(i);
             let value = values.get_as_wstr(i);
             raw.push((name.clone(), value.clone()));
-            let is_continuation =
-                value.starts_with('|') && last_name.as_deref() == Some(name.as_str());
-            if is_continuation {
+            // C++ appends EVERY later same-named `|`-continuation
+            // regardless of interleaving (MatrixHint.cpp:519-563); a
+            // `|`-value with no head is dropped.
+            if value.starts_with('|') {
                 if let Some(entry) = templates.get_mut(&name) {
                     entry.push_str(&value);
                 }
             } else {
                 templates.entry(name.clone()).or_insert(value);
             }
-            last_name = Some(name);
         }
         log::info!("hint: loaded {} templates", templates.len());
         Self { templates, raw }
@@ -420,6 +419,10 @@ pub enum HintPart {
         text: String,
         font: String,
         color: [u8; 4],
+        /// Rangers-rasterizer `alignx` (MatrixHint.cpp:590/652): 0 =
+        /// left, 1 = center (default), 3 = justify. Shipped tooltips
+        /// override to 0 via `_ALIGN:0:0`.
+        align_x: i32,
     },
     /// Named inline image (resolves via `HintChromeLibrary::bitmaps`).
     Bitmap {
@@ -723,6 +726,8 @@ pub fn build_hint(
     // `copy = new_copy` tracker from MatrixHint.cpp:390-417 — armed by
     // a HEM_COPY element, consumed by the very next element.
     let mut copy_pending = false;
+    // Rasterizer alignx — default 1 (center), MatrixHint.cpp:590.
+    let mut align_x: i32 = 1;
 
     // `m_SoundIn`/`m_SoundOut` (MatrixHint.cpp:622-627) — fired on show/hide.
     let mut sound_in: Option<String> = None;
@@ -778,8 +783,16 @@ pub fn build_hint(
             sound_out = Some(rest.trim().to_string());
             continue;
         }
-        if directive.starts_with("_ALIGN:") || directive.starts_with("_BORDER:") {
-            continue; // scalar-ish; we don't use them for text hints.
+        if let Some(rest) = directive.strip_prefix("_ALIGN:") {
+            // `_ALIGN:x:y` (MatrixHint.cpp:652-655) — sticky until the
+            // next _ALIGN; only alignx affects our renderer.
+            if let Some(v) = rest.split(':').next().and_then(|s| s.trim().parse::<i32>().ok()) {
+                align_x = v;
+            }
+            continue;
+        }
+        if directive.starts_with("_BORDER:") {
+            continue; // scalar-ish; we don't use it for text hints.
         }
         // _POS:X:Y → set absolute coord for next bitmap.
         // These zero-size positioning directives also count as an
@@ -855,11 +868,41 @@ pub fn build_hint(
             } else {
                 parse_mod(&m_spec)
             };
-            if name_trim.is_empty() {
-                continue;
-            }
-            let Some(bmp) = bitmaps.get(&name_trim) else {
-                log::debug!("hint: unknown bitmap alias '{name_trim}'");
+            // Unresolved alias still emits a NULL 0×0 element in the
+            // C++ (MatrixHint.cpp:671-691): its layout modifier (`:L`
+            // line break, `:T:n` tab) and any pending `_MOD:COPY`
+            // anchor are consumed either way.
+            let bmp = if name_trim.is_empty() {
+                None
+            } else {
+                let b = bitmaps.get(&name_trim);
+                if b.is_none() {
+                    log::debug!("hint: unknown bitmap alias '{name_trim}'");
+                }
+                b
+            };
+            let Some(bmp) = bmp else {
+                let (px, py) = pass1_position(
+                    part_mod,
+                    &mut cx,
+                    &mut cy,
+                    &mut cw,
+                    &mut ch,
+                    0,
+                    0,
+                    &mut new_coord,
+                );
+                emitted.push(Emitted {
+                    part: HintPart::Bitmap {
+                        x: px,
+                        y: py,
+                        w: 0,
+                        h: 0,
+                        name: String::new(),
+                    },
+                    hem: part_mod,
+                    record_copy: std::mem::take(&mut copy_pending),
+                });
                 continue;
             };
             let (bw, bh) = bitmap_sizer(&bmp.path).unwrap_or((16, 16));
@@ -968,6 +1011,7 @@ pub fn build_hint(
                     text: joined,
                     font: font.clone(),
                     color,
+                    align_x,
                 },
                 hem: modif,
                 record_copy: std::mem::take(&mut copy_pending),
@@ -1147,7 +1191,11 @@ fn resolve_sentinel(part: HintPart, hem: Hem, cw: i32, ots_left: i32, ots_top: i
     let y = y0 + ots_top;
     match part {
         HintPart::Text {
-            text, font, color, ..
+            text,
+            font,
+            color,
+            align_x,
+            ..
         } => HintPart::Text {
             x,
             y,
@@ -1156,6 +1204,7 @@ fn resolve_sentinel(part: HintPart, hem: Hem, cw: i32, ots_left: i32, ots_top: i
             text,
             font,
             color,
+            align_x,
         },
         HintPart::Bitmap { name, .. } => HintPart::Bitmap {
             x,
@@ -1209,9 +1258,19 @@ pub(super) fn measure_rich(atlas: &mut super::text::GlyphAtlas, font: &str, text
 pub fn center_text_parts(parts: &mut [HintPart], atlas: &mut super::text::GlyphAtlas) {
     for part in parts.iter_mut() {
         if let HintPart::Text {
-            x, w, text, font, ..
+            x,
+            w,
+            text,
+            font,
+            align_x,
+            ..
         } = part
         {
+            // `_ALIGN:0:*` templates render left-aligned in the
+            // original rasterizer — leave them at the band origin.
+            if *align_x == 0 {
+                continue;
+            }
             let measured: i32 = text
                 .split('\n')
                 .map(|line| measure_rich(atlas, font, line) as i32)

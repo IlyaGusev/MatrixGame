@@ -88,6 +88,10 @@ pub struct BaseVisibilityCtx<'a> {
     /// `None` when no pylon is focused. Port of the
     /// `m_FocusedElement->m_Param1/Param2` reads at CInterface.cpp:2358-2406.
     pub focused_target: Option<crate::matrix_game::interface::constructor::FocusTarget>,
+    /// Per-pylon CRITICAL_RAMKA flag (pihe, pihu, pich, pi1..pi5):
+    /// true when the total (×counter) price is short on a resource the
+    /// MOUNTED part actually costs (CInterface.cpp:1885-2097).
+    pub pylon_criticals: [bool; 8],
 }
 
 /// Subset of `CMatrixSide` state the Main panel's visibility dispatch
@@ -133,6 +137,9 @@ pub struct MainVisibilityCtx {
     /// stack capacity, OR `cant_build_tu` (resource shortage for the
     /// cheapest cannon kind).
     pub buca_disabled: bool,
+    /// `callhell` DISABLED flag — maintenance off or its cooldown
+    /// running (CInterface.cpp:1609-1613).
+    pub maintenance_cooling: bool,
     /// Per-slot installed turret kind (1..=4) for the building's
     /// physical turret slots. `Some(k)` ⇒ slot is occupied with a
     /// cannon of kind `k` (`m_TurretsPlaces[i].m_CannonType`). `None` ⇒
@@ -177,9 +184,10 @@ pub struct MainVisibilityCtx {
     pub auto_protect_on: bool,
     pub auto_capture_on: bool,
     /// Active group's order → order-glow index 0..5 (stop/move/patrol/
-    /// fire/capture/bomb-repair), lighting the `osel` icon with id
-    /// ORDERS_GLOW_ID+index (CInterface.cpp:1663-1677). `None` = no glow.
-    pub order_glow: Option<i32>,
+    /// fire/capture/bomb-repair), lighting the `osel` icons with ids
+    /// ORDERS_GLOW_ID+index (CInterface.cpp:1663-1677). Aggregated
+    /// across the whole selection — several may glow at once.
+    pub order_glows: [bool; 6],
 }
 
 /// Per-frame snapshot driving the robot selection panel — populated
@@ -207,6 +215,11 @@ pub struct RobotPanelCtx {
     /// caption (CInterface.cpp:1396-1404).
     pub robot_hp: i32,
     pub robot_max_hp: i32,
+    /// SINGLE_MODE weapon readout (CreateWeaponDynamicStatics,
+    /// CInterface.cpp:3013-3114): one `(display_slot 0..4, weapon
+    /// kind 1..10, overheat alpha 0..1)` per mounted weapon of the
+    /// lone selected robot. Empty for multi-robot selections.
+    pub single_weapons: Vec<(usize, i32, f32)>,
 }
 
 /// One entry of `RobotPanelCtx::group`. Carries the data the
@@ -529,12 +542,20 @@ impl CInterface {
                             e.def_state = ElementState::Normal;
                         }
                     }
-                    // Reinforcements ("call from hell") is visible and
-                    // clickable for any selected building unless we're in
-                    // turret-build mode (CInterface.cpp:1607). The C++
-                    // cooldown/disabled gating (:1609-1613) isn't modelled,
-                    // so it stays enabled — matching the common case.
-                    "callhell" if !bld_tu => e.set_visible(true),
+                    // Reinforcements ("call from hell") is visible for
+                    // any selected building unless we're in turret-build
+                    // mode (CInterface.cpp:1607); DISABLED while
+                    // maintenance is off or the cooldown runs (:1609-1613).
+                    "callhell" if !bld_tu => {
+                        e.set_visible(true);
+                        if ctx.maintenance_cooling {
+                            e.cur_state = ElementState::Disabled;
+                            e.def_state = ElementState::Disabled;
+                        } else if matches!(e.cur_state, ElementState::Disabled) {
+                            e.cur_state = ElementState::Normal;
+                            e.def_state = ElementState::Normal;
+                        }
+                    }
                     "baseln" => e.set_visible(true),
                     "zagl1" => e.set_visible(true),
                     // Resource-income readout — shown while the build
@@ -592,7 +613,8 @@ impl CInterface {
                     // Order glow: light the osel icon for the active order
                     // (ids ORDERS_GLOW_ID..+5, CInterface.cpp:1663-1677).
                     "osel" => {
-                        if ctx.order_glow == Some(e.id - ORDERS_GLOW_ID) {
+                        let idx = e.id - ORDERS_GLOW_ID;
+                        if (0..6).contains(&idx) && ctx.order_glows[idx as usize] {
                             e.set_visible(true);
                         }
                     }
@@ -649,7 +671,15 @@ impl CInterface {
         // sub-modes (CInterface.cpp:1696). Each tur{N} also flips
         // DISABLED when the player can't afford it / the building has
         // no free turret slot (CInterface.cpp:1713-1738).
-        if ctx.turret_build_active {
+        // C++ shows the picker only inside the BUILDING/BASE-selected
+        // branch (CInterface.cpp:1708-1741).
+        if ctx.turret_build_active
+            && matches!(
+                ctx.curr_sel,
+                crate::matrix_game::side::CurrSel::BaseSelected
+                    | crate::matrix_game::side::CurrSel::BuildingSelected
+            )
+        {
             let show_picker = !ctx.turret_kind_committed;
             for e in &mut self.elements {
                 let n = e.name.as_str();
@@ -760,6 +790,8 @@ impl CInterface {
                 hint_offset_x: 0,
                 hint_offset_y: 0,
                 animation: None,
+                visible_alpha: None,
+                ramka_color: None,
             });
         }
 
@@ -830,6 +862,8 @@ impl CInterface {
                     hint_offset_x: 0,
                     hint_offset_y: 0,
                     animation: None,
+                    visible_alpha: None,
+                    ramka_color: None,
                 });
             }
         }
@@ -849,6 +883,8 @@ impl CInterface {
             !e.name.starts_with("_dyngroup_")
                 && !e.name.starts_with("_dynramka_")
                 && !e.name.starts_with("_dynpers_")
+                && !e.name.starts_with("_dynweap_")
+                && !e.name.starts_with("_dynovhe_")
         });
         if matches!(ctx.curr_sel, CurrSel::RobotsSelected) {
             if let Some(rp) = ctx.robot_panel.as_ref() {
@@ -875,17 +911,14 @@ impl CInterface {
                     (GROUP_X0 + col * GROUP_DX, GROUP_Y0 + row * GROUP_DY)
                 };
 
-                // 9.a — selection ramka over the active slot. Port of
-                // CreateGroupSelection (CInterface.cpp:3550). The C++
-                // creates 9 ramka statics at z=0.000001 and toggles
-                // `SetVisibility` based on `selected_index`; we emit
-                // only the one over the active slot. Pushed BEFORE the
-                // group icons so it renders BEHIND them — the C++
-                // SortElementsByZ orders descending by zPos so the
-                // higher-z ramka draws first (back), letting the icon
-                // draw on top with the ramka peeking past its edges.
-                let sel_idx = rp.selected_index.min(rp.group.len().saturating_sub(1));
-                if !rp.group.is_empty() {
+                // 9.a — selection ramka frames. The C++ shows the
+                // `gram` frame behind EVERY occupied group slot
+                // (CInterface.cpp:1546-1571) and hides them all in
+                // single mode; it is never an active-slot marker.
+                // Pushed BEFORE the group icons so they render BEHIND
+                // them — the C++ SortElementsByZ orders descending by
+                // zPos so the higher-z ramka draws first (back).
+                if rp.group.len() > 1 {
                     if let Some(gram_idx) = self.elements.iter().position(|e| e.name == "gram") {
                         let images = self.elements[gram_idx].images.clone();
                         // `gram` is an Image-kind template — its
@@ -898,13 +931,90 @@ impl CInterface {
                             .and_then(|i| i.as_ref())
                             .map(|i| (i.w.max(GROUP_W), i.h.max(GROUP_H)))
                             .unwrap_or((GROUP_W, GROUP_H));
-                        let (px, py) = pos_for(sel_idx);
+                        for i in 0..rp.group.len().min(9) {
+                            let (px, py) = pos_for(i);
+                            self.elements.push(IFaceElement {
+                                name: format!("_dynramka_{}", i),
+                                kind: ElementKind::Static,
+                                button_type: ButtonType::default(),
+                                // GROUP_SELECTION_ID + i (CInterface.h:69).
+                                id: 450 + i as i32,
+                                group: 0,
+                                flags: IFEF_VISIBLE,
+                                param1: 0.0,
+                                param2: 0.0,
+                                i_param: 0,
+                                pos_x: px,
+                                pos_y: py,
+                                pos_z: 0.000001,
+                                size_x: gw,
+                                size_y: gh,
+                                images: images.clone(),
+                                labels: Vec::new(),
+                                cur_state: ElementState::Normal,
+                                def_state: ElementState::Normal,
+                                hint_template: String::new(),
+                                hint_offset_x: 0,
+                                hint_offset_y: 0,
+                                animation: None,
+                                visible_alpha: None,
+                                ramka_color: None,
+                            });
+                        }
+                    }
+                }
+
+                // 9.b' — SINGLE_MODE weapon readout (one robot
+                // selected): the `wsl` plate + one weapon icon per
+                // mounted weapon at the m_DWeaponX/Y grid + overheat
+                // overlays with alpha = heat·0.25
+                // (CreateWeaponDynamicStatics CInterface.cpp:3013-3114
+                // + the singlem branch :1510-1538). The group grid is
+                // suppressed (GROUP_SELECTOR needs `!singlem`, :1659).
+                if rp.group.len() == 1 {
+                    const DWEAPON: [(f32, f32); 5] = [
+                        (243.0, 106.0),
+                        (283.0, 106.0),
+                        (243.0, 65.0),
+                        (283.0, 65.0),
+                        (323.0, 65.0),
+                    ];
+                    let icon_name = |kind: i32| -> &'static str {
+                        match kind {
+                            1 => "wman",
+                            2 => "wcan",
+                            3 => "wron",
+                            4 => "wfin",
+                            5 => "wmin",
+                            6 => "wlan",
+                            7 => "wbon",
+                            8 => "wpln",
+                            9 => "weln",
+                            10 => "wren",
+                            _ => "",
+                        }
+                    };
+                    for &(slot, kind, heat_alpha) in &rp.single_weapons {
+                        let name = icon_name(kind);
+                        if name.is_empty() || slot >= DWEAPON.len() {
+                            continue;
+                        }
+                        let Some(src) = self.elements.iter().position(|e| e.name == name) else {
+                            continue;
+                        };
+                        let images = self.elements[src].images.clone();
+                        let (iw, ih) = images
+                            .first()
+                            .and_then(|i| i.as_ref())
+                            .map(|i| (i.w, i.h))
+                            .unwrap_or((32.0, 32.0));
+                        let (px, py) = DWEAPON[slot];
                         self.elements.push(IFaceElement {
-                            name: format!("_dynramka_{}", sel_idx),
+                            name: format!("_dynweap_{}", slot),
                             kind: ElementKind::Static,
                             button_type: ButtonType::default(),
-                            // GROUP_SELECTION_ID + i (CInterface.h:69).
-                            id: 450 + sel_idx as i32,
+                            // DYNAMIC_WEAPON_ON_ID (CInterface.h).
+                            id: 650 + slot as i32,
                             group: 0,
                             flags: IFEF_VISIBLE,
                             param1: 0.0,
@@ -912,9 +1022,9 @@ impl CInterface {
                             i_param: 0,
                             pos_x: px,
                             pos_y: py,
-                            pos_z: 0.000001,
-                            size_x: gw,
-                            size_y: gh,
+                            pos_z: 0.0000001,
+                            size_x: iw,
+                            size_y: ih,
                             images,
                             labels: Vec::new(),
                             cur_state: ElementState::Normal,
@@ -923,7 +1033,50 @@ impl CInterface {
                             hint_offset_x: 0,
                             hint_offset_y: 0,
                             animation: None,
+                            visible_alpha: None,
+                            ramka_color: None,
                         });
+                        if heat_alpha > 0.0 {
+                            if let Some(oh) =
+                                self.elements.iter().position(|e| e.name == "ovhe")
+                            {
+                                let images = self.elements[oh].images.clone();
+                                let (ow, ohh) = images
+                                    .first()
+                                    .and_then(|i| i.as_ref())
+                                    .map(|i| (i.w, i.h))
+                                    .unwrap_or((32.0, 32.0));
+                                self.elements.push(IFaceElement {
+                                    name: format!("_dynovhe_{}", slot),
+                                    kind: ElementKind::Static,
+                                    button_type: ButtonType::default(),
+                                    id: 660 + slot as i32,
+                                    group: 0,
+                                    flags: IFEF_VISIBLE,
+                                    param1: 0.0,
+                                    param2: 0.0,
+                                    i_param: 0,
+                                    pos_x: px,
+                                    pos_y: py,
+                                    pos_z: 0.000001,
+                                    size_x: ow,
+                                    size_y: ohh,
+                                    images,
+                                    labels: Vec::new(),
+                                    cur_state: ElementState::Normal,
+                                    def_state: ElementState::Normal,
+                                    hint_template: String::new(),
+                                    hint_offset_x: 0,
+                                    hint_offset_y: 0,
+                                    animation: None,
+                                    visible_alpha: Some(heat_alpha),
+                                    ramka_color: None,
+                                });
+                            }
+                        }
+                    }
+                    if let Some(wsl) = self.elements.iter_mut().find(|e| e.name == "wsl") {
+                        wsl.set_visible(true);
                     }
                 }
 
@@ -931,8 +1084,14 @@ impl CInterface {
                 // from each entry's pre-baked `m_MedTexture` atlas key.
                 // Robots without a baked icon are skipped (the slot
                 // stays empty until the bake catches up). Pushed AFTER
-                // the ramka so they draw on top of it.
-                for (i, entry) in rp.group.iter().enumerate().take(9) {
+                // the ramka so they draw on top of it. Hidden in
+                // single mode (GROUP_SELECTOR `!singlem`).
+                for (i, entry) in rp
+                    .group
+                    .iter()
+                    .enumerate()
+                    .take(if rp.group.len() > 1 { 9 } else { 0 })
+                {
                     let Some(key) = entry.atlas_key.as_ref() else {
                         continue;
                     };
@@ -978,6 +1137,8 @@ impl CInterface {
                         hint_offset_x: 0,
                         hint_offset_y: 0,
                         animation: None,
+                        visible_alpha: None,
+                        ramka_color: None,
                     });
                 }
 
@@ -1026,6 +1187,8 @@ impl CInterface {
                         hint_offset_x: 0,
                         hint_offset_y: 0,
                         animation: None,
+                        visible_alpha: None,
+                        ramka_color: None,
                     });
                 }
             }
@@ -1112,6 +1275,7 @@ impl CInterface {
             build_enabled: true,
             robot_limit_reached: false,
             focused_target: None,
+            pylon_criticals: [false; 8],
         });
     }
 
@@ -1323,6 +1487,35 @@ impl CInterface {
             } else {
                 None
             };
+
+            // Affordability outline on the 8 constructor pylons —
+            // NORMAL_RAMKA green / CRITICAL_RAMKA orange
+            // (CInterface.cpp:1885-2097 + CreateElementRamka).
+            {
+                let pyl_idx = match n {
+                    "pihe" => Some(0),
+                    "pihu" => Some(1),
+                    "pich" => Some(2),
+                    "pi1" => Some(3),
+                    "pi2" => Some(4),
+                    "pi3" => Some(5),
+                    "pi4" => Some(6),
+                    "pi5" => Some(7),
+                    _ => None,
+                };
+                if let Some(pi) = pyl_idx {
+                    e.ramka_color = if ctx.constructor_active {
+                        // 0xFFFF8C00 orange / 0xFFB6E68B green.
+                        Some(if ctx.pylon_criticals[pi] {
+                            [1.0, 0.549, 0.0, 1.0]
+                        } else {
+                            [0.714, 0.902, 0.545, 1.0]
+                        })
+                    } else {
+                        None
+                    };
+                }
+            }
 
             // History button enabled state per CInterface.cpp:1954-1967.
             // The C++ uses SetState(IFACE_DISABLED) and keeps the
@@ -1716,6 +1909,8 @@ impl CInterface {
                 hint_offset_x: 0,
                 hint_offset_y: 0,
                 animation: None,
+                visible_alpha: None,
+                ramka_color: None,
             });
         };
 
@@ -1781,6 +1976,8 @@ impl CInterface {
                         hint_offset_x: 0,
                         hint_offset_y: 0,
                         animation: None,
+                        visible_alpha: None,
+                        ramka_color: None,
                     });
                 }
             }
@@ -2204,6 +2401,8 @@ fn load_element(stor: &Storage, rec: &str, kind: ElementKind) -> Option<IFaceEle
         hint_offset_x,
         hint_offset_y,
         animation,
+        visible_alpha: None,
+        ramka_color: None,
     })
 }
 

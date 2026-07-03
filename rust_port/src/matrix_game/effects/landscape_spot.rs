@@ -39,6 +39,16 @@ impl SpotKind {
             SpotKind::SoleTrack | SpotKind::SoleWheel | SpotKind::SolePneumatic => 30_000.0,
         }
     }
+    /// Eviction priority (`CMatrixEffectLandscapeSpot::Priority`,
+    /// MatrixEffectLandscapeSpot.cpp:611-617): plasma hits go first,
+    /// craters last.
+    fn priority(self) -> i32 {
+        match self {
+            SpotKind::Voronka => 500,
+            SpotKind::PlasmaHit => 0,
+            _ => 100,
+        }
+    }
     pub fn texture(self) -> TexRef {
         match self {
             SpotKind::Voronka => TexRef::Path("Matrix/Textures/LandSpots/varonka"),
@@ -212,7 +222,14 @@ impl LandscapeSpots {
     pub fn spawn(&mut self, map: &GameMap, s: &SpotSpawn) {
         if let Some(spot) = Spot::build(map, s) {
             if self.spots.len() >= MAX_SPOTS {
-                self.spots.remove(0);
+                // Priority-aware eviction (CMatrixMap::AddEffect,
+                // MatrixMap.hpp:689-703): drop the oldest
+                // lowest-priority spot.
+                if let Some(idx) = (0..self.spots.len())
+                    .min_by_key(|&i| (self.spots[i].kind.priority(), i))
+                {
+                    self.spots.remove(idx);
+                }
             }
             self.spots.push(spot);
         }

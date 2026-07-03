@@ -45,6 +45,7 @@ fn spline_point(k: &SplineKoefs, t: f32) -> Vec3 {
 /// Port of `CTrajectory` with `Init2` (Math3D.cpp:461-490): one
 /// segment per consecutive point pair, neighbor points clamped at the
 /// ends.
+#[derive(Debug, Clone)]
 pub struct Trajectory {
     segments: Vec<SplineKoefs>,
 }

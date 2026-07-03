@@ -39,6 +39,7 @@ pub enum GameEffect {
     Smoke(smoke_and_fire::Smoke),
     Fire(smoke_and_fire::Fire),
     BillboardLine(billboard_fx::BillboardLineFx),
+    Keelwater(billboard_fx::KeelwaterFx),
     Score(billboard_fx::ScoreFx),
     Lightening(lightening::Lightening),
     Explosion(explosion::Explosion),
@@ -58,9 +59,10 @@ impl GameEffect {
             GameEffect::Smoke(e) => e.takt(step, rng),
             GameEffect::Fire(e) => e.takt(step, rng),
             GameEffect::BillboardLine(e) => e.takt(step),
+            GameEffect::Keelwater(e) => e.takt(step),
             GameEffect::Score(e) => e.takt(step),
             GameEffect::Lightening(e) => e.takt(step, rng),
-            GameEffect::Explosion(e) => e.takt(step, map, rng),
+            GameEffect::Explosion(e) => e.takt(step, map, rng, objs),
             GameEffect::FireAnim(e) => e.takt(step),
             GameEffect::Dust(e) => e.takt(step, map),
         }
@@ -94,6 +96,7 @@ impl GameEffect {
             GameEffect::Smoke(e) => e.draw(q),
             GameEffect::Fire(e) => e.draw(q),
             GameEffect::BillboardLine(e) => e.draw(q),
+            GameEffect::Keelwater(e) => e.draw(q),
             GameEffect::Score(e) => e.draw(q),
             GameEffect::Lightening(e) => e.draw(q),
             GameEffect::Explosion(e) => e.draw(q, meshes),
@@ -119,12 +122,23 @@ pub fn effects_takt(
     // smoke pair + the voronka spot (MatrixEffect.cpp:452-501).
     let spawns: Vec<_> = objs.pending_explosions.drain(..).collect();
     for sp in spawns {
+        // MAX_EFFECT_DISTANCE_SQ cull (MatrixEffect.cpp:456) — skips
+        // the visuals, the sound and the crater alike.
+        if !crate::matrix_game::map::effect_in_range(sp.pos.x, sp.pos.y) {
+            continue;
+        }
+        // Preset sound (MatrixEffect.cpp:481).
+        if !sp.props.sound.is_empty() {
+            objs.queue_snd_at(sp.props.sound, sp.pos);
+        }
         let e = explosion::Explosion::new(sp.pos, sp.props, map, rng, &objs.debris_types);
         let (voronka, scale) = e.voronka();
         objs.pending_effects.push(GameEffect::Explosion(e));
         // Attached point-light flash (MatrixEffectExplosion.cpp:340,640-641).
         if sp.props.light {
-            let z = map.get_z(sp.pos.x, sp.pos.y) + 10.0;
+            // `max(pos.z, ground+10)` — mid-air blasts (flyer deaths)
+            // flash where they happen, not on the ground.
+            let z = (map.get_z(sp.pos.x, sp.pos.y) + 10.0).max(sp.pos.z);
             // C++ advances m_Time at DEBRIS_SPEED (1/100) per ms, so a
             // light_time of T seconds spans T/DEBRIS_SPEED = T*100 ms
             // (MatrixEffectExplosion.cpp:628,636,644).

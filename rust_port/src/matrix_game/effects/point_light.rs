@@ -617,6 +617,8 @@ mod tests {
             shadow_color: 0,
             robots: Vec::new(),
             side_res_info: Vec::new(),
+            maintenance_prc: 100,
+            effect_spawners: Vec::new(),
             ground_z_base_middle: 0.0,
             ground_z_base_max: 0.0,
             water_color: 0,
@@ -713,6 +715,8 @@ mod tests {
 
         let mut lights = PointLightSystem::new(&map);
         lights.add_light(&map, [10.0, 10.0, 8.0], 30.0, 0x00604020);
+        // Adds are deferred; the frame loop flushes before sampling.
+        lights.flush(&map);
 
         let lit = map.get_color_with_lighting(10.0, 10.0, Some(&lights));
         assert!(lit != base, "expected point light to affect sampled color");

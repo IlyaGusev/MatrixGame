@@ -264,6 +264,9 @@ pub struct MapObject {
     /// object has been on fire. At 5000ms the OBJECT_STATE_BURNED bit is
     /// set and the skin swaps to the burnt variant.
     pub burn_time_total: i32,
+    /// `m_NextExplosionTimeSound` (MatrixObject.hpp) — countdown to the
+    /// next rolling `expl_bb` pop sound during the terron death.
+    pub next_snd_time: i32,
 
     /// Own arena id, captured on the first `damage` call (the C++ uses
     /// `this`; the takt drivers don't pass an id). Needed by the terron
@@ -348,6 +351,7 @@ impl MapObject {
             sens_radius: 0.0,
             next_time: 0,
             burn_time_total: 0,
+            next_snd_time: 0,
             break_hit_point: 0,
             break_hit_point_max: 0,
             anim_state: -1,
@@ -597,9 +601,12 @@ impl MapObject {
             self.init(new_type, objs);
         } else if self.ablaze_ttl < 100 && self.object_state & OBJECT_STATE_TERRON_EXPL2 == 0 {
             self.object_state |= OBJECT_STATE_TERRON_EXPL2;
+            // S_EXPLOSION_BUILDING_BOOM4 (MatrixObject.cpp:1266/1280).
+            objs.queue_snd_at("expl_bb4", self.core.geo_center);
             self.terron_bigboom(rng, objs);
         } else if self.ablaze_ttl < 1000 && self.object_state & OBJECT_STATE_TERRON_EXPL1 == 0 {
             self.object_state |= OBJECT_STATE_TERRON_EXPL1;
+            objs.queue_snd_at("expl_bb4", self.core.geo_center);
             self.terron_bigboom(rng, objs);
         } else {
             // Rolling pops every BUILDING_EXPLOSION_PERIOD (10ms),
@@ -612,6 +619,13 @@ impl MapObject {
             let mut vrng = crate::matrix_game::logic::Rnd::new(
                 ((self.ablaze_ttl) ^ ((origin.x + origin.y) as i32)).max(1),
             );
+            // S_EXPLOSION_BUILDING_BOOM every 100-500ms
+            // (MatrixObject.cpp:1293-1298).
+            self.next_snd_time -= ms;
+            while self.next_snd_time <= 0 {
+                self.next_snd_time += 100 + frnd(&mut vrng, 400.0) as i32;
+                objs.queue_snd_at("expl_bb", origin);
+            }
             self.next_time -= ms;
             while self.next_time <= 0 {
                 self.next_time += 10; // BUILDING_EXPLOSION_PERIOD
@@ -686,6 +700,9 @@ impl MapObject {
 impl MapStatic for MapObject {
     fn core(&self) -> &ObjectCore {
         &self.core
+    }
+    fn is_special(&self) -> bool {
+        self.object_state & OBJECT_STATE_SPECIAL != 0
     }
     fn core_mut(&mut self) -> &mut ObjectCore {
         &mut self.core
@@ -962,8 +979,8 @@ impl MapStatic for MapObject {
         }
 
         // BEHF_TERRON (MatrixObject.cpp:142-187). Pain animation /
-        // sounds / progress bar / music-volume not ported; HP
-        // depletion + the death flags are.
+        // progress bar / music-volume not ported; HP depletion, pain
+        // voices + the death flags are.
         if beh0 == BehFlag::Terron
             && self.object_state & crate::matrix_game::map_static::OBJECT_STATE_TERRON_EXPL == 0
         {
@@ -972,6 +989,14 @@ impl MapStatic for MapObject {
                     self.break_hit_point -= entry.damage;
                 }
             }
+            // S_TERRON_PAIN1..4, IRND(4) (MatrixObject.cpp:156-164).
+            // Without m_Graph the "not already in Pain anim" gate is
+            // approximated by the hit itself.
+            let pain = (self.break_hit_point.unsigned_abs() % 4) + 1;
+            objs.pending_sounds.push((
+                format!("s_terron_pain{pain}"),
+                Some([self.core.geo_center.x, self.core.geo_center.y, self.core.geo_center.z]),
+            ));
             if self.break_hit_point <= 0 {
                 // MatrixObject.cpp:168-172 — MMFLAG_TERRON_DEAD only
                 // when the terron is the special win target.
@@ -979,6 +1004,8 @@ impl MapStatic for MapObject {
                     objs.terron_dead = true;
                 }
                 self.object_state |= crate::matrix_game::map_static::OBJECT_STATE_TERRON_EXPL;
+                // S_TERRON_KILLED (MatrixObject.cpp:175).
+                objs.queue_snd_at("s_terron_killed", self.core.geo_center);
                 // Death animation runs for 5s of ablaze TTL
                 // (MatrixObject.cpp:177).
                 self.ablaze_ttl = 5000;
@@ -1044,16 +1071,29 @@ impl MapStatic for MapObject {
                 let robot_nearby =
                     objs.any_object_in_radius(pos, self.sens_radius, 1.0, TRACE_ROBOT, None);
 
+                // Activate/deactivate config sounds — BEHAVIOUR par 1
+                // fields 4/5 (MatrixObject.cpp:1509-1513/1524-1528).
+                // SetAnimById stays deferred (no per-instance m_Graph).
                 if robot_nearby {
                     if self.prev_state_robots_in_radius == 0 {
                         self.prev_state_robots_in_radius = 1;
-                        // SetAnimById(..., activate-clip) + CSound::AddSound —
-                        // deferred.
+                        let par1 = wstr::str_par(&self.behaviour, 1, ",");
+                        if wstr::count_par(par1, ":") >= 5 {
+                            let snd = wstr::str_par(par1, 4, ":");
+                            if !snd.is_empty() {
+                                objs.queue_snd_at(snd, self.core.geo_center);
+                            }
+                        }
                     }
                 } else if self.prev_state_robots_in_radius != 0 {
                     self.prev_state_robots_in_radius = 0;
-                    // SetAnimById(..., deactivate-clip) + CSound::AddSound —
-                    // deferred.
+                    let par1 = wstr::str_par(&self.behaviour, 1, ",");
+                    if wstr::count_par(par1, ":") >= 6 {
+                        let snd = wstr::str_par(par1, 5, ":");
+                        if !snd.is_empty() {
+                            objs.queue_snd_at(snd, self.core.geo_center);
+                        }
+                    }
                 }
             }
             return;
@@ -1145,17 +1185,22 @@ impl MapStatic for MapObject {
                 }
             }
 
-            // MatrixObject.cpp:1576-1609: 5s after ignition, flip to
-            // BURNED. The original also swaps the skin & possibly the
-            // VO (for "Burn,Type,..." variants); those depend on the
-            // skin manager and VO loader per-instance which aren't
-            // ported.
+            // MatrixObject.cpp:1576-1600: 5s after ignition, flip to
+            // BURNED. `Burn,<repl>,Type` rows swap to the burnt
+            // replacement object and demote to STATIC — permanently
+            // inert, never re-ignitable; `Tex` variants ramp the char
+            // skin (render-side, MR_GRAPH covers the latch).
             if self.object_state & OBJECT_STATE_BURNED == 0
                 && self.burn_time_total > OBJECT_ABLAZE_BURNED_AT_MS
             {
                 self.object_state |= OBJECT_STATE_BURNED;
-                // `rchange |= MR_GRAPH` in C++ — triggers a skin swap
-                // on the next `r_need` pass.
+                let row = ids_get(self.type_id);
+                let beh = wstr::str_par(&row, OTP_BEHAVIOUR, "*");
+                if wstr::str_par(&beh, 2, ",") == "Type" {
+                    let repl = wstr::int_par(&beh, 1, ",");
+                    self.init(repl, objs);
+                    self.beh_flag = BehFlag::Static; // сгорела :(
+                }
                 self.rchange |= MR_GRAPH;
             }
             // No early return: logic_takt continues so BEHF_STATIC
@@ -1175,14 +1220,17 @@ impl MapStatic for MapObject {
             use crate::matrix_game::map_static::{Control, SpawnerBotRequest};
             use crate::matrix_lib::base::wstr;
             let f1 = wstr::str_par(&self.behaviour, 1, ",");
-            let timing = wstr::int_par(f1, 1, ":").max(100);
+            // Par 1 is the POST-trigger cooldown before the spawner
+            // re-arms (the `addt` at MatrixObject.cpp:1365); the idle
+            // detection poll runs every 107 ms (:1358).
+            let rearm = wstr::int_par(f1, 1, ":").max(107);
             let rmin = wstr::int_par(f1, 2, ":");
             let rmax = wstr::int_par(f1, 3, ":");
-            const SPAWN_COOLDOWN_MS: i32 = 3000;
+            const POLL_MS: i32 = 107;
             self.ablaze_ttl -= ms;
             if self.prev_state_robots_in_radius <= 0 {
                 if self.ablaze_ttl <= 0 {
-                    self.ablaze_ttl = timing;
+                    self.ablaze_ttl = POLL_MS;
                     let w = self.core.matrix.w_axis;
                     let pos2 = glam::Vec2::new(w.x, w.y);
                     let mut ids = Vec::new();
@@ -1194,6 +1242,10 @@ impl MapStatic for MapObject {
                         objs.get(id).map(|o| o.side() == PLAYER_SIDE).unwrap_or(false)
                     });
                     if found {
+                        // The C++ stages the spawn through the open/
+                        // close clips (states 1→3); without object
+                        // anims we spawn immediately and hold the
+                        // re-arm cooldown.
                         let number = rng.range(rmin, rmax);
                         let pick = rng.next() as usize;
                         objs.pending_spawner_bots.push(SpawnerBotRequest {
@@ -1202,13 +1254,25 @@ impl MapStatic for MapObject {
                             pick,
                             sens_radius: self.sens_radius,
                         });
+                        // BEHAVIOUR par-1 fields 8 (open) / 9 (spawn) /
+                        // 10 (close) config sounds (MatrixObject.cpp:
+                        // 1368-1369 / :1428-1429 / :1468-1469). Our
+                        // collapsed state machine runs open→spawn→close
+                        // in one tick, so all fire here.
+                        for fld in [8, 9, 10] {
+                            let snd = wstr::str_par(f1, fld, ":");
+                            if !snd.is_empty() {
+                                objs.pending_sounds
+                                    .push((snd.to_string(), Some([w.x, w.y, w.z])));
+                            }
+                        }
                         self.prev_state_robots_in_radius = 1;
-                        self.ablaze_ttl = SPAWN_COOLDOWN_MS;
+                        self.ablaze_ttl = rearm;
                     }
                 }
             } else if self.ablaze_ttl <= 0 {
                 self.prev_state_robots_in_radius = 0;
-                self.ablaze_ttl = timing;
+                self.ablaze_ttl = POLL_MS;
             }
         }
 

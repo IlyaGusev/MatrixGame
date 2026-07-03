@@ -79,10 +79,11 @@ impl Dust {
             if p.ttl <= 0.0 {
                 continue;
             }
-            // CMatrixEffectBillboard lerps scale r1→r2 and color c1→c2
-            // by 1 - ttl/ttl_total.
+            // CMatrixEffectBillboard lerps color c1→c2 by t but scale
+            // only HALFWAY to r2: `r1 + (r2-r1)*k*0.5`
+            // (MatrixEffectBillboard.cpp:79).
             let t = 1.0 - p.ttl / self.ttl_total.max(1.0);
-            let scale = p.r1 + (p.r2 - p.r1) * t;
+            let scale = p.r1 + (p.r2 - p.r1) * t * 0.5;
             let color = lic(DUST_C1, DUST_C2, t);
             // Same flat-quad geometry as the C++ billboard ctor —
             // dust puffs hug the terrain (pos.z = GetZ + 0.1).

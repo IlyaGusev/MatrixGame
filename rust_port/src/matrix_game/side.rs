@@ -310,6 +310,14 @@ pub struct Side {
     pub region_stats: Vec<LogicRegion>,
     /// `m_RegionIndex` — wave-search scratch parallel to regions.
     pub region_index: Vec<i32>,
+
+    /// `MMFLAG_SOUND_BASE_SEL_ENABLED` (MatrixSide.cpp:1009-1012) —
+    /// the very first base selection (game-start auto-select) is
+    /// silent; the flag arms afterwards.
+    pub base_sel_sound_enabled: bool,
+    /// Cycles the S_SELECTION_1..7 voice pick (C++ uses Rnd(0,6),
+    /// MatrixSide.cpp:978-993).
+    pub sel_voice_seed: u32,
 }
 
 /// Port of `SMatrixLogicRegion` (MatrixSide.hpp:327-355) — the subset
@@ -339,16 +347,16 @@ impl Side {
             active_object: None,
             curr_sel: CurrSel::Nothing,
             selected: Vec::new(),
-            // Each side starts with a plausible resource pool — the
-            // C++ seeds this from map `StartResources` which isn't
-            // parsed yet. Give every side enough to build a basic
-            // robot so the constructor UI is exercisable until the
-            // map-side seeding lands.
-            resources: [500, 500, 500, 500],
+            // C++ ctor default (MatrixSide.cpp:215-218); maps override
+            // via `SideResInfo` in `apply_side_resources`.
+            resources: [300, 300, 300, 300],
             robots_cnt: 0,
             base_res_force: 100,
             builder: Some(crate::matrix_game::interface::constructor::RobotBuilder::new()),
-            status: SideStatus::Active,
+            // `SS_NONE` until StaticPrepare2 activates base/robot
+            // owners (MatrixMapPrepare.cpp:1690-1697, 1713-1719) —
+            // see `ensure_sides_from_objects`.
+            status: SideStatus::None,
             statistic: [0; MAX_STATISTICS],
             player_groups: std::iter::repeat_with(PlayerGroup::default)
                 .take(MAX_LOGIC_GROUP)
@@ -361,6 +369,8 @@ impl Side {
             last_takt_underfire: 0,
             region_stats: Vec::new(),
             region_index: Vec::new(),
+            base_sel_sound_enabled: false,
+            sel_voice_seed: 0,
         }
     }
 
@@ -456,6 +466,33 @@ impl Side {
         self.selected.push(id);
         self.active_object = Some(id);
         self.curr_sel = curr_sel;
+        self.selection_sound(curr_sel);
+    }
+
+    /// Selection voices — port of the CSound::Play calls in
+    /// `CMatrixSideUnit::Select` (MatrixSide.cpp:976-1016). Player
+    /// side only; robots get one of seven voices, bases/factories a
+    /// fixed one. The first base select (game-start auto-select) is
+    /// suppressed via [`Self::base_sel_sound_enabled`].
+    fn selection_sound(&mut self, curr_sel: CurrSel) {
+        use crate::matrix_game::interface::sound::play_named;
+        if self.id != crate::matrix_game::common::PLAYER_SIDE {
+            return;
+        }
+        match curr_sel {
+            CurrSel::RobotsSelected => {
+                self.sel_voice_seed = self.sel_voice_seed.wrapping_add(1);
+                play_named(&format!("s_selection_{}", self.sel_voice_seed % 7 + 1));
+            }
+            CurrSel::BaseSelected => {
+                if self.base_sel_sound_enabled {
+                    play_named("s_base_sel");
+                }
+                self.base_sel_sound_enabled = true;
+            }
+            CurrSel::BuildingSelected => play_named("s_building_sel"),
+            _ => {}
+        }
     }
 
     /// Backward-compat alias for `select_single`. Ports
@@ -484,6 +521,7 @@ impl Side {
             self.selected.push(id);
             self.active_object = Some(id);
             self.curr_sel = curr_sel;
+            self.selection_sound(curr_sel);
         }
     }
 
@@ -504,6 +542,9 @@ impl Side {
         } else {
             CurrSel::Nothing
         };
+        if primary.is_some() {
+            self.selection_sound(curr_sel);
+        }
     }
 
     /// Clear the selection — C++ `CMatrixSide::UnSelect` equivalent.

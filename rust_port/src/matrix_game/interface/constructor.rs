@@ -1004,6 +1004,30 @@ pub fn cost_of_live(
     out
 }
 
+/// Component-price sum of a queued `RobotConfig` — port of
+/// `CBuildStack::ReturnRobotResources`'s per-unit price walk
+/// (MatrixObjectBuilding.cpp:1974-2008), used to refund cancelled
+/// build-queue items.
+pub fn cost_of_config(cfg: &RobotConfig) -> UnitPrice {
+    let prices = config::global().prices;
+    let mut out = UnitPrice::zero();
+    if !cfg.chassis.is_empty() {
+        out.add_from(prices.get(RobotUnitType::Chassis, cfg.chassis.kind));
+    }
+    if !cfg.hull.unit.is_empty() {
+        out.add_from(prices.get(RobotUnitType::Armor, cfg.hull.unit.kind));
+    }
+    if !cfg.head.is_empty() {
+        out.add_from(prices.get(RobotUnitType::Head, cfg.head.kind));
+    }
+    for w in &cfg.weapon {
+        if !w.is_empty() {
+            out.add_from(prices.get(RobotUnitType::Weapon, w.kind));
+        }
+    }
+    out
+}
+
 /// Port of `CConstructorPanel::MakeItemReplacements` (CConstructor.cpp:
 /// 1100-1191). Substitutes `<Damage>`, `<AddDamage>`, `<Size>`,
 /// `<Pilons>`, `<AddPilons>`, `<WeaponSpeed>`, `<WeaponHeat>`,

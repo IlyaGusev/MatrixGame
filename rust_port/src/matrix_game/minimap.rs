@@ -78,11 +78,6 @@ const MINIMAP_ROBOT_R: f32 = 8.0;
 const MINIMAP_FLYER_R: f32 = 8.0;
 const MINIMAP_CANNON_R: f32 = 8.0;
 
-/// Water plane Z — from `renderer/water.rs`, matches `WATER_LEVEL` in the
-/// original. Used both for the heightmap bake (coast cutoff) and for the
-/// frustum projection plane in `frustum_on_water`.
-const WATER_LEVEL: f32 = -2.0;
-
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable, Default)]
 struct MMVertex {
@@ -919,17 +914,21 @@ impl Minimap {
     }
 
     /// Port of `CMinimap::ButtonZoomIn` (MatrixMinimap.cpp:1344-1348).
-    /// `scale *= 1.8`, clamped to [MINIMAP_MIN_SCALE, MINIMAP_MAX_SCALE].
+    /// `SetOutParams(GetScale() * 1.8)` — compounds from the CURRENTLY
+    /// ANIMATING scale, so rapid clicks land between ladder steps like
+    /// the original.
     pub fn zoom_in(&mut self) {
         self.tgt_scale =
-            (self.tgt_scale * MINIMAP_ZOOM_IN_FACTOR).clamp(MINIMAP_MIN_SCALE, MINIMAP_MAX_SCALE);
+            (self.scale * MINIMAP_ZOOM_IN_FACTOR).clamp(MINIMAP_MIN_SCALE, MINIMAP_MAX_SCALE);
+        crate::matrix_game::interface::sound::play_named("map_plus");
     }
 
     /// Port of `CMinimap::ButtonZoomOut` (MatrixMinimap.cpp:1350-1354).
-    /// `scale *= 0.5`, clamped the same way.
+    /// `scale *= 0.5` from the animating scale, clamped the same way.
     pub fn zoom_out(&mut self) {
         self.tgt_scale =
-            (self.tgt_scale * MINIMAP_ZOOM_OUT_FACTOR).clamp(MINIMAP_MIN_SCALE, MINIMAP_MAX_SCALE);
+            (self.scale * MINIMAP_ZOOM_OUT_FACTOR).clamp(MINIMAP_MIN_SCALE, MINIMAP_MAX_SCALE);
+        crate::matrix_game::interface::sound::play_named("map_minus");
     }
 
     /// Port of `CMinimap::BeforeDraw` (MatrixMinimap.cpp:182-248) — computes
@@ -1138,11 +1137,23 @@ impl Minimap {
                 btn.local[3] * ui_scale,
             ]
         };
+        // DISABLED tint at the scale bounds (CInterface.cpp:1192-1203
+        // greys `zi` at MINIMAP_MAX_SCALE / `zo` at MINIMAP_MIN_SCALE).
+        let zi_tint = if self.tgt_scale >= MINIMAP_MAX_SCALE - 1e-3 {
+            [0.5, 0.5, 0.5, 0.8]
+        } else {
+            [1.0, 1.0, 1.0, 1.0]
+        };
+        let zo_tint = if self.tgt_scale <= MINIMAP_MIN_SCALE + 1e-3 {
+            [0.5, 0.5, 0.5, 0.8]
+        } else {
+            [1.0, 1.0, 1.0, 1.0]
+        };
         fill_uv_rect_quad(
             &mut head[12..18],
             place_button(&self.zi_button),
             self.zi_button.uv,
-            [1.0, 1.0, 1.0, 1.0],
+            zi_tint,
             screen_w,
             screen_h,
         );
@@ -1150,7 +1161,7 @@ impl Minimap {
             &mut head[18..24],
             place_button(&self.zo_button),
             self.zo_button.uv,
-            [1.0, 1.0, 1.0, 1.0],
+            zo_tint,
             screen_w,
             screen_h,
         );
@@ -1314,8 +1325,11 @@ impl Minimap {
                 Self::push_marker(&mut point_markers, pos, r, self.icon_point, color);
             }
         }
+        // C++ draws event pings FIRST so object blips render over them
+        // (MatrixMinimap.cpp:638-763).
+        point_markers.append(&mut markers);
+        let markers = point_markers;
         // Clamp to capacity so we never overrun the vertex buffer.
-        markers.extend(point_markers);
         let max_marker_verts = self
             .quad_capacity
             .saturating_sub(24)
@@ -1339,8 +1353,9 @@ impl Minimap {
             );
         }
 
-        // Camera frustum loop — 4 world-space points on z=WATER_LEVEL, closed.
-        let quad = camera.frustum_bounds_on_plane_zup(WATER_LEVEL);
+        // Camera frustum loop — 4 world-space points on the z=0 plane
+        // (MatrixMinimap.cpp:798-807 divides by -FrustumCenter.z).
+        let quad = camera.frustum_bounds_on_plane_zup(0.0);
         let mut loop_verts = [MMVertex::default(); 5];
         for i in 0..4 {
             // Camera returns centered world coords; the minimap math uses

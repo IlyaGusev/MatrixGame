@@ -159,6 +159,13 @@ pub use crate::matrix_game::config::{robot_build_time_ms, turret_build_time_ms};
 pub struct BuildStack {
     items: Vec<PendingItem>,
     timer: i32,
+    /// Items dropped by `clear`/`delete_item`, awaiting the C++
+    /// `DeleteItem` side effects (resource refund + queued-turret
+    /// ghost teardown, MatrixObjectBuilding.cpp:1844-1880). Applied
+    /// by the building's logic takt, which has arena access. The bool
+    /// is "refund" — false on building death (~CBuildStack refunds
+    /// nothing, :1882-1919).
+    pending_teardown: Vec<(PendingItem, bool)>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -198,6 +205,14 @@ impl BuildStack {
     pub fn items(&self) -> usize {
         self.items.len()
     }
+    /// Port of `CBuildStack::GetRobotsCnt` (MatrixObjectBuilding.cpp:
+    /// 1938-1950) — only queued robots count toward the robot cap.
+    pub fn robots_cnt(&self) -> usize {
+        self.items
+            .iter()
+            .filter(|it| matches!(it.kind, PendingKind::Robot(_)))
+            .count()
+    }
     pub fn is_full(&self) -> bool {
         self.items.len() >= MAX_STACK_UNITS
     }
@@ -205,18 +220,43 @@ impl BuildStack {
         self.items.is_empty()
     }
 
+    /// Port of `CBuildStack::ClearStack` (MatrixObjectBuilding.cpp:
+    /// 1952-1954) — drains every queued item through `DeleteItem`,
+    /// refunding resources and tearing down queued-turret ghosts.
+    pub fn clear(&mut self) {
+        self.pending_teardown
+            .extend(self.items.drain(..).map(|it| (it, true)));
+        self.timer = 0;
+    }
+
+    /// Death-path drain — `~CBuildStack` (MatrixObjectBuilding.cpp:
+    /// 1882-1919): queued items are destroyed with NO refund.
+    pub fn clear_no_refund(&mut self) {
+        self.pending_teardown
+            .extend(self.items.drain(..).map(|it| (it, false)));
+        self.timer = 0;
+    }
+
+    /// Port of `CBuildStack::DeleteItem(no)` (MatrixObjectBuilding.cpp:
+    /// 1844-1880). `no` is 1-based like the C++; cancelling the head
+    /// resets the build timer.
+    pub fn delete_item(&mut self, no: usize) -> bool {
+        if no == 0 || no > self.items.len() {
+            return false;
+        }
+        if no == 1 {
+            self.timer = 0;
+        }
+        let it = self.items.remove(no - 1);
+        self.pending_teardown.push((it, true));
+        true
+    }
+
     /// Port of `CBuildStack::AddItem` (MatrixObjectBuilding.cpp:
     /// 1832-1842). Pushes `item` to the tail of the queue if there's
     /// room. The C++ also creates a UI stack-icon on the player-side
     /// HUD (`g_IFaceList->CreateStackIcon`); that hook lands with the
     /// rest of the player-side interface integration.
-    /// Port of `CBuildStack::ClearStack` (MatrixObjectBuilding.cpp) —
-    /// drop everything queued, reset the timer.
-    pub fn clear(&mut self) {
-        self.items.clear();
-        self.timer = 0;
-    }
-
     pub fn add_item(&mut self, item: PendingItem) -> bool {
         if self.is_full() {
             return false;
@@ -339,8 +379,23 @@ impl BuildStack {
                         &mut *(obj as *mut dyn MapStatic as *mut crate::matrix_game::robot::Robot)
                     };
                     r.self_id = Some(id);
+                    // Seed map coords so gather_info doesn't read cell
+                    // (0,0) before the robot's first move order.
+                    if let Some(map) = crate::matrix_game::map::current_map() {
+                        r.map_pos_calc(map);
+                    }
                 }
                 objs.add_lt(id);
+                // RobotSpawn rally (MatrixRobot.cpp:2216-2221): player
+                // robots get a place near the base + a muted
+                // attack-move there so they disperse after move-out.
+                if head.side == crate::matrix_game::common::PLAYER_SIDE {
+                    objs.pending_spawn_rallies.push(id);
+                    // S_ROBOT_BUILD_END(_ALT) 50/50
+                    // (MatrixObjectBuilding.cpp:1693-1695).
+                    let alt = (spawn_pos.x as i32 ^ spawn_pos.y as i32) & 1 == 1;
+                    objs.queue_snd(if alt { "r_build_e_alt" } else { "r_build_e" });
+                }
                 Some(id)
             }
             PendingKind::Turret { slot, turret_kind } => {
@@ -349,6 +404,11 @@ impl BuildStack {
                 // ramp HP to 100%, drop invulnerability, flip to IDLE.
                 // Port of MatrixObjectBuilding.cpp:1779-1813.
                 ramp_turret_hp(objs, parent_self_id, slot, 1.0);
+                // S_TURRET_BUILD_<num> voice, player side
+                // (MatrixObjectBuilding.cpp:1780-1786).
+                if head.side == crate::matrix_game::common::PLAYER_SIDE {
+                    objs.queue_snd(&format!("t_build_{}", (turret_kind - 1).clamp(0, 3)));
+                }
                 // STAT_TURRET_BUILD (MatrixObjectBuilding.cpp:1810).
                 if head.side != 0 {
                     objs.inc_side_stat(head.side, |s| s.turret_build += 1);
@@ -1143,6 +1203,58 @@ impl MapStatic for Building {
     fn logic_takt(&mut self, cms: i32, _rng: &mut Rnd, objs: &mut Objects) {
         use crate::matrix_game::common::BASE_FLOOR_SPEED;
 
+        // Deferred `CBuildStack::DeleteItem` side effects
+        // (MatrixObjectBuilding.cpp:1844-1880): refund each dropped
+        // item's cost to its side and tear down queued-turret ghosts
+        // (UnjoinGroup + StaticDelete → free slot, un-count turret).
+        if !self.build_stack.pending_teardown.is_empty() {
+            let items: Vec<(PendingItem, bool)> =
+                self.build_stack.pending_teardown.drain(..).collect();
+            for (it, refund) in items {
+                match it.kind {
+                    PendingKind::Robot(cfg) => {
+                        if refund && it.side != 0 {
+                            let price =
+                                crate::matrix_game::interface::constructor::cost_of_config(&cfg);
+                            objs.pending_refunds.push((it.side, price.resources));
+                        }
+                    }
+                    PendingKind::Turret { slot, turret_kind } => {
+                        if refund && it.side != 0 {
+                            let price =
+                                crate::matrix_game::config::global().turrets.cost_of(turret_kind);
+                            objs.pending_refunds.push((it.side, price.resources));
+                        }
+                        // Silent ghost delete (the C++ StaticDelete +
+                        // ReleaseMe slot bookkeeping).
+                        if let Some(me) = self.self_id {
+                            let ghost = objs.iter_live().find(|&oid| {
+                                crate::matrix_game::logic::cannon_ref(objs, oid)
+                                    .map(|c| {
+                                        c.parent == Some(me)
+                                            && c.slot == slot
+                                            && matches!(
+                                                c.state,
+                                                crate::matrix_game::object_cannon::CannonState::UnderConstruction
+                                            )
+                                    })
+                                    .unwrap_or(false)
+                            });
+                            if let Some(gid) = ghost {
+                                objs.remove_deferred(gid);
+                            }
+                        }
+                        if let Some(p) = self.turret_places.get_mut(slot as usize) {
+                            p.cannon_type = -1;
+                        }
+                        if self.turrets_have > 0 {
+                            self.turrets_have -= 1;
+                        }
+                    }
+                }
+            }
+        }
+
         // Build-stack tick — port of `m_BS.TickTimer(cms)` call at
         // MatrixObjectBuilding.cpp:601-605: only for a live, owned
         // building (a dying/DIP factory must not finish its queue).
@@ -1351,6 +1463,15 @@ impl MapStatic for Building {
                 ((now as i32) ^ ((self.pos.x + self.pos.y) as i32)).max(1),
             );
             use crate::matrix_game::effects::smoke_and_fire::{frnd, fsrnd};
+            // Rolling boom sound at IRND(100..500) ms
+            // (m_NextExplosionTimeSound, MatrixObjectBuilding.cpp:768-772).
+            if self.next_explosion_time_sound == 0 {
+                self.next_explosion_time_sound = now as i32;
+            }
+            while now > self.next_explosion_time_sound as i64 {
+                self.next_explosion_time_sound += 100 + (frnd(&mut vrng, 400.0) as i32);
+                objs.queue_snd_at("expl_bb", self.core.geo_center);
+            }
             let radius = self.core.radius.max(20.0);
             // Aim point sits 60 units behind the building along its
             // facing (`m_Pos - m_Core->m_Matrix._21/22 * 60`, :782-784);
@@ -1416,6 +1537,8 @@ impl MapStatic for Building {
                     use crate::matrix_game::effects::weapon::{
                         weapon_takt, WeaponEffect, WeaponHandler, WEAPON_BIGBOOM,
                     };
+                    // S_EXPLOSION_BUILDING_BOOM4 (MatrixObjectBuilding.cpp:679).
+                    objs.queue_snd_at("expl_bb4", self.core.geo_center);
                     let mut w = WeaponEffect::new(WEAPON_BIGBOOM, 0, WeaponHandler::None);
                     w.set_owner(self_id, self.side);
                     w.modify(self.core.geo_center, glam::Vec3::Z, glam::Vec3::ZERO);
@@ -1433,10 +1556,13 @@ impl MapStatic for Building {
             }
             if self.hit_point < downtime {
                 // Ruin swap + StaticDelete (MatrixObjectBuilding.cpp:
-                // 691-758). The S_EXPLOSION_BUILDING_BOOM3 pop for
-                // non-BASE kinds (:695) waits on the sound system.
                 use crate::matrix_game::object::MapObject;
                 let n = self.kind as i32;
+                if n != 0 {
+                    // S_EXPLOSION_BUILDING_BOOM3 on the ruin swap for
+                    // non-BASE kinds (MatrixObjectBuilding.cpp:695).
+                    objs.queue_snd_at("expl_bb3", self.core.geo_center);
+                }
                 let z = crate::matrix_game::map::current_map()
                     .map(|m| m.get_z(self.pos.x, self.pos.y))
                     .unwrap_or(self.core.matrix.w_axis.z);
@@ -1480,6 +1606,8 @@ impl MapStatic for Building {
                 if self.base_floor_progress >= 1.0 {
                     self.base_floor_progress = 1.0;
                     self.state = BaseState::Opened;
+                    // S_PLATFORM_UP_STOP (MatrixObjectBuilding.cpp:821).
+                    objs.queue_snd_at("base_platform_up_stop", self.core.geo_center);
                 }
             }
             if self.state == BaseState::Closing {
@@ -1487,6 +1615,8 @@ impl MapStatic for Building {
                 if self.base_floor_progress <= 0.0 {
                     self.base_floor_progress = 0.0;
                     self.state = BaseState::Closed;
+                    // S_DOORS_CLOSE_STOP (MatrixObjectBuilding.cpp:831).
+                    objs.queue_snd_at("base_doors_close_stop", self.core.geo_center);
                 }
             }
 
@@ -1585,15 +1715,30 @@ impl MapStatic for Building {
             self.show_hitpoint();
         }
 
-        // MatrixObjectBuilding.cpp:294-304 — under-attack warning sound.
-        // Deferred (sound not ported); the timer itself tracks enemy hits.
+        // MatrixObjectBuilding.cpp:294-304 — under-attack warning,
+        // throttled by the idle timer.
         if self.side == PLAYER_SIDE && !friendly_fire {
+            if self.under_attack_time == 0 {
+                let pick = (self.pos.x as i32 ^ self.hit_point as i32).rem_euclid(3) + 1;
+                objs.queue_snd(&format!("s_side_attacked_{pick}"));
+            }
             self.under_attack_time = UNDER_ATTACK_IDLE_TIME_MS;
         }
 
         // MatrixObjectBuilding.cpp:308-341 — death transition.
         if self.hit_point <= 0.0 {
-            // Death sounds deferred.
+            // Death voice (player side, :317-324): base / factory
+            // 70%-or-30% generic split.
+            if self.side == PLAYER_SIDE {
+                let key = if self.is_base() {
+                    "s_base_dead"
+                } else if (self.pos.y as i32) % 10 < 7 {
+                    "s_fa_dead"
+                } else {
+                    "s_building_dead"
+                };
+                objs.queue_snd(key);
+            }
             if attacker_side != 0 && !friendly_fire {
                 objs.inc_side_stat(attacker_side, |s| s.building_kill += 1);
             }
@@ -1604,6 +1749,11 @@ impl MapStatic for Building {
             // still needs effects). `0` = "fire as soon as possible".
             self.next_explosion_time = 0;
             self.next_explosion_time_sound = 0;
+
+            // ~CBuildStack (MatrixObjectBuilding.cpp:1882-1919):
+            // queued items are destroyed with no refund; the ghost
+            // teardown runs on the next logic takt.
+            self.build_stack.clear_no_refund();
 
             // ReleaseMe cascade (MatrixObjectBuilding.cpp:1364-1431):
             // robots spawning here die, capture state referencing this
@@ -1625,6 +1775,16 @@ impl MapStatic for Building {
                     } else if let Some(c) = crate::matrix_game::logic::cannon_mut(objs, oid) {
                         if c.parent == Some(me) {
                             c.parent = None;
+                            // Queued ghost turret: ~CBuildStack kills it
+                            // outright (WEAPON_INSTANT_DEATH,
+                            // MatrixObjectBuilding.cpp:1897/1918) — it
+                            // must not survive as an invulnerable prop.
+                            if matches!(
+                                c.state,
+                                crate::matrix_game::object_cannon::CannonState::UnderConstruction
+                            ) {
+                                objs.remove_deferred(oid);
+                            }
                         }
                     }
                 }

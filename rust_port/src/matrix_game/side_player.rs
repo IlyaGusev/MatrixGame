@@ -169,16 +169,23 @@ fn place_get(map: &GameMap, no: i32) -> Option<(u32, u8, (i32, i32), u8)> {
 
 /// `ObjPlaceData(obj, 1)` for every live unit (the "mark occupied
 /// places" loop repeated all over WarPL / RepairPL / PGAssignPlace).
-/// Robots claim `env.place`; cannons have no RN place index in the
-/// port (their footprint blockers come from `collect_place_blockers`),
-/// matching the documented divergence in `logic.rs`.
+/// Robots claim `env.place`; live cannons claim their `place` (set
+/// from `FindInPL` at build/load, MatrixSide.cpp:9436-9461).
 fn mark_occupied_places(map: &GameMap, objs: &Objects) {
+    mark_occupied_places_skip(map, objs, None)
+}
+
+/// `mark_occupied_places` with the `obj != robot` exemption the C++
+/// per-robot AssignPlace uses (MatrixSide.cpp:5284-5288).
+fn mark_occupied_places_skip(map: &GameMap, objs: &Objects, skip: Option<ObjectId>) {
     for id in objs.iter_live() {
-        if !is_live_unit(objs, id) {
+        if Some(id) == skip || !is_live_unit(objs, id) {
             continue;
         }
         if let Some(r) = robot_ref(objs, id) {
             place_set_data(map, r.env.place, 1);
+        } else if let Some(c) = crate::matrix_game::logic::cannon_ref(objs, id) {
+            place_set_data(map, c.place, 1);
         }
     }
 }
@@ -500,7 +507,36 @@ impl MapLogic {
                         continue;
                     }
                     if let Some((tx, ty)) = orr.move_to_coords() {
-                        let np = rn.find_in_pl(&Point { x: tx, y: ty });
+                        // C++ marks via FindPlace (MatrixLogic.cpp:2127-
+                        // 2142) whose bounds check reads `mappos.x <
+                        // (tp.y+4)` — a typo that makes the lookup fail
+                        // for most cells. Kept bit-faithful so escaping
+                        // robots pick the same retreat spots as the
+                        // original (a correct find_in_pl excludes more
+                        // candidates and retreats farther).
+                        let np = {
+                            let zone = map.move_cell(tx, ty).map(|c| c.zone).unwrap_or(-1);
+                            if zone < 0 {
+                                -1
+                            } else {
+                                rn.zones
+                                    .get(zone as usize)
+                                    .and_then(|z| {
+                                        z.place.iter().copied().find(|&pl| {
+                                            rn.places
+                                                .get(pl as usize)
+                                                .map(|p| {
+                                                    tx >= p.pos.x
+                                                        && tx < (p.pos.y + 4)
+                                                        && ty >= p.pos.y
+                                                        && ty < (p.pos.y + 4)
+                                                })
+                                                .unwrap_or(false)
+                                        })
+                                    })
+                                    .unwrap_or(-1)
+                            }
+                        };
                         if np >= 0 {
                             rn.places[np as usize].data |= 2;
                             touched.push(np);
@@ -2549,7 +2585,10 @@ impl MapLogic {
                             }
                             zero_places(map, &list);
                             mark_occupied_places(map, &self.objects);
-                            // C++ retries the same robot.
+                            // C++'s for-loop increment advances to the
+                            // next robot after a successful grow
+                            // (MatrixSide.cpp:7666-7675).
+                            i += 1;
                         }
                     }
                 }
@@ -3583,6 +3622,9 @@ impl MapLogic {
                 pg.obj = Some(b);
                 pg.region_path.clear();
                 pg.road_path.clear_fast();
+                // C++ robots read the group route live (MatrixRobot.cpp:1587);
+                // our per-robot snapshots must be refreshed on clear too.
+                self.distribute_road_path(no);
                 return;
             }
         }
@@ -3709,6 +3751,7 @@ impl MapLogic {
             pg.obj = Some(t);
             pg.region_path.clear();
             pg.road_path.clear_fast();
+            self.distribute_road_path(no);
             return;
         }
 
@@ -3859,6 +3902,7 @@ impl MapLogic {
         }
 
         // Current region first.
+        let mut local_target = None;
         for oid in self.objects.iter_live() {
             if !is_live_unit(&self.objects, oid) {
                 continue;
@@ -3873,13 +3917,18 @@ impl MapLogic {
                 .map(|tp| get_region(map, tp.0, tp.1) == regionmass)
                 .unwrap_or(false)
             {
-                let pg = &mut self.player_side.player_groups[no];
-                pg.obj = Some(oid);
-                pg.region = regionmass;
-                pg.region_path.clear();
-                pg.road_path.clear_fast();
-                return;
+                local_target = Some(oid);
+                break;
             }
+        }
+        if let Some(oid) = local_target {
+            let pg = &mut self.player_side.player_groups[no];
+            pg.obj = Some(oid);
+            pg.region = regionmass;
+            pg.region_path.clear();
+            pg.road_path.clear_fast();
+            self.distribute_road_path(no);
+            return;
         }
 
         let graph = self.region_graph(map);
@@ -4411,6 +4460,9 @@ impl MapLogic {
             primary,
             crate::matrix_game::side::CurrSel::RobotsSelected,
         );
+        // `Select(GROUP, ...)` resets the personal-panel cursor to the
+        // first member (SetCurSelNum(0), MatrixSide.cpp:1020/1032).
+        self.player_side.cur_sel_num = 0;
     }
 
     /// Port of `CMatrixSideUnit::OnLButtonDouble` (MatrixSide.cpp:
@@ -4483,6 +4535,28 @@ impl MapLogic {
         use crate::matrix_game::interface::constructor::{ArmorUnit, RobotConfig, Unit};
         use crate::matrix_game::config::RobotUnitKind;
         use crate::matrix_game::robot::Robot;
+
+        // `MAX_ALWAYS_DRAW_OBJ` cap (MatrixSide.cpp:388) — at most 16
+        // live supply flyers at once.
+        const MAX_ALWAYS_DRAW_OBJ: usize = 16;
+        let live_flyers = self
+            .objects
+            .iter_live()
+            .filter(|&id| {
+                self.objects
+                    .get(id)
+                    .map(|o| {
+                        matches!(
+                            o.core().obj_type,
+                            crate::matrix_game::map_static::ObjectType::Flyer
+                        )
+                    })
+                    .unwrap_or(false)
+            })
+            .count();
+        if live_flyers >= MAX_ALWAYS_DRAW_OBJ {
+            return;
+        }
 
         let cfg = crate::matrix_game::config::give_bot_config();
         let Some(entry) = cfg.bots.get(botpar_i).cloned() else {
@@ -4594,7 +4668,12 @@ impl MapLogic {
                 _ => cx += 6,
             }
         }
-        let _ = logic::place_find_near_with_blockers(map, 0, 4, cx, cy, &[]);
+        // C++ PlaceFindNear adjusts cx,cy by reference before PlaceList
+        // floods from them (MatrixObjectBuilding.cpp:1285-1292).
+        if let Some((nx, ny)) = logic::place_find_near_with_blockers(map, 0, 4, cx, cy, &[]) {
+            cx = nx;
+            cy = ny;
+        }
 
         let mut list: Vec<i32> = Vec::new();
         let (ret, _) = place_list(map, 0x1f, (cx, cy), (cx, cy), 100, false, &mut list);
@@ -4602,6 +4681,8 @@ impl MapLogic {
             return;
         }
         self.init_maintenance_time();
+        // S_MAINTENANCE (MatrixObjectBuilding.cpp:1295).
+        self.objects.queue_snd("s_maintenance");
 
         // Mark occupied (MatrixObjectBuilding.cpp:1298-1310).
         zero_places(map, &list);
@@ -4737,9 +4818,9 @@ impl MapLogic {
         h: f32,
         map: &GameMap,
     ) {
-        let target = self.screen_pick(camera, sx, sy, w, h).filter(|&id| {
-            self.objects.get(id).map(|o| o.is_live()).unwrap_or(false)
-        });
+        let target = self
+            .screen_pick(camera, sx, sy, w, h)
+            .filter(|&id| crate::matrix_game::logic::is_live_or_special(&self.objects, id));
         match target {
             Some(id) => {
                 let Some(tp) = get_map_pos(&self.objects, id) else {
@@ -4801,6 +4882,110 @@ impl MapLogic {
         );
         let no = self.sel_group_to_logic_group();
         self.pg_order_move_to(map, no, tp);
+    }
+
+    /// Port of `CMatrixSideUnit::AssignPlace(robot, region)`
+    /// (MatrixSide.cpp:5270-5301) — pick the first free, standable
+    /// place in `region` for this robot (keeping the current place if
+    /// it's already in the region).
+    fn assign_place_robot(&mut self, map: &GameMap, rid: ObjectId, region: i32) {
+        if region < 0 {
+            return;
+        }
+        let (cur_place, cbit) = match robot_ref(&self.objects, rid) {
+            Some(r) => (r.env.place, chassis_bit(r)),
+            None => return,
+        };
+        let place_all: Vec<i32> = {
+            let Some(rn_lock) = map.road_network.as_ref() else {
+                return;
+            };
+            let rn = rn_lock.lock().unwrap();
+            let Some(reg) = rn.regions.get(region as usize) else {
+                return;
+            };
+            if cur_place >= 0 && reg.place_all.contains(&cur_place) {
+                return;
+            }
+            reg.place_all.clone()
+        };
+        zero_places(map, &place_all);
+        mark_occupied_places_skip(map, &self.objects, Some(rid));
+        for &pi in &place_all {
+            let Some((data, mv, _, _)) = place_get(map, pi) else {
+                continue;
+            };
+            if data != 0 || mv & cbit != 0 {
+                continue;
+            }
+            if let Some(r) = robot_mut(&mut self.objects, rid) {
+                r.env.place = pi;
+            }
+            place_set_data(map, pi, 1);
+            break;
+        }
+    }
+
+    /// RobotSpawn rally (MatrixRobot.cpp:2216-2221): each freshly
+    /// produced player robot gets a place in the base's region and a
+    /// sound-muted attack-move to it (or to the base itself when no
+    /// place was found).
+    pub fn drain_spawn_rallies(&mut self, map: &GameMap) {
+        if self.objects.pending_spawn_rallies.is_empty() {
+            return;
+        }
+        let gsm = GameMap::GLOBAL_SCALE_MOVE;
+        let rids: Vec<ObjectId> = self.objects.pending_spawn_rallies.drain(..).collect();
+        for rid in rids {
+            let Some(base_id) = robot_ref(&self.objects, rid).and_then(|r| r.base) else {
+                continue;
+            };
+            let Some(bpos) = building_ref(&self.objects, base_id).map(|b| b.pos) else {
+                continue;
+            };
+            let bp = ((bpos.x / gsm) as i32, (bpos.y / gsm) as i32);
+            let region = get_region(map, bp.0, bp.1);
+            self.assign_place_robot(map, rid, region);
+            let place = robot_ref(&self.objects, rid).map(|r| r.env.place).unwrap_or(-1);
+            let tp = place_get(map, place).map(|p| p.2).unwrap_or(bp);
+            self.sound_order_attack_disable = true;
+            let no = self.robot_to_logic_group(rid);
+            self.pg_order_attack(map, no, tp, None);
+            self.sound_order_attack_disable = false;
+        }
+    }
+
+    /// World-position move cell with the footprint offset — the
+    /// `CalcMinimap2World`-substituted coordinates in the C++
+    /// pre-order dispatch (MatrixSide.cpp:672-680).
+    fn world_move_cell(&self, map: &GameMap, w: glam::Vec2) -> (i32, i32) {
+        let (cmx, cmy) = map.world_to_move(w.x, w.y);
+        (
+            cmx - ROBOT_MOVECELLS_PER_SIZE / 2,
+            cmy - ROBOT_MOVECELLS_PER_SIZE / 2,
+        )
+    }
+
+    /// PREORDER_FIRE at a minimap world position — always attack-move
+    /// to landscape (the minimap substitutes TRACE_STOP_LANDSCAPE).
+    pub fn order_attack_world(&mut self, map: &GameMap, w: glam::Vec2) {
+        let tp = self.world_move_cell(map, w);
+        let no = self.sel_group_to_logic_group();
+        self.pg_order_attack(map, no, tp, None);
+    }
+
+    /// PREORDER_PATROL at a minimap world position.
+    pub fn order_patrol_world(&mut self, map: &GameMap, w: glam::Vec2) {
+        let tp = self.world_move_cell(map, w);
+        let no = self.sel_group_to_logic_group();
+        self.pg_order_patrol(map, no, tp);
+    }
+
+    /// PREORDER_BOMB at a minimap world position.
+    pub fn order_bomb_world(&mut self, map: &GameMap, w: glam::Vec2) {
+        let tp = self.world_move_cell(map, w);
+        let no = self.sel_group_to_logic_group();
+        self.pg_order_bomb(map, no, tp, None);
     }
 }
 

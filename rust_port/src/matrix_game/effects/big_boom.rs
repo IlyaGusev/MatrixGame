@@ -154,8 +154,12 @@ impl BigBoom {
             let mut uv = [[0.0f32; 2]; 3];
             for i in 0..3 {
                 v[i] = self.center + tri[i] * scale;
+                // Raw rotated coords ×k·2 with WRAP addressing — the
+                // spinning noise tiles up to ~4× across the shell
+                // (MatrixEffectBigBoom.cpp:253-258); the *0.5+0.5
+                // remap squeezed one stretched clamped copy.
                 let t = rot * tri[i] * tscale;
-                uv[i] = [t.x * 0.5 + 0.5, t.y * 0.5 + 0.5];
+                uv[i] = [t.x, t.y];
             }
             q.tris.push(QueuedTri {
                 v,

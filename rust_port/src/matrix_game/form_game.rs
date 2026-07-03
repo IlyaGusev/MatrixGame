@@ -214,6 +214,12 @@ impl ApplicationHandler for App {
             log::info!("world: spawned {} initial robots", robot_ids.len());
             game.ensure_sides_from_objects();
             game.apply_side_resources(&map);
+            game.init_effect_spawners(&map);
+            // Load-time `LogicTakt(100000)` fast-forward
+            // (MatrixMapPrepare.cpp:1945): every owned building pays
+            // one income tick at t=0.
+            game.accrue_resources(100_000);
+            select_start_base(&mut game, &mut camera, &map);
             let (_ids, stats) = game.spawn_map_objects(&map, &stor);
             log::info!(
                 "world: spawned {} map objects (static={}, burn={}, break={}, anim={}, sens={}, spawner={}, terron={}, portret={}, special={})",
@@ -233,8 +239,9 @@ impl ApplicationHandler for App {
                 crate::matrix_game::multi_selection::MarqueeRenderer::new(&gfx.device, &gfx.config);
             let move_to = crate::matrix_game::effects::move_to::MoveToRenderer::new();
 
-            let iface_list =
+            let mut iface_list =
                 crate::matrix_game::interface::IFaceList::load_default_panels(&matrix_data);
+            seed_mission_briefing(&mut iface_list, &game);
             log::info!("iface: loaded {} panels", iface_list.panels.len());
             let mut iface_renderer = crate::matrix_game::interface::InterfaceRenderer::new(
                 &gfx.device,
@@ -344,6 +351,20 @@ impl ApplicationHandler for App {
                 fps_last_log: crate::platform::now_secs(),
                 fps_frames: 0,
             });
+            // Mission-begin dialog at end of load (MatrixMapPrepare.cpp:
+            // 1956) — game paused behind it until dismissed. Skipped
+            // when the data ships no "Begin" template (avoids an
+            // undismissable empty dialog).
+            if let Some(state) = self.state.borrow_mut().as_mut() {
+                if !state
+                    .iface_list
+                    .hint_templates
+                    .dialog_templates("Begin")
+                    .is_empty()
+                {
+                    enter_dialog_mode(state, "Begin");
+                }
+            }
         }
 
         // WASM: init asynchronously
@@ -426,6 +447,9 @@ impl ApplicationHandler for App {
                 log::info!("world: spawned {} initial robots", robot_ids.len());
                 game.ensure_sides_from_objects();
                 game.apply_side_resources(&map);
+                game.init_effect_spawners(&map);
+                game.accrue_resources(100_000);
+                select_start_base(&mut game, &mut camera, &map);
                 let (_ids, stats) = game.spawn_map_objects(&map, &stor);
                 log::info!(
                     "world: spawned {} map objects (static={}, burn={}, break={}, anim={}, sens={}, spawner={}, terron={}, portret={}, special={})",
@@ -448,8 +472,9 @@ impl ApplicationHandler for App {
                 );
                 let move_to = crate::matrix_game::effects::move_to::MoveToRenderer::new();
 
-                let iface_list =
+                let mut iface_list =
                     crate::matrix_game::interface::IFaceList::load_default_panels(&matrix_data);
+                seed_mission_briefing(&mut iface_list, &game);
                 log::info!("iface: loaded {} panels", iface_list.panels.len());
                 let mut iface_renderer = crate::matrix_game::interface::InterfaceRenderer::new(
                     &gfx.device,
@@ -543,6 +568,17 @@ impl ApplicationHandler for App {
                     fps_last_log: crate::platform::now_secs(),
                     fps_frames: 0,
                 });
+                // Mission-begin dialog (MatrixMapPrepare.cpp:1956).
+                if let Some(state) = state_slot.borrow_mut().as_mut() {
+                    if !state
+                        .iface_list
+                        .hint_templates
+                        .dialog_templates("Begin")
+                        .is_empty()
+                    {
+                        enter_dialog_mode(state, "Begin");
+                    }
+                }
                 win.request_redraw();
                 hide_loading_overlay();
             });
@@ -646,8 +682,16 @@ impl ApplicationHandler for App {
                     let over_ui = state.iface_list.hit_test(cx, cy, w, h).is_some()
                         || state.minimap.click_to_world(cx, cy).is_some();
                     // Right-click backs out of an armed order without
-                    // issuing anything (mirrors ResetOrderingMode).
+                    // issuing anything (mirrors ResetOrderingMode). RMB
+                    // also cancels an armed turret placement, dropping
+                    // the ghost (MatrixSide.cpp:804-810).
                     if !ui_consumed_rmb
+                        && btn_state == ElementState::Pressed
+                        && state.iface_list.turret_build.is_active()
+                    {
+                        state.iface_list.turret_build.cancel();
+                        log::debug!("turret placement: cancelled by right-click");
+                    } else if !ui_consumed_rmb
                         && btn_state == ElementState::Pressed
                         && state.iface_list.pre_order.take().is_some()
                     {
@@ -704,8 +748,14 @@ impl ApplicationHandler for App {
                                 }
                                 match state.minimap.click(cx, cy) {
                                     MinimapClick::BeginDrag(tgt) => {
-                                        state.camera.set_xy_strategy(tgt);
-                                        state.minimap_dragging = true;
+                                        // Armed pre-order + minimap click →
+                                        // execute the order at the minimap
+                                        // world position instead of
+                                        // recentring (MatrixSide.cpp:672-680).
+                                        if !execute_pre_order_world(state, tgt) {
+                                            state.camera.set_xy_strategy(tgt);
+                                            state.minimap_dragging = true;
+                                        }
                                         state.lmb_anchor = None;
                                         state.lmb_consumed_by_ui = true;
                                     }
@@ -1069,15 +1119,19 @@ impl ApplicationHandler for App {
                     // `current_map()` (ports `g_MatrixMap`).
                     let _scope =
                         crate::matrix_game::map::MapScope::enter(&state.map, state.game.elapsed_ms);
-                    // Port of `if (IsPaused()) return;` guarding
-                    // `CMatrixMapLogic::Takt` (MatrixLogic.cpp:2607).
-                    // Graphic takt still runs so animation cursors keep
-                    // ticking — matches the C++ where rendering and
-                    // effect timers continue while logic is frozen.
+                    // Frustum-center for MAX_EFFECT_DISTANCE culling
+                    // (MatrixEffect.cpp:456) — the strategy link point.
+                    let (cx, cy) = state.camera.strategy_xy();
+                    crate::matrix_game::map::set_frustum_center([cx, cy]);
+                    // Port of the pause early-return in
+                    // `CMatrixMapLogic::Takt` (MatrixLogic.cpp:2643):
+                    // it fires BEFORE `CMatrixMap::Takt` (:2761), so
+                    // while paused object animations, water, and effect
+                    // timers all freeze — only rendering continues.
                     if !state.is_paused {
                         state.game.takt(step_ms);
+                        state.game.graphic_takt(step_ms);
                     }
-                    state.game.graphic_takt(step_ms);
                     // Landscape decals: age + build geometry for new
                     // spawns (CMatrixEffectLandscapeSpot list).
                     if !state.is_paused {
@@ -1248,8 +1302,12 @@ impl ApplicationHandler for App {
                 refresh_progress_bars(state);
 
                 state.minimap.takt(dt * 1000.0);
+                // Water/object animation freezes while paused (the C++
+                // pause return precedes CMatrixMap::Takt); a 0 ms takt
+                // still uploads current state for rendering.
+                let anim_ms = if state.is_paused { 0.0 } else { dt * 1000.0 };
                 state.terrain.takt(
-                    dt * 1000.0,
+                    anim_ms,
                     &state.map,
                     &state.point_lights,
                     &state.camera,
@@ -1290,7 +1348,8 @@ impl ApplicationHandler for App {
                     &mut state.game.objects,
                     &state.map,
                     &state.point_lights,
-                    step_ms,
+                    // Chassis walk-anim cursors freeze while paused.
+                    if state.is_paused { 0 } else { step_ms },
                     ghost,
                     &markers,
                 );
@@ -1902,7 +1961,9 @@ fn dispatch_ui_click(state: &mut AppState, click: &crate::matrix_game::interface
     // are CIFaceStatic elements bound to `CIFaceList::JumpToBuilding`
     // (CInterface.cpp:4552-4559). The callback centres the strategy
     // camera on the currently-selected building's geo center.
-    if name == "basepl" {
+    // JumpToBuilding is wired to ALL five plant portraits
+    // (titpl/plaspl/elecpl/batpl/basepl, CInterface.cpp:577-586).
+    if matches!(name, "basepl" | "titpl" | "plaspl" | "elecpl" | "batpl") {
         if matches!(
             state.game.player_side.curr_sel,
             CurrSel::BuildingSelected | CurrSel::BaseSelected
@@ -1912,7 +1973,7 @@ fn dispatch_ui_click(state: &mut AppState, click: &crate::matrix_game::interface
                     let p = obj.core().geo_center;
                     state.camera.set_xy_strategy([p.x, p.y]);
                     log::debug!(
-                        "basepl: center camera on building at ({:.1},{:.1})",
+                        "{name}: center camera on building at ({:.1},{:.1})",
                         p.x,
                         p.y
                     );
@@ -2159,6 +2220,91 @@ fn dispatch_ui_click(state: &mut AppState, click: &crate::matrix_game::interface
             enter_dialog_mode(state, "Menu");
             return;
         }
+        // IF_SHOWROBOTS_BUTT — cyan minimap ping on every player robot
+        // (CMinimap::ShowPlayerBots, MatrixMinimap.cpp:1381-1390).
+        "srb" => {
+            let objs = &state.game.objects;
+            let pings: Vec<[f32; 2]> = objs
+                .iter_live()
+                .filter_map(|id| objs.get(id))
+                .filter(|o| {
+                    matches!(
+                        o.core().obj_type,
+                        crate::matrix_game::map_static::ObjectType::RobotAi
+                    ) && o.side() == crate::matrix_game::common::PLAYER_SIDE
+                })
+                .map(|o| [o.core().geo_center.x, o.core().geo_center.y])
+                .collect();
+            for [x, y] in pings {
+                state.minimap.add_event(x, y, 0xFF00FFFF, 0xFF00FFFF);
+            }
+            return;
+        }
+        // Group panel icon (CInterface.cpp:1061-1080): LMB switches the
+        // active member; LMB on the already-active icon promotes it to
+        // a single-robot selection; Shift+LMB removes it from the group.
+        n if n.starts_with("_dyngroup_") => {
+            if let Ok(idx) = n["_dyngroup_".len()..].parse::<usize>() {
+                let member = state
+                    .game
+                    .player_side
+                    .cur_group()
+                    .and_then(|g| g.get_object_by_n(idx as i32));
+                if let Some(rid) = member {
+                    if state.shift_down {
+                        state.game.remove_object_from_selected_group(rid);
+                        state
+                            .game
+                            .player_side
+                            .selected
+                            .retain(|&x| x != rid);
+                        state.game.sync_group_from_selection();
+                    } else if state.game.player_side.cur_sel_num == idx as i32 {
+                        // Promote to single (CreateGroupFromCurrent +
+                        // Select(ROBOT), CInterface.cpp:1070-1076).
+                        state.game.player_side.select_single(
+                            rid,
+                            crate::matrix_game::side::CurrSel::RobotsSelected,
+                        );
+                        state.game.sync_group_from_selection();
+                    } else {
+                        state.game.player_side.cur_sel_num = idx as i32;
+                    }
+                }
+            }
+            return;
+        }
+        // Personal portrait → jump camera to the active robot
+        // (CIFaceList::JumpToRobot, CInterface.cpp:4562-4570).
+        n if n.starts_with("_dynpers_") => {
+            let target = state
+                .game
+                .player_side
+                .get_cur_sel_object()
+                .or(state.game.player_side.active_object)
+                .and_then(|id| state.game.objects.get(id))
+                .map(|o| [o.core().geo_center.x, o.core().geo_center.y]);
+            if let Some(pos) = target {
+                state.camera.set_xy_strategy(pos);
+            }
+            return;
+        }
+        // Build-queue icon → cancel that queued item with refund
+        // (CInterface.cpp:1081-1086 → CBuildStack::DeleteItem).
+        n if n.starts_with("_dynstack_") => {
+            if let Ok(no) = n["_dynstack_".len()..].parse::<usize>() {
+                if let Some(bid) = state.game.active_object() {
+                    if let Some(b) =
+                        crate::matrix_game::logic::building_mut(&mut state.game.objects, bid)
+                    {
+                        if b.build_stack.delete_item(no) {
+                            log::debug!("build stack: cancelled item {}", no);
+                        }
+                    }
+                }
+            }
+            return;
+        }
         _ => {}
     }
 
@@ -2234,6 +2380,88 @@ fn dispatch_ui_click(state: &mut AppState, click: &crate::matrix_game::interface
 /// object under the cursor when there is one (any side — friendly
 /// fire is the player's prerogative, like `PGOrderAttack(.., pObject)`),
 /// otherwise the bare terrain point.
+/// The SR2 host passes the real mission briefing via the `_begin` /
+/// `_win` / `_loose` replaces (MatrixGame.cpp:274-308); the standalone
+/// data ships developer placeholders ("Go! Go! Go!"). Compose a task
+/// description from the map's actual win condition instead.
+fn seed_mission_briefing(
+    iface_list: &mut crate::matrix_game::interface::IFaceList,
+    game: &crate::matrix_game::logic::MapLogic,
+) {
+    let begin = if game.before_win_count > 0 {
+        "Задание: найдите и уничтожьте особые объекты противника."
+    } else {
+        "Задание: уничтожьте всех роботов противника\r\nили захватите все его базы."
+    };
+    iface_list.hint_replacer.set("_begin", begin);
+    iface_list.hint_replacer.set("_win", "Задание выполнено!");
+    iface_list.hint_replacer.set("_loose", "Задание провалено.");
+}
+
+/// Start-of-game base selection + camera fallback — port of the
+/// "Camera & Select" block of RS_CAMPOS (MatrixMapPrepare.cpp:951-985):
+/// with `CamPos` present, select the player base standing near it;
+/// without, select the first player base and aim the camera at the
+/// point 100 units in front of it.
+fn select_start_base(
+    game: &mut crate::matrix_game::logic::MapLogic,
+    camera: &mut crate::matrix_game::camera::Camera,
+    map: &crate::matrix_game::map::GameMap,
+) {
+    use crate::matrix_game::map_static::MapStatic as _;
+    use crate::matrix_game::object_building::BuildingType;
+    use crate::matrix_game::side::CurrSel;
+    let (si, co) = map.camera_angle.sin_cos();
+    let player = game.player_side.id;
+    let bases: Vec<(crate::matrix_game::map_static::ObjectId, glam::Vec2)> = game
+        .objects
+        .iter_live()
+        .filter_map(|id| {
+            let b = crate::matrix_game::logic::building_ref(&game.objects, id)?;
+            (b.kind == BuildingType::Base && b.side == player && b.is_live())
+                .then_some((id, glam::Vec2::new(b.pos.x, b.pos.y)))
+        })
+        .collect();
+    for (bid, bpos) in bases {
+        let bup = glam::Vec2::new(bpos.x - 100.0 * si, bpos.y + 100.0 * co);
+        match map.camera_pos {
+            Some(cp) => {
+                if (bup - glam::Vec2::new(cp[0], cp[1])).length_squared() < 300.0 * 300.0 {
+                    game.player_side.select_single(bid, CurrSel::BaseSelected);
+                    break;
+                }
+            }
+            None => {
+                game.player_side.select_single(bid, CurrSel::BaseSelected);
+                camera.set_xy_strategy([bup.x, bup.y]);
+                break;
+            }
+        }
+    }
+}
+
+/// Execute an armed pre-order at a minimap world position — the
+/// `CalcMinimap2World` substitution at MatrixSide.cpp:672-680. Returns
+/// false (order stays armed) for target-requiring orders the minimap
+/// can't express (capture / repair), letting the click fall through.
+fn execute_pre_order_world(state: &mut AppState, tgt: [f32; 2]) -> bool {
+    use crate::matrix_game::interface::iface_list::PreOrder;
+
+    let Some(po) = state.iface_list.pre_order else {
+        return false;
+    };
+    let w = glam::Vec2::new(tgt[0], tgt[1]);
+    match po {
+        PreOrder::Move => state.game.order_move_to_world(&state.map, w),
+        PreOrder::Fire => state.game.order_attack_world(&state.map, w),
+        PreOrder::Patrol => state.game.order_patrol_world(&state.map, w),
+        PreOrder::Bomb => state.game.order_bomb_world(&state.map, w),
+        PreOrder::Capture | PreOrder::Repair => return false,
+    }
+    state.iface_list.pre_order = None;
+    true
+}
+
 fn execute_pre_order(state: &mut AppState, cx: f32, cy: f32, w: f32, h: f32) {
     use crate::matrix_game::interface::iface_list::PreOrder;
 
@@ -2342,21 +2570,14 @@ fn preview_popup_hover(
     if popup.previewed == popup.hovered {
         return false;
     }
-    popup.previewed = popup.hovered;
     let Some(idx) = popup.hovered else {
-        // Cursor left the popup rows — restore the saved preview
-        // and re-apply the originating pylon's focused label/price
-        // for the equipped component, so the Base-panel left card
-        // keeps showing the equipped item rather than going blank.
-        // The C++ leaves `m_FocusedElement` pointed at the pylon
-        // for the entire popup lifetime (CIFaceMenu.cpp:383 commented
-        // out), and `Djeans007` only fires on row hover.
-        if let Some(saved) = popup.saved_config {
-            builder.apply_config(saved);
-        }
-        builder.refresh_current_focus();
-        return true;
+        // Cursor left the popup rows — the C++ keeps showing the LAST
+        // hovered component until commit/cancel (`Djeans007` only
+        // fires on row hover, CConstructor.cpp:576-671; the restore
+        // happens in ResetMenu on close). Leave the preview alone.
+        return false;
     };
+    popup.previewed = popup.hovered;
     let Some(item) = popup.items.get(idx).cloned() else {
         return false;
     };
@@ -2466,8 +2687,12 @@ fn refresh_hint_replacements(state: &mut AppState) {
             let cannon_idx = weap_to_index(cannon_weap).unwrap_or(0);
             let cooldown_ms = cfg.weapon_cooldown.table[cannon_idx];
             let per_shot_damage = cfg.robot_damages.table[cannon_idx].damage;
+            // `Float2Int(1/(cooldown/1000))` FIRST, then × damage
+            // (CInterface.cpp:4464) — rounding order changes the
+            // displayed numbers for turrets 1 and 4.
             let dps = if cooldown_ms > 0 {
-                ((1000.0 / cooldown_ms as f32) * per_shot_damage as f32) as i32
+                crate::matrix_game::common::float2int(1000.0 / cooldown_ms as f32)
+                    * per_shot_damage
             } else {
                 0
             };
@@ -2724,9 +2949,9 @@ fn update_turret_build(
     };
 
     // Snap to nearest free slot — C++ uses `rr < 4` in move-cell space
-    // (MatrixSide.cpp:1645). 4 move-cells × GLOBAL_SCALE_MOVE = 40
+    // (MatrixSide.cpp:1645): dist² < 4 cells² → dist < 2 cells = 20
     // world units.
-    const SNAP_DIST: f32 = 4.0 * crate::matrix_game::map::GameMap::GLOBAL_SCALE_MOVE;
+    const SNAP_DIST: f32 = 2.0 * crate::matrix_game::map::GameMap::GLOBAL_SCALE_MOVE;
     const SNAP_DIST_SQ: f32 = SNAP_DIST * SNAP_DIST;
     let mut hovered: Option<(usize, f32)> = None;
     for (i, p) in slots.iter().enumerate() {
@@ -2815,14 +3040,14 @@ fn try_place_turret(state: &mut AppState, _cx: f32, _cy: f32, _w: f32, _h: f32) 
     // The per-frame `update_turret_build` already snapped the cursor to
     // a slot (or determined no slot is hovered). Honour its decision —
     // the C++ click path also reads `m_CannonForBuild.m_CanBuildFlag`
-    // set by the LogicTakt branch (MatrixSide.cpp:626).
+    // set by the LogicTakt branch (MatrixSide.cpp:626). A click off any
+    // slot keeps the placement mode armed (MatrixSide.cpp:665-667 only
+    // places when the flag is up; RMB / UI buttons cancel).
     if !state.iface_list.turret_build.can_build {
-        log::debug!("turret: click without valid slot — cancelling placement");
-        state.iface_list.turret_build.cancel();
+        log::debug!("turret: click without valid slot — placement stays armed");
         return;
     }
     let Some(slot_idx) = state.iface_list.turret_build.hovered_slot else {
-        state.iface_list.turret_build.cancel();
         return;
     };
     let ghost_pos = state.iface_list.turret_build.ghost_pos;
@@ -2856,6 +3081,8 @@ fn try_place_turret(state: &mut AppState, _cx: f32, _cy: f32, _w: f32, _h: f32) 
         state.iface_list.turret_build.cancel();
         return;
     }
+    // S_TURRET_BUILD_START (MatrixSide.cpp:659).
+    state.game.objects.queue_snd("t_build_s");
 
     // Spawn the Cannon object immediately — the build-stack timer
     // still runs for the cost/progress UI, but the C++ mounts the
@@ -2872,6 +3099,9 @@ fn try_place_turret(state: &mut AppState, _cx: f32, _cy: f32, _w: f32, _h: f32) 
         slot_idx,
     );
     cannon.begin_construction();
+    // `m_Place = m_RN.FindInPL(...)` at placement (MatrixSide.cpp:563).
+    cannon.place =
+        crate::matrix_game::logic::cannon_rn_place(&state.map, ghost_pos.x, ghost_pos.y);
     let id = state.game.objects.spawn(Box::new(cannon));
     if let Some(obj) = state.game.objects.get_mut(id) {
         let c: &mut crate::matrix_game::object_cannon::Cannon = unsafe {
@@ -2930,7 +3160,9 @@ fn build_counter_ctx(state: &AppState) -> crate::matrix_game::interface::counter
         .for_each_live(|_, obj| match obj.core().obj_type {
             ObjectType::RobotAi => {
                 let r: &Robot = unsafe { &*(obj as *const dyn MapStatic as *const Robot) };
-                if r.side == state.game.player_side.id {
+                // DIP (dying) robots don't count toward the cap
+                // (`m_CurrState != ROBOT_DIP`, MatrixSide.cpp:591).
+                if r.side == state.game.player_side.id && r.is_live() {
                     side_robots += 1;
                 }
             }
@@ -2939,7 +3171,10 @@ fn build_counter_ctx(state: &AppState) -> crate::matrix_game::interface::counter
                 if b.side == state.game.player_side.id {
                     if b.kind == BuildingType::Base {
                         bases += 1;
-                        robots_in_stack += b.build_stack.items() as i32;
+                        // Queued turrets aren't robots
+                        // (CBuildStack::GetRobotsCnt filters
+                        // OBJECT_TYPE_ROBOTAI, MatrixObjectBuilding.cpp:1938-1950).
+                        robots_in_stack += b.build_stack.robots_cnt() as i32;
                     } else {
                         factories += 1;
                     }
@@ -3040,12 +3275,12 @@ fn commit_and_queue_robot(state: &mut AppState) {
         }
         queued += 1;
     }
-    // CConstructor.cpp:237-242 — deduct price × counter. NOTE: the C++
-    // deducts even if some StackRobot calls were dropped by a full
-    // stack; CIFaceCounter::CheckUp is supposed to have prevented that
-    // case ahead of time. We mirror the C++ deduction faithfully.
+    // CConstructor.cpp:237-242 — deduct price × counter. The C++
+    // deducts blindly because the stack-full case is unreachable there
+    // (the build button disables at MAX_STACK_UNITS); charge only what
+    // was actually queued so a dropped item can't burn resources.
     for r in Resource::ALL {
-        let spent = price.resources[r as usize] * count;
+        let spent = price.resources[r as usize] * queued;
         state.game.player_side.add_resource_amount(r, -spent);
     }
     // CConstructor.cpp:231 — push to global config history.
@@ -3095,7 +3330,11 @@ fn refresh_progress_bars(state: &mut AppState) {
     state.progress_bars.clear();
 
     // ── Floating HP bars over robots / turrets / buildings ──────────
-    {
+    // Skipped while paused: the C++ hover trace lives in CMatrixMap::
+    // Takt (MatrixMap.cpp:1150-1178), which the pause early-return
+    // skips — so with the constructor (Pause(true)) or a dialog open,
+    // world HP bars neither arm on hover nor draw over the window.
+    if !state.is_paused {
         use crate::matrix_game::common::{TRACE_ALL, TRACE_LANDSCAPE};
         use crate::matrix_game::interface::interface::DESIGN_H;
         use crate::matrix_game::map_trace::{trace, TraceStop};
@@ -3500,7 +3739,8 @@ fn refresh_interface_visibility(state: &mut AppState) {
     // `RESOURCES_INCOME` for a factory (10).
     const RESOURCES_INCOME: i32 = 10;
     const RESOURCES_INCOME_BASE: i32 = 3;
-    let force_up = 100; // default m_BaseResForce (MatrixSide.hpp:441).
+    // `GetResourceForceUp()` — the map's SideResInfo income multiplier.
+    let force_up = state.game.player_side.get_resource_force_up();
     let income_per_minute = match kind {
         Some(BuildingType::Base) => RESOURCES_INCOME_BASE * force_up / 100,
         Some(_) => RESOURCES_INCOME,
@@ -3592,10 +3832,11 @@ fn refresh_interface_visibility(state: &mut AppState) {
                 continue;
             }
             let r: &Robot = unsafe { &*(obj as *const dyn MapStatic as *const Robot) };
-            // C++ stores HP as a float ranging 0..max — UI displays
-            // integers (CInterface.cpp:1503: `Float2Int(lives)`).
-            let hp = r.hit_point.round().max(0.0) as i32;
-            let max_hp = r.hit_point_max.round().max(0.0) as i32;
+            // `CMatrixRobotAI::GetHitPoint()` returns `m_HitPoint/10`
+            // (MatrixObjectRobot.hpp:243-244) — the lives caption shows
+            // the /10 value, same scale as the building readout.
+            let hp = (r.hit_point / 10.0).round().max(0.0) as i32;
+            let max_hp = (r.hit_point_max / 10.0).round().max(0.0) as i32;
             snapshot.push((*id, r.config, r.name.clone(), hp, max_hp));
         }
         if !snapshot.is_empty() {
@@ -3640,6 +3881,29 @@ fn refresh_interface_visibility(state: &mut AppState) {
                     cur_cfg,
                 )
             });
+            // SINGLE_MODE weapon readout — one robot selected only
+            // (CreateWeaponDynamicStatics, CInterface.cpp:3013-3114).
+            let single_weapons: Vec<(usize, i32, f32)> = if snapshot.len() == 1 {
+                let sid = snapshot[0].0;
+                crate::matrix_game::logic::robot_ref(&state.game.objects, sid)
+                    .map(|r| {
+                        r.weapons
+                            .iter()
+                            .filter_map(|bw| {
+                                let kind = r.config.weapon.get(bw.unit)?.kind.0;
+                                if kind == 0 {
+                                    return None;
+                                }
+                                // alpha = heat·0.25 as a byte (:1526-1535).
+                                let a = (bw.heat as f32 * 0.25 / 255.0).clamp(0.0, 1.0);
+                                Some((bw.unit, kind, a))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
             robot_panel = Some(RobotPanelCtx {
                 group,
                 selected_index,
@@ -3647,6 +3911,7 @@ fn refresh_interface_visibility(state: &mut AppState) {
                 robot_name: cur_name.clone(),
                 robot_hp: *cur_hp,
                 robot_max_hp: *cur_max,
+                single_weapons,
             });
         }
     }
@@ -3673,27 +3938,50 @@ fn refresh_interface_visibility(state: &mut AppState) {
     // Auto-order toggle state for the current group (AUTO_*_ON).
     let (auto_cap, auto_atk, auto_def) = state.game.show_order_state();
     // Order-glow index for the active group's current manual order.
-    let order_glow = if curr_sel == CurrSel::RobotsSelected {
+    // Order glow flags aggregated across ALL selected robots
+    // (CInterface.cpp:1316-1354) with the cross-suppression rules at
+    // :1663-1677: move suppressed by capture/bomb/repair; bomb/repair
+    // glow needs a bomber/repairer in the selection.
+    let order_glows = if curr_sel == CurrSel::RobotsSelected {
         use crate::matrix_game::side::PlayerOrder;
-        state
-            .game
-            .player_side
-            .get_cur_sel_object()
-            .and_then(|id| crate::matrix_game::logic::robot_ref(&state.game.objects, id))
-            .map(|r| r.group_logic)
-            .filter(|&gl| gl >= 0)
-            .and_then(|gl| state.game.player_side.player_groups.get(gl as usize))
-            .and_then(|g| match g.order {
-                PlayerOrder::Stop => Some(0),
-                PlayerOrder::MoveTo => Some(1),
-                PlayerOrder::Patrol => Some(2),
-                PlayerOrder::Attack => Some(3),
-                PlayerOrder::Capture => Some(4),
-                PlayerOrder::Bomb | PlayerOrder::Repair => Some(5),
-                _ => None,
-            })
+        let mut flags = [false; 6]; // stop/move/patrol/fire/capt/bomb|rep
+        let (mut capt_like, mut bomb_or_rep, mut bomber_or_rep_sel) = (false, false, false);
+        for &rid in &state.game.player_side.selected {
+            let Some(r) = crate::matrix_game::logic::robot_ref(&state.game.objects, rid) else {
+                continue;
+            };
+            if r.have_bomb(&state.game.objects) || r.have_repair != 0 {
+                bomber_or_rep_sel = true;
+            }
+            if r.group_logic < 0 {
+                continue;
+            }
+            let Some(g) = state
+                .game
+                .player_side
+                .player_groups
+                .get(r.group_logic as usize)
+            else {
+                continue;
+            };
+            match g.order {
+                PlayerOrder::Stop => flags[0] = true,
+                PlayerOrder::MoveTo => flags[1] = true,
+                PlayerOrder::Patrol => flags[2] = true,
+                PlayerOrder::Attack => flags[3] = true,
+                PlayerOrder::Capture => {
+                    flags[4] = true;
+                    capt_like = true;
+                }
+                PlayerOrder::Bomb | PlayerOrder::Repair => bomb_or_rep = true,
+                _ => {}
+            }
+        }
+        flags[1] = flags[1] && !capt_like && !bomb_or_rep;
+        flags[5] = bomb_or_rep && bomber_or_rep_sel;
+        flags
     } else {
-        None
+        [false; 6]
     };
     let ctx = MainVisibilityCtx {
         curr_sel,
@@ -3707,6 +3995,7 @@ fn refresh_interface_visibility(state: &mut AppState) {
         turret_kind_committed,
         turret_disabled,
         buca_disabled,
+        maintenance_cooling: state.game.maintenance_disabled() || state.game.maintenance_time > 0,
         installed_turret_kinds,
         building_stack_turret_kinds: stack_kinds,
         building_stack_robot_atlas_keys: stack_robot_keys,
@@ -3716,7 +4005,7 @@ fn refresh_interface_visibility(state: &mut AppState) {
         auto_frobot_on: auto_atk,
         auto_protect_on: auto_def,
         auto_capture_on: auto_cap,
-        order_glow,
+        order_glows,
     };
     if let Some(p) = state.iface_list.panel_mut("Main") {
         p.refresh_main_visibility(&ctx);
@@ -3796,11 +4085,22 @@ fn refresh_interface_visibility(state: &mut AppState) {
                 let buildable_base = matches!(kind, Some(BuildingType::Base));
                 let under_cap = counter_ctx.side_robots + counter_ctx.robots_in_stack
                     < counter_ctx.max_side_robots;
+                // Stack-full disable (CInterface.cpp:1815-1817:
+                // `bld = m_BS.GetItemsCnt() < MAX_STACK_UNITS`).
+                let stack_full = state
+                    .game
+                    .active_object()
+                    .and_then(|id| {
+                        crate::matrix_game::logic::building_ref(&state.game.objects, id)
+                    })
+                    .map(|bb| bb.build_stack.is_full())
+                    .unwrap_or(false);
                 // Port of `CConstructor::RemoteBuild`'s player-side guard
                 // at CConstructor.cpp:225-227 — enemy / neutral bases can
                 // be selected for inspection but the build button must not
                 // fire on them.
-                enough = enough && buildable_base && under_cap && active_is_player_owned;
+                enough =
+                    enough && buildable_base && under_cap && active_is_player_owned && !stack_full;
                 // Decode the focused pylon → (type, kind) so the visibility
                 // refresh knows which `head{N}_st` / `iw{N}text` etc. to
                 // expose.
@@ -3822,6 +4122,43 @@ fn refresh_interface_visibility(state: &mut AppState) {
     // (`ps->GetRobotsCnt()+ps->GetRobotsInStack() >= ps->GetMaxSideRobots()`).
     let robot_limit_reached =
         counter_ctx.side_robots + counter_ctx.robots_in_stack >= counter_ctx.max_side_robots;
+    // Per-pylon CRITICAL_RAMKA (CInterface.cpp:1885-2097): the total
+    // (×counter) price is short on a resource that the MOUNTED part
+    // actually costs. Empty pylons stay NORMAL (Param2 == 0 there).
+    let pylon_criticals: [bool; 8] = {
+        use crate::matrix_game::config::Resource;
+        use crate::matrix_game::interface::constructor::UnitPrice;
+        let mut out = [false; 8];
+        if let Some(cfg) = live_cfg.as_ref() {
+            let prices = crate::matrix_game::config::global().prices;
+            let short: [bool; 4] = {
+                let mut s = [false; 4];
+                for r in Resource::ALL {
+                    s[r as usize] = state.game.player_side.get_resource_amount(r)
+                        < summ_price.resources[r as usize];
+                }
+                s
+            };
+            let crit = |p: UnitPrice| -> bool {
+                (0..4).any(|i| short[i] && p.resources[i] != 0)
+            };
+            if !cfg.head.is_empty() {
+                out[0] = crit(prices.get(cfg.head.ty, cfg.head.kind));
+            }
+            if !cfg.hull.unit.is_empty() {
+                out[1] = crit(prices.get(cfg.hull.unit.ty, cfg.hull.unit.kind));
+            }
+            if !cfg.chassis.is_empty() {
+                out[2] = crit(prices.get(cfg.chassis.ty, cfg.chassis.kind));
+            }
+            for (i, w) in cfg.weapon.iter().enumerate().take(5) {
+                if !w.is_empty() {
+                    out[3 + i] = crit(prices.get(w.ty, w.kind));
+                }
+            }
+        }
+        out
+    };
     // Port of the C++ `m_VisibleAlpha = IS_VISIBLEA` gate at
     // CInterface.cpp:1797 — the Base panel is *visible* whenever a
     // base/building is the active selection; whether individual
@@ -3847,6 +4184,7 @@ fn refresh_interface_visibility(state: &mut AppState) {
                 build_enabled,
                 robot_limit_reached,
                 focused_target,
+                pylon_criticals,
             },
         );
         if constructor_active {
@@ -3950,7 +4288,23 @@ fn sync_selection_ring(state: &mut AppState, step_ms: f32) {
                 // Fixed ring size — ROBOT_SELECTION_SIZE / FLYER_SELECTION_SIZE
                 // are both 20 in the original (MatrixRobot.hpp:42,
                 // MatrixFlyer.hpp:51), independent of collision radius.
-                (obj.core().geo_center, 20.0)
+                // Robots anchor at body-matrix z + 3 (MatrixRobot.cpp:
+                // 5280/5299) — geo_center sits ~9 above the ground and
+                // floats the ring visibly high.
+                let gc = obj.core().geo_center;
+                let c = if matches!(
+                    obj.core().obj_type,
+                    crate::matrix_game::map_static::ObjectType::RobotAi
+                ) {
+                    let r: &crate::matrix_game::robot::Robot = unsafe {
+                        &*(obj as *const dyn crate::matrix_game::map_static::MapStatic
+                            as *const crate::matrix_game::robot::Robot)
+                    };
+                    glam::Vec3::new(gc.x, gc.y, r.pos_z + 3.0)
+                } else {
+                    gc
+                };
+                (c, 20.0)
             }
         });
         if let Some((c, r)) = placement {
@@ -4874,11 +5228,6 @@ fn handle_game_key(state: &mut AppState, code: winit::keyboard::KeyCode) -> bool
                         }
                         dispatch_ui_click(state, &Click::Button("buca".into()));
                     }
-                    return true;
-                }
-                // "H"elp — call maintenance.
-                K::KeyH => {
-                    dispatch_ui_click(state, &Click::Button("bure".into()));
                     return true;
                 }
                 // Digit quick-pick on the focused constructor pylon.

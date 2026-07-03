@@ -125,6 +125,29 @@ pub fn current_elapsed_ms() -> i64 {
     CURRENT_ELAPSED_MS.with(|c| c.get())
 }
 
+thread_local! {
+    static FRUSTUM_CENTER: Cell<Option<[f32; 2]>> = const { Cell::new(None) };
+}
+
+/// Camera frustum-center XY for effect-distance culling — set once per
+/// frame by the app loop. `None` (headless sims/tests) disables culling.
+pub fn set_frustum_center(xy: [f32; 2]) {
+    FRUSTUM_CENTER.with(|c| c.set(Some(xy)));
+}
+
+/// `MAX_EFFECT_DISTANCE_SQ` gate (MatrixEffect.hpp:13, guards the
+/// Create* effect factories at MatrixEffect.cpp:456 etc.).
+pub fn effect_in_range(x: f32, y: f32) -> bool {
+    const MAX_EFFECT_DISTANCE_SQ: f32 = 3000.0 * 3000.0;
+    match FRUSTUM_CENTER.with(|c| c.get()) {
+        Some([cx, cy]) => {
+            let (dx, dy) = (x - cx, y - cy);
+            dx * dx + dy * dy <= MAX_EFFECT_DISTANCE_SQ
+        }
+        None => true,
+    }
+}
+
 /// Heightmap point from SCompilePoint (12 bytes, /Zp1 packed).
 #[derive(Debug, Clone, Copy)]
 pub struct CompilePoint {
@@ -247,6 +270,15 @@ pub struct GameMap {
     /// Per-side starting economy from the map `SideResInfo` property
     /// (MatrixMapPrepare.cpp:464-493): `(side_id, [res;4], force_up)`.
     pub side_res_info: Vec<(i32, [i32; 4], i32)>,
+    /// `MaintenanceTime` map property → `m_MaintenancePRC`
+    /// (MatrixMapPrepare.cpp:411-418): percentage scaling the
+    /// reinforcement cooldown; 0 disables maintenance entirely.
+    pub maintenance_prc: i32,
+    /// Author-placed ambient effect spawners (RS_EFFECTS,
+    /// MatrixMapPrepare.cpp:902-926): `(pos, spec)` where `spec` is
+    /// the comma-separated `type,minper,maxper,…` string from the map
+    /// IDS table.
+    pub effect_spawners: Vec<([f32; 3], String)>,
     /// Camera terrain-follow clamp bounds from building floor heights
     /// (`m_GroundZBaseMiddle` = mean build_z, `m_GroundZBaseMax` = max;
     /// MatrixMapPrepare.cpp:623-690).
@@ -381,6 +413,8 @@ impl GameMap {
             water_name: String::new(),
             water_normal_len: 1.0,
             side_res_info: Vec::new(),
+            maintenance_prc: 100,
+            effect_spawners: Vec::new(),
             ground_z_base_middle: 0.0,
             ground_z_base_max: 0.0,
             light_main_color: 0,
@@ -640,6 +674,39 @@ impl GameMap {
             .map(|idx| prop_values.get_as_wstr(idx))
             .map(|s| parse_side_res_info(&s))
             .unwrap_or_default();
+        let maintenance_prc =
+            find_property_int(prop_names, prop_values, "MaintenanceTime").unwrap_or(100);
+        // Ambient effect spawners (RS_EFFECTS, MatrixMapPrepare.cpp:
+        // 902-926): parallel f32 X/Y/Z arrays + i32 IDS index into the
+        // map strings table, which holds the spawner spec string.
+        let effect_spawners: Vec<([f32; 3], String)> = (|| {
+            let fx = stor.get_buf("effects", "X")?;
+            let fy = stor.get_buf("effects", "Y")?;
+            let fz = stor.get_buf("effects", "Z")?;
+            let ft = stor.get_buf("effects", "Type")?;
+            let ids = stor.get_buf("strings", "String")?;
+            let f32s = |b: &[u8]| -> Vec<f32> {
+                b.chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect()
+            };
+            let xs = f32s(fx.get_bytes(0));
+            let ys = f32s(fy.get_bytes(0));
+            let zs = f32s(fz.get_bytes(0));
+            let ts: Vec<i32> = ft
+                .get_bytes(0)
+                .chunks_exact(4)
+                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            let n = xs.len().min(ys.len()).min(zs.len()).min(ts.len());
+            Some(
+                (0..n)
+                    .filter(|&i| ts[i] >= 0 && (ts[i] as usize) < ids.arrays_count())
+                    .map(|i| ([xs[i], ys[i], zs[i]], ids.get_as_wstr(ts[i] as usize)))
+                    .collect(),
+            )
+        })()
+        .unwrap_or_default();
         let water_normal_len =
             find_property_float(prop_names, prop_values, "WaterNormLen").unwrap_or(1.0);
         let light_main_color =
@@ -863,6 +930,8 @@ impl GameMap {
             water_name,
             water_normal_len,
             side_res_info,
+            maintenance_prc,
+            effect_spawners,
             ground_z_base_middle,
             ground_z_base_max,
             ruins,
@@ -2429,6 +2498,10 @@ struct Uniforms {
 struct GlossUniforms {
     view_proj: [[f32; 4]; 4],
     normal_mat: [[f32; 4]; 4],
+    /// Camera view matrix — the fragment shader needs camera-space
+    /// POSITION to build the true reflection vector R = 2(N·E)N − E
+    /// (D3DTSS_TCI_CAMERASPACEREFLECTIONVECTOR).
+    view: [[f32; 4]; 4],
     fog_color: [f32; 4],
     fog_params: [f32; 4],
 }
@@ -2754,6 +2827,7 @@ impl MapRenderer {
             contents: bytemuck::bytes_of(&GlossUniforms {
                 view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
                 normal_mat: glam::Mat4::IDENTITY.to_cols_array_2d(),
+                view: glam::Mat4::IDENTITY.to_cols_array_2d(),
                 fog_color,
                 fog_params: [FOG_START, FOG_END, 0.0, 0.0],
             }),
@@ -3258,6 +3332,7 @@ impl MapRenderer {
                 bytemuck::bytes_of(&GlossUniforms {
                     view_proj: view_proj.to_cols_array_2d(),
                     normal_mat: normal_mat.to_cols_array_2d(),
+                    view: view_mat.to_cols_array_2d(),
                     fog_color: self.fog_color,
                     fog_params: [FOG_START, FOG_END, 0.0, 0.0],
                 }),
@@ -3435,6 +3510,7 @@ impl MapRenderer {
                 bytemuck::bytes_of(&GlossUniforms {
                     view_proj: view_proj.to_cols_array_2d(),
                     normal_mat: glam::Mat4::IDENTITY.to_cols_array_2d(),
+                    view: glam::Mat4::IDENTITY.to_cols_array_2d(),
                     fog_color: self.fog_color,
                     fog_params: [FOG_START, FOG_END, 0.0, 0.0],
                 }),

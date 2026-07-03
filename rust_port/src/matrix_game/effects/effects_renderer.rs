@@ -255,7 +255,22 @@ impl EffectsRenderer {
         });
 
         let mut bind_groups: Vec<wgpu::BindGroup> = Vec::new();
-        let mut make_bg = |view: &wgpu::TextureView| -> usize {
+        // D3D9's device default is D3DTADDRESS_WRAP — standalone
+        // (non-atlased) effect textures must wrap so out-of-range UVs
+        // tile (the BigBoom shell's spinning ×k·2 noise,
+        // MatrixEffectBigBoom.cpp:253-258). The BBT atlas keeps clamp:
+        // its sub-rect UVs never exceed [0,1] and wrapping would bleed
+        // across packed neighbours.
+        let wrap_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("fx wrap sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            ..Default::default()
+        });
+        let mut make_bg_with = |view: &wgpu::TextureView, s: &wgpu::Sampler| -> usize {
             let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("fx tex bg"),
                 layout: &tex_bgl,
@@ -266,7 +281,7 @@ impl EffectsRenderer {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&sampler),
+                        resource: wgpu::BindingResource::Sampler(s),
                     },
                 ],
             });
@@ -284,7 +299,7 @@ impl EffectsRenderer {
         // White 1×1 fallback in slot reserved later via map default.
         let white = image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 255, 255, 255]));
         let white_view = create_texture_from_rgba(device, queue, &white);
-        let white_slot = make_bg(&white_view);
+        let white_slot = make_bg_with(&white_view, &sampler);
 
         // ── BBT table (InitEffects port) ────────────────────────────
         let mut bbt = [BbtEntry {
@@ -299,7 +314,7 @@ impl EffectsRenderer {
             let (sort_slot, sort_w, sort_h) = matrix_data
                 .block_param(&bb_rec, "TexSort")
                 .and_then(|p| load_view(&p.replace('\\', "/")))
-                .map(|(v, w, h)| (make_bg(&v), w as f32, h as f32))
+                .map(|(v, w, h)| (make_bg_with(&v, &sampler), w as f32, h as f32))
                 .unwrap_or((white_slot, 1.0, 1.0));
 
             if let Some(tex_rec) = matrix_data.block_record(&bb_rec, "Textures") {
@@ -329,7 +344,7 @@ impl EffectsRenderer {
                         };
                     } else if let Some(path) = parts.get(1) {
                         let slot = load_view(&path.trim().replace('\\', "/"))
-                            .map(|(v, _, _)| make_bg(&v))
+                            .map(|(v, _, _)| make_bg_with(&v, &sampler))
                             .unwrap_or(white_slot);
                         bbt[id] = BbtEntry {
                             intense: true,
@@ -349,7 +364,7 @@ impl EffectsRenderer {
         let mut path_slots: HashMap<&'static str, usize> = HashMap::new();
         for p in PATH_TEXTURES {
             let slot = load_view(p)
-                .map(|(v, _, _)| make_bg(&v))
+                .map(|(v, _, _)| make_bg_with(&v, &wrap_sampler))
                 .unwrap_or(white_slot);
             path_slots.insert(p, slot);
         }
@@ -381,7 +396,7 @@ impl EffectsRenderer {
             "Matrix/Textures/LandSpots/sole_p",
         ] {
             let slot = load_view(p)
-                .map(|(v, _, _)| make_bg(&v))
+                .map(|(v, _, _)| make_bg_with(&v, &sampler))
                 .unwrap_or(white_slot);
             path_slots_extra.push((p, slot));
         }

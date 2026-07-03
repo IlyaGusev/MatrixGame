@@ -148,7 +148,7 @@ impl MovingObject {
                     spawn,
                     0xFFFF_FFFF,
                     true,
-                    0.04,
+                    0.0, // speed=0: trails hang static (MatrixEffectMovingObject.cpp:298-430)
                 )));
             } else {
                 objs.pending_effects.push(GameEffect::Smoke(Smoke::new(
@@ -158,11 +158,11 @@ impl MovingObject {
                     if with_fire { 800.0 } else { 400.0 },
                     0xFFFF_FFFF,
                     true,
-                    0.04,
+                    0.0, // speed=0: trails hang static (MatrixEffectMovingObject.cpp:298-430)
                 )));
                 if with_fire {
                     objs.pending_effects.push(GameEffect::Fire(Fire::new(
-                        p, 300.0, 300.0, 800.0, 1.0, true, 0.04,
+                        p, 300.0, 300.0, 800.0, 1.0, true, 0.0,
                     )));
                 }
             }
@@ -174,10 +174,33 @@ impl MovingObject {
     fn impact_visuals(&self, hito: TraceStop, hitpos: Vec3, map: &GameMap, objs: &mut Objects) {
         use crate::matrix_game::effects::landscape_spot::{SpotKind, SpotSpawn};
         if hito == TraceStop::Water {
-            // Bomb on deep water: nothing (gun/missile don't splash here).
-            let z = map.get_z(hitpos.x, hitpos.y);
-            if z <= crate::matrix_game::common::WATER_LEVEL {
-                return;
+            match self.kind {
+                // Missiles explode on water like anywhere else — the
+                // C++ missile branch has no water gate (:340-352).
+                MoKind::Missile { .. } => {}
+                // Bomb on shallow water: crater + raised fire blast
+                // (:475-494); deep water swallows it silently.
+                MoKind::Bomb { .. } => {
+                    let z = map.get_z(hitpos.x, hitpos.y);
+                    if z > crate::matrix_game::common::WATER_LEVEL {
+                        objs.pending_spots.push(SpotSpawn {
+                            pos: glam::Vec2::new(hitpos.x, hitpos.y),
+                            angle: (hitpos.x + hitpos.y).fract() * std::f32::consts::PI,
+                            scale: 6.0 + (hitpos.x * 0.43 + hitpos.y * 0.29).fract() * 3.0,
+                            kind: SpotKind::Voronka,
+                        });
+                        objs.pending_explosions.push(
+                            crate::matrix_game::map_static::ExplosionSpawn {
+                                pos: Vec3::new(hitpos.x, hitpos.y, z + 10.0),
+                                props: &crate::matrix_game::effects::explosion::EXPLOSION_MISSILE,
+                                fire: true,
+                            },
+                        );
+                    }
+                    return;
+                }
+                // Shells never splash (:555-568, :645-660).
+                MoKind::Gun { .. } | MoKind::GunCannon { .. } => return,
             }
         }
         let mut pos = hitpos;
@@ -271,7 +294,9 @@ impl MovingObject {
                     hitpos,
                     wd,
                     col,
-                    col & 0x00FF_FFFF,
+                    // LIC fades every channel to 0 — shell tracers dim
+                    // to black (MatrixEffectMovingObject.cpp:546/642).
+                    0x0000_0000,
                     ttl,
                     TexRef::Bbt(BBT_SHLEIF),
                 )));

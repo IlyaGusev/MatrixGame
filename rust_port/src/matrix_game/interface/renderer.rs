@@ -420,6 +420,14 @@ impl InterfaceRenderer {
             key
         );
         let (w, h) = (rgba.width(), rgba.height());
+        // Alpha channel registry for `ElementAlpha` hover hit-testing
+        // (CIFaceElement.cpp:310-318).
+        super::iface_element::register_atlas_alpha(
+            &key,
+            w,
+            h,
+            rgba.pixels().map(|p| p.0[3]).collect(),
+        );
         self.atlases.insert(
             key,
             Atlas {
@@ -1018,7 +1026,7 @@ impl InterfaceRenderer {
                     let v0 = (img.y + 0.5) / img.tex_h;
                     let u1 = (img.x + img.w - 0.5) / img.tex_w;
                     let v1 = (img.y + img.h - 0.5) / img.tex_h;
-                    let tint = match elem.cur_state {
+                    let mut tint = match elem.cur_state {
                         ElementState::Focused => [1.0, 1.0, 1.0, 1.0],
                         ElementState::Pressed => [0.8, 0.8, 0.8, 1.0],
                         ElementState::Disabled => [0.5, 0.5, 0.5, 0.8],
@@ -1027,6 +1035,10 @@ impl InterfaceRenderer {
                         // `sPressedUnFocused` art untinted.
                         ElementState::PressedUnfocused => [1.0, 1.0, 1.0, 1.0],
                     };
+                    // `m_VisibleAlpha` (weapon overheat overlays etc.).
+                    if let Some(a) = elem.visible_alpha {
+                        tint[3] *= a.clamp(0.0, 1.0);
+                    }
                     open_run(
                         &key,
                         &all_verts,
@@ -1066,6 +1078,35 @@ impl InterfaceRenderer {
                             tint,
                         },
                     ]);
+                    // Affordability outline — `CreateElementRamka`
+                    // (CInterface.cpp:4198-4206) draws a 1 px frame in
+                    // the element rect; we emit 4 flat-colour strips.
+                    if let Some(rc) = elem.ramka_color {
+                        open_run(
+                            SOLID_ATLAS_KEY,
+                            &all_verts,
+                            &mut current_key,
+                            &mut current_start,
+                            &mut self.draw_groups,
+                        );
+                        let t = scale.max(1.0); // 1 design px
+                        let strips = [
+                            [x, y, w, t],           // top
+                            [x, y + h - t, w, t],   // bottom
+                            [x, y, t, h],           // left
+                            [x + w - t, y, t, h],   // right
+                        ];
+                        for [sx, sy, sw, sh] in strips {
+                            all_verts.extend_from_slice(&[
+                                Vertex { pos: [sx, sy], uv: [0.5, 0.5], tint: rc },
+                                Vertex { pos: [sx + sw, sy], uv: [0.5, 0.5], tint: rc },
+                                Vertex { pos: [sx, sy + sh], uv: [0.5, 0.5], tint: rc },
+                                Vertex { pos: [sx + sw, sy], uv: [0.5, 0.5], tint: rc },
+                                Vertex { pos: [sx + sw, sy + sh], uv: [0.5, 0.5], tint: rc },
+                                Vertex { pos: [sx, sy + sh], uv: [0.5, 0.5], tint: rc },
+                            ]);
+                        }
+                    }
                 }
                 per_panel_counts.push((panel.name.clone(), n_visible));
             }
@@ -1439,13 +1480,11 @@ impl InterfaceRenderer {
                         }
                     }
                     if label.wrap {
-                        // Available text width from the label's anchor
-                        // out to the element's right edge. `label.x`
-                        // is the text origin inside the element;
-                        // `label.sme_x` is an extra offset that's
-                        // applied at render time too, so it shrinks
-                        // the wrap budget by the same amount.
-                        let wrap_width = (elem.size_x - label.x - label.sme_x).max(0.0) * scale;
+                        // The C++ hands `m_RangersText` the FULL element
+                        // width as the wrap bound (`m_boundX = m_xSize`,
+                        // CInterface.cpp:775-780, 4674-4720); label.x /
+                        // sme_x only offset the finished bitmap's blit.
+                        let wrap_width = elem.size_x.max(0.0) * scale;
                         emit_wrapped_text(
                             &mut all_verts,
                             &mut current_key,
@@ -2117,8 +2156,14 @@ fn wrap_rich_lines(
             }
             Tok::Word { text, color } => {
                 let word_w = atlas.measure(font, &text);
-                if wrap_width_px > 0 && word_w > wrap_width_px && current.is_empty() {
-                    // Char-break the oversize word.
+                if wrap_width_px > 0 && word_w > wrap_width_px {
+                    // Char-break the oversize word — also when it
+                    // arrives mid-line (break the line first so the
+                    // chunks start at the margin instead of
+                    // overflowing the element).
+                    if !current.is_empty() {
+                        push_line(&mut current, &mut current_w, &mut lines);
+                    }
                     let chunks = split_oversize_word(atlas, font, &text, wrap_width_px);
                     let mut iter = chunks.into_iter().peekable();
                     while let Some(chunk) = iter.next() {

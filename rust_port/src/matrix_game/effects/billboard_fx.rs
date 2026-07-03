@@ -130,3 +130,64 @@ impl ScoreFx {
         }
     }
 }
+
+/// Hover keel-water ripple — a flat ground quad aligned to the
+/// robot's forward axis, growing 5→13.75 (r1=5, r2=22.5 through the
+/// billboard's half-growth rule, MatrixEffectBillboard.cpp:79) and
+/// fading white→transparent over 3000 ms (MatrixObjectRobot.cpp:926).
+pub struct KeelwaterFx {
+    pos: Vec3,
+    fwd: Vec3,
+    ttl: f32,
+}
+
+impl KeelwaterFx {
+    pub fn new(pos: Vec3, fwd: Vec3) -> Self {
+        Self {
+            pos,
+            fwd: fwd.normalize_or_zero(),
+            ttl: 3000.0,
+        }
+    }
+
+    pub fn takt(&mut self, step: f32) -> bool {
+        self.ttl -= step;
+        self.ttl >= 0.0
+    }
+
+    pub fn draw(&self, q: &mut BillboardQueue) {
+        let k = 1.0 - self.ttl / 3000.0;
+        let r = 5.0 + (22.5 - 5.0) * k * 0.5;
+        let alpha = ((1.0 - k) * 255.0) as u32;
+        let color = (alpha << 24) | 0x00FF_FFFF;
+        let right = self.fwd.cross(Vec3::Z).normalize_or_zero();
+        let f = self.fwd * r;
+        let s = right * r;
+        // Two tris forming the oriented flat quad (VecToMatrixX puts
+        // the quad's X axis along the drift dir).
+        let c = [
+            self.pos - f - s,
+            self.pos + f - s,
+            self.pos + f + s,
+            self.pos - f + s,
+        ];
+        let uv = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+        let tex = TexRef::Path(
+            crate::matrix_game::effects::effects_renderer::TEXTURE_PATH_KEELWATER,
+        );
+        q.tris.push(crate::matrix_lib::three_g::billboard::QueuedTri {
+            v: [c[0], c[1], c[2]],
+            uv: [uv[0], uv[1], uv[2]],
+            color,
+            tex,
+            additive: false,
+        });
+        q.tris.push(crate::matrix_lib::three_g::billboard::QueuedTri {
+            v: [c[0], c[2], c[3]],
+            uv: [uv[0], uv[2], uv[3]],
+            color,
+            tex,
+            additive: false,
+        });
+    }
+}

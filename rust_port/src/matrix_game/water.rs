@@ -281,7 +281,10 @@ impl Water {
 
         let [wr, wg, wb] = unpack_rgb(map.water_color);
         let water_color = [wr, wg, wb, 1.0];
-        let [lr, lg, lb] = unpack_rgb(map.light_main_color);
+        // Device light 0's diffuse is `m_LightMainColorObj`
+        // (MatrixGame.cpp:676-678) — `m_LightMainColor` is only the
+        // terrain-bake color.
+        let [lr, lg, lb] = unpack_rgb(map.light_main_color_obj);
         let light_color = [lr, lg, lb, 1.0];
         let ld = map.light_main_dir;
         let light_dir = [ld[0], ld[1], ld[2], 0.0];

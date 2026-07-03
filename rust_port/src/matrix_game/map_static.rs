@@ -238,6 +238,13 @@ pub trait MapStatic {
         true
     }
 
+    /// Port of `IsSpecial()` (MatrixMapStatic.hpp:299) — map objects
+    /// whose destruction is a win condition. Attack orders accept them
+    /// alongside live units (MatrixSide.cpp:704/729/841).
+    fn is_special(&self) -> bool {
+        false
+    }
+
     /// Port of `virtual bool Damage(EWeapon, pos, dir, attacker_side,
     /// attacker)` (MatrixMapStatic.hpp:464). Returns true iff the
     /// damage caused *this* object to be removed from play (C++
@@ -446,6 +453,25 @@ pub struct Objects {
     /// Deferred explosion spawns — `CreateExplosion` calls from damage
     /// paths (which carry no RNG/map); built in `effects_takt`.
     pub pending_explosions: Vec<ExplosionSpawn>,
+    /// Deferred resource refunds `(side, [titan, elec, energy, plasma])`
+    /// from cancelled build-queue items (`CBuildStack::DeleteItem`) —
+    /// drained by `MapLogic::takt`, which owns the sides.
+    pub pending_refunds: Vec<(i32, [i32; 4])>,
+    /// Player robots freshly produced by a base — awaiting the
+    /// `RobotSpawn` rally (AssignPlace + PGOrderAttack,
+    /// MatrixRobot.cpp:2204-2223), which needs side/place access.
+    pub pending_spawn_rallies: Vec<ObjectId>,
+    /// World-sound dispatch queue — `(canonical Sounds-block key,
+    /// optional world position)` for every `CSound::Play/AddSound`
+    /// call site in ported code. Drained (unheard) each takt like the
+    /// order-voice queue; a host audio backend consumes it when the
+    /// SR2 sound assets are available.
+    pub pending_sounds: Vec<(String, Option<[f32; 3]>)>,
+    /// Per-map-group flyer altitude envelope: max(terrain land max,
+    /// static building/object tops). The static-scene slice of
+    /// `m_GroupMaxZObjRobots` (GetZInterpolatedObjRobots,
+    /// MatrixMap.cpp:512-546); built lazily on the first flyer takt.
+    pub flyer_alt_grid: Vec<f32>,
     /// Deferred effect point-light spawns (`CreatePointLight`) — drained
     /// by the app loop into the terrain `PointLightSystem`.
     pub pending_point_lights: Vec<PendingLight>,
@@ -584,6 +610,10 @@ impl Objects {
             side_stats: [SideStats::default(); 9],
             pending_spots: Vec::new(),
             pending_explosions: Vec::new(),
+            pending_refunds: Vec::new(),
+            pending_spawn_rallies: Vec::new(),
+            pending_sounds: Vec::new(),
+            flyer_alt_grid: Vec::new(),
             pending_point_lights: Vec::new(),
             pending_light_follow: Vec::new(),
             pending_light_kill: Vec::new(),
@@ -616,6 +646,18 @@ impl Objects {
         if let Some(s) = self.side_stats.get_mut(side as usize) {
             f(s);
         }
+    }
+
+    /// `CSound::Play(id)` — interface-layer world sound by its
+    /// canonical Sounds-block key (MatrixSoundManager.cpp:80-260).
+    pub fn queue_snd(&mut self, name: &str) {
+        self.pending_sounds.push((name.to_string(), None));
+    }
+
+    /// `CSound::AddSound(id, pos)` — positional 3D world sound.
+    pub fn queue_snd_at(&mut self, name: &str, pos: Vec3) {
+        self.pending_sounds
+            .push((name.to_string(), Some([pos.x, pos.y, pos.z])));
     }
 
     /// Insert `obj` into the arena and return its handle. The ctor
@@ -1063,6 +1105,14 @@ impl Objects {
             Some(b) => b,
             None => return false,
         };
+        // `CSound::AddSound(SoundHit(weap), pos)` at the top of every
+        // C++ Damage entry (MatrixRobot.cpp:1880, MatrixObjectCannon.
+        // cpp:1385, MatrixObjectBuilding.cpp:279, MatrixObject.cpp:111,
+        // MatrixFlyer.cpp:1791).
+        let hit_snd = crate::matrix_game::effects::weapon::hit_sound_key(weap);
+        if !hit_snd.is_empty() {
+            self.queue_snd_at(hit_snd, pos);
+        }
         let result = boxed.damage(weap, pos, dir, attacker_side, attacker, target, self);
         let slot = &mut self.slots[target.index as usize];
         if slot.generation == target.generation && slot.obj.is_none() {

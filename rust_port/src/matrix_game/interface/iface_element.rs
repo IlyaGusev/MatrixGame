@@ -196,6 +196,14 @@ pub struct IFaceElement {
     /// frame cycler; when present, the renderer draws the current
     /// frame's atlas rect in place of the Normal state image.
     pub animation: Option<ElementAnimation>,
+    /// `m_VisibleAlpha` (CIFaceElement) — per-element alpha override
+    /// multiplied into the state tint; used by the weapon overheat
+    /// overlays (alpha = heat·0.25, CInterface.cpp:1526-1535).
+    pub visible_alpha: Option<f32>,
+    /// Affordability outline colour (`CreateElementRamka`,
+    /// CInterface.cpp:4198-4206) — NORMAL_RAMKA green / CRITICAL_RAMKA
+    /// orange stamped onto constructor pylons every frame.
+    pub ramka_color: Option<[f32; 4]>,
 }
 
 /// `CAnimation` payload: the frame rects live in the same atlas as the
@@ -305,7 +313,8 @@ impl IFaceElement {
     /// Hit test against pixel `[sx, sy]` given the parent panel's
     /// top-left origin + ui scale. Matches `ElementCatch` semantics
     /// (Interface/CIFaceElement.cpp) — visible rect containment
-    /// check, no alpha test (the C++ `ElementAlpha` path is deferred).
+    /// check. Per-pixel alpha lives in [`Self::hit_alpha`]; the C++
+    /// applies it on hover only (CIFaceButton.cpp:127 vs :187).
     pub fn hit(&self, panel_px: [f32; 2], scale: f32, sx: f32, sy: f32) -> bool {
         if !self.visible() {
             return false;
@@ -313,4 +322,52 @@ impl IFaceElement {
         let [x, y, w, h] = self.rect_in_panel(panel_px, scale);
         sx >= x && sy >= y && sx < x + w && sy < y + h
     }
+
+    /// `ElementAlpha` (CIFaceElement.cpp:310-318): true when the
+    /// current-state source pixel under the cursor is non-transparent.
+    /// Unregistered atlases (runtime-baked portraits etc.) count as
+    /// opaque.
+    pub fn hit_alpha(&self, panel_px: [f32; 2], scale: f32, sx: f32, sy: f32) -> bool {
+        let Some(img) = self.current_image() else {
+            return true;
+        };
+        if img.tex_path.is_empty() || img.w <= 0.0 || img.h <= 0.0 {
+            return true;
+        }
+        let [x, y, w, h] = self.rect_in_panel(panel_px, scale);
+        if w <= 0.0 || h <= 0.0 || img.tex_w <= 0.0 || img.tex_h <= 0.0 {
+            return true;
+        }
+        // Normalised UVs so a runtime atlas rescale keeps the lookup
+        // aligned with what the renderer samples.
+        let u = (img.x + (sx - x) / w * img.w) / img.tex_w;
+        let v = (img.y + (sy - y) / h * img.h) / img.tex_h;
+        atlas_alpha_at(&img.tex_path, u, v).unwrap_or(true)
+    }
+}
+
+/// Atlas-path → alpha-channel registry backing `ElementAlpha`
+/// hover hit-tests. Filled by the renderer at atlas decode time.
+static ATLAS_ALPHA: std::sync::Mutex<
+    Option<std::collections::HashMap<String, (u32, u32, Vec<u8>)>>,
+> = std::sync::Mutex::new(None);
+
+pub fn register_atlas_alpha(key: &str, w: u32, h: u32, alpha: Vec<u8>) {
+    let mut g = ATLAS_ALPHA.lock().unwrap();
+    g.get_or_insert_with(Default::default)
+        .insert(key.to_string(), (w, h, alpha));
+}
+
+/// Alpha > 0 test at normalised atlas UV; `None` when the atlas isn't
+/// registered or the coord is out of bounds.
+fn atlas_alpha_at(tex_path: &str, u: f32, v: f32) -> Option<bool> {
+    let key = tex_path.replace('\\', "/").to_lowercase();
+    let g = ATLAS_ALPHA.lock().unwrap();
+    let (w, h, alpha) = g.as_ref()?.get(&key)?;
+    let x = (u * *w as f32) as i64;
+    let y = (v * *h as f32) as i64;
+    if x < 0 || y < 0 || x >= *w as i64 || y >= *h as i64 {
+        return None;
+    }
+    Some(alpha[y as usize * *w as usize + x as usize] > 0)
 }

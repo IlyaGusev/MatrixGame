@@ -413,18 +413,12 @@ pub fn marquee_select(
     let vp = camera.view_proj();
     let map_cx = camera.map_cx();
     let map_cy = camera.map_cy();
-    let mut hits: Vec<ObjectId> = if shift {
-        logic.player_side.selected.clone()
-    } else {
-        Vec::new()
-    };
+    // Freshly boxed robots this drag (the C++ sel-group fold).
+    let mut boxed: Vec<ObjectId> = Vec::new();
 
     // MatrixMultiSelection.cpp:211 — a tiny drag (rect area < 9 px²)
     // collapses to a single robot: break on the first in-rect hit.
     let only_one = (rect_max[0] - rect_min[0]).abs() * (rect_max[1] - rect_min[1]).abs() < 9.0;
-    // MatrixMultiSelection.cpp:257 — the marquee itself adds at most 9
-    // objects (`m_SelItems.Len()/sizeof(DWORD) < 9`).
-    let mut added = 0usize;
 
     for id in logic.objects.iter_live() {
         let Some(obj) = logic.objects.get(id) else {
@@ -437,6 +431,7 @@ pub fn marquee_select(
             continue;
         }
         let c = obj.core().geo_center;
+        let radius = obj.core().radius;
         let clip = vp * glam::Vec4::new(c.x - map_cx, c.y - map_cy, c.z, 1.0);
         if clip.w <= 0.0 {
             continue;
@@ -445,10 +440,29 @@ pub fn marquee_select(
         let ndc_y = clip.y / clip.w;
         let sx = (ndc_x * 0.5 + 0.5) * screen_w;
         let sy = (1.0 - (ndc_y * 0.5 + 0.5)) * screen_h;
-        if sx >= rect_min[0] && sx <= rect_max[0] && sy >= rect_min[1] && sy <= rect_max[1] {
-            if added < 9 && !hits.contains(&id) {
-                hits.push(id);
-                added += 1;
+        // C++ `o->InRect(r)` tests projected mesh VERTICES
+        // (EnumVertsHandler, MatrixMapStatic.cpp:933-944) so
+        // partially-boxed robots select too. Approximate the vertex
+        // spread with the projected bounding circle and intersect it
+        // with the rect.
+        let px_radius = {
+            let right = camera.camera_right_world();
+            let e = c + right * radius;
+            let eclip = vp * glam::Vec4::new(e.x - map_cx, e.y - map_cy, e.z, 1.0);
+            if eclip.w > 0.0 {
+                let ex = (eclip.x / eclip.w * 0.5 + 0.5) * screen_w;
+                let ey = (1.0 - (eclip.y / eclip.w * 0.5 + 0.5)) * screen_h;
+                ((ex - sx).powi(2) + (ey - sy).powi(2)).sqrt()
+            } else {
+                0.0
+            }
+        };
+        let nx = sx.clamp(rect_min[0], rect_max[0]);
+        let ny = sy.clamp(rect_min[1], rect_max[1]);
+        if (nx - sx).powi(2) + (ny - sy).powi(2) <= px_radius * px_radius {
+            // MatrixMultiSelection.cpp:257 — the marquee adds at most 9.
+            if boxed.len() < 9 && !boxed.contains(&id) {
+                boxed.push(id);
             }
             // C++ `if (only_one && o->IsRobot()) break;` — every hit
             // here is a robot.
@@ -459,7 +473,7 @@ pub fn marquee_select(
     }
     // No robots boxed → admit a player building (TRACE_ROBOT|TRACE_BUILDING;
     // MatrixMultiSelection.cpp:228-253, MatrixFormGame.cpp:731-737).
-    if hits.is_empty() {
+    if boxed.is_empty() {
         for id in logic.objects.iter_live() {
             let Some(obj) = logic.objects.get(id) else {
                 continue;
@@ -491,6 +505,27 @@ pub fn marquee_select(
             }
         }
     }
+    if boxed.is_empty() {
+        // Empty fold → C++ leaves the current selection untouched
+        // (no count branch fires, MatrixFormGame.cpp:674-741).
+        return 0;
+    }
+    // Shift folds into the current group with toggle semantics: boxed
+    // robots already selected are removed, the rest added
+    // (MatrixFormGame.cpp:677-688, :699-721).
+    let hits: Vec<ObjectId> = if shift {
+        let mut cur = logic.player_side.selected.clone();
+        for id in &boxed {
+            if let Some(pos) = cur.iter().position(|x| x == id) {
+                cur.remove(pos);
+            } else {
+                cur.push(*id);
+            }
+        }
+        cur
+    } else {
+        boxed
+    };
     let n = hits.len();
     let primary = hits.last().copied();
     logic

@@ -194,15 +194,85 @@ impl Flyer {
         }
     }
 
-    /// `CalcFlyerZInPoint` (MatrixFlyer.cpp:249-262).
-    fn calc_z_in_point(&self, map: &GameMap, x: f32, y: f32) -> f32 {
-        let addz = map.get_z(x, y);
+    /// `CalcFlyerZInPoint` (MatrixFlyer.cpp:249-262). The C++ samples
+    /// `GetZInterpolatedObjRobots` — a spline over per-group max
+    /// heights INCLUDING buildings/objects — so the flyer cruises the
+    /// smoothed scene envelope instead of hugging terrain triangles
+    /// (and clipping through tall structures). We sample the lazily
+    /// built static envelope in `objs.flyer_alt_grid`; live robots
+    /// (part of the C++ grid) are low enough to be covered by
+    /// FLYER_ALT_MIN.
+    fn calc_z_in_point(&self, map: &GameMap, objs: &Objects, x: f32, y: f32) -> f32 {
+        let addz = sample_flyer_envelope(map, &objs.flyer_alt_grid, x, y);
         if addz > FLYER_ALT_EMPTY {
             addz + FLYER_ALT_MIN
         } else {
             FLYER_ALT_EMPTY + FLYER_ALT_MIN
         }
     }
+}
+
+/// Build the per-group static altitude envelope: terrain land max
+/// folded with every live building / map object top (the static-scene
+/// slice of `m_GroupMaxZObjRobots`).
+pub fn ensure_flyer_alt_grid(objs: &mut Objects, map: &GameMap) {
+    if !objs.flyer_alt_grid.is_empty() {
+        return;
+    }
+    let mut grid = map.group_max_z_land.clone();
+    let gs =
+        crate::matrix_game::common::MAP_GROUP_SIZE as f32 * crate::matrix_game::map::GLOBAL_SCALE;
+    let ids: Vec<crate::matrix_game::map_static::ObjectId> = objs.iter_live().collect();
+    for id in ids {
+        let Some(o) = objs.get(id) else { continue };
+        if !matches!(
+            o.core().obj_type,
+            crate::matrix_game::map_static::ObjectType::Building
+                | crate::matrix_game::map_static::ObjectType::MapObject
+        ) {
+            continue;
+        }
+        let c = o.core().geo_center;
+        let top = c.z + o.core().radius;
+        let gx = (c.x / gs).floor() as i32;
+        let gy = (c.y / gs).floor() as i32;
+        if gx < 0 || gy < 0 || gx >= map.group_w as i32 || gy >= map.group_h as i32 {
+            continue;
+        }
+        let cell = &mut grid[gy as usize * map.group_w + gx as usize];
+        *cell = cell.max(top);
+    }
+    objs.flyer_alt_grid = grid;
+}
+
+/// Bilinear sample of the flyer envelope in group-center coordinates —
+/// the smoothing stand-in for the C++ 4×4 B-spline
+/// (GetZInterpolatedObjRobots, MatrixMap.cpp:512-546).
+fn sample_flyer_envelope(map: &GameMap, grid: &[f32], wx: f32, wy: f32) -> f32 {
+    if grid.len() != map.group_w * map.group_h {
+        return map.get_z(wx, wy);
+    }
+    let gs =
+        crate::matrix_game::common::MAP_GROUP_SIZE as f32 * crate::matrix_game::map::GLOBAL_SCALE;
+    let fx = wx / gs - 0.5;
+    let fy = wy / gs - 0.5;
+    let gx0 = fx.floor() as i32;
+    let gy0 = fy.floor() as i32;
+    let tx = fx - gx0 as f32;
+    let ty = fy - gy0 as f32;
+    let sample = |gx: i32, gy: i32| -> f32 {
+        if gx < 0 || gy < 0 || gx >= map.group_w as i32 || gy >= map.group_h as i32 {
+            return 0.0;
+        }
+        grid[gy as usize * map.group_w + gx as usize]
+    };
+    let a = sample(gx0, gy0);
+    let b = sample(gx0 + 1, gy0);
+    let c = sample(gx0, gy0 + 1);
+    let d = sample(gx0 + 1, gy0 + 1);
+    let ab = a + (b - a) * tx;
+    let cd = c + (d - c) * tx;
+    ab + (cd - ab) * ty
 }
 
 /// `AngleDist` — shortest signed angular distance.
@@ -417,7 +487,8 @@ impl MapStatic for Flyer {
         self.pitch += d * mul;
 
         // Altitude tracking (1374-1382).
-        let newz = self.calc_z_in_point(map, self.pos.x, self.pos.y);
+        ensure_flyer_alt_grid(objs, map);
+        let newz = self.calc_z_in_point(map, objs, self.pos.x, self.pos.y);
         self.pos.z += (newz - self.pos.z) * mul;
         self.core.geo_center = self.pos;
     }

@@ -358,6 +358,32 @@ impl IFaceList {
         None
     }
 
+    /// Hover variant of [`Self::hit_test`] — additionally requires a
+    /// non-transparent source pixel under the cursor (`ElementAlpha`,
+    /// CIFaceElement.cpp:310-318; the C++ applies it in OnMouseMove
+    /// only, clicks catch on the plain rect).
+    pub fn hit_test_hover(
+        &self,
+        sx: f32,
+        sy: f32,
+        screen_w: f32,
+        screen_h: f32,
+    ) -> Option<(usize, usize)> {
+        let scale = (screen_h / DESIGN_H).max(0.1);
+        for (pi, p) in self.panels.iter().enumerate() {
+            if !p.visible {
+                continue;
+            }
+            let panel_px = p.resolved_pos(screen_w, screen_h, scale);
+            for (ei, e) in p.elements.iter().enumerate().rev() {
+                if e.hit(panel_px, scale, sx, sy) && e.hit_alpha(panel_px, scale, sx, sy) {
+                    return Some((pi, ei));
+                }
+            }
+        }
+        None
+    }
+
     /// Mouse-move event handler. Updates the `Focused` state of the
     /// element under the cursor, clearing the previous focus. Returns
     /// `(unfocused_name, focused_name)` describing any transition —
@@ -380,16 +406,43 @@ impl IFaceList {
             if let Some(popup) = self.popup.as_mut() {
                 popup.hovered = hovered;
             }
-            // While POPUP_MENU_ACTIVE the C++ blocks ALL non-static
-            // OnMouseMove (CInterface.cpp:979) — no button focus/hover
-            // transitions fire, so the popup hover-preview isn't
-            // clobbered. Hints are suppressed too, matching the
-            // `POPUP_MENU_ACTIVE` gate in `CheckShowHintLogic`
-            // (CInterface.cpp:4542-4549).
-            self.hint_system.clear();
+            // While POPUP_MENU_ACTIVE the C++ blocks non-static
+            // OnMouseMove (CInterface.cpp:961-979) — no button focus
+            // transitions fire — but STATICS still run their hint path
+            // (CIFaceStatic.cpp:26-40), e.g. the Top-panel resource
+            // icons keep their income tooltips.
+            let hit = self.hit_test(sx, sy, screen_w, screen_h);
+            let static_hint = hit.and_then(|(pi, ei)| {
+                let p = self.panels.get(pi)?;
+                let e = p.elements.get(ei)?;
+                if !matches!(e.kind, super::iface_element::ElementKind::Static)
+                    || e.hint_template.is_empty()
+                {
+                    return None;
+                }
+                let scale = (screen_h / DESIGN_H).max(0.1);
+                let panel_px = p.resolved_pos(screen_w, screen_h, scale);
+                let [ex, ey, _, _] = e.rect_in_panel(panel_px, scale);
+                Some((
+                    p.name.clone(),
+                    e.name.clone(),
+                    e.hint_template.clone(),
+                    e.hint_offset_x,
+                    e.hint_offset_y,
+                    ex,
+                    ey,
+                ))
+            });
+            match static_hint {
+                Some((pn, en, tpl, ox, oy, ex, ey)) => {
+                    self.hint_system
+                        .set_hovered(Some(&pn), Some(&en), Some(&tpl), ox, oy, ex, ey);
+                }
+                None => self.hint_system.clear(),
+            }
             return (None, None);
         }
-        let new_focus = self.hit_test(sx, sy, screen_w, screen_h);
+        let new_focus = self.hit_test_hover(sx, sy, screen_w, screen_h);
 
         let mut prev_pair: FocusTransition = None;
         let mut new_pair: FocusTransition = None;
@@ -413,11 +466,15 @@ impl IFaceList {
                         let is_button = matches!(e.kind, super::iface_element::ElementKind::Button);
                         // CIFaceElement::Reset (CIFaceElement.cpp:300-308)
                         // restores m_DefState only when not DISABLED.
-                        if is_button
-                            && !pressed_self
-                            && !matches!(e.cur_state, ElementState::Disabled)
-                        {
+                        // The C++ Reset()s the PRESSED element too when
+                        // the cursor drags off it (CInterface.cpp:979-
+                        // 984) — dropping the press so a later release
+                        // doesn't fire the click (CIFaceButton.cpp:106).
+                        if is_button && !matches!(e.cur_state, ElementState::Disabled) {
                             e.cur_state = e.def_state;
+                        }
+                        if pressed_self {
+                            self.pressed = None;
                         }
                         prev_pair = Some((p.name.clone(), e.name.clone()));
                     }
@@ -662,6 +719,7 @@ impl IFaceList {
                     use super::iface_element::ButtonType;
                     let mut latched = false;
                     let mut transitioned = false;
+                    let mut is_check_push = false;
                     if let Some(p) = self.panels.get_mut(pi) {
                         if let Some(e) = p.elements.get_mut(ei) {
                             match e.button_type {
@@ -698,6 +756,7 @@ impl IFaceList {
                                         e.cur_state = ElementState::Pressed;
                                         e.def_state = ElementState::Normal;
                                         transitioned = true;
+                                        is_check_push = true;
                                     }
                                 }
                             }
@@ -711,8 +770,15 @@ impl IFaceList {
                     }
                     // CIFaceButton.cpp:33-95 — sound only fires when a
                     // press/unpress transition actually happened.
+                    // CHECK_PUSH routes through the preset-toggle
+                    // dispatch (CIFaceButton.cpp:79-83) so `conf*`
+                    // slots get S_PRESET_CLICK.
                     if transitioned {
-                        super::sound::play(super::sound::for_push_button_down(&elem_name));
+                        super::sound::play(if is_check_push {
+                            super::sound::for_check_push_button_down(&elem_name)
+                        } else {
+                            super::sound::for_push_button_down(&elem_name)
+                        });
                     }
                 }
                 self.pressed = Some((pi, ei));
@@ -817,6 +883,11 @@ impl IFaceList {
                     // CInterface.cpp:585) + the resource-plant statics
                     // (titan/electr/energy/plasma).
                     click = Some(Click::Button(e.name.clone()));
+                    // The C++ releases the clicked button's hint
+                    // (CIFaceButton.cpp:97-103); the next hover
+                    // rebuilds it with fresh dynamic replacements
+                    // (costs, countdowns, toggle states).
+                    self.hint_system.clear();
                 }
             }
             if group_reset {

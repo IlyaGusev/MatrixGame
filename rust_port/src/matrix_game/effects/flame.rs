@@ -33,6 +33,10 @@ struct FlamePuff {
     bills: [Vec3; FLAME_NUM_BILLS],
     signs: [f32; FLAME_NUM_BILLS],
     cur_alpha: f32,
+    /// `m_Break` — set on the last puff of a firing burst so no
+    /// FLAMELINE spans across to the next burst
+    /// (MatrixEffectFlame.cpp:344-347).
+    break_after: bool,
 }
 
 /// `CMatrixEffectFlame`.
@@ -68,6 +72,13 @@ impl Flame {
     pub fn takt(&mut self, step: f32, map: &GameMap, objs: &mut Objects) -> bool {
         // Drain puffs the owning weapon queued via `AddPuff`.
         if let Some(w) = objs.weapons.get_mut(self.weapon) {
+            // Burst boundary (`Break()`, MatrixEffectWeapon.cpp:810-814).
+            if w.flame_break_pending {
+                w.flame_break_pending = false;
+                if let Some(last) = self.puffs.last_mut() {
+                    last.break_after = true;
+                }
+            }
             for p in w.pending_puffs.drain(..) {
                 let mut signs = [1.0f32; FLAME_NUM_BILLS];
                 for (i, sgn) in signs.iter_mut().enumerate() {
@@ -88,6 +99,7 @@ impl Flame {
                     bills: [p.pos; FLAME_NUM_BILLS],
                     signs,
                     cur_alpha: 0.0,
+                    break_after: false,
                 });
             }
         }
@@ -272,7 +284,10 @@ impl Flame {
             let k = p.time * ttl_inv;
             let k1 = 1.0 - ((k - 0.5) / 0.5).clamp(0.0, 1.0);
             let lin_scale = k * FLAME_SCALE_FACTOR + 1.5;
-            p.cur_alpha = 255.0 * k1 * k1;
+            // Head billboard fades LINEARLY (`m_Alpha*k1`,
+            // MatrixEffectFlame.cpp:221/241); only the trailing bills
+            // use k1² (:245). Tail alpha derived at draw time.
+            p.cur_alpha = 255.0 * k1;
             p.bills[0] = p.pos;
             for i in 1..FLAME_NUM_BILLS {
                 let delta = p.bills[i - 1] - p.bills[i];
@@ -294,18 +309,28 @@ impl Flame {
         // when the gap is under scale*2.
         for w in self.puffs.windows(2) {
             let (prev, cur) = (&w[0], &w[1]);
-            let width = cur.scale * 2.0;
+            // No stream across firing bursts (`m_Break`,
+            // MatrixEffectWeapon.cpp:810-814 + MatrixEffectFlame.cpp:
+            // 344-347).
+            if prev.break_after {
+                continue;
+            }
+            // Width/alpha come from the OLDER endpoint
+            // (MatrixEffectFlame.cpp:97-106).
+            let width = prev.scale * 2.0;
             let l = (prev.pos - cur.pos).length();
             let a = if l < width && width > 1e-6 {
-                cur.cur_alpha * (l * 0.5 / cur.scale)
+                prev.cur_alpha * (l * 0.5 / prev.scale)
             } else {
-                cur.cur_alpha
+                prev.cur_alpha
             };
             let color = ((a as u32) << 24) | 0x00FF_FFFF;
             q.line(prev.pos, cur.pos, width, color, TexRef::Bbt(BBT_FLAMELINE));
         }
         for p in &self.puffs {
             let angle_base = std::f32::consts::TAU / 1024.0 * ((p.time as i32 & 1023) as f32);
+            // Trailing bills fade with k1² (MatrixEffectFlame.cpp:245).
+            let tail_alpha = p.cur_alpha * p.cur_alpha / 255.0;
             for i in 0..FLAME_NUM_BILLS {
                 let angle = angle_base * p.signs[i];
                 let color = if i == 0 {
@@ -314,7 +339,7 @@ impl Flame {
                     let kk = 1.0 - i as f32 / FLAME_NUM_BILLS as f32;
                     let rg = (kk * 128.0) as u32;
                     let b = ((kk * 512.0) as u32).min(255);
-                    ((p.cur_alpha as u32) << 24) | (rg << 16) | (rg << 8) | b
+                    ((tail_alpha as u32) << 24) | (rg << 16) | (rg << 8) | b
                 };
                 q.billboard(p.bills[i], p.scale, angle, color, TexRef::Bbt(BBT_FLAME));
             }

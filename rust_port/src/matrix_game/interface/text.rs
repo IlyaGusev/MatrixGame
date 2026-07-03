@@ -555,11 +555,13 @@ pub struct RichRun {
 ///   `<br>` — line break (already converted to `\r\n` upstream by
 ///   `make_item_replacements`, so we don't need to parse it here).
 ///
-/// Tags don't nest in the shipped data (the C++ never constructs
-/// nested ones); a stray `</color>` outside an open run is ignored.
+/// Nested tags keep a color STACK so `</color>` restores the
+/// enclosing run's color rather than dropping to the default (the
+/// shipped data doesn't nest today, but templated substitutions can).
 pub fn parse_rich_text(text: &str) -> Vec<RichRun> {
     let mut runs: Vec<RichRun> = Vec::new();
     let mut buf = String::new();
+    let mut stack: Vec<[u8; 4]> = Vec::new();
     let mut current: Option<[u8; 4]> = None;
     let bytes = text.as_bytes();
     let mut i = 0;
@@ -577,6 +579,9 @@ pub fn parse_rich_text(text: &str) -> Vec<RichRun> {
                         color: current,
                     });
                 }
+                if let Some(c) = current {
+                    stack.push(c);
+                }
                 current = Some(color);
                 i += consumed;
                 continue;
@@ -588,7 +593,7 @@ pub fn parse_rich_text(text: &str) -> Vec<RichRun> {
                         color: current,
                     });
                 }
-                current = None;
+                current = stack.pop();
                 i += consumed;
                 continue;
             }

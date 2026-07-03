@@ -223,7 +223,10 @@ impl Storage {
         };
         let mut out = Vec::new();
         for i in 0..keys.arrays_count() {
-            if keys.get_as_wstr(i) == key {
+            // Same case-insensitive compare as `block_param` /
+            // `find_as_wstr` — a mixed-case repeated key must not be
+            // found by the single getter yet skipped here.
+            if keys.get_as_wstr(i).eq_ignore_ascii_case(key) {
                 out.push(values.get_as_wstr(i));
             }
         }
