@@ -461,6 +461,9 @@ pub struct Objects {
     /// `RobotSpawn` rally (AssignPlace + PGOrderAttack,
     /// MatrixRobot.cpp:2204-2223), which needs side/place access.
     pub pending_spawn_rallies: Vec<ObjectId>,
+    /// Freshly produced AI-side robots awaiting `ClacSpawnTeam`
+    /// (MatrixRobot.cpp:2204-2205). Drained by the side-AI takt.
+    pub pending_ai_spawn: Vec<ObjectId>,
     /// World-sound dispatch queue — `(canonical Sounds-block key,
     /// optional world position)` for every `CSound::Play/AddSound`
     /// call site in ported code. Drained (unheard) each takt like the
@@ -612,6 +615,7 @@ impl Objects {
             pending_explosions: Vec::new(),
             pending_refunds: Vec::new(),
             pending_spawn_rallies: Vec::new(),
+            pending_ai_spawn: Vec::new(),
             pending_sounds: Vec::new(),
             flyer_alt_grid: Vec::new(),
             pending_point_lights: Vec::new(),

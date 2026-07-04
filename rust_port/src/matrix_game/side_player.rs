@@ -3,11 +3,10 @@
 //! `PGOrder*` command family, the `PG*` placement helpers, and the
 //! file-scope inline helpers at MatrixSide.cpp:9353-9548.
 //!
-//! The enemy-AI sides (`TaktHL` / `TaktTL` / team logic) are out of
-//! scope by project decision, so everything here operates on
-//! `MapLogic::player_side` directly — which also keeps the borrow
-//! splits trivial (`&mut self.player_side` + `&self.objects` are
-//! disjoint fields).
+//! The enemy-AI sides (`TaktHL` / `TaktTL` / team logic) live in
+//! `side_ai.rs`; the side-generic helpers here (underfire recalc,
+//! escape-from-bomb, fire correction, enemy picking) are shared with
+//! it via side-id parameters.
 //!
 //! Locking discipline: the road network sits behind a `Mutex` on
 //! `GameMap`. Helpers that need a single place lookup lock/unlock
@@ -146,7 +145,7 @@ pub fn is_in_place(map: &GameMap, r: &Robot) -> bool {
 }
 
 /// Place `m_Data` write (occupancy scratch).
-fn place_set_data(map: &GameMap, no: i32, v: u32) {
+pub(crate) fn place_set_data(map: &GameMap, no: i32, v: u32) {
     if no < 0 {
         return;
     }
@@ -158,7 +157,7 @@ fn place_set_data(map: &GameMap, no: i32, v: u32) {
     }
 }
 
-fn place_get(map: &GameMap, no: i32) -> Option<(u32, u8, (i32, i32), u8)> {
+pub(crate) fn place_get(map: &GameMap, no: i32) -> Option<(u32, u8, (i32, i32), u8)> {
     if no < 0 {
         return None;
     }
@@ -171,13 +170,13 @@ fn place_get(map: &GameMap, no: i32) -> Option<(u32, u8, (i32, i32), u8)> {
 /// places" loop repeated all over WarPL / RepairPL / PGAssignPlace).
 /// Robots claim `env.place`; live cannons claim their `place` (set
 /// from `FindInPL` at build/load, MatrixSide.cpp:9436-9461).
-fn mark_occupied_places(map: &GameMap, objs: &Objects) {
+pub(crate) fn mark_occupied_places(map: &GameMap, objs: &Objects) {
     mark_occupied_places_skip(map, objs, None)
 }
 
 /// `mark_occupied_places` with the `obj != robot` exemption the C++
 /// per-robot AssignPlace uses (MatrixSide.cpp:5284-5288).
-fn mark_occupied_places_skip(map: &GameMap, objs: &Objects, skip: Option<ObjectId>) {
+pub(crate) fn mark_occupied_places_skip(map: &GameMap, objs: &Objects, skip: Option<ObjectId>) {
     for id in objs.iter_live() {
         if Some(id) == skip || !is_live_unit(objs, id) {
             continue;
@@ -191,7 +190,7 @@ fn mark_occupied_places_skip(map: &GameMap, objs: &Objects, skip: Option<ObjectI
 }
 
 /// Zero `m_Data` for every place in `list`.
-fn zero_places(map: &GameMap, list: &[i32]) {
+pub(crate) fn zero_places(map: &GameMap, list: &[i32]) {
     if let Some(rn) = map.road_network.as_ref() {
         let mut rn = rn.lock().unwrap();
         for &i in list {
@@ -203,7 +202,7 @@ fn zero_places(map: &GameMap, list: &[i32]) {
 }
 
 /// Chassis mask bit — `1 << (m_Unit[0].m_Kind - 1)`.
-fn chassis_bit(r: &Robot) -> u8 {
+pub(crate) fn chassis_bit(r: &Robot) -> u8 {
     1u8 << r.chassis.kind_index()
 }
 
@@ -226,7 +225,11 @@ impl MapLogic {
     /// Live player robots of logic group `no` (helper for the many
     /// `GetFirstLogic … GetGroupLogic()==no` walks).
     fn group_robots(&self, no: usize) -> Vec<ObjectId> {
-        let side_id = self.player_side.id;
+        self.group_robots_of(self.player_side.id, no)
+    }
+
+    /// Live robots of side `side_id` in logic group `no`.
+    pub(crate) fn group_robots_of(&self, side_id: i32, no: usize) -> Vec<ObjectId> {
         self.objects
             .iter_live()
             .filter(|&id| {
@@ -239,7 +242,11 @@ impl MapLogic {
 
     /// All live player robots.
     fn side_robots(&self) -> Vec<ObjectId> {
-        let side_id = self.player_side.id;
+        self.side_robots_of(self.player_side.id)
+    }
+
+    /// All live robots of side `side_id`.
+    pub(crate) fn side_robots_of(&self, side_id: i32) -> Vec<ObjectId> {
         self.objects
             .iter_live()
             .filter(|&id| {
@@ -253,11 +260,11 @@ impl MapLogic {
     /// Port of the underfire recalculation at MatrixSide.cpp:6054-6107
     /// — every place's `m_Underfire` counts enemy units whose max
     /// (and, doubled, min) fire range covers it.
-    fn underfire_calc(&mut self, map: &GameMap) {
+    pub(crate) fn underfire_calc(&mut self, map: &GameMap, my_id: i32) {
         let Some(rn_lock) = map.road_network.as_ref() else {
             return;
         };
-        let side_id = self.player_side.id;
+        let side_id = my_id;
 
         // Collect enemy fire envelopes first to keep the rn lock scope
         // clean of arena reads.
@@ -346,7 +353,7 @@ impl MapLogic {
     /// Player-side automation: auto-ordered robots retreat from nearby
     /// bomb-carrying robots (friendly or enemy) so they aren't caught in
     /// the blast; robots covering a friendly bomb-carrier stay put.
-    fn escape_from_bomb(&mut self, map: &GameMap) {
+    pub(crate) fn escape_from_bomb(&mut self, map: &GameMap, sid: i32) {
         use crate::matrix_game::common::float2int;
         use crate::matrix_game::road_network::Point;
         use crate::matrix_game::side::PlayerOrder;
@@ -356,10 +363,12 @@ impl MapLogic {
         let gsm = GameMap::GLOBAL_SCALE_MOVE;
         let escape_dist = float2int(ESCAPE_RADIUS / gsm) + 4;
         let escape_dist2 = (escape_dist as i64) * (escape_dist as i64);
-        let my_id = self.player_side.id;
+        let my_id = sid;
         let auto_cap = PlayerOrder::AutoCapture as u8;
+        // The manual-order exemption only exists for the player side
+        // (C++ guards each check with `m_Id==PLAYER_SIDE`).
         let is_manual = |gl: i32, ps: &crate::matrix_game::side::Side| -> bool {
-            gl >= 0 && (ps.player_groups[gl as usize].order as u8) < auto_cap
+            sid == ps.id && gl >= 0 && (ps.player_groups[gl as usize].order as u8) < auto_cap
         };
 
         // Pass 1: bomb robots (any side) with enemies nearby.
@@ -625,15 +634,23 @@ impl MapLogic {
         }
         self.player_side.last_takt_pl = now;
 
-        // Player robots dodge bomb blasts (MatrixSide.cpp:6051). CalcStrength
-        // is refreshed per-frame in GatherInfo instead.
-        self.escape_from_bomb(map);
+        // CalcStrength (MatrixSide.cpp:6049) — the enemy AI reads every
+        // side's cached strength when picking its war target.
+        let res = self.player_side.resources;
+        self.player_side.strength = self.calc_side_strength(
+            self.player_side.id,
+            &res,
+            self.player_side.strength_mul,
+        );
+
+        // Player robots dodge bomb blasts (MatrixSide.cpp:6051).
+        self.escape_from_bomb(map, self.player_side.id);
 
         if self.player_side.last_takt_underfire == 0
             || now - self.player_side.last_takt_underfire > 500
         {
             self.player_side.last_takt_underfire = now;
-            self.underfire_calc(map);
+            self.underfire_calc(map, self.player_side.id);
         }
 
         let side_id = self.player_side.id;
@@ -1419,8 +1436,13 @@ impl MapLogic {
     /// The "nearest open enemy, else nearest covered enemy" scan
     /// (MatrixSide.cpp:7027-7086 / 7297-7358). Returns the chosen
     /// enemy, or `None`.
-    fn pick_enemy_for(&self, map: &GameMap, rid: ObjectId, prefer: Option<ObjectId>) -> Option<ObjectId> {
-        let side_id = self.player_side.id;
+    pub(crate) fn pick_enemy_for(
+        &self,
+        map: &GameMap,
+        side_id: i32,
+        rid: ObjectId,
+        prefer: Option<ObjectId>,
+    ) -> Option<ObjectId> {
         let me = robot_ref(&self.objects, rid)?;
         let my_pos = get_world_pos(&self.objects, rid)?;
         let from = me.core().geo_center;
@@ -1455,7 +1477,7 @@ impl MapLogic {
                 continue;
             }
             let dir = (des - from) / dist;
-            if !self.friendly_in_fire_line(rid, eid, from, dir, dist) {
+            if !self.friendly_in_fire_line(side_id, rid, eid, from, dir, dist) {
                 mindist = cd;
                 found = Some(eid);
             }
@@ -1477,7 +1499,6 @@ impl MapLogic {
                 }
             }
         }
-        let _ = side_id;
         found
     }
 
@@ -1486,13 +1507,13 @@ impl MapLogic {
     /// own live units sits within 25 units of the fire line.
     fn friendly_in_fire_line(
         &self,
+        side_id: i32,
         rid: ObjectId,
         target: ObjectId,
         from: glam::Vec3,
         dir: glam::Vec3,
         dist: f32,
     ) -> bool {
-        let side_id = self.player_side.id;
         for oid in self.objects.iter_live() {
             if oid == rid || oid == target {
                 continue;
@@ -1523,11 +1544,23 @@ impl MapLogic {
     /// tail of FirePL (MatrixSide.cpp:7093-7229) and WarPL
     /// (7682-7854). `war` enables the WarPL-only stuck-recovery rules.
     fn fire_correction(&mut self, map: &GameMap, group: usize, war: bool) -> bool {
+        let robots = self.group_robots(group);
+        self.fire_correction_for(map, self.player_side.id, &robots, war)
+    }
+
+    /// Side-generic body — also the WarTL fire-correction tail
+    /// (MatrixSide.cpp:5038-5214).
+    pub(crate) fn fire_correction_for(
+        &mut self,
+        map: &GameMap,
+        side_id: i32,
+        robots: &[ObjectId],
+        war: bool,
+    ) -> bool {
         let mut rv = false;
         let now = self.elapsed_ms as i32;
-        let side_id = self.player_side.id;
 
-        for &rid in &self.group_robots(group) {
+        for &rid in robots {
             let Some(target) = ({
                 let r = robot_ref(&self.objects, rid).unwrap();
                 let t = r.env.target_attack;
@@ -1569,7 +1602,7 @@ impl MapLogic {
 
             if fireline && dist > 0.0 {
                 let dir = (des - from) / dist;
-                if self.friendly_in_fire_line(rid, target, from, dir, dist) {
+                if self.friendly_in_fire_line(side_id, rid, target, from, dir, dist) {
                     fireline = false;
                 }
             }
@@ -1825,7 +1858,7 @@ impl MapLogic {
                     .unwrap_or(false)
             };
             if need_new {
-                if let Some(found) = self.pick_enemy_for(map, rid, None) {
+                if let Some(found) = self.pick_enemy_for(map, self.player_side.id, rid, None) {
                     if let Some(r) = robot_mut(&mut self.objects, rid) {
                         r.env.target_attack = Some(found);
                     }
@@ -2206,7 +2239,9 @@ impl MapLogic {
                 .target_attack
                 .is_none();
             if need {
-                if let Some(found) = self.pick_enemy_for(map, rid, pg_obj.filter(|&o| o != rid)) {
+                if let Some(found) =
+                    self.pick_enemy_for(map, self.player_side.id, rid, pg_obj.filter(|&o| o != rid))
+                {
                     let reposition = cannon_ref(&self.objects, found)
                         .map(|c| {
                             !matches!(c.state, CannonState::Dip | CannonState::UnderConstruction)
@@ -4888,7 +4923,7 @@ impl MapLogic {
     /// (MatrixSide.cpp:5270-5301) — pick the first free, standable
     /// place in `region` for this robot (keeping the current place if
     /// it's already in the region).
-    fn assign_place_robot(&mut self, map: &GameMap, rid: ObjectId, region: i32) {
+    pub(crate) fn assign_place_robot(&mut self, map: &GameMap, rid: ObjectId, region: i32) {
         if region < 0 {
             return;
         }

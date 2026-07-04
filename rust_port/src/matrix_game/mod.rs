@@ -33,6 +33,7 @@ pub mod road_network;
 pub mod robot;
 pub mod shadow;
 pub mod side;
+pub mod side_ai;
 pub mod side_player;
 pub mod slot_marker;
 pub mod ter_surface;

@@ -1674,14 +1674,11 @@ impl AIRobotCatalogue {
         Self { bots }
     }
 
-    /// Load the AI catalogue from `da/AI/Robots`. The C++
-    /// (MatrixConfig.cpp loads it indirectly via `LoadAIRobotType`) —
-    /// we call directly with the storage handle.
+    /// Load the AI catalogue from the root `AIRobotType` block — the
+    /// `SSpecialBot::LoadAIRobotType(*g_MatrixData->BlockGet(L"AIRobotType"))`
+    /// call at MatrixGame.cpp:412.
     pub fn from_matrix_data(stor: &crate::matrix_lib::base::storage::Storage) -> Self {
-        let Some(ai_rec) = stor.block_record("da", "AI") else {
-            return Self::default();
-        };
-        let Some(robots_rec) = stor.block_record(&ai_rec, "Robots") else {
+        let Some(robots_rec) = stor.block_record("da", "AIRobotType") else {
             return Self::default();
         };
         let (Some(keys), Some(values)) = (

@@ -74,6 +74,7 @@ Form, Helper, ShadowProj, ShadowStencil. (Math3D partial — CTrajectory.)
 | matrix_game/render_pipeline.rs| MatrixRenderPipeline.cpp          |
 | matrix_game/side.rs           | MatrixSide.cpp (CMatrixSideUnit data: selection, resources, statistics) |
 | matrix_game/side_player.rs    | MatrixSide.cpp player-side logic (TaktPL, PGOrder*, FirePL, underfire recalc, group placement) |
+| matrix_game/side_ai.rs        | MatrixSide.cpp enemy-AI logic (TaktHL, TaktTL, WarTL/RepairTL, Regroup, BuildRobot/BuildCannon, ClacSpawnTeam) |
 | matrix_game/ter_surface.rs    | MatrixTerSurface.cpp              |
 | matrix_game/robot.rs          | MatrixRobot.cpp (CMatrixRobotAI — full order pool (SOrder), spawn/move-out, MoveTo + collision callback + step-aside, GetLost, SBotWeapon fire control / heat / Damage / DOT) |
 | matrix_game/water.rs          | MatrixWater.cpp + BuildWater in MatrixMapGroup.cpp + WaterAlpha_t3 in MatrixRenderPipeline.cpp — will split in Stage 2 part 2 |

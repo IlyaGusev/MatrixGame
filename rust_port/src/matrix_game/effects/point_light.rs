@@ -617,6 +617,7 @@ mod tests {
             shadow_color: 0,
             robots: Vec::new(),
             side_res_info: Vec::new(),
+            side_ai_info: Vec::new(),
             maintenance_prc: 100,
             effect_spawners: Vec::new(),
             ground_z_base_middle: 0.0,

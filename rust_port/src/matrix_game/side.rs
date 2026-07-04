@@ -3,9 +3,9 @@
 //! CMatrixSide in the original is ~thousands of lines covering
 //! selection state, logical-group rosters, resource accounts, AI
 //! planners, strategy orders, stats, and arcaded-robot handover.
-//! This file ports only the selection fields the interface /
-//! building-selection flow reads in the C++, leaving the logic/AI /
-//! resources / stats for later.
+//! This file holds the per-side data: selection state, resources,
+//! stats, player groups, and the enemy-AI structures (logic groups,
+//! teams, region stats) driven by `side_ai.rs`.
 //!
 //! What's here:
 //! * `CurrSel` enum — mirrors the C++ per-side "what's currently
@@ -28,6 +28,127 @@ pub const MAX_LOGIC_GROUP: usize = MAX_ROBOTS + 1;
 pub const REGION_PATH_MAX_CNT: usize = 32;
 /// `FRIENDLY_SEARCH_RADIUS` (MatrixSide.hpp:30).
 pub const FRIENDLY_SEARCH_RADIUS: f32 = 400.0;
+/// `MAX_TEAM_CNT` (MatrixSide.hpp:19).
+pub const MAX_TEAM_CNT: usize = 3;
+
+/// Port of `EMatrixLogicActionType` (MatrixSide.hpp:155-166).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub enum LogicActionType {
+    #[default]
+    None,
+    Defence,
+    Attack,
+    Forward,
+    Retreat,
+    Capture,
+    Intercept,
+}
+
+/// Port of `SMatrixLogicAction` (MatrixSide.hpp:173-178).
+#[derive(Debug, Clone, Default)]
+pub struct LogicAction {
+    pub ty: LogicActionType,
+    pub region: i32,
+    /// `m_RegionPath[REGION_PATH_MAX_CNT]` + `m_RegionPathCnt`.
+    pub region_path: Vec<i32>,
+}
+
+/// Port of `SMatrixLogicGroup` (MatrixSide.hpp:180-198). The C++ packs
+/// robots-cnt + war into `m_Bits`; plain fields here.
+#[derive(Debug, Clone, Default)]
+pub struct LogicGroup {
+    pub robots_cnt: i32,
+    pub war: bool,
+    pub action: LogicAction,
+    pub team: i32,
+    pub strength: f32,
+}
+
+/// Port of `SMatrixTeam` (MatrixSide.hpp:247-325). The ctor zeroes the
+/// struct and sets `m_TargetRegion=-1` (MatrixSide.cpp:194-198).
+#[derive(Debug, Clone)]
+pub struct SideTeam {
+    /// `Move()` — chassis-kind bitmask of the team's robots.
+    pub move_mask: u8,
+    pub war: bool,
+    pub stay: bool,
+    pub wait_union: bool,
+    pub robot_in_des_region: bool,
+    pub regroup_only_after_war: bool,
+    pub l_ok: bool,
+    pub robot_cnt: i32,
+    pub group_cnt: i32,
+    pub wait_union_last: i32,
+    pub strength: f32,
+    pub target_region: i32,
+    pub center_mass: (i32, i32),
+    pub radius_mass: i32,
+    /// `m_Rect` (left, top, right, bottom).
+    pub rect: (i32, i32, i32, i32),
+    pub center: (i32, i32),
+    pub radius: i32,
+    pub region_mass_prev: i32,
+    pub region_mass: i32,
+    pub region_near_danger: i32,
+    pub region_far_danger: i32,
+    pub region_near_enemy: i32,
+    pub region_near_retreat: i32,
+    pub region_near_forward: i32,
+    pub region_nearest_base: i32,
+    /// `m_Brave` — timestamp when bravery kicked in (0 = not brave).
+    pub brave: i32,
+    pub brave_strange_cancel: f32,
+    /// `m_ActionList[16]` + `m_ActionCnt`.
+    pub action_list: Vec<LogicAction>,
+    pub action: LogicAction,
+    pub action_prev: LogicAction,
+    pub action_time: i32,
+    pub region_next: i32,
+    pub road_path: RoadRoute,
+    /// `m_RegionList`/`m_RegionListRobots` + cnt — (region, robots).
+    pub region_list: Vec<(i32, i32)>,
+}
+
+impl Default for SideTeam {
+    fn default() -> Self {
+        Self {
+            move_mask: 0,
+            war: false,
+            stay: false,
+            wait_union: false,
+            robot_in_des_region: false,
+            regroup_only_after_war: false,
+            l_ok: false,
+            robot_cnt: 0,
+            group_cnt: 0,
+            wait_union_last: 0,
+            strength: 0.0,
+            target_region: -1,
+            center_mass: (0, 0),
+            radius_mass: 0,
+            rect: (0, 0, 0, 0),
+            center: (0, 0),
+            radius: 0,
+            region_mass_prev: 0,
+            region_mass: 0,
+            region_near_danger: 0,
+            region_far_danger: 0,
+            region_near_enemy: 0,
+            region_near_retreat: 0,
+            region_near_forward: 0,
+            region_nearest_base: 0,
+            brave: 0,
+            brave_strange_cancel: 0.0,
+            action_list: Vec::new(),
+            action: LogicAction::default(),
+            action_prev: LogicAction::default(),
+            action_time: 0,
+            region_next: -1,
+            road_path: RoadRoute::default(),
+            region_list: Vec::new(),
+        }
+    }
+}
 
 /// Port of `ESideStatus` (MatrixSide.hpp:103-112).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -318,12 +439,56 @@ pub struct Side {
     /// Cycles the S_SELECTION_1..7 voice pick (C++ uses Rnd(0,6),
     /// MatrixSide.cpp:978-993).
     pub sel_voice_seed: u32,
+
+    // ── Enemy-AI state (MatrixSide.cpp ctor 156-233) ────────────────
+    /// `m_TimeNextBomb` — min interval between bomb-robot builds;
+    /// map `SideAIInfo` TBB overrides with `GetTime() + val`.
+    pub time_next_bomb: i32,
+    /// `m_TimeLastBomb`.
+    pub time_last_bomb: i32,
+    /// `m_StrengthMul` (SK).
+    pub strength_mul: f32,
+    /// `m_BraveMul` (BK).
+    pub brave_mul: f32,
+    /// `m_DangerMul` (DK).
+    pub danger_mul: f32,
+    /// `m_WaitResMul` (WRK).
+    pub wait_res_mul: f32,
+    /// `m_TeamCnt` (TC), 1..=3.
+    pub team_cnt: i32,
+    /// `m_Strength` — cached side strength from `CalcStrength`.
+    pub strength: f32,
+    /// `m_WarSide` — the side id we currently focus attacks on.
+    pub war_side: i32,
+    /// `m_NextWarSideCalcTime`.
+    pub next_war_side_calc_time: i32,
+    /// `m_LastTaktHL` (AI sides; the player reuses `last_takt_pl`).
+    pub last_takt_hl: i32,
+    /// `m_LastTaktTL`.
+    pub last_takt_tl: i32,
+    /// `m_LastTeamChange`.
+    pub last_team_change: i32,
+    /// `m_WaitResForBuildRobot` — AI-catalogue index we're saving up
+    /// for, -1 = none.
+    pub wait_res_for_build_robot: i32,
+    /// `m_BuildRobotLast/2/3` — last three built template indices.
+    pub build_robot_last: i32,
+    pub build_robot_last2: i32,
+    pub build_robot_last3: i32,
+    /// `m_LogicGroup[MAX_LOGIC_GROUP]` — AI logic groups (the player
+    /// uses `player_groups` instead).
+    pub logic_groups: Vec<LogicGroup>,
+    /// `m_Team[MAX_TEAM_CNT]`.
+    pub teams: Vec<SideTeam>,
 }
 
-/// Port of `SMatrixLogicRegion` (MatrixSide.hpp:327-355) — the subset
-/// the player-order logic reads (war-counters are TaktHL-only).
+/// Port of `SMatrixLogicRegion` (MatrixSide.hpp:327-355).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LogicRegion {
+    pub war_enemy_robot_cnt: i32,
+    pub war_enemy_cannon_cnt: i32,
+    pub war_enemy_building_cnt: i32,
+    pub war_enemy_base_cnt: i32,
     pub enemy_robot_cnt: i32,
     pub enemy_cannon_cnt: i32,
     pub enemy_building_cnt: i32,
@@ -335,6 +500,9 @@ pub struct LogicRegion {
     pub our_cannon_cnt: i32,
     pub our_building_cnt: i32,
     pub our_base_cnt: i32,
+    pub enemy_robot_dist: i32,
+    pub enemy_building_dist: i32,
+    pub our_base_dist: i32,
     pub danger: f32,
     pub danger_add: f32,
     pub data: u32,
@@ -371,7 +539,44 @@ impl Side {
             region_index: Vec::new(),
             base_sel_sound_enabled: false,
             sel_voice_seed: 0,
+            time_next_bomb: 60000,
+            time_last_bomb: 0,
+            strength_mul: 1.0,
+            brave_mul: 0.5,
+            danger_mul: 1.0,
+            wait_res_mul: 1.0,
+            team_cnt: 3,
+            strength: 0.0,
+            war_side: -1,
+            next_war_side_calc_time: 0,
+            last_takt_hl: 0,
+            last_takt_tl: 0,
+            last_team_change: 0,
+            wait_res_for_build_robot: -1,
+            build_robot_last: -1,
+            build_robot_last2: -1,
+            build_robot_last3: -1,
+            logic_groups: std::iter::repeat_with(LogicGroup::default)
+                .take(MAX_LOGIC_GROUP)
+                .collect(),
+            teams: std::iter::repeat_with(SideTeam::default)
+                .take(MAX_TEAM_CNT)
+                .collect(),
         }
+    }
+
+    /// `ClearTeam` (MatrixSide.cpp:2013-2025).
+    pub fn clear_team(&mut self, team: usize) {
+        let t = &mut self.teams[team];
+        t.target_region = -1;
+        t.action.ty = LogicActionType::None;
+        t.action.region_path.clear();
+        t.war = false;
+        t.brave = 0;
+        t.brave_strange_cancel = 0.0;
+        t.regroup_only_after_war = false;
+        t.wait_union = false;
+        t.wait_union_last = 0;
     }
 
     /// `GetStatValue` / `SetStatValue` / `IncStatValue`

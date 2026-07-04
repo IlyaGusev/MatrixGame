@@ -205,6 +205,10 @@ impl BuildStack {
     pub fn items(&self) -> usize {
         self.items.len()
     }
+
+    pub fn iter(&self) -> impl Iterator<Item = &PendingItem> {
+        self.items.iter()
+    }
     /// Port of `CBuildStack::GetRobotsCnt` (MatrixObjectBuilding.cpp:
     /// 1938-1950) — only queued robots count toward the robot cap.
     pub fn robots_cnt(&self) -> usize {
@@ -389,6 +393,12 @@ impl BuildStack {
                 // RobotSpawn rally (MatrixRobot.cpp:2216-2221): player
                 // robots get a place near the base + a muted
                 // attack-move there so they disperse after move-out.
+                if head.side != crate::matrix_game::common::PLAYER_SIDE {
+                    // AI robots pick a team via ClacSpawnTeam
+                    // (MatrixRobot.cpp:2204-2205), applied by the side
+                    // AI on its next takt.
+                    objs.pending_ai_spawn.push(id);
+                }
                 if head.side == crate::matrix_game::common::PLAYER_SIDE {
                     objs.pending_spawn_rallies.push(id);
                     // S_ROBOT_BUILD_END(_ALT) 50/50

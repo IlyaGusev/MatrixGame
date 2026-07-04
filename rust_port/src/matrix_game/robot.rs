@@ -236,6 +236,9 @@ pub struct Robot {
     /// borrow impossible, so the PG layer hands each group member an
     /// `Arc` of the route whenever it changes.
     pub group_road_path: Option<std::sync::Arc<crate::matrix_game::road_network::RoadRoute>>,
+    /// AI-side "can't reach destination" marker (MatrixRobot.cpp:
+    /// 1601-1604) — the side AI reassigns team + logic group.
+    pub zone_path_fail_reteam: bool,
 
     /// `m_CollAvoid` (MatrixRobot.hpp — per-instance). Unit vector the
     /// WallAvoid hint pushes Seek to steer along when hugging a wall.
@@ -509,6 +512,7 @@ impl Robot {
             env: crate::matrix_game::logic::environment::Info::new(),
             group_logic: -1,
             group_road_path: None,
+            zone_path_fail_reteam: false,
             animation: Animation::Off,
             chassis_anim: Default::default(),
             armor_anim: Default::default(),
@@ -1465,6 +1469,15 @@ impl Robot {
             self.zone_path_next = 1;
         } else {
             self.zone_path_next = -1;
+        }
+        // AI robots that can't reach their zone change team
+        // (MatrixRobot.cpp:1601-1604) — flagged for the side AI takt.
+        if self.side != crate::matrix_game::common::PLAYER_SIDE
+            && self.side != 0
+            && self.zone_cur != self.zone_des
+            && self.zone_path.is_empty()
+        {
+            self.zone_path_fail_reteam = true;
         }
     }
 

@@ -137,6 +137,9 @@ pub struct MapLogic {
     /// `m_MaintenancePRC` (MatrixMap.hpp:435) — map-level maintenance
     /// scale percent; 0 disables.
     pub maintenance_prc: i32,
+    /// Side id → name from the `da/Side` data block (the map's
+    /// `SideAIInfo` property addresses sides by name).
+    pub side_names: Vec<(i32, String)>,
 }
 
 impl Default for MapLogic {
@@ -183,6 +186,7 @@ impl MapLogic {
             robot_in_position: false,
             maintenance_time: 0,
             maintenance_prc: 100,
+            side_names: Vec::new(),
         }
     }
 
@@ -340,6 +344,38 @@ impl MapLogic {
                 su.set_resource_force_up(fu);
             }
         }
+        // Per-side AI tuning (MatrixMapPrepare.cpp:430-458). Names map
+        // to ids via the da/Side block loaded in `load_config`.
+        let now = self.elapsed_ms as i32;
+        for (name, pairs) in &map.side_ai_info {
+            let Some(&(id, _)) = self
+                .side_names
+                .iter()
+                .find(|(_, n)| n.eq_ignore_ascii_case(name))
+            else {
+                continue;
+            };
+            let Some(su) = self.side_by_id_mut(id) else {
+                continue;
+            };
+            for (k, v) in pairs {
+                match k.as_str() {
+                    "TBB" => su.time_next_bomb = now + v.parse::<i32>().unwrap_or(0),
+                    "SK" => su.strength_mul = v.parse().unwrap_or(1.0),
+                    "DK" => su.danger_mul = v.parse().unwrap_or(1.0),
+                    "WRK" => su.wait_res_mul = v.parse().unwrap_or(1.0),
+                    "BK" => su.brave_mul = v.parse().unwrap_or(0.5),
+                    "TC" => su.team_cnt = v.parse::<i32>().unwrap_or(3).clamp(1, 3),
+                    _ => {}
+                }
+            }
+        }
+        // Assign pre-placed team-less AI robots to fresh logic groups
+        // (GroupNoTeamRobot for every side, MatrixMapPrepare.cpp:1735).
+        let ids: Vec<i32> = self.other_sides.iter().map(|s| s.id).collect();
+        for sid in ids {
+            self.group_no_team_robot(map, sid);
+        }
     }
 
     /// Port of the logic-takt portion of `CMatrixMapLogic::Takt`
@@ -376,16 +412,20 @@ impl MapLogic {
         if rem > 0 {
             self.objects.proceed_logic(rem, &mut self.rng);
         }
-        // `m_Side[i].LogicTakt(LOGIC_TAKT_PERIOD)` — player side only
-        // (enemy-AI sides excluded by scope). The C++ paces these on
-        // the `m_TaktNext += 10` accumulator (MatrixLogic.cpp:2737-
-        // 2745), so fractional frame remainders carry over and the
-        // side gets exactly 100 takts per game-second at any FPS.
+        // `m_Side[i].LogicTakt(LOGIC_TAKT_PERIOD)` for every side. The
+        // C++ paces these on the `m_TaktNext += 10` accumulator
+        // (MatrixLogic.cpp:2737-2745), so fractional frame remainders
+        // carry over and each side gets exactly 100 takts per
+        // game-second at any FPS.
         self.side_takt_carry += step_ms;
         while self.side_takt_carry >= LOGIC_TAKT_PERIOD_MS {
             self.side_takt_carry -= LOGIC_TAKT_PERIOD_MS;
             if let Some(map) = crate::matrix_game::map::current_map() {
                 self.side_logic_takt(map);
+                let ids: Vec<i32> = self.other_sides.iter().map(|s| s.id).collect();
+                for sid in ids {
+                    self.ai_side_logic_takt(map, sid);
+                }
             }
         }
         // Special win-target deaths queued by map objects this takt
@@ -1034,6 +1074,30 @@ impl MapLogic {
             );
         log::info!("config: loaded {} AI robot templates", ai_robots.bots.len());
         crate::matrix_game::interface::constructor::set_global_ai_robots(ai_robots);
+        // Side id → name (da/Side, value "Name,R,G,B,..."), used to
+        // resolve the map's SideAIInfo entries (MatrixMapPrepare.cpp:426-439).
+        self.side_names.clear();
+        if let Some(side_rec) = matrix_data.block_record("da", "Side") {
+            if let (Some(keys), Some(vals)) = (
+                matrix_data.get_buf(&side_rec, "0"),
+                matrix_data.get_buf(&side_rec, "1"),
+            ) {
+                let n = keys.arrays_count().min(vals.arrays_count());
+                for i in 0..n {
+                    let Ok(id) = keys.get_as_wstr(i).parse::<i32>() else {
+                        continue;
+                    };
+                    let name = vals
+                        .get_as_wstr(i)
+                        .split(',')
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    self.side_names.push((id, name));
+                }
+            }
+        }
     }
 
     /// Populate the arena with one [`MapObject`] per decorative

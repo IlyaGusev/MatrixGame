@@ -270,6 +270,10 @@ pub struct GameMap {
     /// Per-side starting economy from the map `SideResInfo` property
     /// (MatrixMapPrepare.cpp:464-493): `(side_id, [res;4], force_up)`.
     pub side_res_info: Vec<(i32, [i32; 4], i32)>,
+    /// Per-side AI tuning from the map `SideAIInfo` property
+    /// (MatrixMapPrepare.cpp:420-458): `(side_name, [(key, value)])`
+    /// with keys TBB/SK/DK/WRK/BK/TC.
+    pub side_ai_info: Vec<(String, Vec<(String, String)>)>,
     /// `MaintenanceTime` map property → `m_MaintenancePRC`
     /// (MatrixMapPrepare.cpp:411-418): percentage scaling the
     /// reinforcement cooldown; 0 disables maintenance entirely.
@@ -413,6 +417,7 @@ impl GameMap {
             water_name: String::new(),
             water_normal_len: 1.0,
             side_res_info: Vec::new(),
+            side_ai_info: Vec::new(),
             maintenance_prc: 100,
             effect_spawners: Vec::new(),
             ground_z_base_middle: 0.0,
@@ -674,6 +679,13 @@ impl GameMap {
             .map(|idx| prop_values.get_as_wstr(idx))
             .map(|s| parse_side_res_info(&s))
             .unwrap_or_default();
+        // Per-side AI tuning (MatrixMapPrepare.cpp:420-458) — entries
+        // "SideName:KEY/VAL/KEY/VAL|...".
+        let side_ai_info = prop_names
+            .find_as_wstr("SideAIInfo")
+            .map(|idx| prop_values.get_as_wstr(idx))
+            .map(|s| parse_side_ai_info(&s))
+            .unwrap_or_default();
         let maintenance_prc =
             find_property_int(prop_names, prop_values, "MaintenanceTime").unwrap_or(100);
         // Ambient effect spawners (RS_EFFECTS, MatrixMapPrepare.cpp:
@@ -930,6 +942,7 @@ impl GameMap {
             water_name,
             water_normal_len,
             side_res_info,
+            side_ai_info,
             maintenance_prc,
             effect_spawners,
             ground_z_base_middle,
@@ -2437,6 +2450,25 @@ fn blend_color(a: u32, b: u32, t: f32) -> u32 {
 
 /// Parse the `SideResInfo` property: `|`-separated per-side entries,
 /// each `id,res0,res1,res2,res3[,forceUp]` (MatrixMapPrepare.cpp:471-493).
+/// Parse the `SideAIInfo` map property (MatrixMapPrepare.cpp:420-458):
+/// `Name:KEY/VAL/KEY/VAL|Name2:...` — side names resolve to ids via the
+/// `da/Side` data block at apply time.
+fn parse_side_ai_info(s: &str) -> Vec<(String, Vec<(String, String)>)> {
+    let mut out = Vec::new();
+    for entry in s.split('|') {
+        let Some((name, kvs)) = entry.split_once(':') else {
+            continue;
+        };
+        let parts: Vec<&str> = kvs.split('/').collect();
+        let pairs: Vec<(String, String)> = parts
+            .chunks_exact(2)
+            .map(|c| (c[0].trim().to_string(), c[1].trim().to_string()))
+            .collect();
+        out.push((name.trim().to_string(), pairs));
+    }
+    out
+}
+
 fn parse_side_res_info(s: &str) -> Vec<(i32, [i32; 4], i32)> {
     let mut out = Vec::new();
     for entry in s.split('|') {
