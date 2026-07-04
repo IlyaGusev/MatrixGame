@@ -1116,7 +1116,7 @@ impl ApplicationHandler for App {
                         state
                             .game
                             .objects
-                            .iter_live()
+                            .iter_units()
                             .filter(|&id| crate::matrix_game::logic::robot_ref(&state.game.objects, id).is_some())
                             .count(),
                         state.game.effects.len(),
@@ -1457,7 +1457,7 @@ impl ApplicationHandler for App {
                                 // DIP wreck smoke (the pieces are the
                                 // robot's own part meshes, drawn by the
                                 // robots renderer).
-                                for id in objs.iter_live() {
+                                for id in objs.iter_units() {
                                     let Some(o) = objs.get(id) else { continue };
                                     match o.core().obj_type {
                                         crate::matrix_game::map_static::ObjectType::RobotAi => {
@@ -2314,7 +2314,7 @@ fn dispatch_ui_click(state: &mut AppState, click: &crate::matrix_game::interface
         "srb" => {
             let objs = &state.game.objects;
             let pings: Vec<[f32; 2]> = objs
-                .iter_live()
+                .iter_units()
                 .filter_map(|id| objs.get(id))
                 .filter(|o| {
                     matches!(
@@ -2504,7 +2504,7 @@ fn select_start_base(
     let player = game.player_side.id;
     let bases: Vec<(crate::matrix_game::map_static::ObjectId, glam::Vec2)> = game
         .objects
-        .iter_live()
+        .iter_units()
         .filter_map(|id| {
             let b = crate::matrix_game::logic::building_ref(&game.objects, id)?;
             (b.kind == BuildingType::Base && b.side == player && b.is_live())
@@ -3463,7 +3463,7 @@ fn refresh_progress_bars(state: &mut AppState) {
         // Collect every armed bar (`BeforeDraw` PB blocks), gated by a
         // landscape LOS trace from the camera like the originals.
         let eye = state.camera.eye_pos_world();
-        let ids: Vec<_> = state.game.objects.iter_live().collect();
+        let ids: Vec<_> = state.game.objects.iter_units().collect();
         for id in ids {
             let Some(obj) = state.game.objects.get(id) else {
                 continue;
@@ -5015,7 +5015,7 @@ fn robot_switch(state: &mut AppState, forward: bool) {
     let robots: Vec<crate::matrix_game::map_static::ObjectId> = state
         .game
         .objects
-        .iter_live()
+        .iter_units()
         .filter(|&id| {
             robot_ref(&state.game.objects, id)
                 .map(|r| r.is_live() && r.side == side_id)

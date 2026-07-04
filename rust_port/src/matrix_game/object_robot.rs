@@ -567,27 +567,28 @@ struct CachedShadow {
     sig: ShadowSig,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy)]
 struct ShadowSig {
-    /// Bit patterns of pos_x / pos_y / pos_z and forward.x / forward.y.
-    /// Direct `to_bits` comparison gives byte-exact equality without
-    /// pulling in a NaN-tolerant float compare — the values are written
-    /// here verbatim from the robot, so equality matches "no movement
-    /// since last rebuild".
-    bits: [u32; 5],
+    pos: Vec3,
+    fwd: glam::Vec2,
 }
 
 impl ShadowSig {
     fn from_robot(r: &Robot) -> Self {
         Self {
-            bits: [
-                r.pos_x.to_bits(),
-                r.pos_y.to_bits(),
-                r.pos_z.to_bits(),
-                r.forward.x.to_bits(),
-                r.forward.y.to_bits(),
-            ],
+            pos: Vec3::new(r.pos_x, r.pos_y, r.pos_z),
+            fwd: glam::Vec2::new(r.forward.x, r.forward.y),
         }
+    }
+
+    /// A projected shadow is a soft ground blob — refreshing it for
+    /// sub-cell movement is invisible, and rebuilding every moving
+    /// robot's ground mesh every frame was a large slice of the
+    /// per-frame robot sync. Rebuild once the robot has moved ~1.5
+    /// world units (cells are 10) or actually turned.
+    fn close_enough(&self, other: &ShadowSig) -> bool {
+        (self.pos - other.pos).length_squared() < 1.5 * 1.5
+            && (self.fwd - other.fwd).length_squared() < 0.03 * 0.03
     }
 }
 
@@ -2045,9 +2046,9 @@ impl RobotsRenderer {
             if let Some(source) = chassis_gpu.shadow_source.as_ref() {
                 let sig = ShadowSig::from_robot(robot);
                 if let Some(cached) = self.shadow_cache.get(&id) {
-                    if cached.sig == sig {
-                        // Stationary since last rebuild — reuse the
-                        // existing batch verbatim.
+                    if cached.sig.close_enough(&sig) {
+                        // (Nearly) stationary since last rebuild —
+                        // reuse the existing batch verbatim.
                         if cached.batch.num_indices > 0 {
                             self.shadow_batches.push(cached.batch.clone());
                         }

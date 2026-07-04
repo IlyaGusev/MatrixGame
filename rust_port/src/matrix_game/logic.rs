@@ -140,6 +140,10 @@ pub struct MapLogic {
     /// Side id → name from the `da/Side` data block (the map's
     /// `SideAIInfo` property addresses sides by name).
     pub side_names: Vec<(i32, String)>,
+    /// Round-robin start offset for `gather_info` so the per-pass
+    /// budget for expensive first-contact evaluations rotates fairly
+    /// across robots.
+    gather_rr: usize,
 }
 
 /// Sub-phase timing for the wasm-bench harness (microseconds):
@@ -218,6 +222,7 @@ impl MapLogic {
             maintenance_time: 0,
             maintenance_prc: 100,
             side_names: Vec::new(),
+            gather_rr: 0,
         }
     }
 
@@ -833,7 +838,25 @@ impl MapLogic {
             AddSlowly(ObjectId),
         }
 
-        for &rid in &robot_ids {
+        // First contact is expensive (visibility traces + a place-list
+        // wave per candidate). A wave of enemies arriving used to pay
+        // for every pair in one pass (a 30+ms frame spike); cap the
+        // evaluations per pass — skipped candidates stay unknown and
+        // get evaluated on the following 100ms passes. Rotation keeps
+        // the budget fair across robots.
+        let mut first_contact_budget: i32 = 24;
+        let rr = if robot_ids.is_empty() {
+            0
+        } else {
+            self.gather_rr % robot_ids.len()
+        };
+        self.gather_rr = self.gather_rr.wrapping_add(1);
+        let rotated: Vec<ObjectId> = robot_ids[rr..]
+            .iter()
+            .chain(robot_ids[..rr].iter())
+            .copied()
+            .collect();
+        for &rid in &rotated {
             // CalcStrength at the top of GatherInfo (MatrixRobot.cpp:4337).
             let strength = robot_ref(&self.objects, rid)
                 .map(|r| r.calc_strength(&self.objects))
@@ -885,6 +908,12 @@ impl MapLogic {
                                     let me_env = &robot_ref(&self.objects, rid).unwrap().env;
                                     me_env.search_enemy(oid) || me_env.is_ignore(oid, now)
                                 };
+                                if !known && first_contact_budget <= 0 {
+                                    continue;
+                                }
+                                if !known {
+                                    first_contact_budget -= 1;
+                                }
                                 if !known && is_logic_visible(map, &self.objects, rid, oid, 0.0)
                                 {
                                     let p_to = (other.map_x, other.map_y);
@@ -932,6 +961,12 @@ impl MapLogic {
                                     let me_env = &robot_ref(&self.objects, rid).unwrap().env;
                                     me_env.search_enemy(oid) || me_env.is_ignore(oid, now)
                                 };
+                                if !known && first_contact_budget <= 0 {
+                                    continue;
+                                }
+                                if !known {
+                                    first_contact_budget -= 1;
+                                }
                                 if !known && is_logic_visible(map, &self.objects, rid, oid, 0.0)
                                 {
                                     {

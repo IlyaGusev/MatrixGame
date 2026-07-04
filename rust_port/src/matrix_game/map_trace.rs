@@ -208,7 +208,7 @@ pub fn trace(
     // Objects — nearest `t` within the segment.
     let mut best_obj: Option<(ObjectId, f32)> = None;
     if mask & TRACE_ANYOBJECT != 0 {
-        if let Some((id, t)) = objs.pick_object(start, dir, mask, skip) {
+        if let Some((id, t)) = objs.pick_object_within(start, dir, len, mask, skip) {
             if t <= len {
                 best_obj = Some((id, t));
             }

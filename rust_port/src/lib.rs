@@ -110,21 +110,37 @@ pub fn bench_battle(pkg_bytes: &[u8], dat_bytes: &[u8]) -> String {
 
     let mut sum = 0.0f64;
     let mut worst = 0.0f64;
+    let mut worst_ph: Vec<f64> = vec![0.0; 5];
+    let mut worst_fx = 0usize;
+    let mut acc_ph = [0f64; 5];
     let mut frames = 0u64;
     for step in 0..(4 * 60 * 20) {
         let _scope = MapScope::enter(&map, game.elapsed_ms);
         let t0 = now_ms();
         game.takt(50);
         let ms = now_ms() - t0;
+        // Per-frame phase snapshot so a spike's composition survives
+        // the window averaging.
+        {
+            use std::sync::atomic::Ordering;
+            let ph: Vec<f64> = matrix_game::logic::TAKT_PHASE_US
+                .iter()
+                .map(|a| a.swap(0, Ordering::Relaxed) as f64 / 1000.0)
+                .collect();
+            for i in 0..5 {
+                acc_ph[i] += ph[i];
+            }
+            if ms > worst {
+                worst_ph = ph;
+                worst_fx = game.effects.len();
+            }
+        }
         sum += ms;
         worst = worst.max(ms);
         frames += 1;
         if step % 400 == 399 {
-            use std::sync::atomic::Ordering;
-            let ph: Vec<f64> = matrix_game::logic::TAKT_PHASE_US
-                .iter()
-                .map(|a| a.swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames as f64)
-                .collect();
+            let ph: Vec<f64> = acc_ph.iter().map(|v| v / frames as f64).collect();
+            acc_ph = [0.0; 5];
             let robots = game
                 .objects
                 .iter_live()
@@ -139,8 +155,14 @@ pub fn bench_battle(pkg_bytes: &[u8], dat_bytes: &[u8]) -> String {
                 game.effects.len(),
                 ph[0], ph[1], ph[2], ph[3], ph[4],
             ));
+            out.push_str(&format!(
+                "   worst frame: gather={:.2} proceed={:.2} sides={:.2} fx={:.2} rest={:.2} effects={}\n",
+                worst_ph[0], worst_ph[1], worst_ph[2], worst_ph[3], worst_ph[4], worst_fx,
+            ));
             sum = 0.0;
             worst = 0.0;
+            worst_ph = vec![0.0; 5];
+            worst_fx = 0;
             frames = 0;
         }
     }

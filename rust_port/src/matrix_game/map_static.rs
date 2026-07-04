@@ -310,6 +310,10 @@ pub fn is_map_object(obj: &dyn MapStatic) -> bool {
 /// `TRACE_SKIP_INVISIBLE` additionally excludes objects with the
 /// `OBJECT_STATE_TRACE_INVISIBLE` bit set — ported here because
 /// `FindObjects` consumers set the flag in the mask.
+/// World-units per decorative-grid cell (map is ~2000 world units →
+/// a few hundred cells).
+const MO_GRID_CELL: f32 = 128.0;
+
 pub fn fit_to_mask(obj: &dyn MapStatic, mask: u32) -> bool {
     // `TRACE_SKIP_INVISIBLE`: objects opting out of trace visibility
     // (MatrixMapStatic.hpp:51, set by OTP_INVLOGIC="1") are filtered.
@@ -469,6 +473,14 @@ pub struct Objects {
     /// Decorative `MapObject` index — consulted only when a trace mask
     /// asks for TRACE_OBJECT.
     mapobject_ids: Vec<ObjectId>,
+    /// Spatial hash over the (static) decoratives: world-space cells of
+    /// [`MO_GRID_CELL`] units, each listing the map objects whose
+    /// bounding sphere overlaps it. Traces and radius queries visit a
+    /// handful of cells instead of every decorative — a flying wreck
+    /// piece used to run its per-slice TRACE_ALL against ~2000 pick()
+    /// calls. Rebuilt lazily when a decorative spawns/despawns.
+    mo_grid: std::cell::RefCell<std::collections::HashMap<(i32, i32), Vec<ObjectId>>>,
+    mo_grid_dirty: std::cell::Cell<bool>,
     /// Freshly produced AI-side robots awaiting `ClacSpawnTeam`
     /// (MatrixRobot.cpp:2204-2205). Drained by the side-AI takt.
     pub pending_ai_spawn: Vec<ObjectId>,
@@ -626,6 +638,8 @@ impl Objects {
             pending_ai_spawn: Vec::new(),
             unit_ids: Vec::new(),
             mapobject_ids: Vec::new(),
+            mo_grid: std::cell::RefCell::new(std::collections::HashMap::new()),
+            mo_grid_dirty: std::cell::Cell::new(true),
             pending_sounds: Vec::new(),
             flyer_alt_grid: Vec::new(),
             pending_point_lights: Vec::new(),
@@ -707,7 +721,10 @@ impl Objects {
             ObjectType::RobotAi | ObjectType::Building | ObjectType::Cannon | ObjectType::Flyer => {
                 self.unit_ids.push(id)
             }
-            ObjectType::MapObject => self.mapobject_ids.push(id),
+            ObjectType::MapObject => {
+                self.mapobject_ids.push(id);
+                self.mo_grid_dirty.set(true);
+            }
             ObjectType::Empty => {}
         }
         id
@@ -726,6 +743,7 @@ impl Objects {
             self.unit_ids.swap_remove(p);
         } else if let Some(p) = self.mapobject_ids.iter().position(|&x| x == id) {
             self.mapobject_ids.swap_remove(p);
+            self.mo_grid_dirty.set(true);
         }
         let slot = &mut self.slots[id.index as usize];
         slot.obj = None;
@@ -739,17 +757,64 @@ impl Objects {
         self.unit_ids.iter().copied()
     }
 
-    /// Candidate ids for a trace/scan `mask`: units always (the mask
-    /// still filters per type), decoratives only when TRACE_OBJECT is
-    /// requested.
-    fn mask_candidates(&self, mask: u32) -> impl Iterator<Item = ObjectId> + '_ {
-        let want_mapobjects = mask & TRACE_OBJECT != 0;
-        self.unit_ids.iter().copied().chain(
-            self.mapobject_ids
-                .iter()
-                .copied()
-                .filter(move |_| want_mapobjects),
-        )
+    fn ensure_mo_grid(&self) {
+        if !self.mo_grid_dirty.get() {
+            return;
+        }
+        let mut grid: std::collections::HashMap<(i32, i32), Vec<ObjectId>> =
+            std::collections::HashMap::new();
+        for &id in &self.mapobject_ids {
+            let Some(obj) = self.get(id) else { continue };
+            let c = obj.core().geo_center;
+            let r = obj.core().radius.max(1.0);
+            let x0 = ((c.x - r) / MO_GRID_CELL).floor() as i32;
+            let x1 = ((c.x + r) / MO_GRID_CELL).floor() as i32;
+            let y0 = ((c.y - r) / MO_GRID_CELL).floor() as i32;
+            let y1 = ((c.y + r) / MO_GRID_CELL).floor() as i32;
+            for gy in y0..=y1 {
+                for gx in x0..=x1 {
+                    grid.entry((gx, gy)).or_default().push(id);
+                }
+            }
+        }
+        *self.mo_grid.borrow_mut() = grid;
+        self.mo_grid_dirty.set(false);
+    }
+
+    /// Decorative candidates near the segment `start → end` (grid
+    /// cells the segment's AABB touches). May contain duplicates —
+    /// callers keep-nearest semantics make re-tests harmless.
+    fn mapobjects_near_segment(&self, start: Vec3, end: Vec3, out: &mut Vec<ObjectId>) {
+        self.ensure_mo_grid();
+        let grid = self.mo_grid.borrow();
+        let x0 = (start.x.min(end.x) / MO_GRID_CELL).floor() as i32;
+        let x1 = (start.x.max(end.x) / MO_GRID_CELL).floor() as i32;
+        let y0 = (start.y.min(end.y) / MO_GRID_CELL).floor() as i32;
+        let y1 = (start.y.max(end.y) / MO_GRID_CELL).floor() as i32;
+        for gy in y0..=y1 {
+            for gx in x0..=x1 {
+                if let Some(v) = grid.get(&(gx, gy)) {
+                    out.extend_from_slice(v);
+                }
+            }
+        }
+    }
+
+    /// Decorative candidates near a circle at `pos` of `radius`.
+    fn mapobjects_near_circle(&self, pos: Vec2, radius: f32, out: &mut Vec<ObjectId>) {
+        self.ensure_mo_grid();
+        let grid = self.mo_grid.borrow();
+        let x0 = ((pos.x - radius) / MO_GRID_CELL).floor() as i32;
+        let x1 = ((pos.x + radius) / MO_GRID_CELL).floor() as i32;
+        let y0 = ((pos.y - radius) / MO_GRID_CELL).floor() as i32;
+        let y1 = ((pos.y + radius) / MO_GRID_CELL).floor() as i32;
+        for gy in y0..=y1 {
+            for gx in x0..=x1 {
+                if let Some(v) = grid.get(&(gx, gy)) {
+                    out.extend_from_slice(v);
+                }
+            }
+        }
     }
 
     pub fn is_valid(&self, id: ObjectId) -> bool {
@@ -989,7 +1054,11 @@ impl Objects {
         mut visit: impl FnMut(Vec2, ObjectId) -> Control,
     ) -> bool {
         let mut hit = false;
-        for id in self.mask_candidates(mask) {
+        let mut cands: Vec<ObjectId> = self.unit_ids.clone();
+        if mask & TRACE_OBJECT != 0 {
+            self.mapobjects_near_circle(pos, radius, &mut cands);
+        }
+        for id in cands {
             let obj = match self.get(id) {
                 Some(o) => o,
                 None => continue,
@@ -1038,7 +1107,11 @@ impl Objects {
         mut visit: impl FnMut(Vec3, ObjectId) -> Control,
     ) -> bool {
         let mut hit = false;
-        for id in self.mask_candidates(mask) {
+        let mut cands: Vec<ObjectId> = self.unit_ids.clone();
+        if mask & TRACE_OBJECT != 0 {
+            self.mapobjects_near_circle(Vec2::new(pos.x, pos.y), radius, &mut cands);
+        }
+        for id in cands {
             let obj = match self.get(id) {
                 Some(o) => o,
                 None => continue,
@@ -1091,23 +1164,49 @@ impl Objects {
         mask: u32,
         skip: Option<ObjectId>,
     ) -> Option<(ObjectId, f32)> {
+        self.pick_object_within(origin, dir, f32::MAX, mask, skip)
+    }
+
+    /// [`Self::pick_object`] with a known segment length — bounds the
+    /// decorative-grid walk to the segment's AABB (a mouse-pick ray or
+    /// weapon trace is a few cells; an unbounded reach would touch the
+    /// whole grid).
+    pub fn pick_object_within(
+        &self,
+        origin: Vec3,
+        dir: Vec3,
+        max_t: f32,
+        mask: u32,
+        skip: Option<ObjectId>,
+    ) -> Option<(ObjectId, f32)> {
         let mut best: Option<(ObjectId, f32)> = None;
-        for id in self.mask_candidates(mask) {
-            let obj = match self.get(id) {
+        let mut test = |objs: &Objects, id: ObjectId| {
+            let obj = match objs.get(id) {
                 Some(o) => o,
-                None => continue,
+                None => return,
             };
             if Some(id) == skip || !fit_to_mask(obj, mask) {
-                continue;
+                return;
             }
             if let Some(t) = obj.pick(origin, dir) {
                 if t < 0.0 {
-                    continue;
+                    return;
                 }
                 match best {
                     Some((_, bt)) if bt <= t => {}
                     _ => best = Some((id, t)),
                 }
+            }
+        };
+        for id in self.unit_ids.iter().copied() {
+            test(self, id);
+        }
+        if mask & TRACE_OBJECT != 0 {
+            let end = origin + dir * max_t.min(4000.0);
+            let mut cands: Vec<ObjectId> = Vec::new();
+            self.mapobjects_near_segment(origin, end, &mut cands);
+            for id in cands {
+                test(self, id);
             }
         }
         best
