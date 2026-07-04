@@ -127,6 +127,10 @@ struct ChassisGpu {
 struct ChassisShadowSource {
     vertices: Vec<ShadowMeshVertex>,
     surfaces: Vec<ShadowMeshSurface>,
+    /// Positions of `vertices`, precomputed — `calc_proj` consumes
+    /// this every frame per moving robot; collecting it per call was
+    /// per-frame allocator churn (expensive under wasm's dlmalloc).
+    positions: Vec<Vec3>,
 }
 
 /// Identifies which mesh slot supplies geometry for a `PartDraw`.
@@ -153,15 +157,36 @@ enum PartKind {
 /// invert=true draws through `pipeline_inverted` so the cull mode
 /// flips to compensate for the flipped X-basis (port of
 /// MatrixObjectRobot.cpp:1052-1056 — `D3DCULL_CW`/`CCW` toggle).
+#[derive(Clone, Copy)]
 struct PartDraw {
     kind: PartKind,
     instance_offset: u32,
+    /// Consecutive instances sharing this mesh + frame — sync_robots
+    /// sorts and merges draws so one call covers the whole run.
+    instance_count: u32,
     vo_frame: usize,
     invert: bool,
     /// `true` when the source robot's side is non-player. Selects
     /// `SurfaceGpu::bind_group_enemy` (the `_e`-textured variant) at
     /// render time when present; falls back to `bind_group` otherwise.
     is_enemy: bool,
+}
+
+impl PartDraw {
+    /// Merge key: draws with equal keys share mesh, frame, pipeline
+    /// and bind-group choice, so contiguous ones batch into a single
+    /// instanced draw.
+    fn sort_key(&self) -> (u8, usize, usize, bool, bool) {
+        let (k, idx) = match self.kind {
+            PartKind::Chassis(c) => (0u8, chassis_kind_index(c)),
+            PartKind::Armor(i) => (1, i),
+            PartKind::Head(i) => (2, i),
+            PartKind::Weapon(i) => (3, i),
+            PartKind::FlyerBody(i) => (4, i),
+            PartKind::FlyerVint(i) => (5, i),
+        };
+        (k, idx, self.vo_frame, self.invert, self.is_enemy)
+    }
 }
 
 const IDENTITY_MAT: [[f32; 4]; 4] = [
@@ -1070,6 +1095,10 @@ impl RobotsRenderer {
                 None
             } else {
                 Some(ChassisShadowSource {
+                    positions: shadow_vertices
+                        .iter()
+                        .map(|v| Vec3::from_array(v.position))
+                        .collect(),
                     vertices: shadow_vertices,
                     surfaces: shadow_surfaces,
                 })
@@ -1773,6 +1802,7 @@ impl RobotsRenderer {
                     self.draws.push(PartDraw {
                         kind: PartKind::FlyerBody(kidx),
                         instance_offset: offset,
+                        instance_count: 1,
                         vo_frame: 0,
                         invert: false,
                         is_enemy: fl.side != crate::matrix_game::common::PLAYER_SIDE,
@@ -1796,6 +1826,7 @@ impl RobotsRenderer {
                     self.draws.push(PartDraw {
                         kind: PartKind::FlyerVint(kidx),
                         instance_offset: offset,
+                        instance_count: 1,
                         vo_frame: 0,
                         invert: false,
                         is_enemy: fl.side != crate::matrix_game::common::PLAYER_SIDE,
@@ -1894,6 +1925,7 @@ impl RobotsRenderer {
                     self.draws.push(PartDraw {
                         kind,
                         instance_offset: offset,
+                        instance_count: 1,
                         vo_frame,
                         invert: u.invert,
                         is_enemy,
@@ -2016,20 +2048,17 @@ impl RobotsRenderer {
                     if cached.sig == sig {
                         // Stationary since last rebuild — reuse the
                         // existing batch verbatim.
-                        self.shadow_batches.push(cached.batch.clone());
+                        if cached.batch.num_indices > 0 {
+                            self.shadow_batches.push(cached.batch.clone());
+                        }
                         alive_shadow_ids.insert(id);
                     }
                 }
                 if !alive_shadow_ids.contains(&id) {
                     let world_uc = robot_world_uncentered(robot);
-                    let local_pts: Vec<Vec3> = source
-                        .vertices
-                        .iter()
-                        .map(|v| Vec3::from_array(v.position))
-                        .collect();
                     if let Some(proj) =
                         self.shadow_system
-                            .calc_proj(&local_pts, light_world, world_uc)
+                            .calc_proj(&source.positions, light_world, world_uc)
                     {
                         let texture = self
                             .shadow_textures
@@ -2067,17 +2096,22 @@ impl RobotsRenderer {
                                     })
                             })
                             .clone();
-                        if let Some(batch) = self.shadow_system.build_geometry(
-                            device,
-                            map,
-                            &proj,
-                            &texture,
-                            8,
-                            [cx, cy],
-                        ) {
-                            self.shadow_batches.push(batch.clone());
-                            self.shadow_cache.insert(id, CachedShadow { batch, sig });
+                        // Refresh the robot's persistent shadow batch in
+                        // place — buffer/bind-group creation happens once
+                        // per robot, not once per moved robot per frame.
+                        let geo = self.shadow_system.build_geometry_cpu(map, &proj, 8, [cx, cy]);
+                        let cached = self.shadow_cache.entry(id).or_insert_with(|| CachedShadow {
+                            batch: self.shadow_system.make_reusable_batch(device, &texture, 8),
+                            sig,
+                        });
+                        match geo {
+                            Some(geo) => {
+                                self.shadow_system.update_batch(queue, &mut cached.batch, &geo);
+                                self.shadow_batches.push(cached.batch.clone());
+                            }
+                            None => cached.batch.num_indices = 0,
                         }
+                        cached.sig = sig;
                         alive_shadow_ids.insert(id);
                     }
                 }
@@ -2308,6 +2342,7 @@ impl RobotsRenderer {
                 draws.push(PartDraw {
                     kind,
                     instance_offset: *offset,
+                    instance_count: 1,
                     vo_frame,
                     invert,
                     is_enemy,
@@ -2380,6 +2415,36 @@ impl RobotsRenderer {
         objs.pending_spots.append(&mut pneumatic_decals);
         self.light_bbs = light_bbs_local;
 
+        // Sort draws by mesh/frame and merge contiguous same-key runs
+        // into instanced draws — the render pass then binds each mesh
+        // once and issues one draw per run instead of one per part.
+        // Instance data is permuted to match the new draw order.
+        if !self.draws.is_empty() {
+            let mut order: Vec<usize> = (0..self.draws.len()).collect();
+            order.sort_by_key(|&i| self.draws[i].sort_key());
+            let mut sorted_draws: Vec<PartDraw> = Vec::with_capacity(self.draws.len());
+            let mut sorted_instances: Vec<InstanceData> =
+                Vec::with_capacity(instance_data.len());
+            for &i in &order {
+                let mut d = self.draws[i];
+                sorted_instances.push(instance_data[d.instance_offset as usize]);
+                d.instance_offset = (sorted_instances.len() - 1) as u32;
+                d.instance_count = 1;
+                match sorted_draws.last_mut() {
+                    Some(prev)
+                        if prev.sort_key() == d.sort_key()
+                            && prev.instance_offset + prev.instance_count
+                                == d.instance_offset =>
+                    {
+                        prev.instance_count += 1;
+                    }
+                    _ => sorted_draws.push(d),
+                }
+            }
+            self.draws = sorted_draws;
+            instance_data = sorted_instances;
+        }
+
         if !instance_data.is_empty() {
             queue.write_buffer(
                 &self.instance_buffer,
@@ -2431,6 +2496,9 @@ impl RobotsRenderer {
         pass.set_pipeline(&self.pipeline);
         pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
         let mut current_pipeline_inverted = false;
+        // (mesh-ordinal, mesh-idx) of the bound vertex buffer — draws
+        // are sorted, so same-mesh runs bind it once.
+        let mut bound_mesh: Option<(u8, usize)> = None;
         for draw in &self.draws {
             let gpu = match draw.kind {
                 PartKind::FlyerBody(idx) => {
@@ -2488,7 +2556,14 @@ impl RobotsRenderer {
                 });
                 current_pipeline_inverted = draw.invert;
             }
-            pass.set_vertex_buffer(0, gpu.vertex_buffer.slice(..));
+            let mesh_key = {
+                let (k, i, _, _, _) = draw.sort_key();
+                (k, i)
+            };
+            if bound_mesh != Some(mesh_key) {
+                pass.set_vertex_buffer(0, gpu.vertex_buffer.slice(..));
+                bound_mesh = Some(mesh_key);
+            }
             for surface in &frame.surfaces {
                 // For non-player robots, prefer the `_e`-textured
                 // bind group (port of MatrixObjectRobot.cpp:335-348);
@@ -2510,7 +2585,7 @@ impl RobotsRenderer {
                 pass.draw_indexed(
                     0..surface.num_indices,
                     0,
-                    draw.instance_offset..(draw.instance_offset + 1),
+                    draw.instance_offset..(draw.instance_offset + draw.instance_count),
                 );
             }
         }

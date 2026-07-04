@@ -32,6 +32,15 @@ pub struct PointLightSystem {
     next_id: PointLightId,
     revision: u64,
     dirty: bool,
+    /// Game-time of the last recompute, for [`Self::flush_throttled`].
+    last_flush_ms: f64,
+    /// Union of the map-cell windows touched by light mutations since
+    /// the last recompute — lets the flush relight only that region
+    /// and lets consumers re-upload only the vertices/instances in it.
+    dirty_rect: Option<[i32; 4]>,
+    /// Cell rect covered by the latest recompute (what changed for
+    /// `revision`'s consumers). Full map after a full recompute.
+    changed_rect: [i32; 4],
 }
 
 impl PointLightSystem {
@@ -43,7 +52,36 @@ impl PointLightSystem {
             next_id: 1,
             revision: 0,
             dirty: false,
+            last_flush_ms: f64::NEG_INFINITY,
+            dirty_rect: None,
+            changed_rect: [0, 0, i32::MAX, i32::MAX],
         }
+    }
+
+    /// The map-cell window a light footprint covers — must match the
+    /// per-light loop bounds in [`Self::recompute`].
+    fn light_rect(pos: [f32; 3], radius: f32) -> [i32; 4] {
+        let r = radius.max(0.001);
+        [
+            float2int((pos[0] - r) / GLOBAL_SCALE) - 1,
+            float2int((pos[1] - r) / GLOBAL_SCALE) - 1,
+            1 + float2int((pos[0] + r) / GLOBAL_SCALE),
+            1 + float2int((pos[1] + r) / GLOBAL_SCALE),
+        ]
+    }
+
+    fn mark_dirty_rect(&mut self, pos: [f32; 3], radius: f32) {
+        let r = Self::light_rect(pos, radius);
+        self.dirty_rect = Some(match self.dirty_rect {
+            None => r,
+            Some(d) => [d[0].min(r[0]), d[1].min(r[1]), d[2].max(r[2]), d[3].max(r[3])],
+        });
+    }
+
+    /// Cell rect the last flush actually relit — consumers keyed off
+    /// [`Self::revision`] can restrict their re-uploads to it.
+    pub fn changed_rect(&self) -> [i32; 4] {
+        self.changed_rect
     }
 
     /// Add an animated light that LERPs radius `r1→r2` and colour
@@ -107,6 +145,15 @@ impl PointLightSystem {
             .map(|t| t.id)
             .collect();
         if !expired.is_empty() {
+            let footprints: Vec<([f32; 3], f32)> = self
+                .lights
+                .iter()
+                .filter(|l| expired.contains(&l.id))
+                .map(|l| (l.pos, l.radius))
+                .collect();
+            for (pos, radius) in footprints {
+                self.mark_dirty_rect(pos, radius);
+            }
             self.lights.retain(|l| !expired.contains(&l.id));
             self.transient.retain(|t| t.remaining > 0.0);
             self.dirty = true;
@@ -131,16 +178,25 @@ impl PointLightSystem {
         // Defer the (expensive) luminance recompute to the next `flush` so
         // a burst of adds in one frame collapses to a single rebuild.
         let _ = map;
+        self.mark_dirty_rect(pos, radius);
         self.dirty = true;
         id
     }
 
     pub fn remove_light(&mut self, map: &GameMap, id: PointLightId) -> bool {
+        let footprint = self
+            .lights
+            .iter()
+            .find(|l| l.id == id)
+            .map(|l| (l.pos, l.radius));
         let old_len = self.lights.len();
         self.lights.retain(|light| light.id != id);
         let removed = self.lights.len() != old_len;
         if removed {
             let _ = map;
+            if let Some((pos, radius)) = footprint {
+                self.mark_dirty_rect(pos, radius);
+            }
             self.dirty = true;
         }
         removed
@@ -153,7 +209,10 @@ impl PointLightSystem {
         if light.pos == pos {
             return true;
         }
+        let (old_pos, radius) = (light.pos, light.radius);
         light.pos = pos;
+        self.mark_dirty_rect(old_pos, radius);
+        self.mark_dirty_rect(pos, radius);
         self.dirty = true;
         true
     }
@@ -166,7 +225,9 @@ impl PointLightSystem {
         if light.radius == r {
             return true;
         }
+        let (pos, old_r) = (light.pos, light.radius);
         light.radius = r;
+        self.mark_dirty_rect(pos, old_r.max(r));
         self.dirty = true;
         true
     }
@@ -178,7 +239,9 @@ impl PointLightSystem {
         if light.color == color {
             return true;
         }
+        let (pos, radius) = (light.pos, light.radius);
         light.color = color;
+        self.mark_dirty_rect(pos, radius);
         self.dirty = true;
         true
     }
@@ -192,7 +255,36 @@ impl PointLightSystem {
         if !self.dirty {
             return;
         }
-        self.recompute(map);
+        self.recompute_dirty(map);
+        self.dirty = false;
+    }
+
+    /// Relight only the accumulated dirty window (full recompute when
+    /// there is none, e.g. after a resize).
+    fn recompute_dirty(&mut self, map: &GameMap) {
+        let rect = self.dirty_rect.take();
+        match rect {
+            Some(r) if self.point_lums.len() == map.points.len() => self.recompute_rect(map, r),
+            _ => self.recompute(map),
+        }
+    }
+
+    /// `flush`, but at most once per `min_interval_ms`. During battles
+    /// transient muzzle-flash / explosion lights are added or expire
+    /// nearly every frame, and each recompute cascades into a full
+    /// terrain-vertex + object/building instance re-upload downstream
+    /// (they key off `revision`). Capping the rate bounds that cost;
+    /// a ≤100ms lighting latency is invisible next to the flashes'
+    /// own 100-300ms lifetimes.
+    pub fn flush_throttled(&mut self, map: &GameMap, now_ms: f64, min_interval_ms: f64) {
+        if !self.dirty {
+            return;
+        }
+        if now_ms - self.last_flush_ms < min_interval_ms {
+            return;
+        }
+        self.last_flush_ms = now_ms;
+        self.recompute_dirty(map);
         self.dirty = false;
     }
 
@@ -209,6 +301,8 @@ impl PointLightSystem {
     }
 
     pub fn recompute(&mut self, map: &GameMap) {
+        self.changed_rect = [0, 0, map.size_x as i32, map.size_y as i32];
+        self.dirty_rect = None;
         if self.point_lums.len() != map.points.len() {
             self.point_lums.resize(map.points.len(), [0, 0, 0]);
         }
@@ -249,6 +343,55 @@ impl PointLightSystem {
             }
         }
 
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    /// Relight only the cells inside `rect` (inclusive, cell coords) —
+    /// clears their accumulated luminance and re-adds every light whose
+    /// footprint overlaps. During battles the transient muzzle-flash /
+    /// explosion lights churn every frame; recomputing (and later
+    /// re-uploading) the whole map for each burst was the frame killer.
+    fn recompute_rect(&mut self, map: &GameMap, rect: [i32; 4]) {
+        let x0 = rect[0].max(0);
+        let y0 = rect[1].max(0);
+        let x1 = rect[2].min(map.size_x as i32);
+        let y1 = rect[3].min(map.size_y as i32);
+        self.changed_rect = [x0, y0, x1, y1];
+        if x0 > x1 || y0 > y1 {
+            self.revision = self.revision.wrapping_add(1);
+            return;
+        }
+        let stride = map.size_x + 1;
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                self.point_lums[y as usize * stride + x as usize] = [0, 0, 0];
+            }
+        }
+        for light in &self.lights {
+            let radius_inv = 1.0 / light.radius.max(0.001);
+            let w = Self::light_rect(light.pos, light.radius);
+            let lx0 = w[0].max(x0);
+            let ly0 = w[1].max(y0);
+            let lx1 = w[2].min(x1);
+            let ly1 = w[3].min(y1);
+            for y in ly0..=ly1 {
+                for x in lx0..=lx1 {
+                    let idx = y as usize * stride + x as usize;
+                    let point = map.point(x as usize, y as usize);
+                    let point_z = (point.z + POINTLIGHT_ALTITUDE).max(WATER_LEVEL);
+                    let dx = (light.pos[0] - x as f32 * GLOBAL_SCALE) * radius_inv;
+                    let dy = (light.pos[1] - y as f32 * GLOBAL_SCALE) * radius_inv;
+                    let dz = (light.pos[2] - point_z) * radius_inv;
+                    let lum = 1.0 - (dx * dx + dy * dy + dz * dz);
+                    if lum <= 0.0 {
+                        continue;
+                    }
+                    self.point_lums[idx][0] += float2int(lum * ((light.color >> 16) & 0xFF) as f32);
+                    self.point_lums[idx][1] += float2int(lum * ((light.color >> 8) & 0xFF) as f32);
+                    self.point_lums[idx][2] += float2int(lum * (light.color & 0xFF) as f32);
+                }
+            }
+        }
         self.revision = self.revision.wrapping_add(1);
     }
 }

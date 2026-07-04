@@ -896,7 +896,7 @@ impl Robot {
             let my_r = self.core.radius;
             let my_c = glam::Vec3::new(self.pos_x, self.pos_y, self.core.geo_center.z);
             let mut nearest: Option<(glam::Vec3, f32, f32)> = None;
-            for oid in objs.iter_live() {
+            for oid in objs.iter_units() {
                 if Some(oid) == self.self_id {
                     continue;
                 }
@@ -1494,7 +1494,7 @@ impl Robot {
         self.move_test_change_ms = elapsed_ms;
 
         let mut others: Vec<map_trace::Blocker> = Vec::new();
-        for id in objs.iter_live() {
+        for id in objs.iter_units() {
             if self.self_id == Some(id) {
                 continue;
             }
@@ -1957,7 +1957,7 @@ impl Robot {
         const CAPTURE_RADIUS: f32 = 50.0; // MatrixObjectBuilding.hpp:27
         let mut nearest: Option<(ObjectId, f32)> = None;
         let mut best = CAPTURE_RADIUS * CAPTURE_RADIUS;
-        for id in objs.iter_live() {
+        for id in objs.iter_units() {
             let Some(o) = objs.get(id) else { continue };
             if !matches!(o.core().obj_type, ObjectType::RobotAi) {
                 continue;
@@ -2403,7 +2403,7 @@ impl Robot {
         let mut far_col = false;
         let mut stop = false;
 
-        let ids: Vec<ObjectId> = objs.iter_live().collect();
+        let ids: Vec<ObjectId> = objs.iter_units().collect();
         for id in ids {
             let Some(other_obj) = objs.get(id) else {
                 continue;
@@ -3581,21 +3581,44 @@ impl MapStatic for Robot {
             }
         }
 
-        // Hull tracking — port of the no-enemy fall-through at
-        // MatrixRobot.cpp:945-951:
-        //
-        //   RotateHull(D3DXVECTOR3(m_PosX + m_Forward.x, m_PosY + m_Forward.y, 0));
-        //
-        // While a FIRE order is active the hull turns to the aim point
-        // (the enemy-tracking branch at :940); otherwise it follows
-        // chassis forward.
-        let here = glam::Vec2::new(self.pos_x, self.pos_y);
-        let hull_target = if self.orders.top().map(|o| o.ty) == Some(OrderType::Fire) {
-            glam::Vec2::new(self.weapon_dir.x, self.weapon_dir.y)
-        } else {
-            here + self.forward
-        };
-        self.rotate_hull(hull_target, cms);
+        // Hull tracking + automatic fire cutoff — port of the
+        // env-target block at MatrixRobot.cpp:853-951. MAX_HULL_ANGLE
+        // is GRAD2RAD(360) so the RotateRobot fallbacks there are dead
+        // code: the hull simply tracks a live `env.target`; with no
+        // live target the weapons stop (`StopFire()` at :948 — this is
+        // what makes robots cease fire once their victim dies or a
+        // captured building's turret flips to their own side) and the
+        // hull follows chassis forward.
+        if matches!(self.state, RobotState::Idle | RobotState::BaseCapture) {
+            let here = glam::Vec2::new(self.pos_x, self.pos_y);
+            let mut hull_target: Option<glam::Vec2> = None;
+            if let Some(t) = self.env.target {
+                if let Some(tr) = crate::matrix_game::logic::robot_ref(objs, t) {
+                    // :855 — target robot must be SUCCESSFULLY_BUILD.
+                    if tr.state == RobotState::Idle {
+                        hull_target = Some(glam::Vec2::new(tr.pos_x, tr.pos_y));
+                    }
+                } else if let Some(c) = crate::matrix_game::logic::cannon_ref(objs, t) {
+                    // :891 — IsLiveActiveCannon.
+                    if !matches!(c.state, CannonState::Dip | CannonState::UnderConstruction) {
+                        hull_target =
+                            Some(glam::Vec2::new(c.core().geo_center.x, c.core().geo_center.y));
+                    }
+                } else if let Some(b) = crate::matrix_game::logic::building_ref(objs, t) {
+                    // :924 — live building, unless mid-capture.
+                    if b.is_live() && !self.orders.has(OrderType::CaptureFactory) {
+                        hull_target = Some(glam::Vec2::new(self.weapon_dir.x, self.weapon_dir.y));
+                    }
+                }
+            }
+            match hull_target {
+                Some(tp) => self.rotate_hull(tp, cms),
+                None => {
+                    self.stop_fire();
+                    self.rotate_hull(here + self.forward, cms);
+                }
+            }
+        }
     }
 
     fn side(&self) -> i32 {
@@ -3786,7 +3809,7 @@ impl MapStatic for Robot {
                     .unwrap_or(0.0);
                 let mut danger = 0.0f32;
                 let here = glam::Vec2::new(self.pos_x, self.pos_y);
-                for oid in objs.iter_live().collect::<Vec<_>>() {
+                for oid in objs.iter_units().collect::<Vec<_>>() {
                     if Some(oid) == self.self_id {
                         continue;
                     }
@@ -3901,7 +3924,7 @@ impl MapStatic for Robot {
         self.break_all_orders(objs);
         self.clear_capture_candidates();
         if let Some(me) = self.self_id {
-            let others: Vec<ObjectId> = objs.iter_live().collect();
+            let others: Vec<ObjectId> = objs.iter_units().collect();
             for oid in others {
                 if let Some(other) = crate::matrix_game::logic::robot_mut(objs, oid) {
                     other.env.remove_from_list(me);

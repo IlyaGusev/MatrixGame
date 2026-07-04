@@ -117,6 +117,10 @@ struct AppState {
     /// frames since. Drained once a second from `RedrawRequested`.
     fps_last_log: f64,
     fps_frames: u32,
+    /// Per-phase frame-time accumulators (seconds):
+    /// [takt, graphic_takt, ui, sync_robots, sync_other, render].
+    /// Drained with the FPS log so heavy-battle slowdowns are attributable.
+    perf_acc: [f64; 6],
 }
 
 pub struct App {
@@ -350,6 +354,7 @@ impl ApplicationHandler for App {
                 consumed_keys: Default::default(),
                 fps_last_log: crate::platform::now_secs(),
                 fps_frames: 0,
+                perf_acc: [0.0; 6],
             });
             // Mission-begin dialog at end of load (MatrixMapPrepare.cpp:
             // 1956) — game paused behind it until dismissed. Skipped
@@ -567,6 +572,7 @@ impl ApplicationHandler for App {
                     consumed_keys: Default::default(),
                     fps_last_log: crate::platform::now_secs(),
                     fps_frames: 0,
+                    perf_acc: [0.0; 6],
                 });
                 // Mission-begin dialog (MatrixMapPrepare.cpp:1956).
                 if let Some(state) = state_slot.borrow_mut().as_mut() {
@@ -1095,12 +1101,28 @@ impl ApplicationHandler for App {
                 let fps_elapsed = now - state.fps_last_log;
                 if fps_elapsed >= 1.0 {
                     let fps = state.fps_frames as f64 / fps_elapsed;
+                    let n = state.fps_frames.max(1) as f64;
                     log::info!(
-                        "fps: {:.1} ({} frames / {:.2}s)",
+                        "fps: {:.1} ({} frames / {:.2}s) | per-frame ms: takt={:.2} gfx={:.2} ui={:.2} syncR={:.2} sync={:.2} render={:.2} | robots={} effects={} bb={}",
                         fps,
                         state.fps_frames,
                         fps_elapsed,
+                        state.perf_acc[0] / n * 1000.0,
+                        state.perf_acc[1] / n * 1000.0,
+                        state.perf_acc[2] / n * 1000.0,
+                        state.perf_acc[3] / n * 1000.0,
+                        (state.perf_acc[4] - state.perf_acc[3]).max(0.0) / n * 1000.0,
+                        state.perf_acc[5] / n * 1000.0,
+                        state
+                            .game
+                            .objects
+                            .iter_live()
+                            .filter(|&id| crate::matrix_game::logic::robot_ref(&state.game.objects, id).is_some())
+                            .count(),
+                        state.game.effects.len(),
+                        state.bb_queue.billboards.len(),
                     );
+                    state.perf_acc = [0.0; 6];
                     crate::platform::set_fps_text(&format!("{fps:.0} FPS"));
                     state.fps_last_log = now;
                     state.fps_frames = 0;
@@ -1129,8 +1151,12 @@ impl ApplicationHandler for App {
                     // while paused object animations, water, and effect
                     // timers all freeze — only rendering continues.
                     if !state.is_paused {
+                        let tt = crate::platform::now_secs();
                         state.game.takt(step_ms);
+                        let tg = crate::platform::now_secs();
                         state.game.graphic_takt(step_ms);
+                        state.perf_acc[1] += crate::platform::now_secs() - tg;
+                        state.perf_acc[0] += tg - tt;
                     }
                     // Landscape decals: age + build geometry for new
                     // spawns (CMatrixEffectLandscapeSpot list).
@@ -1174,8 +1200,13 @@ impl ApplicationHandler for App {
                         state.point_lights.takt(&state.map, step_ms as f32);
                     }
                     // Single batched recompute after all light adds/moves/
-                    // expiries this frame (no-op when nothing is dirty).
-                    state.point_lights.flush(&state.map);
+                    // expiries this frame (no-op when nothing is dirty),
+                    // rate-capped: every flush triggers a full terrain +
+                    // instance relight downstream, which at battle-time
+                    // light churn used to run every frame.
+                    state
+                        .point_lights
+                        .flush_throttled(&state.map, state.game.elapsed_ms as f64, 50.0);
                 }
 
                 // Win/Loose end-of-game dialog — the deferred
@@ -1284,6 +1315,7 @@ impl ApplicationHandler for App {
                         }
                     }
                     let sizer = |path: &str| sizes.get(path).copied();
+                    let tu = crate::platform::now_secs();
                     state.iface_list.update(
                         dt * 1000.0,
                         w,
@@ -1291,7 +1323,10 @@ impl ApplicationHandler for App {
                         state.iface_renderer.glyph_atlas_mut(),
                         &sizer,
                     );
+                    state.perf_acc[2] += crate::platform::now_secs() - tu;
                 }
+
+                let t_logic_end = crate::platform::now_secs();
 
                 state.camera.takt(dt * 1000.0); // camera update (ms)
 
@@ -1342,6 +1377,7 @@ impl ApplicationHandler for App {
                 // so newly-spawned robots show up (stand-in for
                 // `CMatrixRobotAI::RNeed`'s per-robot matrix update —
                 // MatrixObjectRobot.cpp:359-480).
+                let t_sr = crate::platform::now_secs();
                 state.terrain.sync_robots(
                     &state.gfx.device,
                     &state.gfx.queue,
@@ -1353,6 +1389,7 @@ impl ApplicationHandler for App {
                     ghost,
                     &markers,
                 );
+                state.perf_acc[3] += crate::platform::now_secs() - t_sr;
 
                 // Bake the minimap background the first time — ports
                 // CMinimap::RenderBackground (called once at map load). Must
@@ -1364,6 +1401,11 @@ impl ApplicationHandler for App {
                     &mut state.terrain,
                     &state.map,
                 );
+                let t_sync_end = crate::platform::now_secs();
+                // sync_other = everything between logic end and frame
+                // begin, minus the robot sync measured above.
+                state.perf_acc[4] += t_sync_end - t_logic_end;
+
                 match state.gfx.begin_frame() {
                     Ok((output, view, mut encoder)) => {
                         let vp = state.camera.view_proj();
@@ -1913,6 +1955,7 @@ impl ApplicationHandler for App {
                             state.progress_bars.render(&mut pass);
                         }
                         state.gfx.end_frame(output, encoder);
+                        state.perf_acc[5] += crate::platform::now_secs() - t_sync_end;
                     }
                     Err(wgpu::SurfaceError::Lost) => {
                         let size = state.window.inner_size();

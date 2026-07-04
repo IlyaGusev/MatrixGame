@@ -47,7 +47,54 @@ pub enum GameEffect {
     Dust(dust::Dust),
 }
 
+/// TEMP per-kind takt timing for sim probes (native only).
+#[cfg(not(target_arch = "wasm32"))]
+pub static EFFECT_TAKT_NS: [std::sync::atomic::AtomicU64; 14] = {
+    #[allow(clippy::declare_interior_mutable_const)]
+    const Z: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    [Z; 14]
+};
+
 impl GameEffect {
+    pub fn kind_index(&self) -> usize {
+        match self {
+            GameEffect::MovingObject(_) => 0,
+            GameEffect::FirePlasma(_) => 1,
+            GameEffect::Flame(_) => 2,
+            GameEffect::BigBoom(_) => 3,
+            GameEffect::Konus(_) => 4,
+            GameEffect::Smoke(_) => 5,
+            GameEffect::Fire(_) => 6,
+            GameEffect::BillboardLine(_) => 7,
+            GameEffect::Keelwater(_) => 8,
+            GameEffect::Score(_) => 9,
+            GameEffect::Lightening(_) => 10,
+            GameEffect::Explosion(_) => 11,
+            GameEffect::FireAnim(_) => 12,
+            GameEffect::Dust(_) => 13,
+        }
+    }
+
+    /// Variant name for diagnostics (effect histograms in sim probes).
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            GameEffect::MovingObject(_) => "MovingObject",
+            GameEffect::FirePlasma(_) => "FirePlasma",
+            GameEffect::Flame(_) => "Flame",
+            GameEffect::BigBoom(_) => "BigBoom",
+            GameEffect::Konus(_) => "Konus",
+            GameEffect::Smoke(_) => "Smoke",
+            GameEffect::Fire(_) => "Fire",
+            GameEffect::BillboardLine(_) => "BillboardLine",
+            GameEffect::Keelwater(_) => "Keelwater",
+            GameEffect::Score(_) => "Score",
+            GameEffect::Lightening(_) => "Lightening",
+            GameEffect::Explosion(_) => "Explosion",
+            GameEffect::FireAnim(_) => "FireAnim",
+            GameEffect::Dust(_) => "Dust",
+        }
+    }
+
     /// Dispatch one `Takt`. Returns false at end of life.
     fn takt(&mut self, step: f32, map: &GameMap, objs: &mut Objects, rng: &mut Rnd) -> bool {
         match self {
@@ -186,7 +233,15 @@ pub fn effects_takt(
     let mut list = std::mem::take(effects);
     let mut survivors: Vec<GameEffect> = Vec::with_capacity(list.len());
     for mut e in list.drain(..) {
-        if e.takt(step, map, objs, rng) {
+        #[cfg(not(target_arch = "wasm32"))]
+        let (t0, ki) = (std::time::Instant::now(), e.kind_index());
+        let alive = e.takt(step, map, objs, rng);
+        #[cfg(not(target_arch = "wasm32"))]
+        EFFECT_TAKT_NS[ki].fetch_add(
+            t0.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        if alive {
             survivors.push(e);
         } else if let Some(w) = e.weapon() {
             objs.weapons.release(w);

@@ -4,3 +4,4 @@
 !/assets/fonts/
 /Data
 Cargo.lock
+/pkg-bench

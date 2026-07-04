@@ -83,6 +83,12 @@ pub struct ShadowBatch {
     pub bind_group: wgpu::BindGroup,
 }
 
+/// CPU-side projected-shadow ground mesh, before upload.
+pub struct ShadowGeometry {
+    pub verts: Vec<ShadowVertex>,
+    pub indices: Vec<u32>,
+}
+
 /// Mesh vertex consumed by the silhouette baker. Layout matches the shared
 /// per-renderer `Vertex` (position + normal + uv).
 #[repr(C)]
@@ -121,7 +127,7 @@ struct TextureUniform {
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
-struct ShadowVertex {
+pub struct ShadowVertex {
     position: [f32; 3],
     uv: [f32; 2],
 }
@@ -366,15 +372,13 @@ impl ShadowSystem {
     /// from world positions to match the centered render space all other
     /// renderers in this port use).
     #[allow(clippy::too_many_arguments)]
-    pub fn build_geometry(
+    pub fn build_geometry_cpu(
         &self,
-        device: &wgpu::Device,
         map: &GameMap,
         proj: &ShadowProjData,
-        texture: &wgpu::TextureView,
         map_radius: i32,
         map_center: [f32; 2],
-    ) -> Option<ShadowBatch> {
+    ) -> Option<ShadowGeometry> {
         if proj.dim_x < 1e-3 || proj.dim_y < 1e-3 {
             return None;
         }
@@ -504,17 +508,48 @@ impl ShadowSystem {
             return None;
         }
 
+        Some(ShadowGeometry {
+            verts: shadow_verts,
+            indices,
+        })
+    }
+
+    /// One-shot batch (static objects — cannons). Buffers sized
+    /// exactly; no COPY_DST.
+    pub fn build_geometry(
+        &self,
+        device: &wgpu::Device,
+        map: &GameMap,
+        proj: &ShadowProjData,
+        texture: &wgpu::TextureView,
+        map_radius: i32,
+        map_center: [f32; 2],
+    ) -> Option<ShadowBatch> {
+        let geo = self.build_geometry_cpu(map, proj, map_radius, map_center)?;
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("ShadowSystem ground VB"),
-            contents: bytemuck::cast_slice(&shadow_verts),
+            contents: bytemuck::cast_slice(&geo.verts),
             usage: wgpu::BufferUsages::VERTEX,
         });
         let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("ShadowSystem ground IB"),
-            contents: bytemuck::cast_slice(&indices),
+            contents: bytemuck::cast_slice(&geo.indices),
             usage: wgpu::BufferUsages::INDEX,
         });
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        Some(ShadowBatch {
+            vertex_buffer,
+            index_buffer,
+            num_indices: geo.indices.len() as u32,
+            bind_group: self.make_proj_bind_group(device, texture),
+        })
+    }
+
+    fn make_proj_bind_group(
+        &self,
+        device: &wgpu::Device,
+        texture: &wgpu::TextureView,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("ShadowSystem proj BG"),
             layout: &self.proj_bgl,
             entries: &[
@@ -531,13 +566,65 @@ impl ShadowSystem {
                     resource: wgpu::BindingResource::Sampler(&self.sampler),
                 },
             ],
+        })
+    }
+
+    /// Reusable batch for per-frame-updated shadows (moving robots):
+    /// COPY_DST buffers pre-sized for the worst-case `map_radius`
+    /// window, refreshed in place by [`Self::update_batch`] instead of
+    /// reallocating every frame.
+    pub fn make_reusable_batch(
+        &self,
+        device: &wgpu::Device,
+        texture: &wgpu::TextureView,
+        map_radius: i32,
+    ) -> ShadowBatch {
+        let n = (map_radius * 2 + 1) as u64;
+        let max_verts = n * n;
+        let max_indices = (n - 1) * (n - 1) * 6;
+        let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ShadowSystem ground VB (reusable)"),
+            size: max_verts * std::mem::size_of::<ShadowVertex>() as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
-        Some(ShadowBatch {
+        let index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ShadowSystem ground IB (reusable)"),
+            size: max_indices * std::mem::size_of::<u32>() as u64,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        ShadowBatch {
             vertex_buffer,
             index_buffer,
-            num_indices: indices.len() as u32,
-            bind_group,
-        })
+            num_indices: 0,
+            bind_group: self.make_proj_bind_group(device, texture),
+        }
+    }
+
+    /// Refresh a reusable batch in place. Geometry beyond the batch's
+    /// capacity is truncated (can't happen while `map_radius` matches
+    /// the `make_reusable_batch` call).
+    pub fn update_batch(&self, queue: &wgpu::Queue, batch: &mut ShadowBatch, geo: &ShadowGeometry) {
+        let vcap = (batch.vertex_buffer.size() / std::mem::size_of::<ShadowVertex>() as u64) as usize;
+        let icap = (batch.index_buffer.size() / std::mem::size_of::<u32>() as u64) as usize;
+        let nv = geo.verts.len().min(vcap);
+        let ni = geo.indices.len().min(icap);
+        if nv > 0 {
+            queue.write_buffer(
+                &batch.vertex_buffer,
+                0,
+                bytemuck::cast_slice(&geo.verts[..nv]),
+            );
+        }
+        if ni > 0 {
+            queue.write_buffer(
+                &batch.index_buffer,
+                0,
+                bytemuck::cast_slice(&geo.indices[..ni]),
+            );
+        }
+        batch.num_indices = ni as u32;
     }
 
     /// Render every batch with the projection pipeline. Caller is responsible
@@ -560,7 +647,7 @@ impl ShadowSystem {
         }
         pass.set_pipeline(&self.proj_pipeline);
         for (i, batch) in batches.iter().enumerate() {
-            if !visible.get(i).copied().unwrap_or(true) {
+            if batch.num_indices == 0 || !visible.get(i).copied().unwrap_or(true) {
                 continue;
             }
             pass.set_bind_group(0, &batch.bind_group, &[]);

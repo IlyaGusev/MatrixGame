@@ -142,6 +142,37 @@ pub struct MapLogic {
     pub side_names: Vec<(i32, String)>,
 }
 
+/// Sub-phase timing for the wasm-bench harness (microseconds):
+/// [gather_info, proceed_logic, side_takts, effects, rest].
+#[cfg(all(target_arch = "wasm32", feature = "wasm-bench"))]
+pub static TAKT_PHASE_US: [std::sync::atomic::AtomicU64; 5] = {
+    #[allow(clippy::declare_interior_mutable_const)]
+    const Z: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    [Z; 5]
+};
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm-bench"))]
+fn phase_mark(idx: usize, t0: f64) -> f64 {
+    let now = js_sys::Date::now();
+    TAKT_PHASE_US[idx].fetch_add(
+        ((now - t0) * 1000.0) as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    now
+}
+#[cfg(not(all(target_arch = "wasm32", feature = "wasm-bench")))]
+fn phase_mark(_idx: usize, t0: f64) -> f64 {
+    t0
+}
+#[cfg(all(target_arch = "wasm32", feature = "wasm-bench"))]
+fn phase_now() -> f64 {
+    js_sys::Date::now()
+}
+#[cfg(not(all(target_arch = "wasm32", feature = "wasm-bench")))]
+fn phase_now() -> f64 {
+    0.0
+}
+
 impl Default for MapLogic {
     fn default() -> Self {
         Self::new()
@@ -223,7 +254,7 @@ impl MapLogic {
     /// data at load (MatrixMapPrepare.cpp). Call after spawning.
     pub fn ensure_sides_from_objects(&mut self) {
         let mut ids: Vec<i32> = Vec::new();
-        for id in self.objects.iter_live() {
+        for id in self.objects.iter_units() {
             let Some(obj) = self.objects.get(id) else {
                 continue;
             };
@@ -242,7 +273,7 @@ impl MapLogic {
         // owning only turrets/factories stay SS_NONE and are exempt
         // from the death scan — matching the C++.
         let mut active: Vec<i32> = Vec::new();
-        for id in self.objects.iter_live() {
+        for id in self.objects.iter_units() {
             let Some(obj) = self.objects.get(id) else {
                 continue;
             };
@@ -395,6 +426,7 @@ impl MapLogic {
         }
         // GatherInfo every >100ms (MatrixLogic.cpp:2713-2718), before
         // the logic portions like the C++ Takt.
+        let mut _pt = phase_now();
         if self.elapsed_ms - self.gather_info_last > 100 {
             self.gather_info_last = self.elapsed_ms;
             if let Some(map) = crate::matrix_game::map::current_map() {
@@ -402,6 +434,7 @@ impl MapLogic {
                 self.gather_info(map, 1);
             }
         }
+        _pt = phase_mark(0, _pt);
         let full = step_ms / LOGIC_TAKT_PERIOD_MS;
         for _ in 0..full {
             self.objects
@@ -412,6 +445,7 @@ impl MapLogic {
         if rem > 0 {
             self.objects.proceed_logic(rem, &mut self.rng);
         }
+        _pt = phase_mark(1, _pt);
         // `m_Side[i].LogicTakt(LOGIC_TAKT_PERIOD)` for every side. The
         // C++ paces these on the `m_TaktNext += 10` accumulator
         // (MatrixLogic.cpp:2737-2745), so fractional frame remainders
@@ -428,6 +462,7 @@ impl MapLogic {
                 }
             }
         }
+        _pt = phase_mark(2, _pt);
         // Special win-target deaths queued by map objects this takt
         // (MatrixObject.cpp:203-212 / :249-260 / :1244-1258).
         if !self.objects.pending_special_deaths.is_empty() {
@@ -526,6 +561,7 @@ impl MapLogic {
         // outside a `MapScope` (unit tests of unrelated systems) the
         // projectiles simply hold still.
         if let Some(map) = crate::matrix_game::map::current_map() {
+            let _pt2 = phase_now();
             crate::matrix_game::effects::effects_takt(
                 &mut self.effects,
                 step_ms as f32,
@@ -533,6 +569,7 @@ impl MapLogic {
                 &mut self.objects,
                 &mut self.rng,
             );
+            phase_mark(3, _pt2);
             // BEHF_SPAWNER robots queued by object logic_takt this frame.
             self.drain_spawner_bots(map);
         }
@@ -552,6 +589,7 @@ impl MapLogic {
             log::trace!("world sound: {name} at {pos:?}");
         }
         self.sound_queue.clear();
+        phase_mark(4, _pt);
         self.elapsed_ms += step_ms as i64;
     }
 
@@ -578,7 +616,7 @@ impl MapLogic {
                 alive[k] = true;
             }
         }
-        for id in self.objects.iter_live() {
+        for id in self.objects.iter_units() {
             let Some(obj) = self.objects.get(id) else {
                 continue;
             };
@@ -620,7 +658,7 @@ impl MapLogic {
             }
             let buildings: Vec<ObjectId> = self
                 .objects
-                .iter_live()
+                .iter_units()
                 .filter(|&id| {
                     building_ref(&self.objects, id)
                         .map(|b| b.is_live() && b.side == sid)
@@ -753,7 +791,7 @@ impl MapLogic {
             self.robot_in_position = in_pos;
             if !in_pos {
                 // "oblom" — nobody in position: clear every robot's flag.
-                let all: Vec<_> = self.objects.iter_live().collect();
+                let all: Vec<_> = self.objects.iter_units().collect();
                 for id in all {
                     if let Some(r) = robot_mut(&mut self.objects, id) {
                         r.in_position = false;
@@ -780,7 +818,7 @@ impl MapLogic {
 
         let robot_ids: Vec<ObjectId> = self
             .objects
-            .iter_live()
+            .iter_units()
             .filter(|&id| {
                 robot_ref(&self.objects, id)
                     .map(|r| r.is_live())
@@ -820,7 +858,7 @@ impl MapLogic {
 
             if gtype == 0 {
                 let mut place_buf: Vec<i32> = Vec::new();
-                for oid in self.objects.iter_live() {
+                for oid in self.objects.iter_units() {
                     if oid == rid {
                         continue;
                     }
@@ -837,29 +875,37 @@ impl MapLogic {
                             let dist_enemy = d.length_squared();
                             let t1 = other.max_fire_dist.max(my_maxfd) * 1.1;
                             if dist_enemy <= t1 * t1 && other.is_live() {
-                                if is_logic_visible(map, &self.objects, rid, oid, 0.0) {
+                                // Known / ignored enemies can't change
+                                // state whichever way the visibility
+                                // trace lands (C++ traces first,
+                                // MatrixRobot.cpp:4358-4360, but the
+                                // outcome is identical) — check them
+                                // first and skip the expensive trace.
+                                let known = {
                                     let me_env = &robot_ref(&self.objects, rid).unwrap().env;
-                                    if !me_env.search_enemy(oid) && !me_env.is_ignore(oid, now) {
-                                        let p_to = (other.map_x, other.map_y);
-                                        let (st, dist) = place_list(
-                                            map,
-                                            my_chassis,
-                                            my_map,
-                                            p_to,
-                                            float2int(my_maxfd / gs),
-                                            false,
-                                            &mut place_buf,
-                                        );
-                                        let d2 = {
-                                            let dx = (my_map.0 - p_to.0) as i64;
-                                            let dy = (my_map.1 - p_to.1) as i64;
-                                            dx * dx + dy * dy
-                                        };
-                                        if st != 0 && ((dist / 4) as i64).pow(2) < d2 {
-                                            acts.push(Act::Add(oid));
-                                        } else {
-                                            acts.push(Act::AddIgnore(oid));
-                                        }
+                                    me_env.search_enemy(oid) || me_env.is_ignore(oid, now)
+                                };
+                                if !known && is_logic_visible(map, &self.objects, rid, oid, 0.0)
+                                {
+                                    let p_to = (other.map_x, other.map_y);
+                                    let (st, dist) = place_list(
+                                        map,
+                                        my_chassis,
+                                        my_map,
+                                        p_to,
+                                        float2int(my_maxfd / gs),
+                                        false,
+                                        &mut place_buf,
+                                    );
+                                    let d2 = {
+                                        let dx = (my_map.0 - p_to.0) as i64;
+                                        let dy = (my_map.1 - p_to.1) as i64;
+                                        dx * dx + dy * dy
+                                    };
+                                    if st != 0 && ((dist / 4) as i64).pow(2) < d2 {
+                                        acts.push(Act::Add(oid));
+                                    } else {
+                                        acts.push(Act::AddIgnore(oid));
                                     }
                                 }
                             } else {
@@ -882,9 +928,13 @@ impl MapLogic {
                             let fire_r = cannon.fire_radius(&self.objects);
                             let t1 = (fire_r * 1.01).max(my_maxfd * 1.1);
                             if dist_enemy <= t1 * t1 && !matches!(cannon.state, CannonState::Dip) {
-                                if is_logic_visible(map, &self.objects, rid, oid, 0.0) {
+                                let known = {
                                     let me_env = &robot_ref(&self.objects, rid).unwrap().env;
-                                    if !me_env.search_enemy(oid) && !me_env.is_ignore(oid, now) {
+                                    me_env.search_enemy(oid) || me_env.is_ignore(oid, now)
+                                };
+                                if !known && is_logic_visible(map, &self.objects, rid, oid, 0.0)
+                                {
+                                    {
                                         let p_to = (
                                             float2int(cannon.pos.x / gs),
                                             float2int(cannon.pos.y / gs),
@@ -930,7 +980,7 @@ impl MapLogic {
                 // Radio (MatrixRobot.cpp:4481-4520): merge enemies of
                 // same-group robots, or same-team robots in my region.
                 let my_region = get_region(map, my_map.0, my_map.1);
-                for oid in self.objects.iter_live() {
+                for oid in self.objects.iter_units() {
                     if oid == rid {
                         continue;
                     }
@@ -1256,7 +1306,7 @@ impl MapLogic {
             // else advance on the spawn point.
             let mut target: Option<ObjectId> = None;
             let mut best = f32::MAX;
-            for id in self.objects.iter_live() {
+            for id in self.objects.iter_units() {
                 if id == rid {
                     continue;
                 }
@@ -1818,7 +1868,7 @@ impl MapLogic {
     /// per tick which is equivalent for the HUD.
     pub fn compute_side_robots(&self, side_id: i32) -> i32 {
         let mut n = 0;
-        for id in self.objects.iter_live() {
+        for id in self.objects.iter_units() {
             let Some(obj) = self.objects.get(id) else {
                 continue;
             };
@@ -1848,7 +1898,7 @@ impl MapLogic {
             Resource::Plasma => BuildingType::Plasma,
         };
         let (mut bases, mut factories) = (0, 0);
-        for id in self.objects.iter_live() {
+        for id in self.objects.iter_units() {
             let Some(obj) = self.objects.get(id) else {
                 continue;
             };
@@ -1894,7 +1944,7 @@ impl MapLogic {
     /// accrual pass.
     fn count_bases_factories(&self, side_id: i32) -> (i32, i32) {
         let (mut bases, mut factories) = (0, 0);
-        for id in self.objects.iter_live() {
+        for id in self.objects.iter_units() {
             let Some(obj) = self.objects.get(id) else {
                 continue;
             };
@@ -1946,7 +1996,7 @@ impl MapLogic {
         // Side without re-entering the arena iterator.
         let ids: Vec<ObjectId> = self
             .objects
-            .iter_live()
+            .iter_units()
             .filter(|&id| {
                 self.objects
                     .get(id)
@@ -2179,7 +2229,7 @@ pub fn place_is_empty(
 
     use crate::matrix_game::robot::Robot;
 
-    for id in objs.iter_live() {
+    for id in objs.iter_units() {
         if skip == Some(id) {
             continue;
         }
@@ -2236,7 +2286,7 @@ pub fn collect_place_blockers(objs: &Objects, skip: Option<ObjectId>) -> Vec<(i3
     use crate::matrix_game::robot::Robot;
 
     let mut out: Vec<(i32, i32)> = Vec::new();
-    for id in objs.iter_live() {
+    for id in objs.iter_units() {
         if skip == Some(id) {
             continue;
         }
@@ -2293,7 +2343,7 @@ pub fn place_find_near_return(
     use crate::matrix_game::robot::{Robot, RobotState};
 
     let mut blockers: Vec<(i32, i32)> = bad_coords.to_vec();
-    for id in objs.iter_live() {
+    for id in objs.iter_units() {
         let Some(obj) = objs.get(id) else { continue };
         match obj.core().obj_type {
             ObjectType::RobotAi => {
@@ -3678,7 +3728,7 @@ pub fn is_on_base(objs: &Objects, x: f32, y: f32) -> bool {
     let gs = crate::matrix_game::map::GLOBAL_SCALE;
     let cx = float2int(x / gs);
     let cy = float2int(y / gs);
-    for id in objs.iter_live() {
+    for id in objs.iter_units() {
         let Some(obj) = objs.get(id) else { continue };
         if !matches!(obj.core().obj_type, ObjectType::Building) {
             continue;

@@ -177,7 +177,7 @@ pub(crate) fn mark_occupied_places(map: &GameMap, objs: &Objects) {
 /// `mark_occupied_places` with the `obj != robot` exemption the C++
 /// per-robot AssignPlace uses (MatrixSide.cpp:5284-5288).
 pub(crate) fn mark_occupied_places_skip(map: &GameMap, objs: &Objects, skip: Option<ObjectId>) {
-    for id in objs.iter_live() {
+    for id in objs.iter_units() {
         if Some(id) == skip || !is_live_unit(objs, id) {
             continue;
         }
@@ -231,7 +231,7 @@ impl MapLogic {
     /// Live robots of side `side_id` in logic group `no`.
     pub(crate) fn group_robots_of(&self, side_id: i32, no: usize) -> Vec<ObjectId> {
         self.objects
-            .iter_live()
+            .iter_units()
             .filter(|&id| {
                 robot_ref(&self.objects, id)
                     .map(|r| r.is_live() && r.side == side_id && r.group_logic == no as i32)
@@ -248,7 +248,7 @@ impl MapLogic {
     /// All live robots of side `side_id`.
     pub(crate) fn side_robots_of(&self, side_id: i32) -> Vec<ObjectId> {
         self.objects
-            .iter_live()
+            .iter_units()
             .filter(|&id| {
                 robot_ref(&self.objects, id)
                     .map(|r| r.is_live() && r.side == side_id)
@@ -275,7 +275,7 @@ impl MapLogic {
         }
         let mut envs: Vec<Envelope> = Vec::new();
         let gsm = GameMap::GLOBAL_SCALE_MOVE;
-        for id in self.objects.iter_live() {
+        for id in self.objects.iter_units() {
             if !is_live_unit(&self.objects, id) {
                 continue;
             }
@@ -374,7 +374,7 @@ impl MapLogic {
         // Pass 1: bomb robots (any side) with enemies nearby.
         // (id, world_pos, side, min_enemy_dist2, map_cell)
         let mut rb: Vec<(ObjectId, glam::Vec2, i32, f32, (i32, i32))> = Vec::new();
-        for id in self.objects.iter_live() {
+        for id in self.objects.iter_units() {
             let Some(r) = robot_ref(&self.objects, id) else {
                 continue;
             };
@@ -398,7 +398,7 @@ impl MapLogic {
 
         let mine: Vec<ObjectId> = self
             .objects
-            .iter_live()
+            .iter_units()
             .filter(|&id| {
                 robot_ref(&self.objects, id)
                     .map(|r| r.is_live() && r.side() == my_id)
@@ -507,7 +507,7 @@ impl MapLogic {
             // Mark places already claimed by other units (data|2) so the
             // wave doesn't send everyone to the same spot.
             let mut touched: Vec<i32> = Vec::new();
-            for oid in self.objects.iter_live() {
+            for oid in self.objects.iter_units() {
                 if oid == id {
                     continue;
                 }
@@ -1223,7 +1223,7 @@ impl MapLogic {
         // still capturable?
         let mut someone_capturing = false;
         let mut capturable = false;
-        for id in self.objects.iter_live() {
+        for id in self.objects.iter_units() {
             if let Some(r) = robot_ref(&self.objects, id) {
                 if r.is_live() && r.side == side_id {
                     if let Some(cf) = r.get_capture_factory() {
@@ -1261,7 +1261,7 @@ impl MapLogic {
             if base_with_turrets {
                 let grp = self.group_robots(i);
                 let mut engaged = false;
-                'outer: for id in self.objects.iter_live() {
+                'outer: for id in self.objects.iter_units() {
                     let Some(c) = cannon_ref(&self.objects, id) else {
                         continue;
                     };
@@ -1329,7 +1329,7 @@ impl MapLogic {
 
         // Already-capturing robot anywhere on the side?
         let mut capturer: Option<ObjectId> = None;
-        for id in self.objects.iter_live() {
+        for id in self.objects.iter_units() {
             let Some(r) = robot_ref(&self.objects, id) else {
                 continue;
             };
@@ -1514,7 +1514,7 @@ impl MapLogic {
         dir: glam::Vec3,
         dist: f32,
     ) -> bool {
-        for oid in self.objects.iter_live() {
+        for oid in self.objects.iter_units() {
             if oid == rid || oid == target {
                 continue;
             }
@@ -1742,7 +1742,7 @@ impl MapLogic {
                         }
                         // Find a new repairable.
                         let mut new_target = None;
-                        for oid in self.objects.iter_live() {
+                        for oid in self.objects.iter_units() {
                             if oid == rid {
                                 continue;
                             }
@@ -2074,7 +2074,7 @@ impl MapLogic {
                     r.env.target = None;
                 }
                 let mut new_target = None;
-                for oid in self.objects.iter_live() {
+                for oid in self.objects.iter_units() {
                     if oid == rid {
                         continue;
                     }
@@ -3336,7 +3336,7 @@ impl MapLogic {
         // Blockers: out-of-group robots' claims + cannon places.
         let mut other: Vec<(i32, i32)> = Vec::new();
         let gsm = GameMap::GLOBAL_SCALE_MOVE;
-        for oid in self.objects.iter_live() {
+        for oid in self.objects.iter_units() {
             let Some(obj) = self.objects.get(oid) else {
                 continue;
             };
@@ -3411,7 +3411,7 @@ impl MapLogic {
             .resize(region_cnt, 0);
 
         let gsm = GameMap::GLOBAL_SCALE_MOVE;
-        for oid in self.objects.iter_live() {
+        for oid in self.objects.iter_units() {
             let Some(obj) = self.objects.get(oid) else {
                 continue;
             };
@@ -3635,7 +3635,7 @@ impl MapLogic {
         }
 
         let building_in_region = |s: &Self, reg: i32| -> Option<ObjectId> {
-            for oid in s.objects.iter_live() {
+            for oid in s.objects.iter_units() {
                 let Some(b) = building_ref(&s.objects, oid) else {
                     continue;
                 };
@@ -3762,7 +3762,7 @@ impl MapLogic {
         }
 
         let unit_in_region = |s: &Self, reg: i32| -> Option<ObjectId> {
-            for oid in s.objects.iter_live() {
+            for oid in s.objects.iter_units() {
                 if !is_live_unit(&s.objects, oid) {
                     continue;
                 }
@@ -3898,7 +3898,7 @@ impl MapLogic {
                 index.push(u);
                 if self.player_side.region_stats[u as usize].enemy_base_cnt > 0 {
                     let mut found: Option<ObjectId> = None;
-                    for oid in self.objects.iter_live() {
+                    for oid in self.objects.iter_units() {
                         let Some(b) = building_ref(&self.objects, oid) else {
                             continue;
                         };
@@ -3938,7 +3938,7 @@ impl MapLogic {
 
         // Current region first.
         let mut local_target = None;
-        for oid in self.objects.iter_live() {
+        for oid in self.objects.iter_units() {
             if !is_live_unit(&self.objects, oid) {
                 continue;
             }
@@ -4048,7 +4048,7 @@ impl MapLogic {
                     if st.our_building_cnt > 0 || st.our_cannon_cnt > 0 {
                         // Enemy robot heading into region u?
                         let mut incoming: Option<ObjectId> = None;
-                        for oid in self.objects.iter_live() {
+                        for oid in self.objects.iter_units() {
                             let Some(r) = robot_ref(&self.objects, oid) else {
                                 continue;
                             };
@@ -4313,7 +4313,7 @@ impl MapLogic {
             .unwrap_or_default();
         let all: Vec<ObjectId> = self
             .objects
-            .iter_live()
+            .iter_units()
             .filter(|&id| robot_ref(&self.objects, id).is_some())
             .collect();
         for id in all {
@@ -4536,7 +4536,7 @@ impl MapLogic {
 
         let nearby: Vec<ObjectId> = self
             .objects
-            .iter_live()
+            .iter_units()
             .filter(|&id| {
                 robot_ref(&self.objects, id)
                     .map(|r| {
@@ -4576,7 +4576,7 @@ impl MapLogic {
         const MAX_ALWAYS_DRAW_OBJ: usize = 16;
         let live_flyers = self
             .objects
-            .iter_live()
+            .iter_units()
             .filter(|&id| {
                 self.objects
                     .get(id)

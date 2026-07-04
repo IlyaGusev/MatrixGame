@@ -163,7 +163,7 @@ impl MapLogic {
         for tm in side.teams.iter_mut() {
             tm.robot_cnt = 0;
         }
-        for id in self.objects.iter_live() {
+        for id in self.objects.iter_units() {
             let Some(r) = robot_ref(&self.objects, id) else {
                 continue;
             };
@@ -186,7 +186,7 @@ impl MapLogic {
         let mut c_building = 0i32;
         let mut s_cannon = 0.0f32;
         let mut s_robot = 0.0f32;
-        for id in self.objects.iter_live() {
+        for id in self.objects.iter_units() {
             let Some(obj) = self.objects.get(id) else {
                 continue;
             };
@@ -251,7 +251,7 @@ impl MapLogic {
             pos: (f32, f32),
         }
         let mut rl: Vec<R> = Vec::new();
-        for id in self.objects.iter_live() {
+        for id in self.objects.iter_units() {
             let Some(r) = robot_ref(&self.objects, id) else {
                 continue;
             };
@@ -420,7 +420,7 @@ impl MapLogic {
             lg.robots_cnt = 0;
         }
         let mut strays: Vec<ObjectId> = Vec::new();
-        for id in self.objects.iter_live() {
+        for id in self.objects.iter_units() {
             let Some(r) = robot_ref(&self.objects, id) else {
                 continue;
             };
@@ -510,7 +510,7 @@ impl MapLogic {
                         continue;
                     }
                     if side.region_stats[ui].our_robot_cnt > 0 {
-                        for id in self.objects.iter_live() {
+                        for id in self.objects.iter_units() {
                             let Some(r) = robot_ref(&self.objects, id) else {
                                 continue;
                             };
@@ -580,7 +580,7 @@ impl MapLogic {
     fn reteam_stuck_robots(&mut self, map: &GameMap, side: &mut Side) {
         let stuck: Vec<ObjectId> = self
             .objects
-            .iter_live()
+            .iter_units()
             .filter(|&id| {
                 robot_ref(&self.objects, id)
                     .map(|r| r.side == side.id && r.zone_path_fail_reteam)
@@ -733,7 +733,7 @@ impl MapLogic {
 
         // ── Census (2619-2724) ─────────────────────────────────────
         // (C++ also counts ourbasecnt here but never reads it.)
-        for id in self.objects.iter_live() {
+        for id in self.objects.iter_units() {
             let Some(obj) = self.objects.get(id) else {
                 continue;
             };
@@ -945,7 +945,7 @@ impl MapLogic {
                 zero_places(map, &region_place);
                 // Robots of team i whose place isn't in the target region.
                 let mut outsiders: Vec<(ObjectId, u8)> = Vec::new();
-                for id in self.objects.iter_live() {
+                for id in self.objects.iter_units() {
                     let Some(r) = robot_ref(&self.objects, id) else {
                         continue;
                     };
@@ -1107,7 +1107,7 @@ impl MapLogic {
         }
 
         // Team radii (2977-2994).
-        for id in self.objects.iter_live() {
+        for id in self.objects.iter_units() {
             let Some(r) = robot_ref(&self.objects, id) else {
                 continue;
             };
@@ -1253,7 +1253,7 @@ impl MapLogic {
         // Nearest own base (3144-3160).
         let our_bases: Vec<i32> = self
             .objects
-            .iter_live()
+            .iter_units()
             .filter_map(|id| building_ref(&self.objects, id))
             .filter(|b| b.is_base() && b.side == sid)
             .map(|b| get_region(map, (b.pos.x / gsm) as i32, (b.pos.y / gsm) as i32))
@@ -1443,7 +1443,7 @@ impl MapLogic {
                             || side.region_stats[ar as usize].enemy_building_cnt > 0)
                     {
                         let mut arrived = false;
-                        for id in self.objects.iter_live() {
+                        for id in self.objects.iter_units() {
                             let Some(r) = robot_ref(&self.objects, id) else {
                                 continue;
                             };
@@ -2839,7 +2839,7 @@ impl MapLogic {
 
                     // Distribute capture targets (4540-4575).
                     let mut targets: Vec<ObjectId> = Vec::new();
-                    for id in self.objects.iter_live() {
+                    for id in self.objects.iter_units() {
                         let Some(b) = building_ref(&self.objects, id) else {
                             continue;
                         };
@@ -3393,7 +3393,7 @@ impl MapLogic {
                 r.env.target = None;
             }
             let mut new_target = None;
-            for oid in self.objects.iter_live() {
+            for oid in self.objects.iter_units() {
                 if oid == rid {
                     continue;
                 }
@@ -3457,7 +3457,7 @@ impl MapLogic {
 
         let mut grp: Vec<ObjectId> = Vec::new();
         let mut mm = 0u8;
-        for id in self.objects.iter_live() {
+        for id in self.objects.iter_units() {
             if let Some(r) = robot_ref(&self.objects, id) {
                 if !r.is_live() {
                     continue;
@@ -3572,7 +3572,7 @@ impl MapLogic {
                     }
                     sort_by_projection(map, &mut list);
                     zero_places(map, &list);
-                    for id in self.objects.iter_live() {
+                    for id in self.objects.iter_units() {
                         if let Some(r) = robot_ref(&self.objects, id) {
                             if !r.is_live() {
                                 continue;
@@ -3702,7 +3702,7 @@ impl MapLogic {
             let rn = rn_lock.lock().unwrap();
             rn.is_nerest_region(r, base_region)
         };
-        for id in self.objects.iter_live() {
+        for id in self.objects.iter_units() {
             if let Some(r) = robot_ref(&self.objects, id) {
                 if !r.is_live() {
                     continue;
@@ -3744,7 +3744,7 @@ impl MapLogic {
         let mut base_region = -1i32;
         let mut minstrange = 0.0f32;
 
-        for id in self.objects.iter_live() {
+        for id in self.objects.iter_units() {
             if let Some(b) = building_ref(&self.objects, id) {
                 if b.side != sid || !b.is_live() {
                     continue;
@@ -4050,7 +4050,7 @@ impl MapLogic {
         let maxrobot = self.compute_max_side_robots(sid);
 
         let mut curcannoncnt = 0;
-        for id in self.objects.iter_live() {
+        for id in self.objects.iter_units() {
             if is_live_unit(&self.objects, id) {
                 if let Some(c) = cannon_ref(&self.objects, id) {
                     if c.side == sid {
@@ -4066,7 +4066,7 @@ impl MapLogic {
         // Building nearest the front with a free slot (5931-5952).
         let mut building: Option<ObjectId> = None;
         let mut mdist = 0i32;
-        for id in self.objects.iter_live() {
+        for id in self.objects.iter_units() {
             let Some(b) = building_ref(&self.objects, id) else {
                 continue;
             };
@@ -4094,7 +4094,7 @@ impl MapLogic {
 
         // Turret-type histogram: standing + queued (5954-5975).
         let mut ct = [0i32; 4];
-        for id in self.objects.iter_live() {
+        for id in self.objects.iter_units() {
             if !is_live_unit(&self.objects, id) {
                 continue;
             }

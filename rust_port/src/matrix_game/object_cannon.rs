@@ -695,7 +695,7 @@ impl MapStatic for Cannon {
                 if pside != self.side {
                     self.side = pside;
                     if let Some(me) = self.self_id {
-                        let others: Vec<ObjectId> = objs.iter_live().collect();
+                        let others: Vec<ObjectId> = objs.iter_units().collect();
                         for oid in others {
                             if let Some(r) = crate::matrix_game::logic::robot_mut(objs, oid) {
                                 r.env.remove_from_list(me);
@@ -1129,7 +1129,7 @@ impl MapStatic for Cannon {
         }
         // ReleaseMe env scrub (MatrixObjectCannon.cpp:1600-1610): every
         // robot forgets the dead turret so war groups retarget instantly.
-        let others: Vec<ObjectId> = objs.iter_live().collect();
+        let others: Vec<ObjectId> = objs.iter_units().collect();
         for oid in others {
             if let Some(r) = crate::matrix_game::logic::robot_mut(objs, oid) {
                 r.env.remove_from_list(self_id);
@@ -1711,7 +1711,7 @@ impl CannonsRenderer {
         );
         let mut alive_shadow_ids: std::collections::HashSet<ObjectId> =
             std::collections::HashSet::new();
-        for id in objs.iter_live() {
+        for id in objs.iter_units() {
             let Some(obj) = objs.get(id) else { continue };
             if !matches!(obj.core().obj_type, ObjectType::Cannon) {
                 continue;

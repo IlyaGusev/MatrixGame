@@ -444,7 +444,7 @@ fn ramp_turret_hp(objs: &mut Objects, parent_id: ObjectId, slot: i32, progress: 
     use crate::matrix_game::map_static::ObjectType;
     use crate::matrix_game::object_cannon::Cannon;
 
-    let live: Vec<ObjectId> = objs.iter_live().collect();
+    let live: Vec<ObjectId> = objs.iter_units().collect();
     for id in live {
         let Some(obj) = objs.get_mut(id) else {
             continue;
@@ -1264,7 +1264,7 @@ impl MapStatic for Building {
                         // Silent ghost delete (the C++ StaticDelete +
                         // ReleaseMe slot bookkeeping).
                         if let Some(me) = self.self_id {
-                            let ghost = objs.iter_live().find(|&oid| {
+                            let ghost = objs.iter_units().find(|&oid| {
                                 crate::matrix_game::logic::cannon_ref(objs, oid)
                                     .map(|c| {
                                         c.parent == Some(me)
@@ -1380,7 +1380,7 @@ impl MapStatic for Building {
                 if let Some(self_id) = self.self_id {
                     let my_side = self.side;
                     let my_pos = self.pos;
-                    let live: Vec<_> = objs.iter_live().collect();
+                    let live: Vec<_> = objs.iter_units().collect();
                     for id in live {
                         let Some(o) = objs.get_mut(id) else { continue };
                         if !matches!(o.core().obj_type, ObjectType::RobotAi) {
@@ -1421,7 +1421,7 @@ impl MapStatic for Building {
                 if self.capture_seek_robot_next_time < now {
                     let mut found: Option<(crate::matrix_game::map_static::ObjectId, i32)> = None;
                     let mut best = CAPTURE_RADIUS * CAPTURE_RADIUS;
-                    for id in objs.iter_live() {
+                    for id in objs.iter_units() {
                         let Some(o) = objs.get(id) else { continue };
                         if !matches!(o.core().obj_type, ObjectType::RobotAi) {
                             continue;
@@ -1796,7 +1796,7 @@ impl MapStatic for Building {
             // building clears, child cannons orphan.
             if let Some(me) = self.self_id {
                 let ids: Vec<crate::matrix_game::map_static::ObjectId> =
-                    objs.iter_live().collect();
+                    objs.iter_units().collect();
                 for oid in ids {
                     if let Some(r) = crate::matrix_game::logic::robot_mut(objs, oid) {
                         if r.base == Some(me) {
@@ -2556,7 +2556,21 @@ impl BuildingsRenderer {
 
         let revision = point_lights.revision();
         if revision != self.last_point_light_revision {
+            // Skip batches with no building near the relit window.
+            let [rx0, ry0, rx1, ry1] = point_lights.changed_rect();
+            let gs = crate::matrix_game::map::GLOBAL_SCALE;
+            let wx0 = (rx0 - 1) as f32 * gs;
+            let wy0 = (ry0 - 1) as f32 * gs;
+            let wx1 = (rx1 + 1) as f32 * gs;
+            let wy1 = (ry1 + 1) as f32 * gs;
             for batch in &mut self.batches {
+                let any_in_window = batch
+                    .buildings
+                    .iter()
+                    .any(|b| b.x >= wx0 && b.x <= wx1 && b.y >= wy0 && b.y <= wy1);
+                if !any_in_window {
+                    continue;
+                }
                 let [cx, cy] = batch.center;
                 let inst_data: Vec<InstanceData> = batch
                     .buildings
@@ -2606,7 +2620,7 @@ impl BuildingsRenderer {
         // path → world placements (x, y, z, angle_z).
         let mut ruins_by_vo: std::collections::HashMap<&str, Vec<(f32, f32, f32, f32)>> =
             std::collections::HashMap::new();
-        for id in objs.iter_live() {
+        for id in objs.iter_units() {
             if let Some(obj) = objs.get(id) {
                 match obj.core().obj_type {
                     ObjectType::Building => {

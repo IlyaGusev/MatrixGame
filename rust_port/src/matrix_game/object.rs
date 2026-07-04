@@ -1396,6 +1396,10 @@ struct MeshBatch {
     instance_buffer: wgpu::Buffer,
     num_instances: u32,
     bind_group: wgpu::BindGroup,
+    /// CPU mirror of `instance_buffer` — lets the point-light pass
+    /// retint only the instances inside the relit window and upload a
+    /// contiguous sub-range (gap entries stay valid from the mirror).
+    cached_instances: Vec<InstanceData>,
     objects: Vec<ObjectInstance>,
     /// Per-instance visibility — pre-registered break replacements start
     /// hidden; `sync_break_swaps` flips entries when the arena object's
@@ -1957,6 +1961,7 @@ impl ObjectsRenderer {
                     instance_buffer: instance_buffer.clone(),
                     num_instances: inst_data.len() as u32,
                     bind_group,
+                    cached_instances: inst_data.clone(),
                     objects: type_objects.clone(),
                     hidden: type_hidden.clone(),
                     type_id: *type_id,
@@ -2082,17 +2087,45 @@ impl ObjectsRenderer {
 
         let revision = point_lights.revision();
         if revision != self.last_point_light_revision {
+            // Retint only instances inside the relit window; same-type
+            // surface batches share one instance buffer, so update it
+            // once per type. Previously this rebuilt EVERY decorative
+            // object's instance (with a light sample each) and
+            // re-uploaded all instance buffers on every relight.
+            let [rx0, ry0, rx1, ry1] = point_lights.changed_rect();
+            let gs = crate::matrix_game::map::GLOBAL_SCALE;
+            let wx0 = (rx0 - 1) as f32 * gs;
+            let wy0 = (ry0 - 1) as f32 * gs;
+            let wx1 = (rx1 + 1) as f32 * gs;
+            let wy1 = (ry1 + 1) as f32 * gs;
+            let mut done_types: std::collections::HashSet<u32> = std::collections::HashSet::new();
             for batch in &mut self.batches {
+                if !done_types.insert(batch.type_id) {
+                    continue;
+                }
                 let [cx, cy] = batch.center;
-                let inst_data = batch_instance_data(
-                    &batch.objects,
-                    &batch.hidden,
-                    cx,
-                    cy,
-                    map,
-                    Some(point_lights),
-                );
-                queue.write_buffer(&batch.instance_buffer, 0, bytemuck::cast_slice(&inst_data));
+                let mut lo = usize::MAX;
+                let mut hi = 0usize;
+                for (i, obj) in batch.objects.iter().enumerate() {
+                    if obj.x < wx0 || obj.x > wx1 || obj.y < wy0 || obj.y > wy1 {
+                        continue;
+                    }
+                    batch.cached_instances[i] = if batch.hidden.get(i).copied().unwrap_or(false) {
+                        hidden_instance()
+                    } else {
+                        instance_matrix(obj, cx, cy, map, Some(point_lights))
+                    };
+                    lo = lo.min(i);
+                    hi = hi.max(i);
+                }
+                if lo <= hi && lo != usize::MAX {
+                    let isz = std::mem::size_of::<InstanceData>();
+                    queue.write_buffer(
+                        &batch.instance_buffer,
+                        (lo * isz) as u64,
+                        bytemuck::cast_slice(&batch.cached_instances[lo..=hi]),
+                    );
+                }
             }
             self.last_point_light_revision = revision;
         }
@@ -2151,7 +2184,7 @@ impl ObjectsRenderer {
             }
             if dirty {
                 let [cx, cy] = batch.center;
-                let inst_data = batch_instance_data(
+                batch.cached_instances = batch_instance_data(
                     &batch.objects,
                     &batch.hidden,
                     cx,
@@ -2159,7 +2192,11 @@ impl ObjectsRenderer {
                     map,
                     Some(point_lights),
                 );
-                queue.write_buffer(&batch.instance_buffer, 0, bytemuck::cast_slice(&inst_data));
+                queue.write_buffer(
+                    &batch.instance_buffer,
+                    0,
+                    bytemuck::cast_slice(&batch.cached_instances),
+                );
             }
         }
         for (i, (key, ty)) in self.shadow_keys.iter().enumerate() {

@@ -461,6 +461,14 @@ pub struct Objects {
     /// `RobotSpawn` rally (AssignPlace + PGOrderAttack,
     /// MatrixRobot.cpp:2204-2223), which needs side/place access.
     pub pending_spawn_rallies: Vec<ObjectId>,
+    /// Live-unit index (RobotAi/Building/Cannon/Flyer) — the hot logic
+    /// scans and object traces walk this instead of every arena slot;
+    /// on real maps decorative MapObjects outnumber units ~100:1 and a
+    /// full-slot walk per trace was the battle-FPS killer.
+    unit_ids: Vec<ObjectId>,
+    /// Decorative `MapObject` index — consulted only when a trace mask
+    /// asks for TRACE_OBJECT.
+    mapobject_ids: Vec<ObjectId>,
     /// Freshly produced AI-side robots awaiting `ClacSpawnTeam`
     /// (MatrixRobot.cpp:2204-2205). Drained by the side-AI takt.
     pub pending_ai_spawn: Vec<ObjectId>,
@@ -616,6 +624,8 @@ impl Objects {
             pending_refunds: Vec::new(),
             pending_spawn_rallies: Vec::new(),
             pending_ai_spawn: Vec::new(),
+            unit_ids: Vec::new(),
+            mapobject_ids: Vec::new(),
             pending_sounds: Vec::new(),
             flyer_alt_grid: Vec::new(),
             pending_point_lights: Vec::new(),
@@ -668,7 +678,8 @@ impl Objects {
     /// equivalent for `CMatrixMapStatic`-derived objects: after this
     /// returns, the subclass may call `add_lt` to opt into logic takts.
     pub fn spawn(&mut self, obj: Box<dyn MapStatic>) -> ObjectId {
-        if let Some(index) = self.free.pop() {
+        let ty = obj.core().obj_type;
+        let id = if let Some(index) = self.free.pop() {
             let slot = &mut self.slots[index as usize];
             slot.obj = Some(obj);
             slot.in_lt = false;
@@ -691,7 +702,15 @@ impl Objects {
                 index,
                 generation: 1,
             }
+        };
+        match ty {
+            ObjectType::RobotAi | ObjectType::Building | ObjectType::Cannon | ObjectType::Flyer => {
+                self.unit_ids.push(id)
+            }
+            ObjectType::MapObject => self.mapobject_ids.push(id),
+            ObjectType::Empty => {}
         }
+        id
     }
 
     /// Destroy the object at `id`. Ports `~CMatrixMapStatic`
@@ -703,10 +722,34 @@ impl Objects {
             return;
         }
         self.del_lt(id);
+        if let Some(p) = self.unit_ids.iter().position(|&x| x == id) {
+            self.unit_ids.swap_remove(p);
+        } else if let Some(p) = self.mapobject_ids.iter().position(|&x| x == id) {
+            self.mapobject_ids.swap_remove(p);
+        }
         let slot = &mut self.slots[id.index as usize];
         slot.obj = None;
         slot.generation = slot.generation.wrapping_add(1);
         self.free.push(id.index);
+    }
+
+    /// Live units only (robots/buildings/cannons/flyers) — the fast
+    /// path for gameplay scans that never care about decoratives.
+    pub fn iter_units(&self) -> impl Iterator<Item = ObjectId> + '_ {
+        self.unit_ids.iter().copied()
+    }
+
+    /// Candidate ids for a trace/scan `mask`: units always (the mask
+    /// still filters per type), decoratives only when TRACE_OBJECT is
+    /// requested.
+    fn mask_candidates(&self, mask: u32) -> impl Iterator<Item = ObjectId> + '_ {
+        let want_mapobjects = mask & TRACE_OBJECT != 0;
+        self.unit_ids.iter().copied().chain(
+            self.mapobject_ids
+                .iter()
+                .copied()
+                .filter(move |_| want_mapobjects),
+        )
     }
 
     pub fn is_valid(&self, id: ObjectId) -> bool {
@@ -946,14 +989,10 @@ impl Objects {
         mut visit: impl FnMut(Vec2, ObjectId) -> Control,
     ) -> bool {
         let mut hit = false;
-        for (i, slot) in self.slots.iter().enumerate() {
-            let obj = match slot.obj.as_deref() {
+        for id in self.mask_candidates(mask) {
+            let obj = match self.get(id) {
                 Some(o) => o,
                 None => continue,
-            };
-            let id = ObjectId {
-                index: i as u32,
-                generation: slot.generation,
             };
             if Some(id) == skip {
                 continue;
@@ -999,14 +1038,10 @@ impl Objects {
         mut visit: impl FnMut(Vec3, ObjectId) -> Control,
     ) -> bool {
         let mut hit = false;
-        for (i, slot) in self.slots.iter().enumerate() {
-            let obj = match slot.obj.as_deref() {
+        for id in self.mask_candidates(mask) {
+            let obj = match self.get(id) {
                 Some(o) => o,
                 None => continue,
-            };
-            let id = ObjectId {
-                index: i as u32,
-                generation: slot.generation,
             };
             if Some(id) == skip {
                 continue;
@@ -1057,14 +1092,10 @@ impl Objects {
         skip: Option<ObjectId>,
     ) -> Option<(ObjectId, f32)> {
         let mut best: Option<(ObjectId, f32)> = None;
-        for (i, slot) in self.slots.iter().enumerate() {
-            let obj = match slot.obj.as_deref() {
+        for id in self.mask_candidates(mask) {
+            let obj = match self.get(id) {
                 Some(o) => o,
                 None => continue,
-            };
-            let id = ObjectId {
-                index: i as u32,
-                generation: slot.generation,
             };
             if Some(id) == skip || !fit_to_mask(obj, mask) {
                 continue;

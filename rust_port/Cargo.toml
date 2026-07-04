@@ -37,6 +37,11 @@ js-sys                      = "0.3"
 console_log                 = "1"
 console_error_panic_hook    = "0.1"
 
+[features]
+# Headless wasm benchmark (node): suppresses the auto-start winit app
+# and exports `bench_battle` (see src/lib.rs + bench_node.mjs).
+wasm-bench = []
+
 [profile.release]
 opt-level = 3
 lto       = true

@@ -3244,20 +3244,42 @@ impl MapRenderer {
     ) {
         let revision = point_lights.revision();
         if revision != self.last_point_light_revision {
+            // Retint only the vertices inside the relit window and
+            // upload just that byte range per batch — a battle's
+            // muzzle-flash churn used to rewrite + re-upload the whole
+            // map's vertex buffers on every relight.
+            let [rx0, ry0, rx1, ry1] = point_lights.changed_rect();
             for batch in &mut self.batches {
                 let (Some(cpu_vertices), Some(point_coords)) =
                     (batch.cpu_vertices.as_mut(), batch.point_coords.as_ref())
                 else {
                     continue;
                 };
-                for (vertex, &(px, py)) in cpu_vertices.iter_mut().zip(point_coords.iter()) {
+                let mut lo = usize::MAX;
+                let mut hi = 0usize;
+                for (i, (vertex, &(px, py))) in
+                    cpu_vertices.iter_mut().zip(point_coords.iter()).enumerate()
+                {
+                    let (xi, yi) = (px as i32, py as i32);
+                    if xi < rx0 || xi > rx1 || yi < ry0 || yi > ry1 {
+                        continue;
+                    }
                     let point = map.point(px, py);
                     let lum = point_lights.point_lum(px, py, map.size_x);
                     vertex.color[0] = ((point.r as i32 + lum[0]).clamp(0, 255) as f32) / 255.0;
                     vertex.color[1] = ((point.g as i32 + lum[1]).clamp(0, 255) as f32) / 255.0;
                     vertex.color[2] = ((point.b as i32 + lum[2]).clamp(0, 255) as f32) / 255.0;
+                    lo = lo.min(i);
+                    hi = hi.max(i);
                 }
-                queue.write_buffer(&batch.vertex_buffer, 0, bytemuck::cast_slice(cpu_vertices));
+                if lo <= hi && lo != usize::MAX {
+                    let vsize = std::mem::size_of::<Vertex>();
+                    queue.write_buffer(
+                        &batch.vertex_buffer,
+                        (lo * vsize) as u64,
+                        bytemuck::cast_slice(&cpu_vertices[lo..=hi]),
+                    );
+                }
             }
             self.last_point_light_revision = revision;
         }
