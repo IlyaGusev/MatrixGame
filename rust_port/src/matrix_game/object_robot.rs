@@ -2250,60 +2250,13 @@ impl RobotsRenderer {
                 };
             }
 
-            // CMatrixRobot::CalcBounds (MatrixObjectRobot.cpp:1217-1259)
-            // + JoinToGroup (MatrixMapStatic.cpp:164-178): geo_center =
-            // AABB mid, radius = half-diagonal, accumulated from every
-            // unit's frame-0 VO bounds through its world matrix. The
-            // spawn-time 6-unit placeholder sphere made hitscan beams
-            // (lasers) pass clean over robots.
-            {
-                let mut bmin = glam::Vec3::splat(f32::INFINITY);
-                let mut bmax = glam::Vec3::splat(f32::NEG_INFINITY);
-                let mut acc = |vo: &vector_object::VoMesh, m: &[[f32; 4]; 4]| {
-                    let Some(f) = vo.frames.first() else { return };
-                    for i in 0..8u32 {
-                        let p = [
-                            if i & 1 == 0 { f.bounds_min[0] } else { f.bounds_max[0] },
-                            if i & 2 == 0 { f.bounds_min[1] } else { f.bounds_max[1] },
-                            if i & 4 == 0 { f.bounds_min[2] } else { f.bounds_max[2] },
-                        ];
-                        // Row-vector convention like the instance rows.
-                        let w = glam::Vec3::new(
-                            p[0] * m[0][0] + p[1] * m[1][0] + p[2] * m[2][0] + m[3][0],
-                            p[0] * m[0][1] + p[1] * m[1][1] + p[2] * m[2][1] + m[3][1],
-                            p[0] * m[0][2] + p[1] * m[1][2] + p[2] * m[2][2] + m[3][2],
-                        );
-                        bmin = bmin.min(w);
-                        bmax = bmax.max(w);
-                    }
-                };
-                acc(&chassis_gpu.vo_mesh, &chassis_world);
-                if let Some((idx, m)) = chain.armor.as_ref() {
-                    if let Some(g) = self.armor.get(*idx).and_then(|o| o.as_ref()) {
-                        acc(&g.vo_mesh, m);
-                    }
-                }
-                if let Some((idx, m)) = chain.head.as_ref() {
-                    if let Some(g) = self.head.get(*idx).and_then(|o| o.as_ref()) {
-                        acc(&g.vo_mesh, m);
-                    }
-                }
-                for w in chain.weapons.iter().flatten() {
-                    if let Some(g) = self.weapon.get(w.idx).and_then(|o| o.as_ref()) {
-                        acc(&g.vo_mesh, &w.world);
-                    }
-                }
-                if bmin.x.is_finite() {
-                    // Only refresh the mesh-derived radius (the hitscan fix).
-                    // Do NOT write `geo_center` here: this is the per-frame
-                    // RENDER sync, and its render-space z disagreed with the
-                    // logic's own `pos_z + 9` geo_center, so the two clobbered
-                    // each other every tick. That made the target's z (and the
-                    // turret's pitch target) oscillate, so turret pitch never
-                    // locked and turrets never fired. geo_center is logic-owned.
-                    robot.core_mut().radius = ((bmax - bmin) * 0.5).length();
-                }
-            }
+            // core.geo_center and core.radius are logic-owned
+            // (ChassisKind::mesh_radius + pos_z + 9). This per-frame
+            // RENDER sync used to write both from the render-space
+            // mesh AABB, fighting the logic's writes every tick —
+            // the oscillating target z kept turret pitch from ever
+            // locking, and the radius differed between browser and
+            // headless sims. The renderer must not touch the core.
 
             // Resolved per-part vo_frame indices, clamped to each
             // mesh's frame count.

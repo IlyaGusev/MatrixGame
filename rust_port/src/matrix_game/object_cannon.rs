@@ -471,9 +471,13 @@ impl Cannon {
         // Hysteresis + grace: hold the current target while it's a live
         // enemy in seek range. Refresh the grace deadline whenever it's
         // fireable; otherwise keep it until the deadline passes.
+        // is_live() matches the fit_to_mask filter of the re-seek scan —
+        // without it a target that enters its death (DIP) animation
+        // stays held through the grace window and the turret keeps
+        // firing at the corpse.
         if let Some(cur) = self.target {
             if let Some(o) = objs.get(cur) {
-                if o.side() != self.side {
+                if o.side() != self.side && o.is_live() {
                     let geo = o.core().geo_center;
                     let distc = (geo - center).length_squared();
                     if distc <= seek_sq {
@@ -603,17 +607,11 @@ pub struct CannonDipUnit {
     pub smoke: crate::matrix_game::effects::smoke_and_fire::Smoke,
 }
 
-/// The radius the C++ fire gate sees: `m_TargetCore->m_Radius` is the
-/// mesh-AABB half-diagonal (JoinToGroup, MatrixMapStatic.cpp:178) —
-/// ~17-22 for robots (probed per chassis via probe_robot_bounds.rs).
-/// Our robot `core.radius` stays the tighter 13 hit-test sphere, so
-/// the aim tolerance must use the C++ value or turrets refuse shots
-/// the original takes (worst at height differences).
-fn cpp_target_radius(objs: &Objects, id: ObjectId) -> f32 {
-    if let Some(r) = crate::matrix_game::logic::robot_ref(objs, id) {
-        const MESH_RADIUS: [f32; 5] = [20.6, 20.2, 22.1, 22.1, 18.4];
-        return MESH_RADIUS[r.chassis.kind_index().min(4)];
-    }
+/// The radius the C++ fire gate sees — `m_TargetCore->m_Radius`, the
+/// mesh-AABB half-diagonal (JoinToGroup, MatrixMapStatic.cpp:178).
+/// `core.radius` carries exactly that (ChassisKind::mesh_radius for
+/// robots, logic-owned).
+fn target_radius(objs: &Objects, id: ObjectId) -> f32 {
     objs.get(id).map(|o| o.core().radius).unwrap_or(0.0)
 }
 
@@ -959,7 +957,7 @@ impl MapStatic for Cannon {
                 let ddq = self.fire_radius(objs);
                 if dq <= ddq * ddq {
                     let mut aim_ok = true;
-                    let tgt_radius = cpp_target_radius(objs, target_id);
+                    let tgt_radius = target_radius(objs, target_id);
                     for (i, &w) in self.weapons.iter().enumerate() {
                         let ff = self.fire_from_barrel(i);
                         let wdist = objs.weapons.get(w).map(|x| x.weapon_dist()).unwrap_or(0.0);
@@ -998,7 +996,7 @@ impl MapStatic for Cannon {
             // without confirmed hits, displace the aim point.
             self.time_from_fire -= takt;
             if self.time_from_fire <= 0 {
-                let r = cpp_target_radius(objs, self.target.unwrap()) * 0.5;
+                let r = target_radius(objs, self.target.unwrap()) * 0.5;
                 let fsrnd = |rng: &mut Rnd, x: f32| (rng.float01() as f32 * 2.0 - 1.0) * x;
                 self.target_disp = glam::Vec3::new(fsrnd(rng, r), fsrnd(rng, r), fsrnd(rng, r));
                 self.time_from_fire = CANNON_TIME_FROM_FIRE;

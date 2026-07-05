@@ -560,6 +560,76 @@ fn run_turret_vs_robot_at_height(kind: i32, dz: f32) -> f32 {
 }
 
 #[test]
+fn turret_drops_target_that_entered_death_animation() {
+    use crate::matrix_game::object_cannon::Cannon;
+    use crate::matrix_game::robot::RobotState;
+
+    install_test_config();
+    let map = GameMap::test_flat(64, 64, 0.0);
+    let mut objs = Objects::new();
+    let mut rng = Rnd::new(11);
+
+    let robot_id = spawn_robot(&mut objs, Vec3::new(220.0, 100.0, 0.0), 2, 10_000.0);
+    let mut c = Cannon::new(glam::Vec2::new(100.0, 100.0), 0.0, 0.0, PLAYER_SIDE, 1, None, 0);
+    c.hit_point = 100.0;
+    c.hit_point_max = 100.0;
+    let cid = objs.spawn(Box::new(c));
+    if let Some(obj) = objs.get_mut(cid) {
+        let cm: &mut Cannon = unsafe { &mut *(obj as *mut dyn MapStatic as *mut Cannon) };
+        cm.self_id = Some(cid);
+    }
+    objs.add_lt(cid);
+    objs.add_lt(robot_id);
+
+    let mut effects: Vec<crate::matrix_game::effects::GameEffect> = Vec::new();
+    let mut tick = |t: i64,
+                    objs: &mut Objects,
+                    rng: &mut Rnd,
+                    effects: &mut Vec<crate::matrix_game::effects::GameEffect>| {
+        let _scope = crate::matrix_game::map::MapScope::enter(&map, t * 10);
+        objs.proceed_logic(10, rng);
+        crate::matrix_game::effects::effects_takt(effects, 10.0, &map, objs, rng);
+    };
+
+    let mut t = 0i64;
+    loop {
+        tick(t, &mut objs, &mut rng, &mut effects);
+        t += 1;
+        let tgt = crate::matrix_game::logic::cannon_ref(&objs, cid).and_then(|c| c.target);
+        if tgt == Some(robot_id) {
+            break;
+        }
+        assert!(t < 500, "turret never acquired the robot");
+    }
+
+    // Kill the target for real: it enters the DIP death animation and
+    // lingers in the arena (~5s of flying pieces) with is_live()==false.
+    // The grace-window hold must not keep the corpse targeted past the
+    // next 100ms think.
+    crate::matrix_game::logic::robot_mut(&mut objs, robot_id).unwrap().hit_point = 1.0;
+    let dead = objs.apply_damage(
+        robot_id,
+        crate::matrix_game::effects::weapon::WEAPON_GUN,
+        Vec3::new(220.0, 100.0, 5.0),
+        Vec3::X,
+        PLAYER_SIDE,
+        None,
+    );
+    assert!(dead, "robot did not die");
+    {
+        let r = crate::matrix_game::logic::robot_mut(&mut objs, robot_id).unwrap();
+        assert_eq!(r.state, RobotState::Dip);
+        assert!(!r.dip_units.is_empty(), "DIP wreck vanished instantly");
+    }
+    for _ in 0..15 {
+        tick(t, &mut objs, &mut rng, &mut effects);
+        t += 1;
+    }
+    let tgt = crate::matrix_game::logic::cannon_ref(&objs, cid).and_then(|c| c.target);
+    assert_ne!(tgt, Some(robot_id), "turret still targets a DIP robot");
+}
+
+#[test]
 fn gun_turret_fires_at_raised_target() {
     let hp = run_turret_vs_robot_at_height(1, 40.0);
     assert!(hp < 10_000.0, "turret never damaged robot 40 above (hp={hp})");

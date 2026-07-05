@@ -78,6 +78,15 @@ impl ChassisKind {
         }
     }
 
+    /// Mesh-AABB half-diagonal of an assembled robot on this chassis —
+    /// the C++ `m_Radius` (JoinToGroup, MatrixMapStatic.cpp:178),
+    /// probed per chassis via probe_robot_bounds.rs. Logic-owned so
+    /// browser and headless sims agree (the renderer must not write
+    /// core.radius, same rule as geo_center).
+    pub fn mesh_radius(self) -> f32 {
+        [20.6, 20.2, 22.1, 22.1, 18.4][self.kind_index()]
+    }
+
     /// Default height offset above the spawn platform for each
     /// chassis (approximate, matches the per-chassis height tables
     /// scattered through MatrixRobot.cpp).
@@ -453,13 +462,13 @@ impl Robot {
     pub fn new(pos: glam::Vec3, side: i32, chassis: ChassisKind) -> Self {
         let core = ObjectCore {
             obj_type: ObjectType::RobotAi,
-            // Placeholder until the first rendered frame: the robot
-            // renderer overwrites both with the real CalcBounds AABB
-            // (JoinToGroup semantics — geo_center mid-body, radius =
-            // half-diagonal, ~13 for a typical build). The old 6-unit
-            // sphere at z+3 made hitscan beams pass clean over robots.
+            // JoinToGroup semantics, logic-owned (the renderer never
+            // writes these): geo_center mid-body ≈ pos_z + 9, radius =
+            // per-chassis mesh-AABB half-diagonal like the C++
+            // m_Radius. The old 6-unit sphere at z+3 made hitscan
+            // beams pass clean over robots.
             geo_center: pos + glam::Vec3::new(0.0, 0.0, 9.0),
-            radius: 13.0,
+            radius: chassis.mesh_radius(),
             matrix: glam::Mat4::from_translation(pos),
             ..Default::default()
         };
