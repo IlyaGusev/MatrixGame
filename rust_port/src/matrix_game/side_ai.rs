@@ -4171,6 +4171,29 @@ impl MapLogic {
             for r in 0..4 {
                 side.resources[r] = (side.resources[r] - cost.resources[r]).max(0);
             }
+            // MatrixSide.cpp:5997-6027 — mount the under-construction
+            // cannon immediately; the build-stack timer only ramps HP.
+            let place = building_ref(&self.objects, bid)
+                .and_then(|b| b.turret_places.get(slot as usize).copied());
+            if let Some(p) = place {
+                let mut cannon = crate::matrix_game::object_cannon::Cannon::new(
+                    p.world,
+                    map.point_avg_z(p.world.x, p.world.y), // m_AddH=0 (:6009)
+                    p.angle,
+                    sid,
+                    curtype + 1,
+                    Some(bid),
+                    slot,
+                );
+                cannon.begin_construction();
+                cannon.place =
+                    crate::matrix_game::logic::cannon_rn_place(map, p.world.x, p.world.y);
+                let id = self.objects.spawn(Box::new(cannon));
+                if let Some(c) = crate::matrix_game::logic::cannon_mut(&mut self.objects, id) {
+                    c.self_id = Some(id);
+                }
+                self.objects.add_lt(id);
+            }
         }
     }
 

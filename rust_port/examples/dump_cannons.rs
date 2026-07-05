@@ -8,12 +8,14 @@ fn main() {
     let cfg = matrixgame_rs::matrix_game::config::global();
     for (i, p) in cfg.turrets.cannons.iter().enumerate() {
         println!(
-            "kind {}: weapon={} seek={} hp={} da={:.4}",
+            "kind {}: weapon={} seek={} hp={} da={:.4} top={:.4} bottom={:.4}",
             i + 1,
             p.weapon,
             p.seek_radius,
             p.hitpoint,
-            p.max_da
+            p.max_da,
+            p.max_top_angle,
+            p.max_bottom_angle,
         );
     }
 }

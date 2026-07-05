@@ -144,6 +144,12 @@ pub struct Cannon {
     /// `Robot::chassis_anim`. Only Shaft{1,2}.vo carry Idle/Fire anims;
     /// for the others the cursor just idles at frame 0.
     pub shaft_anim: AnimState,
+    /// Elapsed-ms deadline through which the current target is kept even
+    /// when it's momentarily out of fire range or occluded. Prevents the
+    /// seek from dropping (and then re-picking a different) target every
+    /// time a robot crosses the sightline in a melee — which otherwise
+    /// keeps the barrel slewing between targets and never firing.
+    target_grace_until: i64,
 }
 
 /// Aiming/fire timing constants (MatrixObjectCannon.hpp:14-18).
@@ -218,6 +224,7 @@ impl Cannon {
             next_time_shorted: 0,
             last_delay_damage_side: 0,
             shaft_anim: AnimState::default(),
+            target_grace_until: 0,
         }
     }
 
@@ -396,17 +403,59 @@ impl Cannon {
         self.shaft_anim.set_anim_looped(false);
     }
 
+    /// Two-stage line-of-sight test from the turret to `geo`: the
+    /// robot/flyer/landscape pass must hit `id` itself, and the
+    /// building/cannon/mapobject pass must hit nothing. Port of the
+    /// double `Trace` in `FindTarget` (MatrixObjectCannon.cpp:806-816).
+    fn los_clear(&self, map: &GameMap, objs: &Objects, center: Vec3, geo: Vec3, id: ObjectId) -> bool {
+        use crate::matrix_game::common::{
+            TRACE_BUILDING, TRACE_CANNON, TRACE_FLYER, TRACE_LANDSCAPE, TRACE_OBJECT,
+            TRACE_OBJECTSPHERE, TRACE_ROBOT,
+        };
+        use crate::matrix_game::map_trace::{trace, TraceStop};
+        let (t1, _) = trace(
+            map,
+            objs,
+            center,
+            geo,
+            TRACE_OBJECTSPHERE | TRACE_ROBOT | TRACE_FLYER | TRACE_LANDSCAPE,
+            self.self_id,
+        );
+        if t1.object() != Some(id) {
+            return false;
+        }
+        let (t2, _) = trace(
+            map,
+            objs,
+            center,
+            geo,
+            TRACE_BUILDING | TRACE_CANNON | TRACE_OBJECT,
+            self.self_id,
+        );
+        t2 == TraceStop::None
+    }
+
     /// `FindTarget` (MatrixObjectCannon.cpp:789-821) — pick the enemy
     /// unit most aligned with the current barrel direction, preferring
     /// anything inside actual fire range, with a two-stage
     /// line-of-sight check.
-    fn seek_target(&self, map: &GameMap, objs: &Objects) -> Option<ObjectId> {
-        use crate::matrix_game::common::{
-            TRACE_BUILDING, TRACE_FLYER, TRACE_LANDSCAPE, TRACE_OBJECT, TRACE_OBJECTSPHERE,
-            TRACE_ROBOT,
-        };
+    ///
+    /// Diverges from the C++ in one deliberate way: target **hysteresis**
+    /// with a grace window. The original re-picks the most barrel-aligned
+    /// enemy every 100ms think with no memory, so a turret surrounded by
+    /// moving units oscillates between them and never finishes slewing
+    /// onto any — it tracks but never fires. We keep the current target
+    /// while it stays a live enemy in seek range: the grace window is
+    /// refreshed whenever it's actually fireable (in range + clear LOS),
+    /// and holds the commitment for `TARGET_GRACE_MS` through transient
+    /// occlusion (a robot crossing the sightline) or brief range dips, so
+    /// the barrel can complete its slew and fire during the clear windows
+    /// instead of dropping the target and restarting on a different one.
+    fn seek_target(&mut self, map: &GameMap, objs: &Objects) -> Option<ObjectId> {
+        use crate::matrix_game::common::{TRACE_FLYER, TRACE_ROBOT};
         use crate::matrix_game::map_static::Control;
-        use crate::matrix_game::map_trace::{trace, TraceStop};
+
+        const TARGET_GRACE_MS: i64 = 1500;
 
         let props = crate::matrix_game::config::global().turrets.cannons
             [((self.kind - 1).max(0) as usize).min(3)];
@@ -416,6 +465,31 @@ impl Cannon {
             let f = self.fire_radius(objs);
             f * f
         };
+        let seek_sq = props.seek_radius * props.seek_radius;
+        let now = crate::matrix_game::map::current_elapsed_ms();
+
+        // Hysteresis + grace: hold the current target while it's a live
+        // enemy in seek range. Refresh the grace deadline whenever it's
+        // fireable; otherwise keep it until the deadline passes.
+        if let Some(cur) = self.target {
+            if let Some(o) = objs.get(cur) {
+                if o.side() != self.side {
+                    let geo = o.core().geo_center;
+                    let distc = (geo - center).length_squared();
+                    if distc <= seek_sq {
+                        let fireable =
+                            distc <= dist_fire && self.los_clear(map, objs, center, geo, cur);
+                        if fireable {
+                            self.target_grace_until = now + TARGET_GRACE_MS;
+                        }
+                        if fireable || now < self.target_grace_until {
+                            return Some(cur);
+                        }
+                    }
+                }
+            }
+        }
+
         let mut dist_cur = props.seek_radius * props.seek_radius;
         let mut coss = -1.0f32;
         let mut target: Option<ObjectId> = None;
@@ -445,31 +519,16 @@ impl Cannon {
             }
             let matches = distc < dist_fire && dist_cur > dist_fire;
             let dot = dir.normalize_or_zero().dot(cdir);
-            if matches || dot > coss {
-                let (t1, _) = trace(
-                    map,
-                    objs,
-                    center,
-                    geo,
-                    TRACE_OBJECTSPHERE | TRACE_ROBOT | TRACE_FLYER | TRACE_LANDSCAPE,
-                    self.self_id,
-                );
-                if t1.object() == Some(id) {
-                    let (t2, _) = trace(
-                        map,
-                        objs,
-                        center,
-                        geo,
-                        TRACE_BUILDING | crate::matrix_game::common::TRACE_CANNON | TRACE_OBJECT,
-                        self.self_id,
-                    );
-                    if t2 == TraceStop::None {
-                        dist_cur = distc;
-                        coss = dot;
-                        target = Some(id);
-                    }
-                }
+            if (matches || dot > coss) && self.los_clear(map, objs, center, geo, id) {
+                dist_cur = distc;
+                coss = dot;
+                target = Some(id);
             }
+        }
+        // A freshly-picked target starts its grace window (re-seek only
+        // yields LOS-clear candidates, so it's fireable now).
+        if target.is_some() {
+            self.target_grace_until = now + TARGET_GRACE_MS;
         }
         target
     }
@@ -542,6 +601,20 @@ pub struct CannonDipUnit {
     /// Spin-clock freeze stamp, set when the piece lands.
     pub freeze_t: Option<f32>,
     pub smoke: crate::matrix_game::effects::smoke_and_fire::Smoke,
+}
+
+/// The radius the C++ fire gate sees: `m_TargetCore->m_Radius` is the
+/// mesh-AABB half-diagonal (JoinToGroup, MatrixMapStatic.cpp:178) —
+/// ~17-22 for robots (probed per chassis via probe_robot_bounds.rs).
+/// Our robot `core.radius` stays the tighter 13 hit-test sphere, so
+/// the aim tolerance must use the C++ value or turrets refuse shots
+/// the original takes (worst at height differences).
+fn cpp_target_radius(objs: &Objects, id: ObjectId) -> f32 {
+    if let Some(r) = crate::matrix_game::logic::robot_ref(objs, id) {
+        const MESH_RADIUS: [f32; 5] = [20.6, 20.2, 22.1, 22.1, 18.4];
+        return MESH_RADIUS[r.chassis.kind_index().min(4)];
+    }
+    objs.get(id).map(|o| o.core().radius).unwrap_or(0.0)
 }
 
 /// `DistOtrezokPoint` — distance from segment `[a, b]` to point `p`.
@@ -886,7 +959,7 @@ impl MapStatic for Cannon {
                 let ddq = self.fire_radius(objs);
                 if dq <= ddq * ddq {
                     let mut aim_ok = true;
-                    let tgt_radius = objs.get(target_id).map(|o| o.core().radius).unwrap_or(0.0);
+                    let tgt_radius = cpp_target_radius(objs, target_id);
                     for (i, &w) in self.weapons.iter().enumerate() {
                         let ff = self.fire_from_barrel(i);
                         let wdist = objs.weapons.get(w).map(|x| x.weapon_dist()).unwrap_or(0.0);
@@ -925,11 +998,7 @@ impl MapStatic for Cannon {
             // without confirmed hits, displace the aim point.
             self.time_from_fire -= takt;
             if self.time_from_fire <= 0 {
-                let r = objs
-                    .get(self.target.unwrap())
-                    .map(|o| o.core().radius)
-                    .unwrap_or(0.0)
-                    * 0.5;
+                let r = cpp_target_radius(objs, self.target.unwrap()) * 0.5;
                 let fsrnd = |rng: &mut Rnd, x: f32| (rng.float01() as f32 * 2.0 - 1.0) * x;
                 self.target_disp = glam::Vec3::new(fsrnd(rng, r), fsrnd(rng, r), fsrnd(rng, r));
                 self.time_from_fire = CANNON_TIME_FROM_FIRE;

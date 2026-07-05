@@ -10,8 +10,19 @@ use wasm_bindgen::prelude::*;
 #[wasm_bindgen(start)]
 pub fn start() {
     console_error_panic_hook::set_once();
-    console_log::init_with_level(log::Level::Info).ok();
-    log::info!("=== MatrixGame WASM v74 (anim+move debug) ===");
+    // URL flags: ?log=trace / ?log=debug raise the console level.
+    let search = web_sys::window()
+        .and_then(|w| w.location().search().ok())
+        .unwrap_or_default();
+    let level = if search.contains("log=trace") {
+        log::Level::Trace
+    } else if search.contains("log=debug") {
+        log::Level::Debug
+    } else {
+        log::Level::Info
+    };
+    console_log::init_with_level(level).ok();
+    log::info!("=== MatrixGame WASM v82 ===");
     matrix_game::form_game::run();
 }
 

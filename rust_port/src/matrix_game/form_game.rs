@@ -1102,7 +1102,9 @@ impl ApplicationHandler for App {
                 if fps_elapsed >= 1.0 {
                     let fps = state.fps_frames as f64 / fps_elapsed;
                     let n = state.fps_frames.max(1) as f64;
-                    log::info!(
+                    // Console perf line off by default; enable with ?log=debug.
+                    // The on-screen FPS counter (set_fps_text below) stays.
+                    log::debug!(
                         "fps: {:.1} ({} frames / {:.2}s) | per-frame ms: takt={:.2} gfx={:.2} ui={:.2} syncR={:.2} sync={:.2} render={:.2} | robots={} effects={} bb={}",
                         fps,
                         state.fps_frames,
@@ -3061,21 +3063,22 @@ fn update_turret_build(
 
     let can_build = hovered.is_some() && turrets_have < turrets_max && resources_ok;
 
-    let tb = &mut state.iface_list.turret_build;
-    tb.cursor_world = (cursor_world.x, cursor_world.y);
-    tb.hovered_slot = hovered.map(|(i, _)| i as i32);
-    tb.can_build = can_build;
-    // Ghost Z: keep at base_z + small platform offset so the cannon sits
-    // on top of the base mesh. The C++ pulls this off `m_BuildZ` directly.
-    tb.ghost_z = parent_z + 8.0;
-
     let (target_pos, target_angle) = if let Some((i, _)) = hovered {
         let p = &slots[i];
         (p.world, p.angle)
     } else {
-        (cursor_world, tb.ghost_angle)
+        (cursor_world, state.iface_list.turret_build.ghost_angle)
     };
+    // Ghost Z: the terrain under the slot, like the C++ cannon RNeed
+    // (4-point average, m_AddH=0 for slot turrets — MatrixSide.cpp:6009).
+    let ghost_z = state.map.point_avg_z(target_pos.x, target_pos.y);
+
+    let tb = &mut state.iface_list.turret_build;
+    tb.cursor_world = (cursor_world.x, cursor_world.y);
+    tb.hovered_slot = hovered.map(|(i, _)| i as i32);
+    tb.can_build = can_build;
     tb.ghost_pos = target_pos;
+    tb.ghost_z = ghost_z;
 
     // Smooth-rotate to the slot's rest angle. Port of MatrixSide.cpp:578:
     //   m_Angle += dang * (1 - 0.99^ms)

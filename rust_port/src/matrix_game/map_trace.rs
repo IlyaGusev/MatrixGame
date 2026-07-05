@@ -59,15 +59,19 @@ impl TraceStop {
     }
 }
 
-/// Möller–Trumbore without backface culling — mirrors the
-/// `IntersectTriangle` helper the per-cell landscape trace calls
-/// (MatrixMapTrace.cpp:265). Returns ray parameter `t ≥ 0`.
+/// Möller–Trumbore with backface culling — mirrors the C++
+/// `IntersectTriangle` (Math3D.cpp:25-59), whose `det < 0.0001f` guard
+/// culls back faces. Terrain triangles are wound face-up, so a ray that
+/// starts below the surface and travels up-and-out (e.g. a turret whose
+/// geo-center sits inside base terrain) passes through instead of being
+/// blocked — without this cull such turrets never acquire a target and
+/// never fire. Returns ray parameter `t ≥ 0`.
 fn intersect_triangle(orig: Vec3, dir: Vec3, p0: Vec3, p1: Vec3, p2: Vec3) -> Option<f32> {
     let e1 = p1 - p0;
     let e2 = p2 - p0;
     let pv = dir.cross(e2);
     let det = e1.dot(pv);
-    if det.abs() < 1.0e-10 {
+    if det < 0.0001 {
         return None;
     }
     let inv = 1.0 / det;
@@ -234,25 +238,52 @@ pub fn trace(
             if out.z > WATER_LEVEL {
                 return (TraceStop::Landscape, out);
             }
-            // Terrain below sea level — fall through to the water
-            // plane test (MatrixMapTrace.cpp:771-781 skips the
-            // landscape return when out.z <= WATER_LEVEL).
+            // Terrain hit below sea level. The C++ skips the landscape
+            // return here and lets the water-plane test fire — but that
+            // test is only correct over a real water cell. Over dry
+            // sub-sea-level ground (e.g. the basins the below-water
+            // turrets sit in) there is no water, so the shot must hit
+            // the ground itself, not a phantom surface. Otherwise fall
+            // through to the water block, which returns the shallower
+            // surface point.
+            if !(mask & TRACE_WATER != 0 && water_cell_at(map, out.x, out.y)) {
+                return (TraceStop::Landscape, out);
+            }
         }
         (None, None) => {}
     }
 
-    // Water plane (MatrixMapTrace.cpp:789-800).
+    // Water plane (MatrixMapTrace.cpp:789-800) — only where a water cell
+    // actually sits under the crossing point. The global z=-2 plane
+    // would otherwise swallow every shot fired toward or across any
+    // below-sea-level dry ground (below-water turrets, deep pits),
+    // which is the "below-water / laser turrets don't fire" bug.
     if mask & TRACE_WATER != 0 {
         let minz = start.z.min(end.z);
         let maxz = start.z.max(end.z);
         if minz < WATER_LEVEL && maxz >= WATER_LEVEL && dir.z.abs() > 1.0e-10 {
             let k = (WATER_LEVEL - start.z) / dir.z;
             let out = start + dir * k;
-            return (TraceStop::Water, Vec3::new(out.x, out.y, WATER_LEVEL));
+            if water_cell_at(map, out.x, out.y) {
+                return (TraceStop::Water, Vec3::new(out.x, out.y, WATER_LEVEL));
+            }
         }
     }
 
     (TraceStop::None, end)
+}
+
+/// True if the map cell under world `(wx, wy)` is open water (not a
+/// bridge deck). Ports the `IsWater() && !IsBridge()` guard `GetZ` uses
+/// (MatrixMap.cpp:621) so the trace's water plane only stops shots where
+/// there is genuinely water to splash into.
+fn water_cell_at(map: &GameMap, wx: f32, wy: f32) -> bool {
+    use crate::matrix_game::common::{CELLFLAG_BRIDGE, CELLFLAG_WATER};
+    let x = (wx / GLOBAL_SCALE).floor() as i32;
+    let y = (wy / GLOBAL_SCALE).floor() as i32;
+    map.unit_flags(x, y)
+        .map(|f| f & CELLFLAG_WATER != 0 && f & CELLFLAG_BRIDGE == 0)
+        .unwrap_or(false)
 }
 
 /// Ray → bounding-sphere distance; stands in for the per-mesh

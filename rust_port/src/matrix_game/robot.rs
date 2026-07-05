@@ -669,6 +669,7 @@ impl Robot {
     /// so the AI can route back to its factory.
     pub fn set_base(&mut self, base: ObjectId) {
         self.base = Some(base);
+        self.time_with_base = 0; // C++ SetBase resets the 10s watchdog
     }
 
     /// Port of `CMatrixRobotAI::RobotSpawn(pBase)` (MatrixRobot.cpp:
@@ -1828,7 +1829,10 @@ impl Robot {
             OrderPhase::CaptureInPosition => {
                 // :1252-1278.
                 if f_is_base {
-                    self.base = Some(fid);
+                    // C++ SetBase(factory) runs every tick of this phase,
+                    // resetting m_TimeWithBase — without it the 10s
+                    // watchdog kills the capturer before the descent.
+                    self.set_base(fid);
                     if f_state != BaseState::Opened && f_state != BaseState::Opening {
                         if let Some(bm) = objs.get_mut(fid) {
                             let b: &mut Building =
@@ -3513,11 +3517,11 @@ impl MapStatic for Robot {
                 // `roboz = mu->m_Base->GetFloorZ()` (MatrixObjectRobot
                 // .cpp:364-381), same tracking as IN_SPAWN's ride up.
                 if self.state == RobotState::BaseCapture {
+                    // Track the base via self.base like IN_SPAWN does —
+                    // the C++ reads mu->m_Base from the map cell, which
+                    // is order-pool independent.
                     let base = self
-                        .orders
-                        .top()
-                        .filter(|o| o.ty == OrderType::CaptureFactory)
-                        .and_then(|o| o.target)
+                        .base
                         .and_then(|fid| objs.get(fid))
                         .filter(|o| matches!(o.core().obj_type, ObjectType::Building))
                         .map(|o| unsafe {
@@ -3530,6 +3534,14 @@ impl MapStatic for Robot {
                         self.core.geo_center.z = self.pos_z + 9.0;
                         self.rchange |= MR_MATRIX;
                     }
+                } else {
+                    // C++ RNeed's default branch runs Z_From_Pos every
+                    // frame (MatrixObjectRobot.cpp:439-441), so a robot
+                    // pushed onto water drowns and a hover parked over
+                    // water floats. Without this, stale pos_z lets
+                    // robots stand on water.
+                    self.pos_z = self.z_from_pos(map);
+                    self.core.geo_center.z = self.pos_z + 9.0;
                 }
             }
         }
@@ -3872,8 +3884,9 @@ impl MapStatic for Robot {
         }
         self.must_die = false; // ResetMustDie
 
-        // Close the spawning base if we died on the pad.
-        if matches!(self.state, RobotState::InSpawn | RobotState::BaseMoveOut) {
+        // Close the base if we died on the pad — spawning OR capturing
+        // (MatrixRobot.cpp:2026-2036 gates on IsDisableManual, not state).
+        if self.is_disable_manual() {
             if let Some(base_id) = self.base {
                 if let Some(obj_mut) = objs.get_mut(base_id) {
                     if matches!(obj_mut.core().obj_type, ObjectType::Building) {
@@ -3881,9 +3894,11 @@ impl MapStatic for Robot {
                             &mut *(obj_mut as *mut dyn MapStatic
                                 as *mut crate::matrix_game::object_building::Building)
                         };
-                        b.object_state_clear(
-                            crate::matrix_game::map_static::OBJECT_STATE_BUILDING_SPAWNBOT,
-                        );
+                        if matches!(self.state, RobotState::InSpawn | RobotState::BaseMoveOut) {
+                            b.object_state_clear(
+                                crate::matrix_game::map_static::OBJECT_STATE_BUILDING_SPAWNBOT,
+                            );
+                        }
                         b.close();
                     }
                 }

@@ -1147,6 +1147,30 @@ impl GameMap {
         }
     }
 
+    /// Average z of the 4 heightmap points under `(wx, wy)` — how the
+    /// C++ derives a cannon's world Z every matrix rebuild
+    /// (MatrixObjectCannon.cpp:263-273, `PointGetTest` × 4 + m_AddH).
+    pub fn point_avg_z(&self, wx: f32, wy: f32) -> f32 {
+        let px = crate::matrix_game::common::trunc_float(wx / GLOBAL_SCALE) as i32;
+        let py = crate::matrix_game::common::trunc_float(wy / GLOBAL_SCALE) as i32;
+        let stride = self.size_x as i32 + 1;
+        let rows = self.size_y as i32 + 1;
+        let mut cnt = 0;
+        let mut rv = 0.0f32;
+        for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+            let (x, y) = (px + dx, py + dy);
+            if x >= 0 && y >= 0 && x < stride && y < rows {
+                cnt += 1;
+                rv += self.points[(y * stride + x) as usize].z;
+            }
+        }
+        if cnt == 0 {
+            0.0
+        } else {
+            rv / cnt as f32
+        }
+    }
+
     pub fn get_color(&self, wx: f32, wy: f32) -> u32 {
         self.get_color_with_lighting(wx, wy, None)
     }

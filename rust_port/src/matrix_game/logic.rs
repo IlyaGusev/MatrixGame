@@ -1420,19 +1420,13 @@ impl MapLogic {
         // each `CannonInstance`.
         let mut spawned_cannons = 0;
         for c in &map.cannons {
-            // Resolve parent building's z / id (if any).
-            let (parent_id, build_z) = if let Some(bi) = c.parent_building {
-                let bid = ids.get(bi).copied();
-                let bz = map.buildings.get(bi).map(|b| b.build_z).unwrap_or(0.0);
-                (bid, bz)
-            } else {
-                // Standalone: anchor to terrain height at (x, y).
-                let z = map.get_z(c.x, c.y).max(0.0);
-                (None, z)
-            };
+            let parent_id = c.parent_building.and_then(|bi| ids.get(bi).copied());
             let mut cannon = crate::matrix_game::object_cannon::Cannon::new(
                 glam::Vec2::new(c.x, c.y),
-                build_z + c.add_h,
+                // C++ RNeed derives cannon Z from the terrain under it
+                // (4-point average + m_AddH), NOT from the parent's
+                // build_z — turrets on hills sit far above their base.
+                map.point_avg_z(c.x, c.y) + c.add_h,
                 c.angle,
                 c.side as i32,
                 c.kind as i32,

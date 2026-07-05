@@ -500,6 +500,89 @@ fn run_turret_vs_robot(kind: i32, _weapon: crate::matrix_game::effects::weapon::
         .unwrap_or(-1.0)
 }
 
+/// Like `run_turret_vs_robot`, but the robot sits on a plateau `dz`
+/// above/below the turret, reached via a flat-cell ramp (cells 6..16)
+/// so the LOS ray isn't clipped by an artificial cliff.
+#[cfg(test)]
+fn run_turret_vs_robot_at_height(kind: i32, dz: f32) -> f32 {
+    use crate::matrix_game::object_cannon::Cannon;
+
+    install_test_config();
+
+    let mut map = GameMap::test_flat(64, 64, 0.0);
+    // Keep all terrain at z >= 0: a negative dz raises the TURRET's
+    // plateau instead of sinking the robot below the water plane
+    // (crossing z = WATER_LEVEL stops shots in the original too).
+    let ramp =
+        |x: usize| -> f32 { dz * ((x as f32 - 6.0) / 10.0).clamp(0.0, 1.0) - dz.min(0.0) };
+    for y in 0..map.size_y {
+        for x in 0..map.size_x {
+            map.units[y * map.size_x + x].a1 = ramp(x);
+        }
+    }
+    for y in 0..=map.size_y {
+        for x in 0..=map.size_x {
+            map.points[y * (map.size_x + 1) + x].z = ramp(x);
+        }
+    }
+
+    let mut objs = Objects::new();
+    let mut rng = Rnd::new(11);
+
+    // Just past the ramp top (cell 17): full plateau height, with the
+    // sight line from the turret clearing the ramp lip.
+    let rz = map.get_z(345.0, 100.0);
+    let robot_id = spawn_robot(&mut objs, Vec3::new(345.0, 100.0, rz), 2, 10_000.0);
+
+    // Terrain-derived Z like the real spawn paths (C++ RNeed).
+    let cz = map.point_avg_z(100.0, 100.0);
+    let mut c = Cannon::new(glam::Vec2::new(100.0, 100.0), cz, 0.0, PLAYER_SIDE, kind, None, 0);
+    c.hit_point = 100.0;
+    c.hit_point_max = 100.0;
+    let cid = objs.spawn(Box::new(c));
+    if let Some(obj) = objs.get_mut(cid) {
+        let cm: &mut Cannon = unsafe { &mut *(obj as *mut dyn MapStatic as *mut Cannon) };
+        cm.self_id = Some(cid);
+    }
+    objs.add_lt(cid);
+    objs.add_lt(robot_id);
+
+    let mut effects: Vec<crate::matrix_game::effects::GameEffect> = Vec::new();
+    for t in 0..1200i64 {
+        let _scope = crate::matrix_game::map::MapScope::enter(&map, t * 10);
+        objs.proceed_logic(10, &mut rng);
+        crate::matrix_game::effects::effects_takt(&mut effects, 10.0, &map, &mut objs, &mut rng);
+    }
+
+    crate::matrix_game::logic::robot_mut(&mut objs, robot_id)
+        .map(|r| r.hit_point)
+        .unwrap_or(-1.0)
+}
+
+#[test]
+fn gun_turret_fires_at_raised_target() {
+    let hp = run_turret_vs_robot_at_height(1, 40.0);
+    assert!(hp < 10_000.0, "turret never damaged robot 40 above (hp={hp})");
+}
+
+#[test]
+fn gun_turret_fires_at_lowered_target() {
+    let hp = run_turret_vs_robot_at_height(1, -40.0);
+    assert!(hp < 10_000.0, "turret never damaged robot 40 below (hp={hp})");
+}
+
+#[test]
+fn laser_turret_fires_at_raised_target() {
+    let hp = run_turret_vs_robot_at_height(3, 40.0);
+    assert!(hp < 10_000.0, "laser turret never damaged robot 40 above (hp={hp})");
+}
+
+#[test]
+fn rocket_turret_fires_at_lowered_target() {
+    let hp = run_turret_vs_robot_at_height(4, -40.0);
+    assert!(hp < 10_000.0, "rocket turret never damaged robot 40 below (hp={hp})");
+}
+
 #[test]
 fn laser_turret_damages_enemy_robot() {
     use crate::matrix_game::effects::weapon::WEAPON_CANNON2;

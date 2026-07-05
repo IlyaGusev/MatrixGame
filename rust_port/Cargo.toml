@@ -42,6 +42,13 @@ console_error_panic_hook    = "0.1"
 # and exports `bench_battle` (see src/lib.rs + bench_node.mjs).
 wasm-bench = []
 
+# Dev builds must also run at playable speed — always O3.
+# line-tables-only keeps backtraces but cuts binary sizes ~5-10x
+# (full debuginfo at O3 was filling the disk).
+[profile.dev]
+opt-level = 3
+debug = "line-tables-only"
+
 [profile.release]
 opt-level = 3
 lto       = true

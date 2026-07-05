@@ -2294,13 +2294,14 @@ impl RobotsRenderer {
                     }
                 }
                 if bmin.x.is_finite() {
-                    let c = robot.core_mut();
-                    c.geo_center = glam::Vec3::new(
-                        (bmin.x + bmax.x) * 0.5 + cx,
-                        (bmin.y + bmax.y) * 0.5 + cy,
-                        (bmin.z + bmax.z) * 0.5,
-                    );
-                    c.radius = ((bmax - bmin) * 0.5).length();
+                    // Only refresh the mesh-derived radius (the hitscan fix).
+                    // Do NOT write `geo_center` here: this is the per-frame
+                    // RENDER sync, and its render-space z disagreed with the
+                    // logic's own `pos_z + 9` geo_center, so the two clobbered
+                    // each other every tick. That made the target's z (and the
+                    // turret's pitch target) oscillate, so turret pitch never
+                    // locked and turrets never fired. geo_center is logic-owned.
+                    robot.core_mut().radius = ((bmax - bmin) * 0.5).length();
                 }
             }
 

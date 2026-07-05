@@ -60,6 +60,8 @@ When asked to "rebuild and rerun":
 
 When asked to just "rebuild", skip step 3. Use `--dev` by default; only use release (`wasm-pack build --target web --out-dir pkg`) when explicitly requested.
 
+ALWAYS build with opt-level 3: `Cargo.toml` sets `[profile.dev] opt-level = 3` so `--dev` builds are O3 too — never remove that override or build unoptimized.
+
 ## Rust Port File Structure (mirrors original C++)
 
 ```
