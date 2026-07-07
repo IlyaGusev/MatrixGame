@@ -994,7 +994,18 @@ impl Building {
     /// nearest-robot `FindObjects` scan is precomputed by the caller
     /// (`me_nearest`); `by_side` is the capturing robot's side; `now`
     /// is game time in ms.
-    pub fn capture(&mut self, by_side: i32, me_nearest: bool, now: i64) -> CaptureStatus {
+    /// The second return is the capture-voice key to queue
+    /// (`S_ENEMY_FACTORY_CAPTURED` on a neutral factory fully painted
+    /// by the player, MatrixObjectBuilding.cpp:1191-1193;
+    /// `S_PLAYER_FACTORY_CAPTURED` when a player factory is erased to
+    /// neutral, :1248-1249) — returned because `self` is checked out
+    /// of the arena, so callers own the sound queue.
+    pub fn capture(
+        &mut self,
+        by_side: i32,
+        me_nearest: bool,
+        now: i64,
+    ) -> (CaptureStatus, Option<&'static str>) {
         let cfg = crate::matrix_game::config::global();
         let erase = cfg.timings.capture_time_erase as i64;
         let paint = cfg.timings.capture_time_paint as i64;
@@ -1006,11 +1017,11 @@ impl Building {
         }
 
         if self.in_capture_next_time_erase >= now || self.in_capture_next_time_paint >= now {
-            return CaptureStatus::Busy;
+            return (CaptureStatus::Busy, None);
         }
 
         if !me_nearest {
-            return CaptureStatus::TooFar;
+            return (CaptureStatus::TooFar, None);
         }
 
         // C++ `0xFF000000 | g_MatrixMap->GetSideColor(side)` — the
@@ -1028,12 +1039,11 @@ impl Building {
                     self.in_capture_next_time_paint += paint;
                     self.in_capture_next_time_erase = now;
                     if self.true_color.colored_cnt == MAX_ZAHVAT_POINTS {
-                        // Sound S_ENEMY_FACTORY_CAPTURED — sound
-                        // manager pending.
+                        let snd = (by_side == PLAYER_SIDE).then_some("s_ef_cap");
                         self.side = by_side;
                         self.build_stack.clear();
                         self.rchange |= crate::matrix_game::map_static::MR_MINIMAP;
-                        return CaptureStatus::Done;
+                        return (CaptureStatus::Done, snd);
                     }
                     self.true_color.colored_cnt += 1;
                 }
@@ -1043,7 +1053,7 @@ impl Building {
                     self.in_capture_next_time_paint = now;
                     if self.true_color.colored_cnt == 0 {
                         self.true_color.color = 0;
-                        return CaptureStatus::InProgress;
+                        return (CaptureStatus::InProgress, None);
                     }
                     self.true_color.colored_cnt -= 1;
                 }
@@ -1053,10 +1063,11 @@ impl Building {
                 self.in_capture_next_time_paint += paint;
                 self.in_capture_next_time_erase = now;
                 if self.true_color.colored_cnt == MAX_ZAHVAT_POINTS {
-                    // "дозахват" — re-capture by the same color.
+                    // "дозахват" — re-capture by the same color; no
+                    // voice (commented out in the C++, :1229-1230).
                     self.side = by_side;
                     self.rchange |= crate::matrix_game::map_static::MR_MINIMAP;
-                    return CaptureStatus::Done;
+                    return (CaptureStatus::Done, None);
                 }
                 self.true_color.colored_cnt += 1;
             }
@@ -1065,19 +1076,18 @@ impl Building {
                 self.in_capture_next_time_erase += erase;
                 self.in_capture_next_time_paint = now + paint;
                 if self.true_color.colored_cnt == 0 {
-                    // Sound S_PLAYER_FACTORY_CAPTURED — sound manager
-                    // pending.
+                    let snd = (self.side == PLAYER_SIDE).then_some("s_pf_cap");
                     self.true_color.color = 0;
                     self.side = 0;
                     self.rchange |= crate::matrix_game::map_static::MR_MINIMAP;
                     self.build_stack.clear();
-                    return CaptureStatus::InProgress;
+                    return (CaptureStatus::InProgress, snd);
                 }
                 self.true_color.colored_cnt -= 1;
             }
         }
 
-        CaptureStatus::InProgress
+        (CaptureStatus::InProgress, None)
     }
 }
 
@@ -1439,7 +1449,10 @@ impl MapStatic for Building {
                     if let Some((_, rside)) = found.filter(|(_, s)| *s != self.side) {
                         // The found robot IS the nearest within radius,
                         // so the Capture() inner scan succeeds.
-                        self.capture(rside, true, now);
+                        let (_, snd) = self.capture(rside, true, now);
+                        if let Some(snd) = snd {
+                            objs.queue_snd(snd);
+                        }
                         let cfg = crate::matrix_game::config::global();
                         let nt = 100
                             .min(cfg.timings.capture_time_erase)

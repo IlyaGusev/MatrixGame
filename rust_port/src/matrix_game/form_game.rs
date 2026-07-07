@@ -1284,6 +1284,29 @@ impl ApplicationHandler for App {
                     for sp in pending {
                         state.spots.spawn(&state.map, &sp);
                     }
+                    // Buildings entering ROP_CAPTURING force-deselect if
+                    // the player has them selected (MatrixRobot.cpp:
+                    // 1286-1294: Select(NOTHING) + PLDropAllActions).
+                    if !state.game.objects.pending_capture_deselect.is_empty() {
+                        use crate::matrix_game::side::CurrSel;
+                        let desel: Vec<_> = state
+                            .game
+                            .objects
+                            .pending_capture_deselect
+                            .drain(..)
+                            .collect();
+                        if matches!(
+                            state.game.player_side.curr_sel,
+                            CurrSel::BaseSelected | CurrSel::BuildingSelected
+                        ) && state
+                            .game
+                            .player_side
+                            .active_object
+                            .is_some_and(|a| desel.contains(&a))
+                        {
+                            pl_drop_all_actions(state);
+                        }
+                    }
                     // Effect point-lights: register new flashes, then age
                     // the transient ones (CreatePointLight + fade).
                     let pending_lights: Vec<_> =
@@ -4998,6 +5021,19 @@ fn build_dialog_hint(
     ))
 }
 
+/// PLDropAllActions (MatrixSide.cpp:1684-1698): cancel turret
+/// build + armed orders, close popup + constructor, deselect all.
+fn pl_drop_all_actions(state: &mut AppState) {
+    state.iface_list.turret_build.cancel();
+    state.iface_list.pre_order = None;
+    state.iface_list.popup = None;
+    state.iface_list.popup_restore_pending = None;
+    if let Some(b) = state.game.player_side.builder.as_mut() {
+        b.deactivate();
+    }
+    state.game.select_nothing();
+}
+
 /// Port of `CMatrixMap::EnterDialogMode` (MatrixMap.cpp:3433-3574).
 fn enter_dialog_mode(state: &mut AppState, name: &str) {
     use crate::matrix_game::interface::dialog::*;
@@ -5007,17 +5043,8 @@ fn enter_dialog_mode(state: &mut AppState, name: &str) {
     leave_dialog_mode(state);
     state.is_paused = true; // Pause(true)
 
-    // PLDropAllActions (MatrixSide.cpp:1684-1698): cancel turret
-    // build + armed orders, close popup + constructor, deselect all.
     if name != "Begin" {
-        state.iface_list.turret_build.cancel();
-        state.iface_list.pre_order = None;
-        state.iface_list.popup = None;
-        state.iface_list.popup_restore_pending = None;
-        if let Some(b) = state.game.player_side.builder.as_mut() {
-            b.deactivate();
-        }
-        state.game.select_nothing();
+        pl_drop_all_actions(state);
     }
 
     // StatD renders the same `Stat` template — only the OK handler

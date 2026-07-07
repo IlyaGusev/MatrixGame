@@ -421,6 +421,10 @@ impl MapLogic {
         if step_ms <= 0 {
             return;
         }
+        // Last frame's capture-deselect notices were drained by the app
+        // loop right after the previous takt; drop leftovers so headless
+        // runs (tests) don't accumulate them.
+        self.objects.pending_capture_deselect.clear();
         // Maintenance countdown (MatrixLogic.cpp:2655-2663);
         // S_MAINTENANCE_ON when the timer runs out.
         if self.maintenance_time > 0 {

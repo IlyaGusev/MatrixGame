@@ -1784,10 +1784,15 @@ impl Robot {
                 OrderType::CaptureFactory => {
                     // :1203-1329.
                     let was_empty_phase = top.phase == OrderPhase::Empty;
-                    if self.dispatch_capture_factory(cms, map, rng, objs, top) {
+                    match self.dispatch_capture_factory(cms, map, rng, objs, top) {
                         // CAPTURING completed on a base — the robot is
                         // consumed (StaticDelete at :1317).
-                        return;
+                        CaptureOutcome::RobotConsumed => return,
+                        // Non-base capture done: `RemoveOrderFromTop();
+                        // continue;` at :1323-1324 — no rotation, no
+                        // cnt++, next order dispatches this takt.
+                        CaptureOutcome::OrderPopped => continue,
+                        CaptureOutcome::Normal => {}
                     }
                     // `cnt--` at :1238 — the Empty-phase setup pushed a
                     // MOVE_TO order; the compensation lets it dispatch
@@ -1815,8 +1820,7 @@ impl Robot {
     }
 
     /// Port of the ROT_CAPTURE_FACTORY dispatch case
-    /// (MatrixRobot.cpp:1203-1329). Returns `true` when the robot got
-    /// consumed by completing a base capture.
+    /// (MatrixRobot.cpp:1203-1329).
     fn dispatch_capture_factory(
         &mut self,
         cms: i32,
@@ -1824,17 +1828,17 @@ impl Robot {
         _rng: &mut Rnd,
         objs: &mut Objects,
         top: Order,
-    ) -> bool {
+    ) -> CaptureOutcome {
         use crate::matrix_game::object_building::{BaseState, Building, CaptureStatus};
         const BASE_DIST: f32 = 70.0;
 
-        let Some(fid) = top.target else { return false };
+        let Some(fid) = top.target else { return CaptureOutcome::Normal };
         // Validate the factory still exists.
         let Some(obj) = objs.get(fid) else {
-            return false;
+            return CaptureOutcome::Normal;
         };
         if !matches!(obj.core().obj_type, ObjectType::Building) {
-            return false;
+            return CaptureOutcome::Normal;
         }
         let (f_pos, f_is_base, f_state, f_fwd) = {
             let b: &Building = unsafe { &*(obj as *const dyn MapStatic as *const Building) };
@@ -1862,7 +1866,7 @@ impl Robot {
                     if let Some(o) = self.orders.top_mut() {
                         o.set_phase(OrderPhase::CaptureSettingUp);
                     }
-                    return false;
+                    return CaptureOutcome::Normal;
                 }
                 if let Some(o) = self.orders.top_mut() {
                     o.set_phase(OrderPhase::CaptureMoving);
@@ -1936,9 +1940,9 @@ impl Robot {
                                 unsafe { &mut *(bm as *mut dyn MapStatic as *mut Building) };
                             b.open();
                         }
-                        return false;
+                        return CaptureOutcome::Normal;
                     } else if f_state != BaseState::Opened {
-                        return false;
+                        return CaptureOutcome::Normal;
                     }
                     self.object_state |= ROBOT_FLAG_DISABLE_MANUAL;
                     self.low_level_move(
@@ -1984,8 +1988,12 @@ impl Robot {
                 self.rotate_hull(hull, cms);
             }
             OrderPhase::Capturing => {
-                // :1286-1327. (The player-side deselection of the
-                // captured building lands with the side layer.)
+                // :1286-1327.
+                // :1287-1294 — if the player has this building selected,
+                // force-deselect (Select(NOTHING) + PLDropAllActions).
+                // The player side isn't reachable here; the app loop
+                // drains this queue each frame.
+                objs.pending_capture_deselect.push(fid);
                 if f_is_base {
                     if f_state != BaseState::Closed && f_state != BaseState::Closing {
                         self.state = RobotState::BaseCapture;
@@ -2016,18 +2024,19 @@ impl Robot {
                         if let Some(me) = self.self_id {
                             objs.remove_deferred(me);
                         }
-                        return true;
+                        return CaptureOutcome::RobotConsumed;
                     }
                 } else {
                     let status = self.building_capture_step(fid, objs);
                     if status == CaptureStatus::Done {
                         self.orders.pop_top();
+                        return CaptureOutcome::OrderPopped;
                     }
                 }
             }
             _ => {}
         }
-        false
+        CaptureOutcome::Normal
     }
 
     /// One `factory->Capture(this)` call (:1321) — precomputes the
@@ -2085,17 +2094,9 @@ impl Robot {
             return CaptureStatus::TooFar;
         };
         let b: &mut Building = unsafe { &mut *(bm as *mut dyn MapStatic as *mut Building) };
-        let old_side = b.side;
-        let status = b.capture(self.side, me_nearest, now);
-        if status == CaptureStatus::Done {
-            // S_ENEMY_FACTORY_CAPTURED / S_PLAYER_FACTORY_CAPTURED
-            // (MatrixObjectBuilding.cpp:1052-1063).
-            let player = crate::matrix_game::common::PLAYER_SIDE;
-            if self.side == player {
-                objs.queue_snd("s_ef_cap");
-            } else if old_side == player {
-                objs.queue_snd("s_pf_cap");
-            }
+        let (status, snd) = b.capture(self.side, me_nearest, now);
+        if let Some(snd) = snd {
+            objs.queue_snd(snd);
         }
         status
     }
@@ -4154,6 +4155,16 @@ pub enum OrderType {
     StopFire,
     CaptureFactory,
     StopCapture,
+}
+
+/// How a ROT_CAPTURE_FACTORY dispatch ended (MatrixRobot.cpp:1203-1329):
+/// `RobotConsumed` = base captured, robot StaticDelete'd (:1317);
+/// `OrderPopped` = non-base capture done, order popped + `continue` (:1323).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureOutcome {
+    Normal,
+    RobotConsumed,
+    OrderPopped,
 }
 
 /// Port of `OrderPhase` (MatrixRobot.hpp:138-151).

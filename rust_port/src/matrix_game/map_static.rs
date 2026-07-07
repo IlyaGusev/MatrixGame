@@ -570,6 +570,10 @@ pub struct Objects {
     /// `MMFLAG_TERRON_DEAD` (MatrixObject.cpp:171) — exempts the
     /// player from the JUST_DEAD scan in CheckStatus.
     pub terron_dead: bool,
+    /// Buildings in the ROP_CAPTURING phase this takt — the app loop
+    /// force-deselects them if the player has one selected
+    /// (MatrixRobot.cpp:1286-1294: Select(NOTHING) + PLDropAllActions).
+    pub pending_capture_deselect: Vec<ObjectId>,
 }
 
 /// Which special-object death path fired (the C++ branches differ:
@@ -684,6 +688,7 @@ impl Objects {
             pending_removals: Vec::new(),
             pending_special_deaths: Vec::new(),
             terron_dead: false,
+            pending_capture_deselect: Vec::new(),
         }
     }
 
@@ -1271,12 +1276,17 @@ impl Objects {
             Some(b) => b,
             None => return false,
         };
-        // `CSound::AddSound(SoundHit(weap), pos)` at the top of every
-        // C++ Damage entry (MatrixRobot.cpp:1880, MatrixObjectCannon.
-        // cpp:1385, MatrixObjectBuilding.cpp:279, MatrixObject.cpp:111,
-        // MatrixFlyer.cpp:1791).
+        // `CSound::AddSound(SoundHit(weap), pos)` in every C++ Damage
+        // entry (MatrixRobot.cpp:1880, MatrixObjectCannon.cpp:1385,
+        // MatrixObjectBuilding.cpp:279, MatrixObject.cpp:111,
+        // MatrixFlyer.cpp:1791). It sits AFTER the WEAPON_REPAIR
+        // early-return and the DIP-state bail in each of them — repair
+        // never plays a hit sound, and dead/DIP targets stay silent.
         let hit_snd = crate::matrix_game::effects::weapon::hit_sound_key(weap);
-        if !hit_snd.is_empty() {
+        if !hit_snd.is_empty()
+            && weap != crate::matrix_game::effects::weapon::WEAPON_REPAIR
+            && boxed.is_live()
+        {
             self.queue_snd_at(hit_snd, pos);
         }
         let result = boxed.damage(weap, pos, dir, attacker_side, attacker, target, self);
