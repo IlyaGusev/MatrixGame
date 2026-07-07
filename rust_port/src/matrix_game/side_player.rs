@@ -1405,7 +1405,7 @@ impl MapLogic {
 
     /// `BigBoom` trigger through the arena (borrow helper — the
     /// take-the-box pattern of `proceed_logic`).
-    fn robot_big_boom(&mut self, map: &GameMap, rid: ObjectId) {
+    pub fn robot_big_boom(&mut self, map: &GameMap, rid: ObjectId) {
         let Some(mut boxed) = self.objects.take_obj(rid) else {
             return;
         };
@@ -4265,7 +4265,153 @@ impl MapLogic {
     }
 }
 
+/// `SPEED_BOOST` (MatrixSide.hpp:28) — the arcaded robot's max-speed
+/// multiplier.
+pub const SPEED_BOOST: f32 = 1.1;
+
 impl MapLogic {
+    /// `IsArcadeMode` (MatrixSide.hpp:543).
+    pub fn is_arcade_mode(&self) -> bool {
+        self.objects.arcaded_object.is_some()
+    }
+
+    /// Port of `CMatrixSideUnit::SetArcadedObject` (MatrixSide.cpp:
+    /// 1290-1355). `None` (or re-passing the current robot) exits
+    /// arcade mode; a player robot id enters it (or switches robots).
+    /// UI side effects (panel shift, weapon HUD statics) live with the
+    /// frontend — this is the logic-state half.
+    pub fn set_arcaded_object(&mut self, map: &GameMap, o: Option<ObjectId>) {
+        use crate::matrix_game::map_static::{ROBOT_FLAG_SARCADE, ROBOT_FLAG_SGROUP};
+
+        // Reject handover to anything but a player robot (:1298-1300).
+        if let Some(nid) = o {
+            let ok = robot_ref(&self.objects, nid)
+                .map(|r| r.side == crate::matrix_game::common::PLAYER_SIDE)
+                .unwrap_or(false);
+            if !ok {
+                return;
+            }
+        }
+
+        let cur = self.objects.arcaded_object;
+        let mut o = o;
+        if let Some(cid) = cur {
+            let alive = robot_ref(&self.objects, cid)
+                .map(|r| r.is_live())
+                .unwrap_or(false);
+            // Hand the departing robot back to its AI: an auto attack
+            // order at its own cell, order sound muted (:1308-1313).
+            if alive {
+                let mpos = robot_mut(&mut self.objects, cid).map(|r| {
+                    r.map_pos_calc(map);
+                    (r.map_x, r.map_y)
+                });
+                if let Some(mpos) = mpos {
+                    let no = self.robot_to_logic_group(cid);
+                    let prev = self.sound_order_attack_disable;
+                    self.sound_order_attack_disable = true;
+                    self.pg_order_attack(map, no, mpos, None);
+                    self.sound_order_attack_disable = prev;
+                }
+            }
+            // Undo the arcade boosts on the departing robot
+            // (:1315-1330): speed / weapon coefficient / selection
+            // flags. Toggling the same robot means plain exit.
+            if o == Some(cid) {
+                o = None;
+            }
+            let wids: Vec<_> = robot_ref(&self.objects, cid)
+                .map(|r| r.weapons.iter().map(|bw| bw.weapon).collect())
+                .unwrap_or_default();
+            for wid in wids {
+                if let Some(we) = self.objects.weapons.get_mut(wid) {
+                    we.set_default_coefficient();
+                }
+            }
+            if let Some(r) = robot_mut(&mut self.objects, cid) {
+                r.max_speed_boost = 1.0;
+                r.is_arcaded = false;
+                r.unselect();
+            }
+            if o.is_none() {
+                self.select_nothing();
+            }
+        }
+
+        self.objects.arcaded_object = o;
+        if let Some(nid) = o {
+            // ENTER (:1334-1353): chassis engine loop, speed boost,
+            // arcade weapon coefficient, Select(ARCADE) + SelectArcade
+            // flags, break the AI orders.
+            let (chassis, geo, wids) = {
+                let r = robot_ref(&self.objects, nid).unwrap();
+                (
+                    r.chassis,
+                    r.core().geo_center,
+                    r.weapons.iter().map(|bw| bw.weapon).collect::<Vec<_>>(),
+                )
+            };
+            let snd = match chassis {
+                crate::matrix_game::robot::ChassisKind::Pneumatic => "s_chassis_pneumatic_l",
+                crate::matrix_game::robot::ChassisKind::Wheel => "s_chassis_wheel_l",
+                crate::matrix_game::robot::ChassisKind::Track => "s_chassis_track_l",
+                crate::matrix_game::robot::ChassisKind::Hovercraft => "s_chassis_hovercraft_l",
+                crate::matrix_game::robot::ChassisKind::AntiGravity => "s_chassis_antigravity_l",
+            };
+            self.objects.queue_snd_at(snd, geo);
+            for wid in wids {
+                if let Some(we) = self.objects.weapons.get_mut(wid) {
+                    we.set_arcade_coefficient();
+                }
+            }
+            self.player_side.active_object = Some(nid);
+            if let Some(r) = robot_mut(&mut self.objects, nid) {
+                r.max_speed_boost = SPEED_BOOST;
+                // `SelectArcade` (MatrixRobot.cpp:5255-5268).
+                r.object_state_clear(ROBOT_FLAG_SGROUP);
+                r.object_state_set(ROBOT_FLAG_SARCADE);
+            }
+            self.robot_break_all_orders(nid);
+        }
+    }
+
+    /// Per-takt arcade upkeep: drop the handover when the arcaded
+    /// robot dies (MatrixRobot.cpp:5180-5183) and pump the manual
+    /// move orders — `OnForward`/`OnBackward` (MatrixSide.cpp:899-929)
+    /// polled off [`Objects::arcade_input`].
+    pub fn arcade_takt(&mut self, map: &GameMap) {
+        let Some(aid) = self.objects.arcaded_object else {
+            return;
+        };
+        let alive = robot_ref(&self.objects, aid)
+            .map(|r| r.is_live())
+            .unwrap_or(false);
+        if !alive {
+            self.set_arcaded_object(map, None);
+            return;
+        }
+        let inp = self.objects.arcade_input;
+        let gsm = GameMap::GLOBAL_SCALE_MOVE;
+        if inp.forward {
+            if let Some(r) = robot_mut(&mut self.objects, aid) {
+                if !r.orders.has(OrderType::MoveTo) {
+                    let vel = r.forward * r.max_speed();
+                    let (x, y) = (r.pos_x + vel.x, r.pos_y + vel.y);
+                    r.move_to(float2int(x / gsm), float2int(y / gsm));
+                }
+            }
+        }
+        if inp.backward {
+            if let Some(r) = robot_mut(&mut self.objects, aid) {
+                if !r.orders.has(OrderType::MoveToBack) {
+                    let vel = r.forward * r.max_speed();
+                    let (x, y) = (r.pos_x - vel.x, r.pos_y - vel.y);
+                    r.move_to_back(float2int(x / gsm), float2int(y / gsm));
+                }
+            }
+        }
+    }
+
     /// `Select(NOTHING, NULL)` (MatrixSide.cpp:1038-1042) — clear the
     /// active selection + groups.
     pub fn select_nothing(&mut self) {

@@ -429,6 +429,13 @@ impl MapLogic {
                 self.objects.queue_snd("s_maintenance_on");
             }
         }
+        // Arcade-mode upkeep: dead-robot handover release + manual
+        // move orders (OnForward/OnBackward polls).
+        if self.objects.arcaded_object.is_some() {
+            if let Some(map) = crate::matrix_game::map::current_map() {
+                self.arcade_takt(map);
+            }
+        }
         // GatherInfo every >100ms (MatrixLogic.cpp:2713-2718), before
         // the logic portions like the C++ Takt.
         let mut _pt = phase_now();
@@ -449,6 +456,17 @@ impl MapLogic {
         let rem = step_ms - full * LOGIC_TAKT_PERIOD_MS;
         if rem > 0 {
             self.objects.proceed_logic(rem, &mut self.rng);
+        }
+        // The arcaded object is skipped inside proceed_logic
+        // (MatrixMapStatic.cpp:350) and instead takes ONE StaticTakt
+        // with the whole frame step (MatrixLogic.cpp:2749-2757).
+        if let Some(aid) = self.objects.arcaded_object {
+            crate::matrix_game::map_static::static_takt(
+                &mut self.objects,
+                aid,
+                step_ms,
+                &mut self.rng,
+            );
         }
         _pt = phase_mark(1, _pt);
         // `m_Side[i].LogicTakt(LOGIC_TAKT_PERIOD)` for every side. The

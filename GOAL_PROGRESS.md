@@ -1,9 +1,10 @@
-# Goal: complete all rust-port mechanics except FPS mode and enemy AI
+# Goal: complete all rust-port mechanics
 
 Consolidated work list from the 2026-06-12 six-subsystem audit (C++ vs working
-tree). Excluded by user decision: FPS/manual-control (arcade) mode, enemy-AI
-decision layers (TaktHL/TaktTL/BestAction/MatrixTactics/Rule/State, AI
-BuildRobot). Robot *sensing* (CInfo env) and player auto-orders ARE in scope.
+tree). The original scope excluded FPS/manual-control (arcade) mode and the
+enemy-AI decision layers; both have since been ported (enemy AI in commit
+37a0d1c, arcade mode in Stage 9 below), so the port now has full mechanic
+parity. Robot *sensing* (CInfo env) and player auto-orders ARE in scope.
 
 Status legend: [ ] todo, [~] in progress, [x] done+verified (build+tests).
 Update this file as work lands. NOTHING below is done until marked [x].
@@ -124,3 +125,38 @@ Update this file as work lands. NOTHING below is done until marked [x].
 - Robot selection panel portrait/group icons (committed earlier)
 - MoveTo path-dots: C++ Path effect has no spawn sites; MoveTo ping ported
 - Minimap core (bake/zoom/markers/arrows/frustum/events all FULL)
+
+## Stage 9 — arcade / first-person (manual-control) mode  [2026-07-07]
+
+Previously excluded ("FPS/manual-control mode"), now ported in full so
+the port has feature parity with the original's arcade mode. Verified:
+`cargo build` clean, 221 lib tests (6 new arcade tests), wasm check
+green, and an end-to-end headless-browser run on SPHERE.CMAP (enter →
+drive → steer → fire → leave, no panics; screenshots captured).
+
+- [x] 9a. Core state: `Objects::arcaded_object` setter +
+        `Objects::arcade_input` (WASD/fire/cursor snapshot). Robot
+        `max_speed_boost` (SPEED_BOOST 1.1) + `is_arcaded` cache.
+- [x] 9b. `MapLogic::set_arcaded_object` (MatrixSide.cpp:1290-1355):
+        reject non-player, chassis engine-loop sound, ×1.1 speed +
+        ×1.2 weapon coeff, SelectArcade flags, BreakAllOrders on enter;
+        hand back to AI (muted PGOrderAttack) + undo boosts on exit.
+- [x] 9c. `MapLogic::arcade_takt`: dead-robot handover release +
+        OnForward/OnBackward manual move orders. Arcaded object takes a
+        single whole-frame StaticTakt (MatrixLogic.cpp:2749) after
+        proceed_logic skips it.
+- [x] 9d. Robot LogicTakt arcade branches (MatrixRobot.cpp:843-1038):
+        hull tracks cursor trace, A/D steer flags → RotateRobot ±90°,
+        W/S LowLevelMove bypassing pathfinding, LMB → Fire(cursor) /
+        release → StopFire; hull-servo sound hysteresis; GetLost no-op;
+        weapon range-cutoff skipped for the player bot.
+- [x] 9e. Camera CAMERA_INROBOT mode (MatrixCamera.cpp:895-1058):
+        per-mode angle/dist params, CalcLinkPoint chase-follow (speed-
+        lerped forward offset, yaw locked to robot heading), mode-change
+        easing `1-0.995^ms`, pan/edge-scroll disabled in-robot.
+- [x] 9f. Input wiring (MatrixFormGame.cpp): held-key + LMB snapshots,
+        Enter/Space enter-from-selection & leave, Esc leaves, E self-
+        destruct, mouse-cam drag steers, marquee/right-orders gated off.
+- [x] 9g. UI: `inro`/`lero`/`sbo` visibility (CInterface.cpp:1510-1544),
+        Main-panel ±196px arcade slide, arcade crosshair cursor,
+        minimap recenters on the arcaded object.

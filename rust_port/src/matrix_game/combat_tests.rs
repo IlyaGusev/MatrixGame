@@ -53,6 +53,11 @@ fn install_test_config() {
     cfg.overheat.gun = oh;
     cfg.overheat.lightening = oh;
     cfg.difficulty = Difficulty::default();
+    // Chassis + hull rates for the arcade manual-drive tests. Real
+    // robots.dat values are in this ballpark (units / 10ms takt).
+    cfg.chassis.move_speed = [3.0; 5];
+    cfg.chassis.rotation_speed = [0.05; 5];
+    cfg.item_chars.armor_rotation_speed = [0.2; 6];
     // Turret props for the turret-fire tests — must live HERE so every
     // concurrent test writes the identical global config.
     {
@@ -672,4 +677,181 @@ fn gun_turret_damages_enemy_robot() {
     use crate::matrix_game::effects::weapon::WEAPON_CANNON0;
     let hp = run_turret_vs_robot(1, WEAPON_CANNON0);
     assert!(hp < 10_000.0, "gun turret never damaged the robot (hp={hp})");
+}
+
+// ── Arcade (manual-control / FPS) mode ──────────────────────────────
+
+#[cfg(test)]
+fn arcade_game(robot_pos: Vec3) -> (crate::matrix_game::logic::MapLogic, ObjectId) {
+    install_test_config();
+    let mut game = crate::matrix_game::logic::MapLogic::with_seed(7);
+    let rid = spawn_robot(&mut game.objects, robot_pos, PLAYER_SIDE, 1_000.0);
+    game.objects.add_lt(rid);
+    (game, rid)
+}
+
+#[cfg(test)]
+fn run_arcade_takts(game: &mut crate::matrix_game::logic::MapLogic, map: &GameMap, steps: i32) {
+    for _ in 0..steps {
+        let _scope = crate::matrix_game::map::MapScope::enter(map, game.elapsed_ms);
+        game.takt(10);
+    }
+}
+
+#[test]
+fn arcade_enter_boosts_exit_restores() {
+    use crate::matrix_game::map_static::ROBOT_FLAG_SARCADE;
+    use crate::matrix_game::side_player::SPEED_BOOST;
+
+    let map = GameMap::test_flat(32, 32, 0.0);
+    let (mut game, rid) = arcade_game(Vec3::new(200.0, 200.0, 0.0));
+
+    // A non-player robot is rejected (MatrixSide.cpp:1298-1300).
+    let enemy = spawn_robot(&mut game.objects, Vec3::new(300.0, 300.0, 0.0), 2, 100.0);
+    game.set_arcaded_object(&map, Some(enemy));
+    assert_eq!(game.objects.arcaded_object, None);
+
+    game.set_arcaded_object(&map, Some(rid));
+    assert_eq!(game.objects.arcaded_object, Some(rid));
+    let r = robot(&game.objects, rid);
+    assert!((r.max_speed_boost - SPEED_BOOST).abs() < 1e-6);
+    assert_ne!(r.object_state() & ROBOT_FLAG_SARCADE, 0);
+
+    // Passing the same robot toggles arcade off (MatrixSide.cpp:1315).
+    game.set_arcaded_object(&map, Some(rid));
+    assert_eq!(game.objects.arcaded_object, None);
+    let r = robot(&game.objects, rid);
+    assert!((r.max_speed_boost - 1.0).abs() < 1e-6);
+    assert_eq!(r.object_state() & ROBOT_FLAG_SARCADE, 0);
+}
+
+#[test]
+fn arcade_manual_drive_moves_forward_and_stops() {
+    let map = GameMap::test_flat(64, 64, 0.0);
+    let (mut game, rid) = arcade_game(Vec3::new(300.0, 300.0, 0.0));
+    game.set_arcaded_object(&map, Some(rid));
+
+    // Hold W for a simulated second: the robot drives along its
+    // forward vector (default (0,-1)).
+    game.objects.arcade_input.forward = true;
+    run_arcade_takts(&mut game, &map, 100);
+    let (x1, y1) = {
+        let r = robot(&game.objects, rid);
+        (r.pos_x, r.pos_y)
+    };
+    assert!(y1 < 290.0, "robot did not drive forward (y={y1})");
+    assert!((x1 - 300.0).abs() < 5.0, "robot drifted sideways (x={x1})");
+
+    // Release W: the MoveTo branch calls StopMoving and the robot
+    // parks (MatrixRobot.cpp:1032-1035).
+    game.objects.arcade_input.forward = false;
+    run_arcade_takts(&mut game, &map, 50);
+    let r = robot(&game.objects, rid);
+    assert!(r.speed.abs() <= 0.01, "robot still moving (speed={})", r.speed);
+    let y2 = r.pos_y;
+    run_arcade_takts(&mut game, &map, 20);
+    assert!((robot(&game.objects, rid).pos_y - y2).abs() < 0.5);
+}
+
+#[test]
+fn arcade_steering_rotates_chassis() {
+    let map = GameMap::test_flat(64, 64, 0.0);
+    let (mut game, rid) = arcade_game(Vec3::new(300.0, 300.0, 0.0));
+    game.set_arcaded_object(&map, Some(rid));
+
+    // Hold D (turn right): dest = forward rotated by +90°
+    // (D3DXMatrixRotationZ row-vector convention = rotate_vec2), so
+    // from (0,-1) the chassis swings through +x. A/left mirrors it.
+    game.objects.arcade_input.right = true;
+    run_arcade_takts(&mut game, &map, 20);
+    let fwd = robot(&game.objects, rid).forward;
+    game.objects.arcade_input.right = false;
+    assert!(fwd.x > 0.1, "chassis did not turn right (forward={fwd:?})");
+
+    game.objects.arcade_input.left = true;
+    run_arcade_takts(&mut game, &map, 40);
+    let fwd2 = robot(&game.objects, rid).forward;
+    game.objects.arcade_input.left = false;
+    assert!(
+        fwd2.x < fwd.x - 0.1,
+        "chassis did not turn back left (forward={fwd2:?})"
+    );
+}
+
+#[test]
+fn arcade_fire_at_cursor_heats_weapon_and_damages_target() {
+    use crate::matrix_game::config::RobotUnitKind;
+    use crate::matrix_game::robot::OrderType;
+
+    let map = GameMap::test_flat(64, 64, 0.0);
+    install_test_config();
+    let mut game = crate::matrix_game::logic::MapLogic::with_seed(7);
+    let rid = {
+        let mut r = Robot::new(Vec3::new(300.0, 300.0, 0.0), PLAYER_SIDE, ChassisKind::Track);
+        r.hit_point = 1_000.0;
+        r.hit_point_max = 1_000.0;
+        r.config.weapon[0].kind = RobotUnitKind::WEAPON_MACHINEGUN;
+        let id = game.objects.spawn(Box::new(r));
+        if let Some(obj) = game.objects.get_mut(id) {
+            let r: &mut Robot = unsafe { &mut *(obj as *mut dyn MapStatic as *mut Robot) };
+            r.self_id = Some(id);
+        }
+        id
+    };
+    game.objects.add_lt(rid);
+    let enemy = spawn_robot(&mut game.objects, Vec3::new(300.0, 200.0, 0.0), 2, 10_000.0);
+    game.objects.add_lt(enemy);
+
+    game.set_arcaded_object(&map, Some(rid));
+    game.objects.arcade_input.fire = true;
+    game.objects.arcade_input.cursor_world = Vec3::new(300.0, 200.0, 5.0);
+    run_arcade_takts(&mut game, &map, 100);
+
+    {
+        let r = robot(&game.objects, rid);
+        assert!(r.orders.has(OrderType::Fire), "no FIRE order while LMB held");
+        assert_eq!(r.weapon_dir, Vec3::new(300.0, 200.0, 5.0));
+        assert!(r.weapons[0].heat > 0, "weapon never heated (never fired)");
+    }
+    let hp = robot(&game.objects, enemy).hit_point;
+    assert!(hp < 10_000.0, "enemy took no damage (hp={hp})");
+
+    // Release LMB → StopFire converts the order away.
+    game.objects.arcade_input.fire = false;
+    run_arcade_takts(&mut game, &map, 10);
+    assert!(!robot(&game.objects, rid).orders.has(OrderType::Fire));
+}
+
+#[test]
+fn arcade_hull_tracks_cursor() {
+    let map = GameMap::test_flat(64, 64, 0.0);
+    let (mut game, rid) = arcade_game(Vec3::new(300.0, 300.0, 0.0));
+    game.set_arcaded_object(&map, Some(rid));
+
+    // Cursor far to +x: the hull (default (0,-1)) must swing toward +x.
+    game.objects.arcade_input.cursor_world = Vec3::new(500.0, 300.0, 0.0);
+    run_arcade_takts(&mut game, &map, 100);
+    let hf = robot(&game.objects, rid).hull_forward;
+    assert!(hf.x > 0.5, "hull did not track the cursor (hull_forward={hf:?})");
+}
+
+#[test]
+fn arcade_handover_released_when_robot_dies() {
+    let map = GameMap::test_flat(32, 32, 0.0);
+    let (mut game, rid) = arcade_game(Vec3::new(200.0, 200.0, 0.0));
+    game.set_arcaded_object(&map, Some(rid));
+    assert_eq!(game.objects.arcaded_object, Some(rid));
+
+    // Kill it: enough damage to zero the HP → DIP on the next takt.
+    for _ in 0..200 {
+        let _scope = crate::matrix_game::map::MapScope::enter(&map, game.elapsed_ms);
+        if game
+            .objects
+            .apply_damage(rid, WEAPON_GUN, Vec3::new(200.0, 200.0, 5.0), Vec3::X, 2, None)
+        {
+            break;
+        }
+    }
+    run_arcade_takts(&mut game, &map, 5);
+    assert_eq!(game.objects.arcaded_object, None, "dead robot kept the handover");
 }

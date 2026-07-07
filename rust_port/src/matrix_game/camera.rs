@@ -1,4 +1,5 @@
-//! Camera — port of CMatrixCamera (MatrixCamera.cpp/hpp) in strategy mode.
+//! Camera — port of CMatrixCamera (MatrixCamera.cpp/hpp), strategy +
+//! in-robot (arcade) modes.
 //!
 //! Key behaviors (from the original) implemented here:
 //!   - Link point follows terrain z + fixed height (MatrixCamera.cpp:924-926,
@@ -15,8 +16,12 @@
 //!     (MatrixCamera.hpp:275-289).
 //!   - PageUp/PageDown adjust pitch (`angle_param` 0..1).
 //!   - Backslash (`\`) resets angles (MatrixFormGame.cpp:1285).
+//!   - Arcade mode (CAMERA_INROBOT): the link point chases the arcaded
+//!     robot with a speed-lerped forward offset and the yaw locks to
+//!     the robot heading (CalcLinkPoint, MatrixCamera.cpp:895-931);
+//!     mode changes ease with `1 - 0.995^ms`.
 //!
-//! Behaviors deliberately omitted here: arcade (in-robot) mode and fly-cam.
+//! Behaviors deliberately omitted here: fly-cam (MMFLAG_FLYCAM).
 
 use glam::{Mat4, Vec2, Vec3};
 
@@ -64,13 +69,38 @@ const STRATEGY_DEFAULTS: CamParam = CamParam {
     move_speed: 1.05,
 };
 
+/// `CAMERA_INROBOT` defaults (MatrixConfig.cpp:236-244) — arcade mode.
+/// Only `angle_param` (0.0 → most level) and `height` (40) differ.
+const INROBOT_DEFAULTS: CamParam = CamParam {
+    angle_param: 0.0,
+    height: 40.0,
+    ..STRATEGY_DEFAULTS
+};
+
+/// Camera mode indices — `CAMERA_STRATEGY` / `CAMERA_INROBOT`
+/// (MatrixConfig.hpp:537-541).
+const MODE_STRATEGY: usize = 0;
+const MODE_INROBOT: usize = 1;
+
+/// Per-frame arcade camera target — the slice of the arcaded robot's
+/// state `CalcLinkPoint` reads (MatrixCamera.cpp:899-915).
+#[derive(Clone, Copy, Debug)]
+pub struct ArcadeCamTarget {
+    /// Robot position, **uncentered** world coords, z = `Z_From_Pos()`.
+    pub pos: Vec3,
+    /// `m_Forward` (chassis heading).
+    pub forward: Vec2,
+    /// `m_Speed / GetMaxSpeed()` — lerps the chase offset 10..30.
+    pub speed_ratio: f32,
+}
+
 // MatrixFormGame.hpp:9 sets MOUSE_BORDER=4. Keep a slightly larger margin
 // to tolerate browser DPR rounding, but small enough to stay out of the way.
 const MOUSE_EDGE: f32 = 8.0;
 
 pub struct Camera {
-    // Current (rendered) state — for strategy mode this equals the target state;
-    // smoothing only kicks in on mode changes (not implemented, no arcade mode).
+    // Current (rendered) state — equals the target state except while
+    // CAM_LINK_POINT_CHANGED easing runs (mode changes / arcade follow).
     angle_z: f32,
     angle_x: f32,
     dist: f32,
@@ -79,8 +109,10 @@ pub struct Camera {
     // Target state (user-controlled).
     xy_strategy: [f32; 2], // in uncentered world coords
     ang_strategy: f32,
-    angle_param: f32,
-    dist_param: f32,
+    // Per-mode pitch / zoom params — `m_AngleParam[CAMERA_PARAM_CNT]`
+    // / `m_DistParam[...]` (MatrixCamera.hpp:186-187).
+    angle_param: [f32; 2],
+    dist_param: [f32; 2],
 
     pub aspect: f32,
     pub near: f32,
@@ -96,9 +128,24 @@ pub struct Camera {
     map_cy: f32,
     strategy_init_angle: f32,
 
-    // Mode + global params, seeded from STRATEGY_DEFAULTS and optionally
-    // patched by apply_camera_config (robots.dat `Camera/Strategy` block).
-    params: CamParam,
+    // Per-mode params, seeded from the defaults and optionally patched
+    // by apply_camera_config (robots.dat `Camera/Strategy` +
+    // `Camera/InRobot` blocks).
+    params: [CamParam; 2],
+    /// `m_ModeIndex` — MODE_STRATEGY / MODE_INROBOT.
+    mode_index: usize,
+    /// `CAM_LINK_POINT_CHANGED` — ease current state toward the target
+    /// with `1 - 0.995^ms` instead of copying (MatrixCamera.cpp:1010-1048).
+    link_point_changed: bool,
+    /// `CAM_XY_LERP_OFF` — while easing, snap the link point XY
+    /// (keyboard pan / SetXYStrategy set this).
+    xy_lerp_off: bool,
+    /// `m_CamInRobotForward0/1` (MatrixConfig.cpp:248-249) — chase
+    /// offset along the robot forward, lerped by speed ratio.
+    in_robot_fwd: [f32; 2],
+    /// The arcaded robot's follow target for this frame; `Some` puts
+    /// the camera in MODE_INROBOT.
+    arcade_target: Option<ArcadeCamTarget>,
     /// `g_Config.m_CamBaseAngleZ` — yaw offset added on top of the map's
     /// `m_CameraAngle` when entering strategy mode (MatrixCamera.cpp:696).
     base_angle_z: f32,
@@ -127,8 +174,8 @@ impl Camera {
             link_point: Vec3::ZERO,
             xy_strategy: [0.0, 0.0],
             ang_strategy: 0.0,
-            angle_param: p.angle_param,
-            dist_param: 1.0,
+            angle_param: [STRATEGY_DEFAULTS.angle_param, INROBOT_DEFAULTS.angle_param],
+            dist_param: [1.0, 1.0],
             aspect,
             near: 1.0,
             far: MAX_VIEW_DISTANCE,
@@ -140,7 +187,12 @@ impl Camera {
             map_cx: 0.0,
             map_cy: 0.0,
             strategy_init_angle: 0.0,
-            params: p,
+            params: [STRATEGY_DEFAULTS, INROBOT_DEFAULTS],
+            mode_index: MODE_STRATEGY,
+            link_point_changed: false,
+            xy_lerp_off: false,
+            in_robot_fwd: [10.0, 30.0],
+            arcade_target: None,
             base_angle_z: 0.0,
             sample_terrain: None,
             sample_ground: None,
@@ -156,53 +208,67 @@ impl Camera {
             return;
         };
 
-        // Top-level Camera params. We only care about the two the strategy
-        // camera actually consumes — InRobotForward0/1 are arcade-mode only.
+        // Top-level Camera params (MatrixConfig.cpp:1017-1022).
         if let Some(v) = parse_f32(matrix_data.block_param(&cam_rec, "CamBaseAngleZ")) {
             self.base_angle_z = v.to_radians();
         }
         if let Some(v) = parse_f32(matrix_data.block_param(&cam_rec, "CamMoveSpeed")) {
-            self.params.move_speed = v;
+            for p in &mut self.params {
+                p.move_speed = v;
+            }
+        }
+        if let Some(v) = parse_f32(matrix_data.block_param(&cam_rec, "CamInRobotForward0")) {
+            self.in_robot_fwd[0] = v;
+        }
+        if let Some(v) = parse_f32(matrix_data.block_param(&cam_rec, "CamInRobotForward1")) {
+            self.in_robot_fwd[1] = v;
         }
 
-        // Strategy sub-block. Angle keys are in degrees; RotAngleMin is capped
-        // at 94° in the original to prevent the pitch going past straight-up.
-        if let Some(strat_rec) = matrix_data.block_record(&cam_rec, "Strategy") {
-            if let Some(v) = parse_f32(matrix_data.block_param(&strat_rec, "CamRotSpeedX")) {
-                self.params.rot_speed_x = v;
+        // Per-mode sub-blocks (MatrixConfig.cpp:1024-1044). Angle keys
+        // are in degrees; RotAngleMin is capped at 94° in the original
+        // to prevent the pitch going past straight-up.
+        for (block, idx) in [("Strategy", MODE_STRATEGY), ("InRobot", MODE_INROBOT)] {
+            let Some(rec) = matrix_data.block_record(&cam_rec, block) else {
+                continue;
+            };
+            let p = &mut self.params[idx];
+            if let Some(v) = parse_f32(matrix_data.block_param(&rec, "CamRotSpeedX")) {
+                p.rot_speed_x = v;
             }
-            if let Some(v) = parse_f32(matrix_data.block_param(&strat_rec, "CamRotSpeedZ")) {
-                self.params.rot_speed_z = v;
+            if let Some(v) = parse_f32(matrix_data.block_param(&rec, "CamRotSpeedZ")) {
+                p.rot_speed_z = v;
             }
-            if let Some(v) = parse_f32(matrix_data.block_param(&strat_rec, "CamMouseWheelStep")) {
-                self.params.wheel_step = v;
+            if let Some(v) = parse_f32(matrix_data.block_param(&rec, "CamMouseWheelStep")) {
+                p.wheel_step = v;
             }
-            if let Some(v) = parse_f32(matrix_data.block_param(&strat_rec, "CamRotAngleMin")) {
-                self.params.rot_angle_min = v.min(94.0).to_radians();
+            if let Some(v) = parse_f32(matrix_data.block_param(&rec, "CamRotAngleMin")) {
+                p.rot_angle_min = v.min(94.0).to_radians();
             }
-            if let Some(v) = parse_f32(matrix_data.block_param(&strat_rec, "CamRotAngleMax")) {
-                self.params.rot_angle_max = v.to_radians();
+            if let Some(v) = parse_f32(matrix_data.block_param(&rec, "CamRotAngleMax")) {
+                p.rot_angle_max = v.to_radians();
             }
-            if let Some(v) = parse_f32(matrix_data.block_param(&strat_rec, "CamDistMin")) {
-                self.params.dist_min = v;
+            if let Some(v) = parse_f32(matrix_data.block_param(&rec, "CamDistMin")) {
+                p.dist_min = v;
             }
-            if let Some(v) = parse_f32(matrix_data.block_param(&strat_rec, "CamDistMax")) {
-                self.params.dist_max = v;
+            if let Some(v) = parse_f32(matrix_data.block_param(&rec, "CamDistMax")) {
+                p.dist_max = v;
             }
-            if let Some(v) = parse_f32(matrix_data.block_param(&strat_rec, "CamAngleParam")) {
-                self.params.angle_param = v;
+            if let Some(v) = parse_f32(matrix_data.block_param(&rec, "CamAngleParam")) {
+                p.angle_param = v;
             }
-            if let Some(v) = parse_f32(matrix_data.block_param(&strat_rec, "CamHeight")) {
-                self.params.height = v;
+            if let Some(v) = parse_f32(matrix_data.block_param(&rec, "CamHeight")) {
+                p.height = v;
             }
         }
 
         // Re-seed state derived from the params: default pitch param, default
         // zoom, and the clamped working values.
-        self.angle_param = self.params.angle_param;
-        self.dist_param = 1.0;
-        self.angle_x = lerp_ang(&self.params, self.angle_param);
-        self.dist = lerp_dist(&self.params, self.dist_param);
+        for i in 0..2 {
+            self.angle_param[i] = self.params[i].angle_param;
+            self.dist_param[i] = 1.0;
+        }
+        self.angle_x = lerp_ang(&self.params[0], self.angle_param[0]);
+        self.dist = lerp_dist(&self.params[0], self.dist_param[0]);
     }
 
     pub fn set_map(&mut self, world_width: f32, world_height: f32) {
@@ -228,7 +294,15 @@ impl Camera {
     }
 
     pub fn set_xy_strategy(&mut self, pos: [f32; 2]) {
+        // `SetXYStrategy` sets CAM_XY_LERP_OFF (MatrixCamera.hpp:262).
+        self.xy_lerp_off = true;
         self.xy_strategy = pos;
+    }
+
+    /// Feed (or clear) the arcade follow target for this frame. `Some`
+    /// switches the camera to `CAMERA_INROBOT`.
+    pub fn set_arcade_target(&mut self, t: Option<ArcadeCamTarget>) {
+        self.arcade_target = t;
     }
 
     /// Uncentered world XY of the strategy link point — equivalent to
@@ -248,24 +322,39 @@ impl Camera {
 
     // ── Input handlers ────────────────────────────────────────────────────
 
-    /// Ports RotateByMouse (MatrixCamera.hpp:238-248).
+    /// Ports RotateByMouse (MatrixCamera.hpp:238-248). Yaw only turns
+    /// in strategy mode; pitch works in both (per-mode param).
     pub fn rotate_by_mouse(&mut self, dx: f32, dy: f32) {
-        let p = &self.params;
-        self.ang_strategy = angle_norm(self.ang_strategy + p.rot_speed_z * dx * 10.0);
-        self.angle_param -= p.rot_speed_x * dy * 5.0;
-        self.angle_param = self.angle_param.clamp(0.0, 1.0);
+        let m = self.mode_index;
+        let p = &self.params[m];
+        if m == MODE_STRATEGY {
+            self.ang_strategy = angle_norm(self.ang_strategy + p.rot_speed_z * dx * 10.0);
+        }
+        self.angle_param[m] = (self.angle_param[m] - p.rot_speed_x * dy * 5.0).clamp(0.0, 1.0);
     }
 
     /// Ports ZoomInStep/OutStep (MatrixCamera.hpp:275-289). `notches` is an
     /// integer-ish wheel delta (positive = zoom in, shrinks distance).
     /// The original steps by `CamMouseWheelStep * 4.5` (0.05 * 4.5 = 0.225).
     pub fn zoom(&mut self, notches: f32) {
-        self.dist_param -= self.params.wheel_step * 4.5 * notches;
-        self.dist_param = self.dist_param.clamp(0.25, 4.0);
+        let m = self.mode_index;
+        self.dist_param[m] =
+            (self.dist_param[m] - self.params[m].wheel_step * 4.5 * notches).clamp(0.25, 4.0);
     }
 
     /// Enter/exit MouseCam rotate mode. The original binds this to the middle
     /// mouse button.
+    /// Middle-drag rotate active (`IsMouseCam`).
+    pub fn is_mouse_cam(&self) -> bool {
+        self.mouse_cam
+    }
+
+    /// Last cursor X seen by [`Self::on_mouse_move`] — the mouse-cam
+    /// robot steer reads the pre-update value to compute its dx.
+    pub fn last_mouse_x(&self) -> f32 {
+        self.last_mouse[0]
+    }
+
     pub fn on_rotate_button(&mut self, pressed: bool, x: f32, y: f32) {
         self.mouse_cam = pressed;
         self.last_mouse = [x, y];
@@ -292,14 +381,21 @@ impl Camera {
     }
 
     pub fn on_key(&mut self, key: KeyAction, pressed: bool) {
-        let p = &self.params;
         if let KeyAction::ResetAngles = key {
+            // `ResetAngles` (MatrixCamera.cpp:693-705) — restore the
+            // per-mode pitch defaults; the yaw only snaps back in
+            // strategy mode (arcade yaw is robot-driven).
             if pressed {
                 self.ang_strategy = self.strategy_init_angle;
-                self.angle_param = p.angle_param;
-                self.angle_z = self.strategy_init_angle;
-                self.angle_x = lerp_ang(p, p.angle_param);
-                self.dist = lerp_dist(p, self.dist_param);
+                for i in 0..2 {
+                    self.angle_param[i] = self.params[i].angle_param;
+                }
+                let m = self.mode_index;
+                self.angle_x = lerp_ang(&self.params[m], self.angle_param[m]);
+                self.dist = lerp_dist(&self.params[m], self.dist_param[m]);
+                if m == MODE_STRATEGY {
+                    self.angle_z = self.strategy_init_angle;
+                }
             }
             return;
         }
@@ -323,30 +419,119 @@ impl Camera {
 
     // ── Per-frame update ──────────────────────────────────────────────────
 
-    /// Ports CMatrixCamera::Takt (MatrixCamera.cpp:933-1130) for strategy mode.
+    /// Ports CMatrixCamera::Takt (MatrixCamera.cpp:933-1130) —
+    /// strategy + in-robot (arcade) modes.
     pub fn takt(&mut self, dt_ms: f32) {
-        let p = &self.params;
+        // Mode pick + transition (MatrixCamera.cpp:969-1000). On any
+        // change the camera eases (CAM_LINK_POINT_CHANGED); returning
+        // to strategy re-seats the target 80 units behind the current
+        // link point along the strategy yaw.
+        let index = if self.arcade_target.is_some() {
+            MODE_INROBOT
+        } else {
+            MODE_STRATEGY
+        };
+        if index != self.mode_index {
+            self.link_point_changed = true;
+            self.xy_lerp_off = false;
+            self.mode_index = index;
+            if index == MODE_STRATEGY {
+                let sn = self.ang_strategy.sin();
+                let cs = self.ang_strategy.cos();
+                self.xy_strategy = [
+                    self.link_point.x + self.map_cx - sn * 80.0,
+                    self.link_point.y + self.map_cy + cs * 80.0,
+                ];
+            }
+        }
 
-        self.link_point.x = self.xy_strategy[0] - self.map_cx;
-        self.link_point.y = self.xy_strategy[1] - self.map_cy;
-        self.angle_z = self.ang_strategy;
-        self.angle_x = lerp_ang(p, self.angle_param);
-        self.dist = lerp_dist(p, self.dist_param);
-        let bias = self
-            .sample_terrain
-            .as_ref()
-            .map(|f| f(self.xy_strategy[0], self.xy_strategy[1]))
-            .unwrap_or(0.0);
-        self.link_point.z = p.height + bias;
+        // Target link point + yaw — CalcLinkPoint (MatrixCamera.cpp:
+        // 895-931). link_point is stored map-centered.
+        let (newlp, newangz) = match (self.mode_index, self.arcade_target) {
+            (MODE_INROBOT, Some(t)) => {
+                let p = &self.params[MODE_INROBOT];
+                let fwd_off = lerp_f(
+                    t.speed_ratio,
+                    self.in_robot_fwd[0],
+                    self.in_robot_fwd[1],
+                );
+                let lp = Vec3::new(
+                    t.pos.x - self.map_cx + t.forward.x * fwd_off,
+                    t.pos.y - self.map_cy + t.forward.y * fwd_off,
+                    t.pos.z + p.height,
+                );
+                (lp, angle_norm((-t.forward.x).atan2(t.forward.y) + std::f32::consts::PI))
+            }
+            _ => {
+                let p = &self.params[MODE_STRATEGY];
+                let bias = self
+                    .sample_terrain
+                    .as_ref()
+                    .map(|f| f(self.xy_strategy[0], self.xy_strategy[1]))
+                    .unwrap_or(0.0);
+                (
+                    Vec3::new(
+                        self.xy_strategy[0] - self.map_cx,
+                        self.xy_strategy[1] - self.map_cy,
+                        p.height + bias,
+                    ),
+                    self.ang_strategy,
+                )
+            }
+        };
+        let m = self.mode_index;
+        let newdist = lerp_dist(&self.params[m], self.dist_param[m]);
+        let newangx = lerp_ang(&self.params[m], self.angle_param[m]);
+
+        if self.link_point_changed {
+            // Ease toward the target (MatrixCamera.cpp:1010-1048),
+            // `mul = 1 - 0.995^ms`.
+            let mul = 1.0 - 0.995_f32.powf(dt_ms);
+            let mut dlp = newlp - self.link_point;
+            let daz = angle_dist(self.angle_z, newangz);
+            let dd = newdist - self.dist;
+            let dax = angle_dist(self.angle_x, newangx);
+            self.link_point += dlp * mul;
+            self.angle_z = angle_norm(self.angle_z + daz * mul);
+            self.dist += dd * mul;
+            self.angle_x += dax * mul;
+            if self.xy_lerp_off {
+                dlp.x = 0.0;
+                dlp.y = 0.0;
+                self.link_point.x = newlp.x;
+                self.link_point.y = newlp.y;
+            }
+            let half_deg = 0.5_f32.to_radians();
+            if m == MODE_STRATEGY
+                && dlp.length_squared() < 0.25
+                && daz.abs() < half_deg
+                && dax.abs() < half_deg
+                && dd.abs() < 0.5
+            {
+                self.link_point_changed = false;
+            }
+        } else {
+            self.link_point = newlp;
+            self.angle_z = newangz;
+            self.dist = newdist;
+            self.angle_x = newangx;
+        }
+
+        let p = self.params[m];
 
         // Combine keyboard-held pan bits with per-frame edge-pan, without
         // touching self.actions (clearing it would wipe the keyboard hold and
         // stall movement between OS key-repeat events — the "laggy WASD" bug).
-        let mut move_bits =
-            self.actions & (ACT_MOVE_LEFT | ACT_MOVE_RIGHT | ACT_MOVE_FWD | ACT_MOVE_BACK);
+        // Pan + edge-scroll are strategy-only (MatrixCamera.cpp:1066,
+        // MatrixFormGame.cpp:232-241).
+        let mut move_bits = if m == MODE_STRATEGY {
+            self.actions & (ACT_MOVE_LEFT | ACT_MOVE_RIGHT | ACT_MOVE_FWD | ACT_MOVE_BACK)
+        } else {
+            0
+        };
         let [cx, cy] = self.cursor;
         let [w, h] = self.screen;
-        if cx >= 0.0 && cy >= 0.0 && cx < w && cy < h {
+        if m == MODE_STRATEGY && cx >= 0.0 && cy >= 0.0 && cx < w && cy < h {
             if cx < MOUSE_EDGE {
                 move_bits |= ACT_MOVE_LEFT;
             }
@@ -361,19 +546,24 @@ impl Camera {
             }
         }
 
-        // Yaw/pitch (MatrixCamera.cpp:1103-1127). These bits are cleared on
-        // key release via on_key, so we leave self.actions untouched here.
-        if self.actions & ACT_ROT_LEFT != 0 {
-            self.ang_strategy = angle_norm(self.ang_strategy - p.rot_speed_z * dt_ms);
-        }
-        if self.actions & ACT_ROT_RIGHT != 0 {
-            self.ang_strategy = angle_norm(self.ang_strategy + p.rot_speed_z * dt_ms);
+        // Yaw/pitch (MatrixCamera.cpp:1103-1127). Yaw keys are
+        // strategy-only (the C++ asserts strategy mode); the pitch
+        // keys drive the per-mode angle param in both modes. These
+        // bits are cleared on key release via on_key, so we leave
+        // self.actions untouched here.
+        if m == MODE_STRATEGY {
+            if self.actions & ACT_ROT_LEFT != 0 {
+                self.ang_strategy = angle_norm(self.ang_strategy - p.rot_speed_z * dt_ms);
+            }
+            if self.actions & ACT_ROT_RIGHT != 0 {
+                self.ang_strategy = angle_norm(self.ang_strategy + p.rot_speed_z * dt_ms);
+            }
         }
         if self.actions & ACT_ROT_UP != 0 {
-            self.angle_param = (self.angle_param + p.rot_speed_x * dt_ms).min(1.0);
+            self.angle_param[m] = (self.angle_param[m] + p.rot_speed_x * dt_ms).min(1.0);
         }
         if self.actions & ACT_ROT_DOWN != 0 {
-            self.angle_param = (self.angle_param - p.rot_speed_x * dt_ms).max(0.0);
+            self.angle_param[m] = (self.angle_param[m] - p.rot_speed_x * dt_ms).max(0.0);
         }
         self.ang_strategy = angle_norm(self.ang_strategy);
         self.angle_z = angle_norm(self.angle_z);
@@ -381,6 +571,9 @@ impl Camera {
         // Keyboard + edge-pan (MatrixCamera.cpp:1062-1086) uses the bottom
         // frustum plane normal projected onto XY.
         if move_bits != 0 {
+            // Pan snaps the link-point XY while easing (SETFLAG
+            // CAM_XY_LERP_OFF at MatrixCamera.cpp:1069).
+            self.xy_lerp_off = true;
             let speed = p.move_speed * dt_ms;
             let dir = self.bottom_plane_xy_dir() * speed;
             // lDir/rDir match MatrixCamera.cpp:1076-1077 (left = 90° CW
@@ -727,6 +920,10 @@ impl Camera {
 fn lerp_ang(p: &CamParam, param: f32) -> f32 {
     p.rot_angle_min + (p.rot_angle_max - p.rot_angle_min) * param
 }
+/// `LERPFLOAT(k, c1, c2)` (Math3D.hpp:22).
+fn lerp_f(k: f32, c1: f32, c2: f32) -> f32 {
+    c1 + (c2 - c1) * k
+}
 fn lerp_dist(p: &CamParam, param: f32) -> f32 {
     p.dist_min + (p.dist_max - p.dist_min) * param
 }
@@ -735,7 +932,6 @@ fn angle_norm(a: f32) -> f32 {
     a.rem_euclid(std::f32::consts::TAU)
 }
 
-#[allow(dead_code)]
 fn angle_dist(from: f32, to: f32) -> f32 {
     let d = angle_norm(to) - angle_norm(from);
     if d > std::f32::consts::PI {

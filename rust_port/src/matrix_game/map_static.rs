@@ -96,6 +96,12 @@ pub const ROBOT_FLAG_COLLISION: u32 = 1 << 15;
 /// Set when a base capture commits the robot — blocks manual-control
 /// handover and forces MustDie on order break (MatrixRobot.cpp:1267).
 pub const ROBOT_FLAG_DISABLE_MANUAL: u32 = 1 << 16;
+/// `ROBOT_FLAG_ROT_LEFT` / `ROBOT_FLAG_ROT_RIGHT` (`SETBIT(17/18)`,
+/// MatrixMapStatic.hpp:79-80) — one-shot manual-steer marks consumed
+/// (and cleared) by the arcade branch of the robot logic takt
+/// (MatrixRobot.cpp:977-1002). Set from key polls and mouse-cam drag.
+pub const ROBOT_FLAG_ROT_LEFT: u32 = 1 << 17;
+pub const ROBOT_FLAG_ROT_RIGHT: u32 = 1 << 18;
 /// `ROBOT_CAPTURE_INFORMED` (`SETBIT(22)`, MatrixMapStatic.hpp:85).
 /// Transient mark used by the building's capture-candidate announce
 /// scan (MatrixObjectBuilding.cpp:506-527).
@@ -410,6 +416,28 @@ struct Slot {
     next_lt: Option<ObjectId>,
 }
 
+/// Manual-control input snapshot for the arcaded (FPS-mode) robot.
+/// Ports the `GetAsyncKeyState(g_Config.m_KeyActions[KA_UNIT_*])`
+/// polls scattered through `CMatrixRobotAI::LogicTakt`
+/// (MatrixRobot.cpp:958-974, 1024-1038, 3165-3169) plus the
+/// `g_MatrixMap->m_TraceStopPos` cursor trace (MatrixMap.cpp:1149)
+/// and the `g_IFaceList->m_InFocus == INTERFACE` gate. The frontend
+/// refreshes this every frame; headless sims set it directly.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ArcadeInput {
+    pub left: bool,
+    pub right: bool,
+    pub forward: bool,
+    pub backward: bool,
+    /// `KA_FIRE` (VK_LBUTTON) held.
+    pub fire: bool,
+    /// `m_TraceStopPos` — world point under the cursor (trace skips
+    /// the arcaded robot itself).
+    pub cursor_world: glam::Vec3,
+    /// `m_InFocus == INTERFACE` — cursor is over the 2D UI.
+    pub cursor_on_interface: bool,
+}
+
 /// Arena of all map-static objects + the intrusive logic-temp list.
 /// Ports the `static` members + `m_FirstLogicTemp/m_NextLogicTemp` linkage
 /// from `CMatrixMapStatic` (MatrixMapStatic.hpp:265-268, .cpp:60-61).
@@ -429,6 +457,9 @@ pub struct Objects {
     /// guard in `ProceedLogic` (MatrixMapStatic.cpp:350). Filled in when
     /// sides land; `None` means the guard is inactive.
     pub arcaded_object: Option<ObjectId>,
+
+    /// Manual-control input for the arcaded robot (see [`ArcadeInput`]).
+    pub arcade_input: ArcadeInput,
 
     /// Port of `g_Config.m_ObjectDamages` (MatrixConfig.hpp:574). The
     /// per-weapon damage table used by MapObject's Damage branches.
@@ -626,6 +657,7 @@ impl Objects {
             last_lt: None,
             next_logic_object: None,
             arcaded_object: None,
+            arcade_input: ArcadeInput::default(),
             object_damages: ObjectDamages::default(),
             building_damages: BuildingDamages::default(),
             weapons: Default::default(),
@@ -1328,7 +1360,7 @@ impl<'a> Iterator for LogicIter<'a> {
 /// The `SwitchAnimation(ANIMATION_STAY)` side effect on SHORTED→clear
 /// (MatrixMapStatic.cpp:133) is deferred: it sits inside
 /// `if (IsRobot())`, and no robot subclass exists yet in this port.
-fn static_takt(objs: &mut Objects, id: ObjectId, ms: i32, rng: &mut Rnd) {
+pub(crate) fn static_takt(objs: &mut Objects, id: ObjectId, ms: i32, rng: &mut Rnd) {
     // Take-the-box pattern — see `proceed_logic`. This also handles the
     // case where `id` points at a freed slot (returns early, same as
     // the C++ tombstone branch).

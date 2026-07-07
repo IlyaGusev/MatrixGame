@@ -18,7 +18,9 @@
 //!   - Per-frame `m_Center = camera.GetXYStrategy()` (MatrixMap.cpp:1261).
 //!
 //! Still intentionally skipped:
-//!   - In-robot `DrawRadar` — arcade mode isn't ported.
+//!   - In-robot `DrawRadar` — dead code in the C++ (defined at
+//!     MatrixMinimap.cpp:429 but never called). Arcade mode only
+//!     recenters the map on the arcaded object, which IS ported.
 //!   - Disk-cached background PNG (irrelevant in-browser).
 
 use wgpu::util::DeviceExt;
@@ -1099,8 +1101,13 @@ impl Minimap {
         // MatrixMap.cpp:1261: `SetOutParams(m_Camera.GetXYStrategy())` is
         // called every frame, so the minimap is always centered on what the
         // camera is looking at. The near/far edges get pinned back inside the
-        // rect by `m_Delta` in BeforeDraw.
-        let (cx, cy) = camera.strategy_xy();
+        // rect by `m_Delta` in BeforeDraw. In arcade mode the C++ centers on
+        // the arcaded object instead (MatrixMinimap.cpp:431-460).
+        let (cx, cy) = objects
+            .arcaded_object
+            .and_then(|id| crate::matrix_game::logic::get_world_pos(objects, id))
+            .map(|p| (p.x, p.y))
+            .unwrap_or_else(|| camera.strategy_xy());
         self.center = [cx, cy];
 
         // Quad layout in `quad_vbuf`:

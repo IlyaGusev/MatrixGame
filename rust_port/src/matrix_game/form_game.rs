@@ -103,6 +103,16 @@ struct AppState {
     /// auto-repeats must not leak into the camera bindings (held `S`
     /// would both issue a stop order and scroll the camera otherwise).
     consumed_keys: std::collections::HashSet<winit::keyboard::KeyCode>,
+    /// Physical movement keys currently held — the port of the
+    /// `GetAsyncKeyState(KA_UNIT_*)` polls the arcade branches read
+    /// (WASD + arrows; see `sync_arcade_input`).
+    held_keys: std::collections::HashSet<winit::keyboard::KeyCode>,
+    /// Left mouse button held (`GetAsyncKeyState(KA_FIRE)` port).
+    lmb_down: bool,
+    /// The `if/Main` panel currently sits at the arcade x-offset
+    /// (+196px, CInterface.cpp:3371/3392) — reconciled each frame
+    /// against `is_arcade_mode`.
+    main_panel_arcade: bool,
     /// Effect-primitive renderer (billboards / beams / cones / shells)
     /// — the `CBillboard::SortEndDraw` + BBT texture table port.
     effects_renderer: crate::matrix_game::effects::effects_renderer::EffectsRenderer,
@@ -352,6 +362,9 @@ impl ApplicationHandler for App {
                 dialog: None,
                 exit_state: 0,
                 consumed_keys: Default::default(),
+                held_keys: Default::default(),
+                lmb_down: false,
+                main_panel_arcade: false,
                 fps_last_log: crate::platform::now_secs(),
                 fps_frames: 0,
                 perf_acc: [0.0; 6],
@@ -570,6 +583,9 @@ impl ApplicationHandler for App {
                     dialog: None,
                     exit_state: 0,
                     consumed_keys: Default::default(),
+                    held_keys: Default::default(),
+                    lmb_down: false,
+                    main_panel_arcade: false,
                     fps_last_log: crate::platform::now_secs(),
                     fps_frames: 0,
                     perf_acc: [0.0; 6],
@@ -704,6 +720,7 @@ impl ApplicationHandler for App {
                         log::debug!("order: cancelled by right-click");
                     } else if !ui_consumed_rmb
                         && btn_state == ElementState::Pressed
+                        && !state.game.is_arcade_mode()
                         && !state.game.player_side.selected.is_empty()
                         && state.minimap.click_to_world(cx, cy).is_some()
                     {
@@ -721,17 +738,22 @@ impl ApplicationHandler for App {
                     } else if !ui_consumed_rmb
                         && !over_ui
                         && btn_state == ElementState::Pressed
+                        && !state.game.is_arcade_mode()
                         && !state.game.player_side.selected.is_empty()
                     {
                         // Full OnRButtonDown dispatch (MatrixSide.cpp:
                         // 799-863): enemy building → capture, enemy
-                        // unit → attack, else move.
+                        // unit → attack, else move. `OnRButtonDown`
+                        // early-outs while arcaded (MatrixSide.cpp:806).
                         state
                             .game
                             .on_right_click(&state.camera, cx, cy, w, h, &state.map);
                     }
                 } else if button == MouseButton::Left {
                     use crate::matrix_game::minimap::MinimapClick;
+                    // Raw LMB state — the `GetAsyncKeyState(KA_FIRE)`
+                    // poll the arcaded robot's fire branch reads.
+                    state.lmb_down = btn_state == ElementState::Pressed;
                     match btn_state {
                         ElementState::Pressed => {
                             // UI first dibs (MatrixFormGame.cpp:748-755).
@@ -791,7 +813,11 @@ impl ApplicationHandler for App {
                                         // nor marquee, leaving the
                                         // constructor open until the
                                         // user presses `cocan`.
-                                        if !state.is_paused {
+                                        // Arcade mode: no click-select /
+                                        // marquee (MatrixFormGame.cpp:763
+                                        // gates on !IsArcadeMode()) — LMB
+                                        // is the fire trigger.
+                                        if !state.is_paused && !state.game.is_arcade_mode() {
                                             state.lmb_anchor = Some([cx, cy]);
                                             state.lmb_consumed_by_ui = false;
                                         } else {
@@ -1008,6 +1034,29 @@ impl ApplicationHandler for App {
                         }
                     }
                 }
+                // Mouse-cam drag also steers the arcaded robot's
+                // chassis by the horizontal delta (MatrixFormGame.cpp:
+                // 536-546).
+                if state.camera.is_mouse_cam() {
+                    if let Some(aid) = state.game.objects.arcaded_object {
+                        let dx = cx - state.camera.last_mouse_x();
+                        if dx != 0.0 {
+                            use crate::matrix_game::map_static::{
+                                ROBOT_FLAG_ROT_LEFT, ROBOT_FLAG_ROT_RIGHT,
+                            };
+                            if let Some(r) =
+                                crate::matrix_game::logic::robot_mut(&mut state.game.objects, aid)
+                            {
+                                use crate::matrix_game::map_static::MapStatic;
+                                r.object_state_set(if dx < 0.0 {
+                                    ROBOT_FLAG_ROT_LEFT
+                                } else {
+                                    ROBOT_FLAG_ROT_RIGHT
+                                });
+                            }
+                        }
+                    }
+                }
                 state.camera.on_mouse_move(cx, cy);
             }
 
@@ -1037,6 +1086,26 @@ impl ApplicationHandler for App {
                 // auto-orders) fire once per physical press and a held
                 // `S` must not scroll the camera after stopping a group.
                 if let PhysicalKey::Code(code) = event.physical_key {
+                    // Raw held-state for the arcade `GetAsyncKeyState`
+                    // polls — tracked before any consumption so the
+                    // manual-drive keys can't stick.
+                    if matches!(
+                        code,
+                        KeyCode::KeyW
+                            | KeyCode::KeyA
+                            | KeyCode::KeyS
+                            | KeyCode::KeyD
+                            | KeyCode::ArrowUp
+                            | KeyCode::ArrowDown
+                            | KeyCode::ArrowLeft
+                            | KeyCode::ArrowRight
+                    ) {
+                        if pressed {
+                            state.held_keys.insert(code);
+                        } else {
+                            state.held_keys.remove(&code);
+                        }
+                    }
                     if pressed {
                         if event.repeat {
                             if state.consumed_keys.contains(&code) {
@@ -1143,9 +1212,20 @@ impl ApplicationHandler for App {
                     // `current_map()` (ports `g_MatrixMap`).
                     let _scope =
                         crate::matrix_game::map::MapScope::enter(&state.map, state.game.elapsed_ms);
-                    // Frustum-center for MAX_EFFECT_DISTANCE culling
-                    // (MatrixEffect.cpp:456) — the strategy link point.
-                    let (cx, cy) = state.camera.strategy_xy();
+                    // Arcade (in-robot) mode: refresh the manual-input
+                    // snapshot + camera follow target and reconcile
+                    // the Main-panel arcade slide.
+                    sync_arcade_mode(state);
+                    // Frustum-center for MAX_EFFECT_DISTANCE culling —
+                    // the camera link point (follows the arcaded robot
+                    // in arcade mode, the strategy target otherwise).
+                    let (cx, cy) = if let Some(t) = state.game.objects.arcaded_object.and_then(
+                        |id| crate::matrix_game::logic::get_world_pos(&state.game.objects, id),
+                    ) {
+                        (t.x, t.y)
+                    } else {
+                        state.camera.strategy_xy()
+                    };
                     crate::matrix_game::map::set_frustum_center([cx, cy]);
                     // Port of the pause early-return in
                     // `CMatrixMapLogic::Takt` (MatrixLogic.cpp:2643):
@@ -2076,6 +2156,24 @@ fn dispatch_ui_click(state: &mut AppState, click: &crate::matrix_game::interface
 
     // ── Top-level menu buttons ────────────────────────────────────
     match name {
+        // Arcade-mode buttons (CInterface.cpp:3418-3421, 3480-3483):
+        // enter robot / leave robot / self-destruct.
+        "inro" => {
+            enter_robot(state);
+            return;
+        }
+        "lero" => {
+            leave_robot(state);
+            return;
+        }
+        "sbo" => {
+            if state.game.is_arcade_mode() {
+                if let Some(id) = state.game.objects.arcaded_object {
+                    state.game.robot_big_boom(&state.map, id);
+                }
+            }
+            return;
+        }
         "buro" => {
             // Port of MatrixFormGame.cpp:1385-1389 + CConstructor.cpp:
             // 970-975 — reset the build-multiplier counter, validate it
@@ -3687,6 +3785,15 @@ fn update_os_cursor(state: &AppState) {
     const EDGE: f32 = 8.0;
     let icon = if mx < 0.0 {
         CursorIcon::Default
+    } else if state.game.is_arcade_mode() {
+        // Arcade aim reticle (CInterface.cpp:2960-2977): arrow over
+        // the UI, CURSOR_CROSS_* over the world. The red/yellow/blue
+        // range variants collapse onto the OS crosshair.
+        if state.iface_list.hit_test(mx, my, w, h).is_some() {
+            CursorIcon::Default
+        } else {
+            CursorIcon::Crosshair
+        }
     } else if mx < EDGE || mx > w - EDGE || my < EDGE || my > h - EDGE {
         CursorIcon::Move // CURSOR_STAR — screen-edge scroll band
     } else if state.iface_list.pre_order.is_some()
@@ -4098,6 +4205,14 @@ fn refresh_interface_visibility(state: &mut AppState) {
         auto_protect_on: auto_def,
         auto_capture_on: auto_cap,
         order_glows,
+        arcade_mode: state.game.is_arcade_mode(),
+        single_disable_manual: state
+            .game
+            .player_side
+            .get_cur_sel_object()
+            .and_then(|id| crate::matrix_game::logic::robot_ref(&state.game.objects, id))
+            .map(|r| r.is_disable_manual())
+            .unwrap_or(false),
     };
     if let Some(p) = state.iface_list.panel_mut("Main") {
         p.refresh_main_visibility(&ctx);
@@ -5066,6 +5181,112 @@ fn robot_switch(state: &mut AppState, forward: bool) {
     }
 }
 
+/// Per-frame arcade-mode upkeep (the arcade slices of
+/// `CMatrixMap::Takt` + `CMatrixGameForm::Takt`):
+///   - `m_TraceStopPos` — camera-ray cursor trace skipping the
+///     arcaded robot (MatrixMap.cpp:1149-1160);
+///   - the `GetAsyncKeyState(KA_UNIT_*)` / `KA_FIRE` input snapshot
+///     consumed by the robot logic takt;
+///   - the CAMERA_INROBOT follow target (CalcLinkPoint inputs,
+///     MatrixCamera.cpp:899-915);
+///   - the Main-panel ±196px arcade slide (CInterface.cpp:3371/3392),
+///     reconciled so a robot death restores the panel too.
+fn sync_arcade_mode(state: &mut AppState) {
+    use crate::matrix_game::camera::ArcadeCamTarget;
+    use crate::matrix_game::map_static::MapStatic;
+    use winit::keyboard::KeyCode;
+
+    let arcaded = state.game.objects.arcaded_object.filter(|&id| {
+        crate::matrix_game::logic::robot_ref(&state.game.objects, id)
+            .map(|r| r.is_live())
+            .unwrap_or(false)
+    });
+
+    if let Some(aid) = arcaded {
+        let held = |c: KeyCode| state.held_keys.contains(&c);
+        let w = state.gfx.config.width as f32;
+        let h = state.gfx.config.height as f32;
+        let [mx, my] = state.cursor;
+        let over_ui = mx >= 0.0 && state.iface_list.hit_test(mx, my, w, h).is_some();
+        let mut cursor_world = state.game.objects.arcade_input.cursor_world;
+        if mx >= 0.0 && !state.is_paused {
+            use crate::matrix_game::common::TRACE_ALL;
+            use crate::matrix_game::map_trace::trace;
+            let (o, d) = state.camera.screen_to_world_ray(mx, my, w, h);
+            let (_stop, pos) = trace(
+                &state.map,
+                &state.game.objects,
+                o,
+                o + d * 10_000.0,
+                TRACE_ALL,
+                Some(aid),
+            );
+            cursor_world = pos;
+        }
+        state.game.objects.arcade_input = crate::matrix_game::map_static::ArcadeInput {
+            left: held(KeyCode::KeyA) || held(KeyCode::ArrowLeft),
+            right: held(KeyCode::KeyD) || held(KeyCode::ArrowRight),
+            forward: held(KeyCode::KeyW) || held(KeyCode::ArrowUp),
+            backward: held(KeyCode::KeyS) || held(KeyCode::ArrowDown),
+            fire: state.lmb_down,
+            cursor_world,
+            cursor_on_interface: over_ui,
+        };
+        if let Some(r) = crate::matrix_game::logic::robot_ref(&state.game.objects, aid) {
+            let speed_ratio = (r.speed / r.max_speed().max(1e-6)).clamp(0.0, 1.0);
+            state.camera.set_arcade_target(Some(ArcadeCamTarget {
+                pos: glam::Vec3::new(r.pos_x, r.pos_y, r.pos_z),
+                forward: r.forward,
+                speed_ratio,
+            }));
+        }
+    } else {
+        state.camera.set_arcade_target(None);
+    }
+
+    // Main-panel slide reconciler (relative shift keeps the data-
+    // driven base xPos authoritative).
+    let want = arcaded.is_some();
+    if want != state.main_panel_arcade {
+        if let Some(p) = state.iface_list.panel_mut("Main") {
+            p.design_x += if want { 196.0 } else { -196.0 };
+        }
+        state.main_panel_arcade = want;
+    }
+}
+
+/// `CIFaceList::EnterRobot` (CInterface.cpp:3377-3399) — hand the
+/// currently-selected robot over to manual control.
+fn enter_robot(state: &mut AppState) {
+    let Some(id) = state.game.player_side.get_cur_sel_object() else {
+        return;
+    };
+    state.game.set_arcaded_object(&state.map, Some(id));
+}
+
+/// `CIFaceList::LiveRobot` (CInterface.cpp:3340-3375) — leave arcade
+/// mode and re-select the robot in strategy mode.
+fn leave_robot(state: &mut AppState) {
+    use crate::matrix_game::map_static::MapStatic;
+    use crate::matrix_game::side::CurrSel;
+    if !state.game.is_arcade_mode() {
+        return;
+    }
+    let obj = state.game.objects.arcaded_object;
+    state.game.set_arcaded_object(&state.map, None);
+    if let Some(id) = obj {
+        if crate::matrix_game::logic::robot_ref(&state.game.objects, id)
+            .map(|r| r.is_live())
+            .unwrap_or(false)
+        {
+            state.game.player_side.selected = vec![id];
+            state.game.player_side.active_object = Some(id);
+            state.game.player_side.curr_sel = CurrSel::RobotsSelected;
+            state.game.sync_group_from_selection();
+        }
+    }
+}
+
 /// Constructor quick-pick: digit row → (type, kind, pylon) per the
 /// focused pylon (MatrixFormGame.cpp:1421-1493). `key` is the typed
 /// digit (1..9, 0).
@@ -5184,9 +5405,14 @@ fn handle_game_key(state: &mut AppState, code: winit::keyboard::KeyCode) -> bool
     }
 
     match code {
-        // ESC → main menu dialog (MatrixFormGame.cpp:1263).
+        // ESC — leave the robot when arcaded (MatrixFormGame.cpp:
+        // 1241-1245), else the main-menu dialog (:1263).
         K::Escape => {
-            enter_dialog_mode(state, "Menu");
+            if state.game.is_arcade_mode() {
+                leave_robot(state);
+            } else {
+                enter_dialog_mode(state, "Menu");
+            }
             return true;
         }
         // KEY_PAUSE toggle (MatrixFormGame.cpp:1290-1292). Pause() is
@@ -5199,6 +5425,29 @@ fn handle_game_key(state: &mut AppState, code: winit::keyboard::KeyCode) -> bool
         _ => {}
     }
 
+    // ── Robot (arcade) mode keys (MatrixFormGame.cpp:1294-1307) ──
+    if state.game.is_arcade_mode() {
+        match code {
+            // KA_UNIT_BOOM ('E') — self-destruct.
+            K::KeyE => {
+                if let Some(id) = state.game.objects.arcaded_object {
+                    state.game.robot_big_boom(&state.map, id);
+                }
+                return true;
+            }
+            // KA_UNIT_ENTER / _ALT (Enter / Space) — leave the robot.
+            K::Enter | K::NumpadEnter | K::Space => {
+                leave_robot(state);
+                return true;
+            }
+            // Every strategy-mode game key below is inside the C++
+            // `else` of `IsRobotMode()` (MatrixFormGame.cpp:1308) —
+            // unreachable while arcaded. Camera pitch/zoom bindings
+            // still apply (not consumed).
+            _ => return false,
+        }
+    }
+
     let ordering =
         state.iface_list.pre_order.is_some() || state.iface_list.turret_build.is_active();
     let curr_sel = state.game.player_side.curr_sel;
@@ -5208,6 +5457,13 @@ fn handle_game_key(state: &mut AppState, code: winit::keyboard::KeyCode) -> bool
         if curr_sel == CurrSel::RobotsSelected && state.game.player_side.cur_group().is_some() {
             let (auto_cap, auto_atk, auto_def) = state.game.show_order_state();
             match code {
+                // KA_UNIT_ENTER / _ALT (Enter / Space) — take manual
+                // control of the active selected robot
+                // (MatrixFormGame.cpp:1314-1321).
+                K::Enter | K::NumpadEnter | K::Space => {
+                    enter_robot(state);
+                    return true;
+                }
                 // a"U"to attack toggle.
                 K::KeyU => {
                     let no = state.game.sel_group_to_logic_group();

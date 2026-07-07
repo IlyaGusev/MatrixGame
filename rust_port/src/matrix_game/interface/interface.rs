@@ -188,6 +188,13 @@ pub struct MainVisibilityCtx {
     /// ORDERS_GLOW_ID+index (CInterface.cpp:1663-1677). Aggregated
     /// across the whole selection — several may glow at once.
     pub order_glows: [bool; 6],
+    /// `player_side->IsArcadeMode()` — shows `lero` (leave robot) and,
+    /// for a bomber, `sbo` (self-destruct); hides `inro`
+    /// (CInterface.cpp:1515-1544).
+    pub arcade_mode: bool,
+    /// `sel_bot->IsDisableManual()` — a robot mid-base-capture can't
+    /// be entered; gates `inro` (CInterface.cpp:1516).
+    pub single_disable_manual: bool,
 }
 
 /// Per-frame snapshot driving the robot selection panel — populated
@@ -1077,6 +1084,26 @@ impl CInterface {
                     }
                     if let Some(wsl) = self.elements.iter_mut().find(|e| e.name == "wsl") {
                         wsl.set_visible(true);
+                    }
+                }
+
+                // Arcade enter/leave + manual-mode chrome
+                // (CInterface.cpp:1510-1544): `manbg` frames the
+                // enter-robot button; `inro` shows for an enterable
+                // single robot, `lero` replaces it while arcaded,
+                // `sbo` (self-destruct) joins it for a bomber.
+                let singlem = rp.group.len() == 1 || ctx.arcade_mode;
+                for e in &mut self.elements {
+                    match e.name.as_str() {
+                        "manbg" if singlem && !ctx.single_disable_manual => e.set_visible(true),
+                        "inro"
+                            if singlem && !ctx.arcade_mode && !ctx.single_disable_manual =>
+                        {
+                            e.set_visible(true)
+                        }
+                        "lero" if singlem && ctx.arcade_mode => e.set_visible(true),
+                        "sbo" if ctx.arcade_mode && ctx.has_bomber => e.set_visible(true),
+                        _ => {}
                     }
                 }
 

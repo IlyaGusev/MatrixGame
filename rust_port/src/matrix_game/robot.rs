@@ -13,7 +13,7 @@ use crate::matrix_game::logic::{self, ROBOT_MOVECELLS_PER_SIZE};
 use crate::matrix_game::map::GameMap;
 use crate::matrix_game::map_static::{
     MapStatic, ObjectCore, ObjectId, ObjectType, Objects, MR_ALL, MR_MATRIX,
-    ROBOT_FLAG_COLLISION, ROBOT_FLAG_DISABLE_MANUAL,
+    ROBOT_FLAG_COLLISION, ROBOT_FLAG_DISABLE_MANUAL, ROBOT_FLAG_ROT_LEFT, ROBOT_FLAG_ROT_RIGHT,
 };
 use crate::matrix_game::map_trace::{self, MovePath, ROBOT_FOOTPRINT_HALF};
 use crate::matrix_game::object_cannon::{Cannon, CannonState};
@@ -204,6 +204,22 @@ pub struct Robot {
     /// tracks m_Forward through a smoothed rotation; initial value
     /// = m_Forward at spawn (CConstructor.cpp:192).
     pub hull_forward: glam::Vec2,
+    /// Arcade-mode `SetMaxSpeed(GetMaxSpeed() * SPEED_BOOST)`
+    /// (MatrixSide.cpp:1316,1325,1348). The C++ mutates `m_maxSpeed`
+    /// directly; we keep the chassis base speed in config and store
+    /// the boost factor, so `max_speed()` = base × this.
+    pub max_speed_boost: f32,
+    /// `this == GetArcadedObject()` snapshot, refreshed at the top of
+    /// each logic takt so deep helpers (rotate_hull, get_lost) can
+    /// test it without threading `&Objects` through.
+    pub is_arcaded: bool,
+    /// `m_PrevTurnSign` + `m_HullRotCnt` (MatrixRobot.hpp) — hull-servo
+    /// sound hysteresis while arcaded (MatrixRobot.cpp:2255-2276).
+    prev_turn_sign: i32,
+    hull_rot_cnt: i32,
+    /// rotate_hull has no `&mut Objects`; it raises this and the logic
+    /// takt drains it into `queue_snd_at` (PlayHullSound).
+    hull_sound_pending: bool,
     /// Port of `m_MoveTestPos` + `m_MoveTestChange`
     /// (MatrixRobot.hpp:268-269). Dead-reckoning watchdog: if the
     /// robot hasn't moved >5 units in 2 seconds, the MOVE_TO path
@@ -507,6 +523,11 @@ impl Robot {
             velocity: glam::Vec2::ZERO,
             speed: 0.0,
             hull_forward: glam::Vec2::new(0.0, -1.0),
+            max_speed_boost: 1.0,
+            is_arcaded: false,
+            prev_turn_sign: 0,
+            hull_rot_cnt: 0,
+            hull_sound_pending: false,
             move_test_pos: glam::Vec2::ZERO,
             move_test_change_ms: 0,
             // MatrixRobot.cpp:2970 — m_ColSpeed starts at 100 and Seek
@@ -1002,10 +1023,16 @@ impl Robot {
         self.falling_speed = 0.0;
     }
 
+    /// `GetMaxSpeed()` (MatrixRobot.hpp:339) — per-chassis config
+    /// speed with the arcade SPEED_BOOST factor applied.
+    pub fn max_speed(&self) -> f32 {
+        chassis_max_speed(self.chassis) * self.max_speed_boost
+    }
+
     /// `m_GroupSpeed = GetMaxSpeed()` (MatrixSide.cpp:2359) — the
     /// CalcMaxSpeed reset.
     pub fn reset_group_speed(&mut self) {
-        self.group_speed = chassis_max_speed(self.chassis);
+        self.group_speed = self.max_speed();
     }
 
     /// `m_GroupSpeed *= k` (MatrixSide.cpp:2444).
@@ -1289,10 +1316,43 @@ impl Robot {
     pub fn rotate_hull(&mut self, dest: glam::Vec2, cms: i32) {
         let here = glam::Vec2::new(self.pos_x, self.pos_y);
         let dest_dir = dest - here;
-        if dest_dir.length_squared() < 1e-8 {
-            return;
+        // Arcaded: a cursor closer than MIN_ROT_DIST keeps the current
+        // hull heading so the hull doesn't spin wildly under the robot
+        // (MatrixRobot.cpp:2237-2239, MIN_ROT_DIST=20).
+        let dest_dir_n = if self.is_arcaded && dest_dir.length_squared() < 20.0 * 20.0 {
+            self.hull_forward
+        } else {
+            if dest_dir.length_squared() < 1e-8 {
+                return;
+            }
+            dest_dir.normalize()
+        };
+
+        // Hull-servo sound on turn-direction flips (MatrixRobot.cpp:
+        // 2255-2276): HULL_ROT_S_ANGL=10°, HULL_ROT_TAKTS=30.
+        if self.is_arcaded {
+            let cos3 =
+                (self.hull_forward.x * dest_dir_n.x + self.hull_forward.y * dest_dir_n.y)
+                    .clamp(-1.0, 1.0);
+            let angle3 = cos3.acos();
+            let mut dchanged = false;
+            if angle3.abs() >= (10.0_f32).to_radians() {
+                let cosmos = dest_dir_n.x * (-self.hull_forward.y)
+                    + dest_dir_n.y * self.hull_forward.x;
+                if cosmos < 0.0 && self.prev_turn_sign == 1 {
+                    self.prev_turn_sign = 0;
+                    dchanged = true;
+                } else if cosmos > 0.0 && self.prev_turn_sign == 0 {
+                    self.prev_turn_sign = 1;
+                    dchanged = true;
+                }
+            }
+            self.hull_rot_cnt += 1;
+            if dchanged && self.hull_rot_cnt >= 30 {
+                self.hull_sound_pending = true;
+                self.hull_rot_cnt = 0;
+            }
         }
-        let dest_dir_n = dest_dir.normalize();
 
         // Per-armor max hull rotation speed
         // (`g_Config.m_ItemChars[ARMOR{N}_ROTATION_SPEED]`,
@@ -1353,6 +1413,11 @@ impl Robot {
         v: glam::Vec2,
         rng: &mut Rnd,
     ) {
+        // The manually-driven robot can't be knocked off course
+        // (MatrixRobot.cpp:5190-5191).
+        if self.is_arcaded {
+            return;
+        }
         // Forward more than 70° off `v` → just turn toward it this
         // takt instead of plotting a side-step (MatrixRobot.cpp:5201-5205).
         let f1 = self.forward.normalize_or_zero();
@@ -1439,9 +1504,10 @@ impl Robot {
     }
 
     /// Port of the `ROT_MOVE_TO` dispatch at MatrixRobot.cpp:1020-
-    /// 1112 — minus the arcade / capture-chain branches. If there's
-    /// no active move-path, computes one via A*; if there is, hands
-    /// off to `move_by_move_path`.
+    /// 1112 — the AI/commanded path (the arcade sub-branch is handled
+    /// upstream in `process_orders_list`). If there's no active
+    /// move-path, computes one via A*; if there is, hands off to
+    /// `move_by_move_path`.
     /// Port of `CMatrixRobotAI::ZoneCurFind` (MatrixRobot.cpp:1552-
     /// 1576) — adopt the zone of the cell we stand on when valid.
     fn zone_cur_find(&mut self, map: &GameMap) {
@@ -1612,7 +1678,8 @@ impl Robot {
     /// `while (cnt < m_OrdersInPool) { switch(m_OrdersList[0]) {...}
     /// ProcessOrdersList(); cnt++; }`. Each iteration dispatches the
     /// top order then rotates it to the back; `continue` paths pop
-    /// the top instead. The arcade branches are out of scope.
+    /// the top instead. The MOVE_TO case has an arcade sub-branch for
+    /// the manually-driven robot (MatrixRobot.cpp:1024-1038).
     fn process_orders_list(
         &mut self,
         cms: i32,
@@ -1628,6 +1695,27 @@ impl Robot {
             let top = *self.orders.top().unwrap();
             match top.ty {
                 OrderType::MoveTo | OrderType::MoveToBack => {
+                    // Manual drive (MatrixRobot.cpp:1024-1038): while
+                    // arcaded, W/S hold LowLevelMove straight along
+                    // (or against) m_Forward, bypassing pathfinding;
+                    // neither key held → StopMoving.
+                    if self.is_arcaded {
+                        let inp = objs.arcade_input;
+                        let here = glam::Vec2::new(self.pos_x, self.pos_y);
+                        if inp.forward {
+                            let dest = here + self.forward * self.max_speed();
+                            self.low_level_move(cms, map, objs, dest, true, true, false, false);
+                        } else if inp.backward {
+                            let dest = here - self.forward * self.max_speed();
+                            self.low_level_move(cms, map, objs, dest, true, true, false, true);
+                        } else {
+                            self.stop_moving();
+                        }
+                        self.map_pos_calc(map);
+                        self.orders.rotate_top_to_back();
+                        cnt += 1;
+                        continue;
+                    }
                     // :1041-1048 — frozen while a base-capture order
                     // is IN_POSITION (the base platform is carrying
                     // us).
@@ -2013,8 +2101,8 @@ impl Robot {
     }
 
     /// Port of the ROT_MOVE_TO / ROT_MOVE_TO_BACK dispatch case
-    /// (MatrixRobot.cpp:1020-1112), minus the arcade branch (manual
-    /// control is out of scope).
+    /// (MatrixRobot.cpp:1020-1112) — the pathfinding (non-arcade)
+    /// path; the manual-drive branch is handled in `process_orders_list`.
     fn dispatch_move_to(&mut self, cms: i32, map: &GameMap, objs: &mut Objects, elapsed_ms: i64) {
         self.map_pos_calc(map);
         self.zone_cur_find(map);
@@ -2319,7 +2407,7 @@ impl Robot {
         // MatrixRobot.cpp:2418 — `m_GroupSpeed` 0-init falls back to
         // `m_maxSpeed`. A fresh robot never entered a group, so this is
         // the default path.
-        let max_speed = chassis_max_speed(self.chassis);
+        let max_speed = self.max_speed();
         if self.group_speed <= 0.001 {
             self.group_speed = max_speed;
         }
@@ -3260,6 +3348,10 @@ impl MapStatic for Robot {
         };
         let elapsed_ms = crate::matrix_game::map::current_elapsed_ms();
 
+        // `this == GetArcadedObject()` — cached for the helpers that
+        // don't see `objs` (rotate_hull, get_lost).
+        self.is_arcaded = self.self_id.is_some() && objs.arcaded_object == self.self_id;
+
         // SOrder::Release side effect (MatrixRobot.hpp:219-229): any
         // dropped order whose static target is a building resets that
         // building's capturer, re-opening it for capture.
@@ -3507,6 +3599,45 @@ impl MapStatic for Robot {
                 }
             }
             RobotState::Idle | RobotState::BaseCapture => {
+                // Manual steering + fire polling for the arcaded robot
+                // (MatrixRobot.cpp:958-974): A/D (or mouse-cam drag)
+                // raise the one-shot ROT flags; LMB held issues a FIRE
+                // order aimed at the cursor unless it's over the UI;
+                // LMB released converts it to STOP_FIRE.
+                if self.is_arcaded {
+                    let inp = objs.arcade_input;
+                    if inp.left {
+                        self.object_state |= ROBOT_FLAG_ROT_LEFT;
+                    }
+                    if inp.right {
+                        self.object_state |= ROBOT_FLAG_ROT_RIGHT;
+                    }
+                    if inp.fire {
+                        if !self.orders.has(OrderType::Fire) && !inp.cursor_on_interface {
+                            self.fire(inp.cursor_world, 0);
+                        }
+                    } else if self.orders.has(OrderType::Fire) {
+                        self.stop_fire();
+                    }
+                }
+
+                // Consume the steer flags into a chassis rotation
+                // toward a point 90° left/right of the current heading
+                // (MatrixRobot.cpp:977-1002).
+                if self.object_state & (ROBOT_FLAG_ROT_LEFT | ROBOT_FLAG_ROT_RIGHT) != 0 {
+                    let mut ang = 0.0_f32;
+                    if self.object_state & ROBOT_FLAG_ROT_LEFT != 0 {
+                        ang -= std::f32::consts::FRAC_PI_2;
+                    }
+                    if self.object_state & ROBOT_FLAG_ROT_RIGHT != 0 {
+                        ang += std::f32::consts::FRAC_PI_2;
+                    }
+                    let dest = glam::Vec2::new(self.pos_x, self.pos_y)
+                        + rotate_vec2(self.forward * self.max_speed(), ang);
+                    self.rotate_robot(cms, dest);
+                    self.object_state &= !(ROBOT_FLAG_ROT_LEFT | ROBOT_FLAG_ROT_RIGHT);
+                }
+
                 // Port of `TaktCaptureCandidate` gating at
                 // MatrixRobot.cpp:1005-1006: auto-capture decisions
                 // run for non-player sides (and for the player side
@@ -3610,7 +3741,31 @@ impl MapStatic for Robot {
         // what makes robots cease fire once their victim dies or a
         // captured building's turret flips to their own side) and the
         // hull follows chassis forward.
-        if matches!(self.state, RobotState::Idle | RobotState::BaseCapture) {
+        if self.is_arcaded {
+            // Manual aim (MatrixRobot.cpp:843-847): the hull tracks
+            // the cursor trace while it's off the 2D UI. The env
+            // auto-aim/auto-stop-fire below is skipped entirely for
+            // the arcaded robot (:853, :946).
+            if self.state == RobotState::Idle && !objs.arcade_input.cursor_on_interface {
+                let cw = objs.arcade_input.cursor_world;
+                self.rotate_hull(glam::Vec2::new(cw.x, cw.y), cms);
+            }
+            if self.hull_sound_pending {
+                self.hull_sound_pending = false;
+                // PlayHullSound (MatrixRobot.cpp:5379-5394) — keyed on
+                // the armor kind.
+                let armor_kind = self.config.hull.unit.kind.0;
+                let name = match armor_kind {
+                    1 => "s_hull_passive",
+                    2 => "s_hull_active",
+                    3 => "s_hull_fireproof",
+                    4 => "s_hull_plasmic",
+                    5 => "s_hull_nuclear",
+                    _ => "s_hull_6",
+                };
+                objs.queue_snd_at(name, self.core.geo_center);
+            }
+        } else if matches!(self.state, RobotState::Idle | RobotState::BaseCapture) {
             let here = glam::Vec2::new(self.pos_x, self.pos_y);
             let mut hull_target: Option<glam::Vec2> = None;
             if let Some(t) = self.env.target {
@@ -5112,10 +5267,14 @@ impl Robot {
         };
         match top.ty {
             OrderType::Fire => {
-                // Arcade robots aim at the cursor trace; that path
-                // lands with arcade mode. AI/commanded path: aim at
+                // Arcaded: aim at the live cursor trace every takt
+                // (MatrixRobot.cpp:1151-1160); AI/commanded: aim at
                 // the order's params.
-                self.weapon_dir = glam::Vec3::new(top.p1, top.p2, top.p3);
+                self.weapon_dir = if self.is_arcaded {
+                    objs.arcade_input.cursor_world
+                } else {
+                    glam::Vec3::new(top.p1, top.p2, top.p3)
+                };
                 let ftype = top.p4;
                 let vel = glam::Vec3::new(self.velocity.x, self.velocity.y, 0.0)
                     / crate::matrix_game::logic::LOGIC_TAKT_PERIOD_MS as f32;
