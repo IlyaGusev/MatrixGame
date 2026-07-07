@@ -1037,7 +1037,11 @@ impl MapLogic {
                         }
                     }
                     if k >= 0 {
-                        let mut level = side.region_stats[k as usize].data;
+                        // C++ enters the traceback with the wave's
+                        // leftover `level` (2, or 3 in the k==0 case) —
+                        // NOT data[k], which for a path region is a
+                        // negative marker (MatrixSide.cpp:2905-2925).
+                        let mut level = level as i32;
                         loop {
                             let mut p = -1i32;
                             for &(u, _) in &g.near[k as usize] {
@@ -1045,7 +1049,7 @@ impl MapLogic {
                                 if ud <= 0 {
                                     continue;
                                 }
-                                if (ud as u32) < level {
+                                if ud < level {
                                     p = u;
                                     break;
                                 }
@@ -1058,7 +1062,7 @@ impl MapLogic {
                                 break;
                             }
                             k = p;
-                            level = side.region_stats[k as usize].data;
+                            level = side.region_stats[k as usize].data as i32;
                         }
                     }
                 }
@@ -1826,7 +1830,10 @@ impl MapLogic {
                 cands.push((u, gid));
             }
             cands.sort_by_key(|&(_, d)| d);
-            let fd_danger = side.region_stats[side.teams[i].region_far_danger as usize].danger;
+            // C++ typo kept (MatrixSide.cpp:3707): compares strength
+            // against the m_RegionFarDanger region INDEX, not its
+            // danger — so it almost always stops after one group.
+            let fd_index = side.teams[i].region_far_danger as f32;
             for (u, _) in cands {
                 for rid in self.group_robots_of(sid, u) {
                     let strength = robot_ref(&self.objects, rid).unwrap().strength;
@@ -1837,7 +1844,7 @@ impl MapLogic {
                     }
                     side.teams[i].strength += strength;
                 }
-                if side.teams[i].strength >= fd_danger {
+                if side.teams[i].strength >= fd_index {
                     break;
                 }
             }

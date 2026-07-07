@@ -559,3 +559,79 @@ kept verbatim as the audit record. See round 14 for the final re-verification.
 - L-ui: buhe build-flyer button absent; auto-order ON/OFF toggle collapses to on (latent behind H3).
 
 ## Verified FAITHFUL (no action): water, road-network runtime, effect base/billboard/VO, most robot/cannon/building/side-order logic, counter, history, constructor prices, most minimap.
+
+# Enemy-AI parity audit (2026-07-07) — side_ai.rs line-by-line vs MatrixSide.cpp
+
+side_ai.rs (4.5k lines) was ported after the main audit rounds and had never
+been line-audited. Full comparison of every function against the C++:
+LogicTakt(AI branch)/CalcStrength/Regroup/GroupNoTeamRobot/ClacSpawnTeam/
+CalcMaxSpeed/TaktHL (census, danger growth, region-mass, next-on-path wave,
+danger scan, wait-union, distance waves, retreat pick, nearest base,
+bravery, task validity, forward variants, action variants, BestAction pick,
+all 6 team-reorganisation branches)/TaktTL (underfire refresh, no-break
+release, order validity + execution incl. capture distribution)/WarTL
+(target pick, movement validation, re-placement incl. the faithful
+(tvx-pcx)²+(tvy-pcx)² quirk)/RepairTL/AssignPlace (robot+group)/
+SortRobotList/PlaceInRegion/BuildRobotMinStrange/BuildRobot/BuildCannon/
+FindNearRegionWithUTR/CompareAction/CalcRegionPath/CanMoveNoEnemy.
+Also audited: logic/environment.rs vs MatrixEnvironment.cpp, math3d.rs
+CTrajectory, cursor.rs vs MatrixCursor.cpp (recent commit), arcade-mode
+surfaces (robot LogicTakt branches, CAMERA_INROBOT, SetArcadedObject),
+IsTraceNonPlayerObj/CheckFireDist cursor logic, map_trace.rs.
+
+## FIXED — 2 real bugs
+- takt_hl next-region traceback (MatrixSide.cpp:2905-2925): the port
+  re-seeded `level` from data[k] — a negative path marker cast to u32 —
+  so the first traceback step accepted ANY positive-level neighbour and
+  could route m_RegionNext through a non-path region. Now enters with the
+  wave's leftover level like the C++.
+- takt_hl retreat-reinforcement merge (MatrixSide.cpp:3707): C++ compares
+  team strength against the m_RegionFarDanger region INDEX (shipped typo,
+  ~always stops after absorbing one group); the port compared against that
+  region's danger value and could absorb every candidate group. Typo now
+  replicated + documented.
+
+## Verified faithful (no action)
+- All other side_ai functions listed above, including deliberate divergences
+  already documented in code: intended-comparison port of the C++
+  `m_Action.m_Type=mlat_Capture` assignment typos (3239-3260), the
+  m_Team[u] OOB read ported as intended-k (3858-3902), guards added where
+  the C++ indexes m_Region[-1]/m_Team[-1] (UB in C++).
+- environment.rs: AddBadCoord ports the intended full-element FIFO (the
+  C++ CopyMemory shifts with sizeof(int) over CPoint entries — memory
+  corruption, not behaviour); ignore-ring, strikes, bad-place ring match.
+- Cursor port + arcade mode + RMB cancel semantics (the working-tree
+  form_game.rs diff is correct: picker-armed-without-kind swallows RMB,
+  ghost-committed cancels, armed pre-orders stay armed per
+  MatrixSide.cpp:804-835).
+
+Verified: cargo build clean, 224 lib + 4 integration tests green,
+attack_order_sim / collision_sim (20 runs, 0 violations) / check_maintenance
+/ heavy_battle_bench (180s, no panics), wasm32 check green.
+
+## Round continuation (same day) — remaining-module coverage closed
+Line-audited the last modules without a per-line record, all FAITHFUL:
+- road_network.rs runtime vs MatrixRoadNetwork.cpp: FindPathFromCrotchToRegion
+  (3-type widening BFS + backtrack), FindPathFromRegionPath, FindPathInRegionRun
+  (weighted wave + greedy descend, maxpath/err semantics), IsNerestRegion,
+  FindNerestRegion(ByRadius), FindInPL/ActionDataPL/CorrectRectPL, and the
+  3-wave FindPathInZone (MatrixLogic.cpp:1446-1793) incl. corridor access
+  marking, walk-mark-access level threading, and rollback. (Builder-side
+  functions are map-compile-time — shipped .CMAPs carry the baked network;
+  loader has a round-trip test.)
+- logic.rs place layer vs MatrixLogic.cpp: FindNearPlace (zone BFS + nearest
+  place), PlaceList (toplace wave + reach check + dist*4² heuristic + rect
+  scan + 0x8000_0000/cluster-bit clusterize + wave-to-start + winning-cluster
+  filter), PlaceListGrow. Buffer-cap divergence noted: C++ stops cluster
+  expansion at PlaceCnt (scratch-buffer guard, silent truncation in dense
+  fields); port allows the full ≤2×PlaceCnt expansion — safer, only differs
+  when the C++ would truncate arbitrarily.
+- map_static.rs proceed_logic vs CMatrixMapStatic::ProceedLogic — next-pointer
+  snapshot before dispatch, arcaded-object skip, take/put box pattern.
+
+With this, every module in CROSSREF.md has line-audit coverage across the
+cumulative rounds (effects/interface/hints via the dedicated sweeps; robots/
+cannons/buildings/sides/map/water/camera via rounds 1-15 + BUGS.md phases;
+side_ai/environment/road_network/map_trace/map_static/math3d/cursor/arcade
+via 2026-07-07). All found bugs are fixed; fixes live in the working tree
+(commits require an explicit user order per project convention).

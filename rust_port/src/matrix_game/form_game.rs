@@ -734,21 +734,25 @@ impl ApplicationHandler for App {
                     // MatrixFormGame.cpp:756-760.
                     let over_ui = state.iface_list.hit_test(cx, cy, w, h).is_some()
                         || state.minimap.click_to_world(cx, cy).is_some();
-                    // Right-click backs out of an armed order without
-                    // issuing anything (mirrors ResetOrderingMode). RMB
-                    // also cancels an armed turret placement, dropping
-                    // the ghost (MatrixSide.cpp:804-810).
+                    // RMB cancels only a committed turret placement (ghost
+                    // exists): `IS_PREORDERING && BUILDING_TURRET` at
+                    // MatrixSide.cpp:804-810. Armed pre-orders stay armed —
+                    // OnRButtonDown gates every order branch on
+                    // !IS_PREORDERING and never clears the flag; the picker
+                    // without a kind likewise swallows the click.
                     if !ui_consumed_rmb
                         && btn_state == ElementState::Pressed
                         && state.iface_list.turret_build.is_active()
                     {
-                        state.iface_list.turret_build.cancel();
-                        log::debug!("turret placement: cancelled by right-click");
+                        if state.iface_list.turret_build.kind.is_some() {
+                            state.iface_list.turret_build.cancel();
+                            log::debug!("turret placement: cancelled by right-click");
+                        }
                     } else if !ui_consumed_rmb
                         && btn_state == ElementState::Pressed
-                        && state.iface_list.pre_order.take().is_some()
+                        && state.iface_list.pre_order.is_some()
                     {
-                        log::debug!("order: cancelled by right-click");
+                        // Armed pre-order: RMB is inert (MatrixSide.cpp:835).
                     } else if !ui_consumed_rmb
                         && btn_state == ElementState::Pressed
                         && !state.game.is_arcade_mode()
