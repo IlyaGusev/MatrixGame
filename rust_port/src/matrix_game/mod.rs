@@ -9,6 +9,7 @@ pub mod camera;
 mod combat_tests;
 pub mod common;
 pub mod config;
+pub mod cursor;
 pub mod effects;
 pub mod flyer;
 pub mod form_game;

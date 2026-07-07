@@ -31,6 +31,15 @@ struct AppState {
     game: MapLogic,
     last_time: f64,
     cursor: [f32; 2],
+    /// Software cursor — port of `CMatrixMap::m_Cursor`
+    /// (CMatrixCursor). Mode selection happens in `update_cursor`,
+    /// the sprite draws in the final overlay pass.
+    matrix_cursor: crate::matrix_game::cursor::MatrixCursor,
+    /// `m_TraceStopObj` / `m_TraceStopPos` — the per-frame mouse
+    /// ray-trace result (MatrixMap.cpp:1149-1178). Frozen while
+    /// paused, like the C++ (the trace lives in `CMatrixMap::Takt`).
+    mouse_trace: crate::matrix_game::map_trace::TraceStop,
+    mouse_trace_pos: glam::Vec3,
     minimap_dragging: bool,
     /// Shift-key modifier state — tracked so left-click can toggle
     /// the multi-selection (`CMultiSelection::Add/Remove` at
@@ -290,6 +299,14 @@ impl ApplicationHandler for App {
                 &read,
                 &iface_list.hint_chrome,
             );
+            let matrix_cursor = init_matrix_cursor(
+                &matrix_data,
+                &mut iface_renderer,
+                &gfx.device,
+                &gfx.queue,
+                &read,
+                &window,
+            );
             let mut progress_bars = crate::matrix_game::progress_bar::ProgressBarRenderer::new(
                 &gfx.device,
                 &gfx.config,
@@ -338,6 +355,9 @@ impl ApplicationHandler for App {
                 game,
                 last_time: crate::platform::now_secs(),
                 cursor: [-1.0, -1.0],
+                matrix_cursor,
+                mouse_trace: crate::matrix_game::map_trace::TraceStop::None,
+                mouse_trace_pos: glam::Vec3::ZERO,
                 minimap_dragging: false,
                 shift_down: false,
                 lmb_anchor: None,
@@ -512,6 +532,14 @@ impl ApplicationHandler for App {
                     &read,
                     &iface_list.hint_chrome,
                 );
+                let matrix_cursor = init_matrix_cursor(
+                    &matrix_data,
+                    &mut iface_renderer,
+                    &gfx.device,
+                    &gfx.queue,
+                    &read,
+                    &win,
+                );
                 let mut progress_bars = crate::matrix_game::progress_bar::ProgressBarRenderer::new(
                     &gfx.device,
                     &gfx.config,
@@ -558,6 +586,9 @@ impl ApplicationHandler for App {
                     game,
                     last_time: crate::platform::now_secs(),
                     cursor: [-1.0, -1.0],
+                    matrix_cursor,
+                    mouse_trace: crate::matrix_game::map_trace::TraceStop::None,
+                    mouse_trace_pos: glam::Vec3::ZERO,
                     minimap_dragging: false,
                     shift_down: false,
                     lmb_anchor: None,
@@ -1348,10 +1379,24 @@ impl ApplicationHandler for App {
                 // each frame. Left out unless we add real point lights
                 // (e.g. weapon flashes) that justify the GPU sync cost.
 
+                // Per-frame mouse trace (m_TraceStopObj/Pos) — inside
+                // `CMatrixMap::Takt` in the C++, so it freezes while
+                // paused and cursor logic below reads the frozen value.
+                if !state.is_paused {
+                    update_mouse_trace(state);
+                }
+
                 // Per-frame interface visibility dispatch — ports the
                 // `CInterface::LogicTakt` branch at
                 // CInterface.cpp:1214-1635. Only `if/Main` for now.
+                // Also selects the cursor mode (CInterface.cpp:2957).
                 refresh_interface_visibility(state);
+
+                // Cursor frame animation — runs during pause too
+                // (MatrixMap.cpp:2518 and the paused branch at
+                // MatrixLogic.cpp:2618 both call m_Cursor.Takt).
+                state.matrix_cursor.takt(step_ms);
+                state.matrix_cursor.pos = state.cursor;
 
                 // Advance the constructor 3D preview turntable + emit
                 // a preview draw-ticket while the constructor panel is
@@ -1845,6 +1890,22 @@ impl ApplicationHandler for App {
                                 .as_ref()
                                 .map(|d| d.hints.iter().collect())
                                 .unwrap_or_default();
+                            // Software-cursor quad — scaled with the
+                            // rest of the UI (the original draws raw
+                            // 32 px at its 1024×768 design res).
+                            let cursor_sprite = {
+                                let scale = (state.gfx.config.height as f32
+                                    / crate::matrix_game::interface::interface::DESIGN_H)
+                                    .max(0.1);
+                                state
+                                    .matrix_cursor
+                                    .tex_path()
+                                    .and_then(|p| state.iface_renderer.atlas_size(p))
+                                    .and_then(|(tw, th)| {
+                                        state.matrix_cursor.sprite(tw, th, scale)
+                                    })
+                            };
+                            state.iface_renderer.set_cursor_sprite(cursor_sprite);
                             state.iface_renderer.upload_with_popup_and_hint(
                                 &state.gfx.device,
                                 &state.gfx.queue,
@@ -2035,6 +2096,9 @@ impl ApplicationHandler for App {
                                 multiview_mask: None,
                             });
                             state.progress_bars.render(&mut pass);
+                            // Software cursor — the C++ frame's very
+                            // last draw (MatrixMap.cpp:2485).
+                            state.iface_renderer.render_cursor(&mut pass);
                         }
                         state.gfx.end_frame(output, encoder);
                         state.perf_acc[5] += crate::platform::now_secs() - t_sync_end;
@@ -3525,11 +3589,10 @@ fn refresh_progress_bars(state: &mut AppState) {
     // skips — so with the constructor (Pause(true)) or a dialog open,
     // world HP bars neither arm on hover nor draw over the window.
     if !state.is_paused {
-        use crate::matrix_game::common::{TRACE_ALL, TRACE_LANDSCAPE};
+        use crate::matrix_game::common::TRACE_LANDSCAPE;
         use crate::matrix_game::interface::interface::DESIGN_H;
         use crate::matrix_game::map_trace::{trace, TraceStop};
 
-        let w = state.gfx.config.width as f32;
         let h = state.gfx.config.height as f32;
         let scale = (h / DESIGN_H).max(0.1);
         let bar_h = {
@@ -3541,23 +3604,12 @@ fn refresh_progress_bars(state: &mut AppState) {
             }
         };
 
-        // Arm the bar of the object under the cursor for 1s — the
-        // per-frame mouse trace at MatrixMap.cpp:1150-1178.
-        let [mx, my] = state.cursor;
-        if mx >= 0.0 {
-            let (o, d) = state.camera.screen_to_world_ray(mx, my, w, h);
-            let (stop, _) = trace(
-                &state.map,
-                &state.game.objects,
-                o,
-                o + d * 10_000.0,
-                TRACE_ALL,
-                state.game.objects.arcaded_object,
-            );
-            if let TraceStop::Object(id) = stop {
-                if let Some(obj) = state.game.objects.get_mut(id) {
-                    obj.show_hitpoint();
-                }
+        // Arm the bar of the object under the cursor for 1s — reads
+        // the shared per-frame mouse trace (MatrixMap.cpp:1150-1178,
+        // maintained by `update_mouse_trace`).
+        if let TraceStop::Object(id) = state.mouse_trace {
+            if let Some(obj) = state.game.objects.get_mut(id) {
+                obj.show_hitpoint();
             }
         }
 
@@ -3772,38 +3824,199 @@ fn refresh_progress_bars(state: &mut AppState) {
 /// stack state to decide which `if/Main` elements should show this
 /// frame. Other panels don't have their dispatch ported yet; they
 /// stay hidden.
-/// Context-sensitive gameplay cursor (CInterface.cpp:2978-3010). The
-/// original selects distinct `cross_red/cross_blue/star/arrow` bitmaps;
-/// we map them onto the platform cursor (crosshair for the targeting
-/// crosses, move for the edge-scroll star, arrow otherwise), consistent
-/// with the port's OS-cursor substitution for the default arrow.
-fn update_os_cursor(state: &AppState) {
-    use winit::window::CursorIcon;
+/// Build the software cursor at init: parse the `Cursors` block,
+/// preload the five sprite-sheet atlases, select the arrow
+/// (MatrixGame.cpp:548) and hide the OS cursor over the window —
+/// the port of `m_OldCursor = SetCursor(NULL)` in the CMatrixCursor
+/// ctor.
+fn init_matrix_cursor(
+    matrix_data: &crate::matrix_lib::base::storage::Storage,
+    iface_renderer: &mut crate::matrix_game::interface::InterfaceRenderer,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    read: &dyn Fn(&str) -> Option<Vec<u8>>,
+    window: &Window,
+) -> crate::matrix_game::cursor::MatrixCursor {
+    let mut cursor = crate::matrix_game::cursor::MatrixCursor::new(matrix_data);
+    let paths: Vec<String> = cursor.tex_paths().map(|s| s.to_string()).collect();
+    for p in &paths {
+        iface_renderer.ensure_atlas(device, queue, read, p);
+    }
+    cursor.select(crate::matrix_game::cursor::CURSOR_ARROW);
+    window.set_cursor_visible(false);
+    cursor
+}
+
+/// Per-frame mouse ray-trace — `m_TraceStopObj` / `m_TraceStopPos`
+/// (MatrixMap.cpp:1149-1178). Skips the arcaded robot like the
+/// original so the arcade reticle sees through the player's own hull.
+fn update_mouse_trace(state: &mut AppState) {
+    use crate::matrix_game::common::TRACE_ALL;
+    use crate::matrix_game::map_trace::{trace, TraceStop};
+    let [mx, my] = state.cursor;
+    if mx < 0.0 {
+        state.mouse_trace = TraceStop::None;
+        return;
+    }
+    let w = state.gfx.config.width as f32;
+    let h = state.gfx.config.height as f32;
+    let (o, d) = state.camera.screen_to_world_ray(mx, my, w, h);
+    let (stop, pos) = trace(
+        &state.map,
+        &state.game.objects,
+        o,
+        o + d * 10_000.0,
+        TRACE_ALL,
+        state.game.objects.arcaded_object,
+    );
+    state.mouse_trace = stop;
+    state.mouse_trace_pos = pos;
+}
+
+/// `CMatrixMap::IsTraceNonPlayerObj` (MatrixMap.cpp:3630-3643) — a
+/// robot / building / cannon / flyer / special object under the
+/// cursor that isn't the player's.
+fn is_trace_non_player_obj(state: &AppState) -> bool {
+    use crate::matrix_game::common::PLAYER_SIDE;
+    use crate::matrix_game::map_static::ObjectType;
+    let Some(id) = state.mouse_trace.object() else {
+        return false;
+    };
+    let Some(obj) = state.game.objects.get(id) else {
+        return false;
+    };
+    (matches!(
+        obj.core().obj_type,
+        ObjectType::RobotAi | ObjectType::Building | ObjectType::Cannon | ObjectType::Flyer
+    ) || obj.is_special())
+        && obj.side() != PLAYER_SIDE
+}
+
+/// `CMatrixRobotAI::CheckFireDist` (MatrixRobot.cpp:5411-5433) for the
+/// arcaded robot: true when any weapon's ray toward the cursor point,
+/// bounded by that weapon's range, reaches the object under the cursor.
+fn arcade_check_fire_dist(state: &AppState) -> bool {
+    use crate::matrix_game::common::TRACE_ALL;
+    use crate::matrix_game::map_static::MapStatic;
+    use crate::matrix_game::map_trace::trace;
+    let Some(aid) = state.game.objects.arcaded_object else {
+        return false;
+    };
+    let Some(r) = crate::matrix_game::logic::robot_ref(&state.game.objects, aid) else {
+        return false;
+    };
+    let point = state.mouse_trace_pos;
+    for bw in &r.weapons {
+        let Some(we) = state.game.objects.weapons.get(bw.weapon) else {
+            continue; // `IsEffectPresent`
+        };
+        // `GetWeaponPos` — real muzzle when mounted, geo-center before
+        // the first render frame (same fallback as weapons_logic_takt).
+        let wpos = r
+            .weapon_mounts
+            .get(bw.unit)
+            .copied()
+            .flatten()
+            .map(|m| m.pos)
+            .unwrap_or(r.core().geo_center);
+        let out = (point - wpos).normalize_or_zero() * we.weapon_dist();
+        if out == glam::Vec3::ZERO {
+            continue;
+        }
+        let (stop, _) = trace(
+            &state.map,
+            &state.game.objects,
+            wpos,
+            wpos + out,
+            TRACE_ALL,
+            Some(aid),
+        );
+        if stop == state.mouse_trace {
+            return true;
+        }
+    }
+    false
+}
+
+/// Context-sensitive gameplay cursor — faithful port of the "Cursor
+/// logic" block of `CIFaceList::LogicTakt` (CInterface.cpp:2957-3010):
+/// arcade reticle (red = in weapon range, yellow = enemy out of range,
+/// blue = no target, arrow over the UI), screen-edge scroll star,
+/// armed pre-order crosses, arrow otherwise.
+fn update_cursor(state: &mut AppState) {
+    use crate::matrix_game::common::PLAYER_SIDE;
+    use crate::matrix_game::cursor::*;
+    use crate::matrix_game::interface::iface_list::PreOrder;
+    use crate::matrix_game::map_static::{MapStatic, ObjectType};
+
     let [mx, my] = state.cursor;
     let w = state.gfx.config.width as f32;
     let h = state.gfx.config.height as f32;
-    const EDGE: f32 = 8.0;
-    let icon = if mx < 0.0 {
-        CursorIcon::Default
-    } else if state.game.is_arcade_mode() {
-        // Arcade aim reticle (CInterface.cpp:2960-2977): arrow over
-        // the UI, CURSOR_CROSS_* over the world. The red/yellow/blue
-        // range variants collapse onto the OS crosshair.
-        if state.iface_list.hit_test(mx, my, w, h).is_some() {
-            CursorIcon::Default
+
+    // `ps->IsArcadeMode() && ps->GetArcadedObject()->IsLiveRobot()`.
+    let arcaded_live = state
+        .game
+        .objects
+        .arcaded_object
+        .and_then(|id| crate::matrix_game::logic::robot_ref(&state.game.objects, id))
+        .map(|r| r.is_live())
+        .unwrap_or(false);
+
+    let name = if arcaded_live {
+        if mx >= 0.0 && state.iface_list.hit_test(mx, my, w, h).is_some() {
+            CURSOR_ARROW
+        } else if is_trace_non_player_obj(state) {
+            if arcade_check_fire_dist(state) {
+                CURSOR_CROSS_RED
+            } else {
+                CURSOR_CROSS_YELLOW
+            }
         } else {
-            CursorIcon::Crosshair
+            CURSOR_CROSS_BLUE
         }
-    } else if mx < EDGE || mx > w - EDGE || my < EDGE || my > h - EDGE {
-        CursorIcon::Move // CURSOR_STAR — screen-edge scroll band
-    } else if state.iface_list.pre_order.is_some()
-        || state.iface_list.turret_build.is_active()
-    {
-        CursorIcon::Crosshair // CURSOR_CROSS_* — an order/placement is armed
     } else {
-        CursorIcon::Default // CURSOR_ARROW
+        // MatrixFormGame.hpp:9 — the same 4 px band the edge-scroll uses.
+        const MOUSE_BORDER: f32 = 4.0;
+        let in_screen = mx >= 0.0 && my >= 0.0 && mx < w && my < h;
+        if in_screen
+            && (mx < MOUSE_BORDER
+                || mx > w - MOUSE_BORDER
+                || my < MOUSE_BORDER
+                || my > h - MOUSE_BORDER)
+        {
+            CURSOR_STAR
+        } else {
+            match state.iface_list.pre_order {
+                Some(PreOrder::Fire) | Some(PreOrder::Bomb) => {
+                    if is_trace_non_player_obj(state) {
+                        CURSOR_CROSS_RED
+                    } else {
+                        CURSOR_CROSS_BLUE
+                    }
+                }
+                Some(PreOrder::Capture) => {
+                    let enemy_building = state
+                        .mouse_trace
+                        .object()
+                        .and_then(|id| state.game.objects.get(id))
+                        .map(|o| {
+                            o.core().obj_type == ObjectType::Building && o.side() != PLAYER_SIDE
+                        })
+                        .unwrap_or(false);
+                    if enemy_building {
+                        CURSOR_CROSS_RED
+                    } else {
+                        CURSOR_CROSS_BLUE
+                    }
+                }
+                Some(PreOrder::Move) | Some(PreOrder::Patrol) | Some(PreOrder::Repair) => {
+                    CURSOR_CROSS_BLUE
+                }
+                None => CURSOR_ARROW,
+            }
+        }
     };
-    state.window.set_cursor(icon);
+    state.matrix_cursor.select(name);
 }
 
 fn refresh_interface_visibility(state: &mut AppState) {
@@ -3812,7 +4025,7 @@ fn refresh_interface_visibility(state: &mut AppState) {
     use crate::matrix_game::object_building::{Building, BuildingType};
     use crate::matrix_game::side::CurrSel;
 
-    update_os_cursor(state);
+    update_cursor(state);
     let curr_sel = state.game.player_side.curr_sel;
     let player_side_id = state.game.player_side.id;
     // Pull building context when the selection is a Building. Also

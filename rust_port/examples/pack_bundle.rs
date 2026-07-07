@@ -134,6 +134,17 @@ fn main() {
     for i in 1..=6 {
         extra_paths.push(format!("Matrix/Iface/base_{}", i));
     }
+    // Software-cursor sprite sheets — the `Cursors` block in robots.dat
+    // maps mode names (arrow/cross_*/star) to these 4x4 frame grids.
+    for c in [
+        "arrow_blue",
+        "cross_blue",
+        "cross_red",
+        "cross_yellow",
+        "star",
+    ] {
+        extra_paths.push(format!("Matrix/Textures/Cursors/{}", c));
+    }
     // Progress-bar sprite used by `CMatrixProgressBar`
     // (MatrixProgressBar.cpp:22 `TEXTURE_PATH_PB`). Ships only as DDS.
     extra_paths.push("Matrix/Textures/pb".to_string());

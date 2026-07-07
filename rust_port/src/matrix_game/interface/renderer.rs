@@ -100,6 +100,13 @@ pub struct InterfaceRenderer {
     /// `render_base` / `render_overlay` split here so the 3D preview
     /// pass can slot between them.
     overlay_start: usize,
+    /// First draw-group index of the software cursor. The cursor is
+    /// the last thing the C++ frame draws (MatrixMap.cpp:2485, after
+    /// interface + progress bars), so `render_cursor` runs in the
+    /// final overlay pass, after the progress-bar renderer.
+    cursor_start: usize,
+    /// Set per frame by the game loop (`CMatrixCursor::Draw` input).
+    cursor_sprite: Option<crate::matrix_game::cursor::CursorSprite>,
     num_verts: u32,
     /// Glyph cache + GPU upload tracking. Re-uploaded whenever a new
     /// glyph is rasterised (atlas.generation changes).
@@ -308,6 +315,8 @@ impl InterfaceRenderer {
             atlases: solid_atlases,
             draw_groups: Vec::new(),
             overlay_start: 0,
+            cursor_start: 0,
+            cursor_sprite: None,
             num_verts: 0,
             glyph_atlas: GlyphAtlas::new(),
             glyph_atlas_generation: 0,
@@ -1540,6 +1549,48 @@ impl InterfaceRenderer {
             );
         }
 
+        // ── Software cursor ───────────────────────────────────────
+        // `CMatrixCursor::Draw` (MatrixCursor.cpp:241-288) — one
+        // alpha-blended quad, the very last thing the frame draws.
+        // Flush the open run first so the cursor lands in its own
+        // group range (`cursor_start`..end), rendered by
+        // `render_cursor` after the progress bars.
+        if let Some(k) = current_key.take() {
+            let end = all_verts.len() as u32;
+            if end > current_start {
+                self.draw_groups.push(DrawGroup {
+                    atlas_key: k,
+                    start: current_start,
+                    count: end - current_start,
+                });
+            }
+            current_start = all_verts.len() as u32;
+        }
+        self.cursor_start = self.draw_groups.len();
+        if let Some(cs) = &self.cursor_sprite {
+            let key = normalise_atlas_key(&cs.tex_path);
+            if self.atlases.contains_key(&key) {
+                open_run(
+                    &key,
+                    &all_verts,
+                    &mut current_key,
+                    &mut current_start,
+                    &mut self.draw_groups,
+                );
+                let [u0, v0, u1, v1] = cs.uv;
+                let tint = [1.0, 1.0, 1.0, 1.0];
+                let (x0, y0, x1, y1) = (cs.x, cs.y, cs.x + cs.w, cs.y + cs.h);
+                all_verts.extend_from_slice(&[
+                    Vertex { pos: [x0, y0], uv: [u0, v0], tint },
+                    Vertex { pos: [x1, y0], uv: [u1, v0], tint },
+                    Vertex { pos: [x0, y1], uv: [u0, v1], tint },
+                    Vertex { pos: [x1, y0], uv: [u1, v0], tint },
+                    Vertex { pos: [x1, y1], uv: [u1, v1], tint },
+                    Vertex { pos: [x0, y1], uv: [u0, v1], tint },
+                ]);
+            }
+        }
+
         static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         // Log once on change. We check if the count for any panel
         // differs from the last log.
@@ -1615,9 +1666,30 @@ impl InterfaceRenderer {
     }
 
     /// Dialog hints / hint buttons / popup / hover hint — everything
-    /// above the constructor 3D preview.
+    /// above the constructor 3D preview (but below the progress bars
+    /// and cursor).
     pub fn render_overlay<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
-        self.render_groups(pass, self.overlay_start.min(self.draw_groups.len()), self.draw_groups.len());
+        self.render_groups(
+            pass,
+            self.overlay_start.min(self.draw_groups.len()),
+            self.cursor_start.min(self.draw_groups.len()),
+        );
+    }
+
+    /// Set the software-cursor quad for the next `upload_*` call, or
+    /// `None` to hide it (mouse outside the window).
+    pub fn set_cursor_sprite(&mut self, s: Option<crate::matrix_game::cursor::CursorSprite>) {
+        self.cursor_sprite = s;
+    }
+
+    /// The software cursor — drawn on top of everything, in the last
+    /// screen-space pass of the frame.
+    pub fn render_cursor<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
+        self.render_groups(
+            pass,
+            self.cursor_start.min(self.draw_groups.len()),
+            self.draw_groups.len(),
+        );
     }
 
     fn render_groups<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, from: usize, to: usize) {

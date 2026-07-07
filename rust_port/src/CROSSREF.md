@@ -50,6 +50,7 @@ Form, Helper, ShadowProj, ShadowStencil. (Math3D partial — CTrajectory.)
 | matrix_game/camera.rs         | MatrixCamera.cpp                  |
 | matrix_game/common.rs         | Common.hpp                        |
 | matrix_game/config.rs         | MatrixConfig.cpp (damage/radius/cooldown/overheat tables, cannon props, difficulty; gamma/keybind/sound deferred) |
+| matrix_game/cursor.rs         | MatrixCursor.cpp (software cursor: Cursors block, frame anim, CalcUV; drawn via interface renderer) |
 | matrix_game/form_game.rs      | MatrixFormGame.cpp (+ MatrixGame.cpp entry glue) |
 | matrix_game/map.rs            | MatrixMap.cpp (map data + `MapRenderer` draw orchestration + DrawSky/skybox)|
 | matrix_game/map_group.rs      | MatrixMapGroup.cpp (BuildBottom + BuildWater — merged across groups by texture; see header) |
@@ -82,8 +83,7 @@ Form, Helper, ShadowProj, ShadowStencil. (Math3D partial — CTrajectory.)
 N/A-by-design (D3D9 infrastructure replaced by the wgpu glue):
 MatrixInstantDraw, MatrixMapTexture, MatrixSampleStateManager,
 MatrixSkinManager (vector_object.rs handles materials), MatrixVisiCalc
-(frustum culling lives in the renderers), MatrixCursor (only
-CURSOR_ARROW is ever selected — the OS cursor stands in),
+(frustum culling lives in the renderers),
 MatrixLoadProgress / MatrixTransition (index.html spinner + CSS fade),
 MatrixDebugInfo + DevConsole (dev/cheat tooling). MatrixSoundManager:
 the standalone original is silent (every CSound::Play is gated on the
