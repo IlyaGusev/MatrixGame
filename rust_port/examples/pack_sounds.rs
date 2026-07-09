@@ -16,6 +16,7 @@
 
 use matrixgame_rs::gfx::bundle::AssetBundle;
 use matrixgame_rs::matrix_game::config::SoundDefs;
+use matrixgame_rs::matrix_lib::base::pack::PkgArchive;
 use matrixgame_rs::matrix_lib::base::storage::Storage;
 use std::collections::HashMap;
 use std::path::Path;
@@ -39,31 +40,42 @@ fn main() {
     index_dir(Path::new(&dir), Path::new(&dir), &mut files);
     println!("{} audio files under {dir}", files.len());
 
+    // (key, SR2 resource path) worklist: every Sounds-block entry plus
+    // the map ambience the EST_SOUND spawners play by name
+    // (Sound.MapWater etc. — resolved by the host in the original,
+    // absent from the Sounds block).
+    let mut wanted: Vec<(String, String)> = defs
+        .iter()
+        .filter(|(_, d)| !d.path.is_empty())
+        .map(|(k, d)| (k.clone(), d.path.clone()))
+        .collect();
+    wanted.sort();
+    // Ambient names go last so paths shared with Sounds-block keys
+    // resolve through the key probe first.
+    for name in ambient_spawner_names() {
+        wanted.push((name.clone(), name));
+    }
+
     let mut bundle = AssetBundle::new();
     let mut packed: HashMap<String, String> = HashMap::new(); // path → source file
     let mut missing: Vec<String> = Vec::new();
-    let mut keys: Vec<_> = defs.iter().collect();
-    keys.sort_by(|a, b| a.0.cmp(b.0));
-    for (key, def) in keys {
-        if def.path.is_empty() {
-            continue;
-        }
-        if packed.contains_key(&def.path) {
+    for (key, path) in wanted {
+        if packed.contains_key(&path) {
             continue;
         }
         let candidates = [
             key.to_lowercase(),
-            def.path.to_lowercase(),
-            def.path.to_lowercase().replace('.', "/"),
+            path.to_lowercase(),
+            path.to_lowercase().replace('.', "/"),
         ];
         let hit = candidates.iter().find_map(|c| files.get(c));
         match hit {
             Some(f) => {
                 let bytes = std::fs::read(f).expect("read audio file");
-                bundle.add(&def.path, bytes);
-                packed.insert(def.path.clone(), f.display().to_string());
+                bundle.add(&path, bytes);
+                packed.insert(path.clone(), f.display().to_string());
             }
-            None => missing.push(format!("{key} ({})", def.path)),
+            None => missing.push(format!("{key} ({path})")),
         }
     }
 
@@ -79,6 +91,37 @@ fn main() {
     let bytes = bundle.to_zstd_bytes(19);
     std::fs::write(&out, &bytes).expect("write bundle");
     println!("wrote {out} ({} KiB)", bytes.len() / 1024);
+}
+
+/// Distinct sound names authored on EST_SOUND effect spawners across
+/// all maps in robots.pkg (`3,min,max,vol0,vol1,pan0,pan1,attn,name`).
+fn ambient_spawner_names() -> Vec<String> {
+    let mut out = std::collections::BTreeSet::new();
+    let Ok(data) = std::fs::read("../Data/robots.pkg") else {
+        return Vec::new();
+    };
+    let Ok(pkg) = PkgArchive::from_bytes(data) else {
+        return Vec::new();
+    };
+    for f in pkg.list_files() {
+        if !f.ends_with(".CMAP") {
+            continue;
+        }
+        let Ok(cmap) = pkg.read_file(&f) else { continue };
+        let Ok(map) = matrixgame_rs::matrix_game::map::GameMap::from_cmap_bytes(&cmap) else {
+            continue;
+        };
+        for (_, spec) in &map.effect_spawners {
+            let parts: Vec<&str> = spec.split(',').map(|s| s.trim()).collect();
+            if parts.first() == Some(&"3") {
+                if let Some(name) = parts.get(8).filter(|n| !n.is_empty()) {
+                    out.insert(name.to_string());
+                }
+            }
+        }
+    }
+    println!("{} ambient spawner sounds across maps: {:?}", out.len(), out);
+    out.into_iter().collect()
 }
 
 /// Recursive scan; keys are lowercased extension-less paths relative

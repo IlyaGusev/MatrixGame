@@ -330,14 +330,27 @@ impl MapLogic {
             let ty = pint(0);
             let min_period = pint(1).max(1);
             let max_period = pint(2).max(min_period);
-            // EST_SMOKE=1 / EST_FIRE=2 (MatrixEffect.hpp:492-497).
-            if ty != 1 && ty != 2 {
-                continue;
-            }
+            // EST_SMOKE=1 / EST_FIRE=2 / EST_SOUND=3 (MatrixEffect.hpp:
+            // 492-497; EST_LIGHTENING needs the beam renderer pair).
+            let fx = match ty {
+                1 => SpawnerFx::Smoke,
+                2 => SpawnerFx::Fire,
+                // `3,min,max,vol0,vol1,pan0,pan1,attn,name`
+                // (MatrixMap.cpp:3168-3190).
+                3 => SpawnerFx::Sound {
+                    name: parts.get(8).unwrap_or(&"").to_string(),
+                    vol0: pf(3),
+                    vol1: pf(4),
+                    pan0: pf(5),
+                    pan1: pf(6),
+                    attn: pf(7),
+                },
+                _ => continue,
+            };
             let next_time = self.rng.range(min_period, max_period) as i64;
             self.ambient_spawners.push(AmbientSpawner {
                 pos: glam::Vec3::new(pos[0], pos[1], pos[2]),
-                is_fire: ty == 2,
+                fx,
                 min_period,
                 max_period,
                 next_time,
@@ -554,7 +567,28 @@ impl MapLogic {
             s.next_time = self.elapsed_ms + delay;
             use crate::matrix_game::effects::smoke_and_fire::{Fire, Smoke};
             use crate::matrix_game::effects::GameEffect;
-            if s.is_fire {
+            if let SpawnerFx::Sound {
+                name,
+                vol0,
+                vol1,
+                pan0,
+                pan1,
+                attn,
+            } = &s.fx
+            {
+                // EffectSpawnerSound (MatrixEffect.cpp:206-210):
+                // by-name AddSound with the map-authored params.
+                let ev = crate::matrix_game::sound::SndEvent::AddNamed {
+                    path: name.clone(),
+                    pos: [s.pos.x, s.pos.y, s.pos.z],
+                    attn: attn * 0.002,
+                    pan0: *pan0,
+                    pan1: *pan1,
+                    vol0: *vol0,
+                    vol1: *vol1,
+                };
+                self.objects.pending_sounds.push(ev);
+            } else if matches!(s.fx, SpawnerFx::Fire) {
                 self.objects.pending_effects.push(GameEffect::Fire(Fire::new(
                     s.pos,
                     s.ttl,
@@ -2147,6 +2181,9 @@ impl MapLogic {
             }
             if let Some(s) = score {
                 let pos = glam::Vec3::new(bpos.x, bpos.y, bpos.z + 40.0);
+                // CreateBillboardScore opens with `AddSound(S_RESINCOME,
+                // pos)` (MatrixEffect.cpp:888).
+                self.objects.queue_snd_at("s_resincome", pos);
                 self.objects.pending_effects.push(
                     crate::matrix_game::effects::GameEffect::Score(
                         crate::matrix_game::effects::billboard_fx::ScoreFx::new(&s, pos),
@@ -3831,7 +3868,7 @@ pub fn building_mut(
 /// `rnd(min_period, max_period)` ms.
 struct AmbientSpawner {
     pos: glam::Vec3,
-    is_fire: bool,
+    fx: SpawnerFx,
     min_period: i32,
     max_period: i32,
     next_time: i64,
@@ -3842,6 +3879,23 @@ struct AmbientSpawner {
     speed: f32,
     color: u32,
     disp_factor: f32,
+}
+
+/// EST_SMOKE / EST_FIRE / EST_SOUND payloads (MatrixEffect.hpp:492-497;
+/// EST_LIGHTENING is not ported). The sound variant is the map ambience
+/// (water lapping, wind) played by name with per-spawner mixing params
+/// (SpawnEffectSound, MatrixMap.cpp:3168-3190).
+enum SpawnerFx {
+    Smoke,
+    Fire,
+    Sound {
+        name: String,
+        vol0: f32,
+        vol1: f32,
+        pan0: f32,
+        pan1: f32,
+        attn: f32,
+    },
 }
 
 /// `m_RN.FindInPL` from a cannon's world position — the place index

@@ -106,6 +106,22 @@ pub enum SndEvent {
         layer: SoundLayer,
         ifl: Interrupt,
     },
+    /// `CSound::AddSound(pos, attn, pan0, pan1, vol0, vol1, name)` —
+    /// the by-name variant map ambient spawners use
+    /// (EffectSpawnerSound, MatrixEffect.cpp:206-210): `path` is the
+    /// SR2 resource path directly (bypasses the Sounds block), the
+    /// mixing params come from the map data, `attn` pre-scaled ×0.002.
+    /// Entries carry `snd == S_UNDEF` in the C++: never deduped,
+    /// no ttl expiry, never looped.
+    AddNamed {
+        path: String,
+        pos: [f32; 3],
+        attn: f32,
+        pan0: f32,
+        pan1: f32,
+        vol0: f32,
+        vol1: f32,
+    },
     /// `CSound::ChangePos(id, snd, pos)`.
     ChangePos {
         handle: SndHandle,
@@ -173,11 +189,18 @@ struct Slid {
     id: u32,
 }
 
-/// `CSoundArray::SSndData` (hpp:342-350). pan/vol/attn re-read from
-/// the def by key (the C++ copies them; values are identical).
+/// `CSoundArray::SSndData` (hpp:342-350) — params copied at add time
+/// like the C++. `undef` marks by-name entries (`snd == S_UNDEF`):
+/// they skip the dedup scan and the ttl bookkeeping.
 struct SndData {
     key: String,
+    undef: bool,
     id: u32,
+    attn: f32,
+    pan0: f32,
+    pan1: f32,
+    vol0: f32,
+    vol1: f32,
     ttl: f32,
     fade: f32,
 }
@@ -532,7 +555,7 @@ impl SoundMixer {
         let existing = self
             .pos_sounds
             .get(&cell)
-            .and_then(|arr| arr.iter().position(|e| e.key == key))
+            .and_then(|arr| arr.iter().position(|e| !e.undef && e.key == key))
             .map(|i| {
                 let id = self.pos_sounds[&cell][i].id;
                 (i, id)
@@ -567,13 +590,72 @@ impl SoundMixer {
         let Some(def) = self.defs.get(key) else {
             return;
         };
-        let (ttl, fade) = (def.ttl, def.fade);
         self.pos_sounds.entry(cell).or_default().push(SndData {
             key: key.to_string(),
+            undef: false,
             id,
-            ttl,
-            fade,
+            attn: def.attn,
+            pan0: def.pan0,
+            pan1: def.pan1,
+            vol0: def.vol0,
+            vol1: def.vol1,
+            ttl: def.ttl,
+            fade: def.fade,
         });
+    }
+
+    /// `Play(pos, attn, pan0, pan1, vol0, vol1, name)` (cpp:587-629) +
+    /// the appending `CSoundArray::AddSound` overload (hpp:357-370):
+    /// no layer, never looped, `snd = S_UNDEF` entry semantics.
+    #[allow(clippy::too_many_arguments)]
+    fn add_sound_named(
+        &mut self,
+        path: &str,
+        pos: Vec3,
+        attn: f32,
+        pan0: f32,
+        pan1: f32,
+        vol0: f32,
+        vol1: f32,
+    ) {
+        if !self.out.ready() {
+            return;
+        }
+        let (pan, vol) = self.calc_pan_vol(pos, attn, pan0, pan1, vol0, vol1);
+        if vol < 0.00001 {
+            return;
+        }
+        let newid = self.last_id;
+        self.last_id += 1;
+        let si = self.find_slot_for_sound();
+        let internal = self.out.create(path, false);
+        if internal == 0 {
+            return;
+        }
+        self.slots[si] = PlayedSound {
+            id_internal: internal,
+            id: newid,
+            curvol: vol,
+            curpan: pan,
+        };
+        self.out.set_pan(internal, pan);
+        self.out.set_vol(internal, vol);
+        self.out.play(internal);
+        self.pos_sounds
+            .entry(Self::pos2key(pos))
+            .or_default()
+            .push(SndData {
+                key: path.to_string(),
+                undef: true,
+                id: newid,
+                attn,
+                pan0,
+                pan1,
+                vol0,
+                vol1,
+                ttl: 1e30,
+                fade: 1000.0,
+            });
     }
 
     /// Drain one queued event into the mixer.
@@ -607,6 +689,15 @@ impl SoundMixer {
                 layer,
                 ifl,
             } => self.add_sound(&key, Vec3::from(pos), layer, ifl),
+            SndEvent::AddNamed {
+                path,
+                pos,
+                attn,
+                pan0,
+                pan1,
+                vol0,
+                vol1,
+            } => self.add_sound_named(&path, Vec3::from(pos), attn, pan0, pan1, vol0, vol1),
             SndEvent::ChangePos { handle, key, pos } => {
                 self.change_pos(handle, &key, Vec3::from(pos))
             }
@@ -684,19 +775,22 @@ impl SoundMixer {
         let mut arr = self.pos_sounds.remove(&cell).unwrap_or_default();
         arr.retain_mut(|e| {
             // UpdateTimings: ttl runs down, then fade counts `-ttl`→0.
-            match self.find_sound_slot_played(e.id) {
-                None => return false,
-                Some(idx) => {
-                    if e.ttl < 0.0 {
-                        if e.fade < 0.0 {
-                            self.stop_slot(idx);
-                            return false;
-                        }
-                        e.fade -= ms;
-                    } else {
-                        e.ttl -= ms;
+            // S_UNDEF (by-name) entries skip the bookkeeping (cpp:1033).
+            if !e.undef {
+                match self.find_sound_slot_played(e.id) {
+                    None => return false,
+                    Some(idx) => {
                         if e.ttl < 0.0 {
-                            e.ttl = -e.fade;
+                            if e.fade < 0.0 {
+                                self.stop_slot(idx);
+                                return false;
+                            }
+                            e.fade -= ms;
+                        } else {
+                            e.ttl -= ms;
+                            if e.ttl < 0.0 {
+                                e.ttl = -e.fade;
+                            }
                         }
                     }
                 }
@@ -705,12 +799,12 @@ impl SoundMixer {
             let Some(idx) = self.find_sound_slot_played(e.id) else {
                 return false;
             };
-            let k = if e.ttl < 0.0 { -e.fade / e.ttl } else { 1.0 };
-            let Some(def) = self.defs.get(&e.key) else {
-                return false;
+            let k = if !e.undef && e.ttl < 0.0 {
+                -e.fade / e.ttl
+            } else {
+                1.0
             };
-            let (attn, p0, p1, v0, v1) = (def.attn, def.pan0, def.pan1, def.vol0, def.vol1);
-            let (pan, mut vol) = self.calc_pan_vol(pos, attn, p0, p1, v0, v1);
+            let (pan, mut vol) = self.calc_pan_vol(pos, e.attn, e.pan0, e.pan1, e.vol0, e.vol1);
             vol *= k;
             if vol < 0.00001 {
                 self.stop_slot(idx);

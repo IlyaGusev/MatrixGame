@@ -1355,6 +1355,16 @@ impl Objects {
         // early-return and the DIP-state bail in each of them — repair
         // never plays a hit sound, and dead/DIP targets stay silent.
         let hit_snd = crate::matrix_game::effects::weapon::hit_sound_key(weap);
+        // Decorative map objects only voice the burning DOT
+        // (MatrixObject.cpp:107-112, whablaze on BEHF_BURN); the other
+        // classes run the full `SoundHit` table.
+        let hit_snd = if boxed.core().obj_type == ObjectType::MapObject
+            && weap != crate::matrix_game::effects::weapon::WEAPON_ABLAZE
+        {
+            ""
+        } else {
+            hit_snd
+        };
         if !hit_snd.is_empty()
             && weap != crate::matrix_game::effects::weapon::WEAPON_REPAIR
             && boxed.is_live()
