@@ -425,6 +425,7 @@ impl MapStatic for Flyer {
                     r.carry_release();
                 }
             }
+            objs.queue_snd_stop(crate::matrix_game::sound::SndHandle::Flyer(self_id));
             objs.remove_deferred(self_id);
             true
         }
@@ -463,11 +464,23 @@ impl MapStatic for Flyer {
                 }
             }
             if let Some(me) = self.self_id {
+                objs.queue_snd_stop(crate::matrix_game::sound::SndHandle::Flyer(me));
                 objs.remove_deferred(me);
             }
             return;
         }
         self.core.geo_center = self.pos;
+
+        // `m_Sound = CSound::Play(m_Sound, S_FLYER_VINT_CONTINUE, m_Pos)`
+        // (MatrixFlyer.cpp:1325) — looped rotor hum follows the flyer.
+        if let Some(me) = self.self_id {
+            objs.queue_snd_follow(
+                crate::matrix_game::sound::SndHandle::Flyer(me),
+                "fl_cont",
+                self.pos,
+                crate::matrix_game::sound::SoundLayer::All,
+            );
+        }
 
         if self.trajectory_pos > 0.5 {
             if let Some(rid) = self.carrying.take() {

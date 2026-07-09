@@ -26,6 +26,7 @@ use crate::matrix_game::common::{
 };
 use crate::matrix_game::config::{BuildingDamages, ObjectDamages};
 use crate::matrix_game::logic::Rnd;
+use crate::matrix_game::sound::{Interrupt, SndEvent, SndHandle, SoundLayer};
 
 // ── Resource-change bits (MR_*) (MatrixMapStatic.hpp:17-25) ──────────────
 //
@@ -515,12 +516,12 @@ pub struct Objects {
     /// Freshly produced AI-side robots awaiting `ClacSpawnTeam`
     /// (MatrixRobot.cpp:2204-2205). Drained by the side-AI takt.
     pub pending_ai_spawn: Vec<ObjectId>,
-    /// World-sound dispatch queue — `(canonical Sounds-block key,
-    /// optional world position)` for every `CSound::Play/AddSound`
-    /// call site in ported code. Drained (unheard) each takt like the
-    /// order-voice queue; a host audio backend consumes it when the
-    /// SR2 sound assets are available.
-    pub pending_sounds: Vec<(String, Option<[f32; 3]>)>,
+    /// World-sound dispatch queue — one [`SndEvent`] per
+    /// `CSound::Play/AddSound/ChangePos/StopPlay` call site in ported
+    /// code. Drained by the app loop into the [`SoundMixer`]
+    /// (`pump_sounds` in form_game.rs); without an audio backend the
+    /// mixer is a no-op and the queue just empties.
+    pub pending_sounds: Vec<SndEvent>,
     /// Per-map-group flyer altitude envelope: max(terrain land max,
     /// static building/object tops). The static-scene slice of
     /// `m_GroupMaxZObjRobots` (GetZInterpolatedObjRobots,
@@ -713,16 +714,87 @@ impl Objects {
         }
     }
 
-    /// `CSound::Play(id)` — interface-layer world sound by its
-    /// canonical Sounds-block key (MatrixSoundManager.cpp:80-260).
+    /// `CSound::Play(snd)` — non-positional one-shot by its canonical
+    /// Sounds-block key (MatrixSoundManager.cpp:80-260).
     pub fn queue_snd(&mut self, name: &str) {
-        self.pending_sounds.push((name.to_string(), None));
+        self.queue_snd_layer(name, SoundLayer::All);
     }
 
-    /// `CSound::AddSound(id, pos)` — positional 3D world sound.
+    /// `CSound::Play(snd, sl)`.
+    pub fn queue_snd_layer(&mut self, name: &str, layer: SoundLayer) {
+        self.pending_sounds.push(SndEvent::Play {
+            key: name.to_string(),
+            layer,
+        });
+    }
+
+    /// `CSound::AddSound(snd, pos)` — positional with the Pos2Key
+    /// cell dedup (SEF_INTERRUPT default).
     pub fn queue_snd_at(&mut self, name: &str, pos: Vec3) {
-        self.pending_sounds
-            .push((name.to_string(), Some([pos.x, pos.y, pos.z])));
+        self.pending_sounds.push(SndEvent::Add {
+            key: name.to_string(),
+            pos: [pos.x, pos.y, pos.z],
+            layer: SoundLayer::All,
+            ifl: Interrupt::Interrupt,
+        });
+    }
+
+    /// `CSound::AddSound(snd, pos, SL_ALL, SEF_SKIP)` — dedup that
+    /// refreshes the playing instance instead of restarting it.
+    pub fn queue_snd_at_skip(&mut self, name: &str, pos: Vec3) {
+        self.pending_sounds.push(SndEvent::Add {
+            key: name.to_string(),
+            pos: [pos.x, pos.y, pos.z],
+            layer: SoundLayer::All,
+            ifl: Interrupt::Skip,
+        });
+    }
+
+    /// `id = CSound::Play(snd, pos, sl)` — positional immediate (no
+    /// dedup); `handle` mirrors the C++ keeping the returned id.
+    pub fn queue_snd_play_at(
+        &mut self,
+        name: &str,
+        pos: Vec3,
+        layer: SoundLayer,
+        handle: Option<SndHandle>,
+    ) {
+        self.pending_sounds.push(SndEvent::PlayAt {
+            key: name.to_string(),
+            pos: [pos.x, pos.y, pos.z],
+            layer,
+            handle,
+        });
+    }
+
+    /// `id = CSound::Play(id, snd, pos, sl)` — ambient retrigger
+    /// (chassis loop, flyer vint, looped weapon hum).
+    pub fn queue_snd_follow(&mut self, handle: SndHandle, name: &str, pos: Vec3, layer: SoundLayer) {
+        self.pending_sounds.push(SndEvent::PlayHandle {
+            handle,
+            key: name.to_string(),
+            pos: [pos.x, pos.y, pos.z],
+            layer,
+        });
+    }
+
+    /// `CSound::ChangePos(id, snd, pos)`.
+    pub fn queue_snd_move(&mut self, handle: SndHandle, name: &str, pos: Vec3) {
+        self.pending_sounds.push(SndEvent::ChangePos {
+            handle,
+            key: name.to_string(),
+            pos: [pos.x, pos.y, pos.z],
+        });
+    }
+
+    /// `CSound::StopPlay(id)`.
+    pub fn queue_snd_stop(&mut self, handle: SndHandle) {
+        self.pending_sounds.push(SndEvent::Stop { handle });
+    }
+
+    /// `CMatrixMap::SetMusicVolume` hook (MatrixMap.cpp:3583).
+    pub fn queue_music_volume(&mut self, vol: f32) {
+        self.pending_sounds.push(SndEvent::MusicVolume(vol));
     }
 
     /// Insert `obj` into the arena and return its handle. The ctor
@@ -1287,7 +1359,9 @@ impl Objects {
             && weap != crate::matrix_game::effects::weapon::WEAPON_REPAIR
             && boxed.is_live()
         {
-            self.queue_snd_at(hit_snd, pos);
+            // `SoundHit` is `AddSound(snd, pos, SL_ALL, SEF_SKIP)`
+            // (MatrixEffectWeapon.cpp:846).
+            self.queue_snd_at_skip(hit_snd, pos);
         }
         let result = boxed.damage(weap, pos, dir, attacker_side, attacker, target, self);
         let slot = &mut self.slots[target.index as usize];

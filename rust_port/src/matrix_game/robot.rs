@@ -3764,7 +3764,14 @@ impl MapStatic for Robot {
                     5 => "s_hull_nuclear",
                     _ => "s_hull_6",
                 };
-                objs.queue_snd_at(name, self.core.geo_center);
+                // `CSound::Play(S_HULL_*, pos, SL_HULL)` — immediate
+                // positional on the hull layer, not the dedup path.
+                objs.queue_snd_play_at(
+                    name,
+                    self.core.geo_center,
+                    crate::matrix_game::sound::SoundLayer::Hull,
+                    None,
+                );
             }
         } else if matches!(self.state, RobotState::Idle | RobotState::BaseCapture) {
             let here = glam::Vec2::new(self.pos_x, self.pos_y);

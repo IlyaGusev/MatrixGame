@@ -130,6 +130,9 @@ pub fn bench_battle(pkg_bytes: &[u8], dat_bytes: &[u8]) -> String {
         let t0 = now_ms();
         game.takt(50);
         let ms = now_ms() - t0;
+        // No app loop here to pump the sound queues — drop them.
+        game.objects.pending_sounds.clear();
+        game.sound_queue.clear();
         // Per-frame phase snapshot so a spike's composition survives
         // the window averaging.
         {

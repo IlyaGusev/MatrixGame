@@ -680,22 +680,26 @@ impl Side {
     /// fixed one. The first base select (game-start auto-select) is
     /// suppressed via [`Self::base_sel_sound_enabled`].
     fn selection_sound(&mut self, curr_sel: CurrSel) {
-        use crate::matrix_game::interface::sound::play_named;
+        use crate::matrix_game::interface::sound::play_named_layer;
+        use crate::matrix_game::sound::SoundLayer;
         if self.id != crate::matrix_game::common::PLAYER_SIDE {
             return;
         }
         match curr_sel {
             CurrSel::RobotsSelected => {
                 self.sel_voice_seed = self.sel_voice_seed.wrapping_add(1);
-                play_named(&format!("s_selection_{}", self.sel_voice_seed % 7 + 1));
+                play_named_layer(
+                    &format!("s_selection_{}", self.sel_voice_seed % 7 + 1),
+                    SoundLayer::Selection,
+                );
             }
             CurrSel::BaseSelected => {
                 if self.base_sel_sound_enabled {
-                    play_named("s_base_sel");
+                    play_named_layer("s_base_sel", SoundLayer::Selection);
                 }
                 self.base_sel_sound_enabled = true;
             }
-            CurrSel::BuildingSelected => play_named("s_building_sel"),
+            CurrSel::BuildingSelected => play_named_layer("s_building_sel", SoundLayer::Selection),
             _ => {}
         }
     }

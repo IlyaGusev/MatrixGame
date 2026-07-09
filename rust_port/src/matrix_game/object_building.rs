@@ -404,7 +404,7 @@ impl BuildStack {
                     // S_ROBOT_BUILD_END(_ALT) 50/50
                     // (MatrixObjectBuilding.cpp:1693-1695).
                     let alt = (spawn_pos.x as i32 ^ spawn_pos.y as i32) & 1 == 1;
-                    objs.queue_snd(if alt { "r_build_e_alt" } else { "r_build_e" });
+                    objs.queue_snd(if alt { "r_build_ea" } else { "r_build_e" });
                 }
                 Some(id)
             }

@@ -4,6 +4,11 @@ mod native;
 #[cfg(target_arch = "wasm32")]
 mod web;
 
+pub mod audio;
+
+#[cfg(target_arch = "wasm32")]
+pub mod audio_web;
+
 #[cfg(not(target_arch = "wasm32"))]
 pub fn now_secs() -> f64 {
     use std::sync::OnceLock;

@@ -140,6 +140,9 @@ struct AppState {
     /// [takt, graphic_takt, ui, sync_robots, sync_other, render].
     /// Drained with the FPS log so heavy-battle slowdowns are attributable.
     perf_acc: [f64; 6],
+    /// CSound port — consumes the queued [`SndEvent`]s each frame
+    /// (SOUND_PROPOSAL.md §3: logic produces, the app loop mixes).
+    sounds: crate::matrix_game::sound::SoundMixer,
 }
 
 pub struct App {
@@ -388,6 +391,10 @@ impl ApplicationHandler for App {
                 fps_last_log: crate::platform::now_secs(),
                 fps_frames: 0,
                 perf_acc: [0.0; 6],
+                sounds: crate::matrix_game::sound::SoundMixer::new(
+                    crate::matrix_game::config::SoundDefs::from_matrix_data(&matrix_data),
+                    crate::platform::audio::make_output(),
+                ),
             });
             // Mission-begin dialog at end of load (MatrixMapPrepare.cpp:
             // 1956) — game paused behind it until dismissed. Skipped
@@ -620,6 +627,10 @@ impl ApplicationHandler for App {
                     fps_last_log: crate::platform::now_secs(),
                     fps_frames: 0,
                     perf_acc: [0.0; 6],
+                sounds: crate::matrix_game::sound::SoundMixer::new(
+                    crate::matrix_game::config::SoundDefs::from_matrix_data(&matrix_data),
+                    crate::platform::audio::make_output(),
+                ),
                 });
                 // Mission-begin dialog (MatrixMapPrepare.cpp:1956).
                 if let Some(state) = state_slot.borrow_mut().as_mut() {
@@ -1348,6 +1359,10 @@ impl ApplicationHandler for App {
                         .point_lights
                         .flush_throttled(&state.map, state.game.elapsed_ms as f64, 50.0);
                 }
+
+                // Drain every queued sound event into the mixer —
+                // runs during pause too (UI clicks stay audible).
+                pump_sounds(state);
 
                 // Win/Loose end-of-game dialog — the deferred
                 // EnterDialogMode(TEMPLATE_DIALOG_WIN/LOOSE) call from
@@ -4924,6 +4939,37 @@ async fn load_map_async() -> (
     log::info!("loaded matrix data from bundle (robots.dat)");
 
     (map, stor, matrix_data, bundle)
+}
+
+/// Drain all queued sound events into the mixer — the app-loop side
+/// of the split in SOUND_PROPOSAL.md §3: game logic and UI code queue
+/// [`SndEvent`]s, this pump feeds them to the `CSound` port with the
+/// current camera listener. Runs every frame, pause included.
+fn pump_sounds(state: &mut AppState) {
+    use crate::matrix_game::sound::{Interrupt, SndEvent, SndHandle};
+    // `GetFrustumCenter()` / `GetRight()` — the CalcPanVol inputs.
+    state
+        .sounds
+        .set_listener(state.camera.eye_pos_world(), state.camera.camera_right_world());
+    // Weapon slots freed this takt — stop their looped hums (the C++
+    // weapon destructor's FireEnd → StopPlay path).
+    for id in std::mem::take(&mut state.game.objects.weapons.freed) {
+        state.sounds.dispatch(SndEvent::Stop {
+            handle: SndHandle::Weapon(id),
+        });
+    }
+    for ev in state.game.objects.pending_sounds.drain(..) {
+        state.sounds.dispatch(ev);
+    }
+    for gs in state.game.sound_queue.drain(..) {
+        state.sounds.dispatch_game_sound(gs);
+    }
+    for (key, layer) in crate::matrix_game::interface::sound::drain() {
+        state.sounds.play(&key, layer, Interrupt::Interrupt);
+    }
+    state
+        .sounds
+        .takt((crate::platform::now_secs() * 1000.0) as i64);
 }
 
 /// Parse the current page URL for a `?bundle=<url>` parameter. Returns None

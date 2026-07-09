@@ -37,5 +37,6 @@ pub mod side;
 pub mod side_ai;
 pub mod side_player;
 pub mod slot_marker;
+pub mod sound;
 pub mod ter_surface;
 pub mod water;

@@ -1,5 +1,15 @@
 # Sound & Music Proposal
 
+> **Status: implemented.** §5 steps 1-5 + §6 landed: `SoundDefs` in
+> config.rs, the CSound mixer port in `matrix_game/sound.rs`, the
+> WebAudio backend in `platform/audio_web.rs` (gesture-gated, probes
+> `assets/sounds.bundle`, music playlist from `assets/music/playlist.txt`),
+> queue wiring via `pump_sounds` in form_game.rs, layers + looped
+> handles at the call sites, and `examples/pack_sounds.rs` (the
+> `--dir` escape hatch; the SR2-archive reader of §5.6 remains open).
+> An on-screen 🔊/🔇 button (`#sound-btn`) toggles the master gain and
+> persists to localStorage.
+
 Status quo, design, and implementation plan for making the Rust port audible.
 Everything below is grounded in the C++ source (`MatrixSoundManager.{cpp,hpp}`)
 and the current state of the port.

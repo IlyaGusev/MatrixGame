@@ -1839,3 +1839,182 @@ pub fn turret_build_time_ms() -> i32 {
         UNIT_ROBOT_BUILD_TIME_MS
     }
 }
+
+// ── Sounds block (MatrixSoundManager.cpp SureLoaded) ─────────────────
+
+/// One `Sounds/<key>` entry from robots.dat — the parameters
+/// `CSound::SureLoaded` (MatrixSoundManager.cpp:392-460) reads lazily
+/// per sound. Defaults match the C++ pre-init values exactly.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SoundDef {
+    /// SR2 resource path (`Sound.X`) — the asset id the host resolves.
+    pub path: String,
+    pub vol0: f32,
+    pub vol1: f32,
+    pub pan0: f32,
+    pub pan1: f32,
+    /// Already scaled: `0.002 * attn_par`; `0` ⇒ infinite radius.
+    pub attn: f32,
+    pub looped: bool,
+    /// Valid only for looped positional sounds (ms).
+    pub ttl: f32,
+    pub fade: f32,
+}
+
+impl Default for SoundDef {
+    fn default() -> Self {
+        Self {
+            path: String::new(),
+            vol0: 1.0,
+            vol1: 1.0,
+            pan0: 0.0,
+            pan1: 0.0,
+            attn: 0.002,
+            looped: false,
+            ttl: 1e30,
+            fade: 1000.0,
+        }
+    }
+}
+
+/// All `Sounds/*` entries, plus the `ChassisSounds` order-voice table.
+/// Missing keys resolve to the `dummy` entry (`Sound.Mute`, vol 0) —
+/// the `bps->BlockGetNE(L"dummy")` fallback in SureLoaded, which is
+/// how the original silences sounds absent from robots.dat.
+#[derive(Debug, Clone, Default)]
+pub struct SoundDefs {
+    map: std::collections::HashMap<String, SoundDef>,
+    /// `Chars/ChassisSounds/<kind 1..5>` → (MoveTo keys, Patrol keys)
+    /// (MatrixSide.cpp:7975/8196).
+    chassis_voices: std::collections::HashMap<i32, (Vec<String>, Vec<String>)>,
+}
+
+impl SoundDefs {
+    pub fn from_matrix_data(stor: &Storage) -> Self {
+        let mut map = std::collections::HashMap::new();
+        if let Some(snds) = stor.block_record("da", "Sounds") {
+            for (name, rec) in stor.block_records(&snds) {
+                let mut def = SoundDef::default();
+                if let Some(p) = stor.block_param(&rec, "path") {
+                    def.path = p;
+                }
+                if let Some(v) = stor.block_param(&rec, "pan") {
+                    def.pan0 = wstr::double_par(&v, 0, ",") as f32;
+                    def.pan1 = wstr::double_par(&v, 1, ",") as f32;
+                }
+                if let Some(v) = stor.block_param(&rec, "vol") {
+                    def.vol0 = wstr::double_par(&v, 0, ",") as f32;
+                    def.vol1 = wstr::double_par(&v, 1, ",") as f32;
+                }
+                if let Some(v) = stor.block_param(&rec, "looped") {
+                    def.looped = wstr::int_par(&v, 0, ",") != 0;
+                }
+                if let Some(v) = stor.block_param(&rec, "ttl") {
+                    def.ttl = wstr::double_par(&v, 0, ",") as f32;
+                    def.fade = wstr::double_par(&v, 1, ",") as f32;
+                }
+                if let Some(v) = stor.block_param(&rec, "attn") {
+                    def.attn = 0.002 * wstr::double_par(&v, 0, ",") as f32;
+                }
+                map.insert(name.to_lowercase(), def);
+            }
+        }
+        let mut chassis_voices = std::collections::HashMap::new();
+        if let Some(chars) = stor.block_record("da", "Chars") {
+            if let Some(cs) = stor.block_record(&chars, "ChassisSounds") {
+                for (name, rec) in stor.block_records(&cs) {
+                    if let Ok(kind) = name.parse::<i32>() {
+                        chassis_voices.insert(
+                            kind,
+                            (
+                                stor.block_params(&rec, "MoveTo"),
+                                stor.block_params(&rec, "Patrol"),
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+        Self {
+            map,
+            chassis_voices,
+        }
+    }
+
+    /// Resolve a Sounds-block key; falls back to `dummy` like the C++.
+    /// Lookup is case-insensitive (CBlockPar compares with _wcsicmp).
+    pub fn get(&self, key: &str) -> Option<&SoundDef> {
+        self.map
+            .get(&key.to_lowercase())
+            .or_else(|| self.map.get("dummy"))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    /// Iterate all `(key, def)` pairs — used by the asset packer.
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &SoundDef)> {
+        self.map.iter()
+    }
+
+    /// Order-voice keys for a chassis kind: `(MoveTo, Patrol)`.
+    pub fn chassis_voices(&self, kind: i32) -> Option<&(Vec<String>, Vec<String>)> {
+        self.chassis_voices.get(&kind)
+    }
+
+    /// Test-only entry point — mixer tests build tiny def sets
+    /// without a robots.dat on disk.
+    #[cfg(test)]
+    pub fn insert_for_test(&mut self, key: &str, def: SoundDef) {
+        self.map.insert(key.to_lowercase(), def);
+    }
+}
+
+#[cfg(test)]
+mod sound_tests {
+    use super::*;
+
+    fn load() -> Option<SoundDefs> {
+        let data = std::fs::read("../Data/robots.dat").ok()?;
+        let stor = Storage::from_bytes(&data).ok()?;
+        Some(SoundDefs::from_matrix_data(&stor))
+    }
+
+    #[test]
+    fn sounds_block_parses_real_values() {
+        let Some(defs) = load() else {
+            eprintln!("robots.dat not present; skipping");
+            return;
+        };
+        let w = defs.get("wplasma").unwrap();
+        assert_eq!(w.path, "Sound.WeapPlasma");
+        assert_eq!((w.vol0, w.vol1), (0.0, 0.5));
+        assert_eq!((w.pan0, w.pan1), (-0.3, 0.3));
+        assert!((w.attn - 0.001).abs() < 1e-6); // 0.002 * 0.5
+        assert!(!w.looped);
+
+        let e = defs.get("expl_bb").unwrap();
+        assert_eq!(e.path, "Sound.ExpBuildS");
+        assert_eq!((e.vol0, e.vol1), (0.4, 1.0));
+        assert!((e.attn - 0.002).abs() < 1e-6);
+
+        // expl_bb4 has attn=0 ⇒ infinite radius sentinel.
+        assert_eq!(defs.get("expl_bb4").unwrap().attn, 0.0);
+
+        // Looped + ttl pair.
+        let a = defs.get("whablaze").unwrap();
+        assert!(a.looped);
+        assert_eq!((a.ttl, a.fade), (200.0, 100.0));
+
+        // Missing key falls back to the silent dummy.
+        let d = defs.get("no_such_sound").unwrap();
+        assert_eq!(d.path, "Sound.Mute");
+        assert_eq!((d.vol0, d.vol1), (0.0, 0.0));
+
+        // Chassis order voices.
+        let (move_to, patrol) = defs.chassis_voices(3).unwrap();
+        assert_eq!(move_to, &["s_ord_mtc3_1", "s_ord_mtc3_2"]);
+        assert_eq!(patrol, &["s_ord_mtc3_1", "s_ord_mtc3_2"]);
+    }
+}

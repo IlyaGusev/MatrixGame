@@ -187,6 +187,23 @@ impl WeaponId {
     }
 }
 
+/// `WEAPFLAGS_SND_SKIP` + `WEAPFLAGS_SND_OFF` weapons
+/// (MatrixEffectWeapon.cpp:90-160): the fire sound is a looped /
+/// sustained hum retriggered per burst (`Play(m_Sound, ...)`) and
+/// explicitly stopped on `FireEnd`. Both flags are always set together
+/// in the C++.
+pub fn fire_sound_sustained(w: Weapon) -> bool {
+    matches!(
+        w,
+        WEAPON_VOLCANO
+            | WEAPON_FLAMETHROWER
+            | WEAPON_LIGHTENING
+            | WEAPON_LASER
+            | WEAPON_REPAIR
+            | WEAPON_CANNON2
+    )
+}
+
 /// Canonical Sounds-block key for a weapon's FIRE sound (`m_SoundType`,
 /// MatrixEffectWeapon.cpp:90-137 → MatrixSoundManager.cpp:130-144).
 pub fn fire_sound_key(w: Weapon) -> &'static str {
@@ -251,6 +268,10 @@ struct WSlot {
 pub struct Weapons {
     slots: Vec<WSlot>,
     free: Vec<u32>,
+    /// Slots freed this takt — the app loop turns them into
+    /// `SndEvent::Stop` so a looped hum can't outlive its weapon
+    /// (the C++ destructor's `FireEnd()` → `StopPlay(m_Sound)`).
+    pub freed: Vec<WeaponId>,
 }
 
 impl Weapons {
@@ -318,6 +339,7 @@ impl Weapons {
     }
 
     fn free_slot(&mut self, id: WeaponId) {
+        self.freed.push(id);
         let slot = &mut self.slots[id.index as usize];
         slot.w = None;
         slot.live = false;
@@ -398,6 +420,8 @@ pub struct WeaponEffect {
     /// its newest puff as a burst boundary (`Break()`,
     /// MatrixEffectWeapon.cpp:810-814).
     pub flame_break_pending: bool,
+    /// FireEnd happened → issue `StopPlay(m_Sound)` next takt.
+    pub snd_stop_pending: bool,
 
     // Repair beam state (replaces the C++ `m_Repair` effect pointer;
     // the seek logic from MatrixEffectRepair.cpp:177-250 runs inline
@@ -467,6 +491,7 @@ impl WeaponEffect {
             pending_puffs: Vec::new(),
             flame_alive: false,
             flame_break_pending: false,
+            snd_stop_pending: false,
             repair_target: None,
             repair_time: 0.0,
             repair_next_seek: 0.0,
@@ -561,6 +586,12 @@ impl WeaponEffect {
             return;
         }
         self.flags &= !WEAPFLAGS_FIRE;
+        // `WEAPFLAGS_SND_OFF` → `StopPlay(m_Sound)`
+        // (MatrixEffectWeapon.cpp:754-760). No queue access here, so
+        // the next takt issues the stop.
+        if fire_sound_sustained(self.weapon_type) {
+            self.snd_stop_pending = true;
+        }
         if self.weapon_type == WEAPON_FLAMETHROWER {
             self.flame_break_pending = true;
         }
@@ -601,6 +632,19 @@ impl WeaponEffect {
         }
         if self.time > 0.0 && !self.is_fire() {
             self.time = 0.0;
+        }
+        let snd = fire_sound_key(self.weapon_type);
+        if !snd.is_empty() && self.fire_count > 0 {
+            let h = crate::matrix_game::sound::SndHandle::Weapon(self_id);
+            if self.snd_stop_pending {
+                self.snd_stop_pending = false;
+                objs.queue_snd_stop(h);
+            } else {
+                // `m_Sound = ChangePos(m_Sound, m_SoundType, m_Pos)`
+                // (MatrixEffectWeapon.cpp:210-213) — re-pan the live
+                // voice as the muzzle moves; no-op once it ended.
+                objs.queue_snd_move(h, snd, self.pos);
+            }
         }
         if self.weapon_type == WEAPON_REPAIR {
             self.repair_time += step;
@@ -701,10 +745,28 @@ impl WeaponEffect {
         let dist = self.weapon_dist();
 
         // Per-shot fire sound (`m_SoundType` at the muzzle,
-        // MatrixEffectWeapon.cpp:291-294).
+        // MatrixEffectWeapon.cpp:286-296): SND_SKIP weapons retrigger
+        // the live voice (`Play(m_Sound, ...)`), the rest start a new
+        // instance whose id lands in `m_Sound`.
         let snd = fire_sound_key(self.weapon_type);
         if !snd.is_empty() {
-            objs.queue_snd_at(snd, self.pos);
+            self.snd_stop_pending = false;
+            let h = crate::matrix_game::sound::SndHandle::Weapon(self_id);
+            if fire_sound_sustained(self.weapon_type) {
+                objs.queue_snd_follow(
+                    h,
+                    snd,
+                    self.pos,
+                    crate::matrix_game::sound::SoundLayer::All,
+                );
+            } else {
+                objs.queue_snd_play_at(
+                    snd,
+                    self.pos,
+                    crate::matrix_game::sound::SoundLayer::All,
+                    Some(h),
+                );
+            }
         }
 
         let now = crate::matrix_game::map::current_elapsed_ms();

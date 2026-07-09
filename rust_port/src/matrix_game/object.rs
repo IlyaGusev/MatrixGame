@@ -1026,16 +1026,16 @@ impl MapStatic for MapObject {
             // Without m_Graph the "not already in Pain anim" gate is
             // approximated by the hit itself.
             let pain = (self.break_hit_point.unsigned_abs() % 4) + 1;
-            objs.pending_sounds.push((
-                format!("s_terron_pain{pain}"),
-                Some([self.core.geo_center.x, self.core.geo_center.y, self.core.geo_center.z]),
-            ));
+            objs.queue_snd_at(&format!("s_terron_pain{pain}"), self.core.geo_center);
             if self.break_hit_point <= 0 {
                 // MatrixObject.cpp:168-172 — MMFLAG_TERRON_DEAD only
                 // when the terron is the special win target.
                 if self.object_state & OBJECT_STATE_SPECIAL != 0 {
                     objs.terron_dead = true;
                 }
+                // `SetMusicVolume(0)` at MatrixObject.cpp:170 — duck
+                // the soundtrack for the terron death.
+                objs.queue_music_volume(0.0);
                 self.object_state |= crate::matrix_game::map_static::OBJECT_STATE_TERRON_EXPL;
                 // S_TERRON_KILLED (MatrixObject.cpp:175).
                 objs.queue_snd_at("s_terron_killed", self.core.geo_center);
@@ -1295,8 +1295,7 @@ impl MapStatic for MapObject {
                         for fld in [8, 9, 10] {
                             let snd = wstr::str_par(f1, fld, ":");
                             if !snd.is_empty() {
-                                objs.pending_sounds
-                                    .push((snd.to_string(), Some([w.x, w.y, w.z])));
+                                objs.queue_snd_at(snd, glam::Vec3::new(w.x, w.y, w.z));
                             }
                         }
                         self.prev_state_robots_in_radius = 1;

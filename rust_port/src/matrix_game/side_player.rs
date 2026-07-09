@@ -4296,6 +4296,10 @@ impl MapLogic {
         let cur = self.objects.arcaded_object;
         let mut o = o;
         if let Some(cid) = cur {
+            // `StopPlay(m_SoundChassis)` on leaving robot mode
+            // (MatrixSide.cpp:1301-1306).
+            self.objects
+                .queue_snd_stop(crate::matrix_game::sound::SndHandle::Chassis(cid));
             let alive = robot_ref(&self.objects, cid)
                 .map(|r| r.is_live())
                 .unwrap_or(false);
@@ -4358,7 +4362,14 @@ impl MapLogic {
                 crate::matrix_game::robot::ChassisKind::Hovercraft => "s_chassis_hovercraft_l",
                 crate::matrix_game::robot::ChassisKind::AntiGravity => "s_chassis_antigravity_l",
             };
-            self.objects.queue_snd_at(snd, geo);
+            // `m_SoundChassis = Play(m_SoundChassis, S_CHASSIS_*_LOOP,
+            // geo, SL_CHASSIS)` (MatrixSide.cpp:1335-1345).
+            self.objects.queue_snd_follow(
+                crate::matrix_game::sound::SndHandle::Chassis(nid),
+                snd,
+                geo,
+                crate::matrix_game::sound::SoundLayer::Chassis,
+            );
             for wid in wids {
                 if let Some(we) = self.objects.weapons.get_mut(wid) {
                     we.set_arcade_coefficient();

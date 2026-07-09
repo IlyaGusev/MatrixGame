@@ -78,6 +78,7 @@ Form, Helper, ShadowProj, ShadowStencil. (Math3D partial — CTrajectory.)
 | matrix_game/side_ai.rs        | MatrixSide.cpp enemy-AI logic (TaktHL, TaktTL, WarTL/RepairTL, Regroup, BuildRobot/BuildCannon, ClacSpawnTeam) |
 | matrix_game/ter_surface.rs    | MatrixTerSurface.cpp              |
 | matrix_game/robot.rs          | MatrixRobot.cpp (CMatrixRobotAI — full order pool (SOrder), spawn/move-out, MoveTo + collision callback + step-aside, GetLost, SBotWeapon fire control / heat / Damage / DOT) |
+| matrix_game/sound.rs          | MatrixSoundManager.cpp (CSound/CSoundArray mixer: CalcPanVol, 16-slot eviction, layers, Pos2Key dedup, ttl/fade; voices go to the `SoundOutput` host table — WebAudio in platform/audio_web.rs, silent on native like the NULL-g_RangersInterface original) |
 | matrix_game/water.rs          | MatrixWater.cpp + BuildWater in MatrixMapGroup.cpp + WaterAlpha_t3 in MatrixRenderPipeline.cpp — will split in Stage 2 part 2 |
 
 N/A-by-design (D3D9 infrastructure replaced by the wgpu glue):
@@ -85,11 +86,8 @@ MatrixInstantDraw, MatrixMapTexture, MatrixSampleStateManager,
 MatrixSkinManager (vector_object.rs handles materials), MatrixVisiCalc
 (frustum culling lives in the renderers),
 MatrixLoadProgress / MatrixTransition (index.html spinner + CSS fade),
-MatrixDebugInfo + DevConsole (dev/cheat tooling). MatrixSoundManager:
-the standalone original is silent (every CSound::Play is gated on the
-NULL g_RangersInterface host) — the dispatch surfaces are ported
-(`MapLogic::sound_queue`, interface/sound.rs) so a host backend can
-attach like the original DLL mode. StringConstants: inlined per use.
+MatrixDebugInfo + DevConsole (dev/cheat tooling).
+StringConstants: inlined per use.
 
 ## matrix_game/effects/ (MatrixGame/src/Effects/)
 
@@ -135,7 +133,7 @@ sites exist in the original — dead code).
 | matrix_game/interface/iface_menu.rs     | CIFaceMenu.{cpp,h}                                 |
 | matrix_game/interface/interface.rs      | CInterface.{cpp,h} (panel struct + `if/<Name>` loader) |
 | matrix_game/interface/renderer.rs       | (no C++ peer — wgpu 2D quad pipeline for the HUD)  |
-| matrix_game/interface/sound.rs          | (no direct peer — dispatch wrapper for CSound::Play UI calls; backend deferred) |
+| matrix_game/interface/sound.rs          | (no direct peer — queued dispatch for the CSound::Play UI/by-name calls; drained into the mixer by form_game's pump_sounds) |
 | matrix_game/interface/hint.rs           | MatrixHint.{cpp,hpp} (template build, chrome, copy-pos button anchors) |
 | matrix_game/interface/robot_icons.rs    | CInterface group/personal icon rows |
 | matrix_game/interface/text.rs           | (no direct peer — AFT bitmap-font parser + glyph renderer for the SR2 Rangers rasteriser) |

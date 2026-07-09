@@ -1,22 +1,15 @@
 //! Port of the constructor / interface UI sound dispatch
-//! (CSound::Play calls in Interface/CIFaceButton.cpp:33-167).
+//! (CSound::Play calls in Interface/CIFaceButton.cpp:33-167) plus the
+//! by-name `CSound::Play(name, sl)` sites that have no `Objects`
+//! access (selection voices, minimap zoom, hint SOUNDIN/SOUNDOUT).
 //!
-//! The C++ sound IDs are listed in MatrixSoundManager.hpp:44-52. The
-//! relevant subset for the Base / constructor panel is:
-//!
-//! | C++ ID            | Trigger                                       |
-//! |-------------------|-----------------------------------------------|
-//! | `S_BCLICK`        | LB-down on a generic UI button                |
-//! | `S_BENTER`        | Cursor enters a button (focus transition)     |
-//! | `S_BUILD_CLICK`   | LB-down on `cobuild`                          |
-//! | `S_CANCEL_CLICK`  | LB-down on `cocan`                            |
-//! | `S_PRESET_CLICK`  | LB-down on a `conf*` preset toggle            |
-//!
-//! The Rust port doesn't yet have an audio backend (CROSSREF.md:50 —
-//! "sound deferred"). This module owns the dispatch surface so every
-//! call site that the C++ has is also wired here. `play()` is a stub
-//! that logs the event; replacing it with a real backend (web-audio
-//! on WASM, rodio on native) is a single-file change.
+//! Events land in a thread-local queue the app loop drains into the
+//! [`SoundMixer`](crate::matrix_game::sound::SoundMixer) once per
+//! frame — same pattern as `Objects::pending_sounds`, just reachable
+//! from UI code that only has `&self`.
+
+use crate::matrix_game::sound::SoundLayer;
+use std::cell::RefCell;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UiSound {
@@ -32,27 +25,57 @@ pub enum UiSound {
     PresetClick,
 }
 
-/// Port of `CSound::Play(sound_id, SL_INTERFACE)`. Currently a stub —
-/// logs the event so we can verify dispatch wiring; once the audio
-/// backend lands this becomes a real playback call.
+impl UiSound {
+    /// Sounds-block key (`CSound::Init`, MatrixSoundManager.cpp:84-91).
+    fn key(self) -> &'static str {
+        match self {
+            UiSound::BClick => "bclick",
+            UiSound::BEnter => "benter",
+            UiSound::BuildClick => "build_click",
+            UiSound::CancelClick => "cancel_click",
+            UiSound::PresetClick => "preset_click",
+        }
+    }
+}
+
+thread_local! {
+    static UI_SOUNDS: RefCell<Vec<(String, SoundLayer)>> = const { RefCell::new(Vec::new()) };
+}
+
+fn queue(key: &str, layer: SoundLayer) {
+    UI_SOUNDS.with(|q| q.borrow_mut().push((key.to_string(), layer)));
+}
+
+/// Drain the queued UI sounds — called once per frame by the app
+/// loop's `pump_sounds`.
+pub fn drain() -> Vec<(String, SoundLayer)> {
+    UI_SOUNDS.with(|q| std::mem::take(&mut *q.borrow_mut()))
+}
+
+/// Port of `CSound::Play(sound_id, SL_INTERFACE)`.
 pub fn play(sound: UiSound) {
-    log::trace!("ui sound: {:?}", sound);
+    queue(sound.key(), SoundLayer::Interface);
 }
 
 /// Fire a hint's `_SOUNDIN:`/`_SOUNDOUT:` sound by name (MatrixHint.hpp:
-/// 134-158). Silent like the rest of the sound layer until a host backend
-/// is attached, but the dispatch site is present.
+/// 134-158) — resolved as a Sounds-block key like every by-name play.
 pub fn play_hint_sound(name: &str) {
     if !name.is_empty() {
-        log::trace!("hint sound: {name}");
+        queue(name, SoundLayer::Interface);
     }
 }
 
 /// Fire an interface-layer sound by its Sounds-block key — the
-/// `CSound::Play(S_*, SL_*)` sites outside the button dispatch
-/// (minimap zoom, selection voices, ...).
+/// `CSound::Play(S_*, SL_ALL)` sites outside the button dispatch
+/// (minimap zoom, elevator field).
 pub fn play_named(name: &str) {
-    log::trace!("ui sound: {name}");
+    queue(name, SoundLayer::All);
+}
+
+/// `CSound::Play(S_*, SL_*)` by name with an explicit layer
+/// (selection voices on SL_SELECTION, MatrixSide.cpp:980-1015).
+pub fn play_named_layer(name: &str, layer: SoundLayer) {
+    queue(name, layer);
 }
 
 /// Pick the right sound for an `LB-down on PUSH_BUTTON` event, matching

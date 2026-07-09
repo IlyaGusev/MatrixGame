@@ -22,6 +22,14 @@
       font-size: 13px; color: #7cff7c; text-shadow: 0 0 3px #000, 0 0 3px #000;
       pointer-events: none; user-select: none;
     }
+    #sound-btn {
+      position: fixed; top: 26px; right: 8px; z-index: 30;
+      font-size: 18px; line-height: 1;
+      padding: 4px 6px; border-radius: 6px;
+      background: rgba(0, 0, 0, 0.35); border: 1px solid rgba(200, 212, 224, 0.25);
+      cursor: pointer; user-select: none;
+    }
+    #sound-btn:hover { background: rgba(0, 0, 0, 0.6); }
     #loading .spinner {
       width: 42px; height: 42px; margin-bottom: 18px;
       border: 3px solid rgba(200, 212, 224, 0.18);
@@ -36,13 +44,14 @@
 <body>
   <canvas id="game-canvas"></canvas>
   <div id="fps"></div>
+  <div id="sound-btn" title="Sound">🔊</div>
   <div id="loading">
     <div class="spinner"></div>
     <div class="label">Loading…</div>
   </div>
 
   <script type="module">
-    import init from "./pkg/matrixgame_rs.js?v=331";
+    import init from "./pkg/matrixgame_rs.js?v=334";
 
 
 

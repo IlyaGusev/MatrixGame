@@ -430,7 +430,11 @@ impl MapLogic {
         if self.maintenance_time > 0 {
             self.maintenance_time = (self.maintenance_time - step_ms).max(0);
             if self.maintenance_time == 0 {
-                self.objects.queue_snd("s_maintenance_on");
+                // `CSound::Play(S_MAINTENANCE_ON, SL_INTERFACE)`.
+                self.objects.queue_snd_layer(
+                    "s_maintenance_on",
+                    crate::matrix_game::sound::SoundLayer::Interface,
+                );
             }
         }
         // Arcade-mode upkeep: dead-robot handover release + manual
@@ -608,14 +612,10 @@ impl MapLogic {
         self.accrue_resources(step_ms);
         self.refresh_side_robots();
         self.sync_side_stats();
-        // The standalone build plays no audio (g_RangersInterface is
-        // NULL in the original) — drain the queued sound events each
-        // frame so the dispatch surface can't grow unboundedly. A
-        // future host backend consumes them here instead.
-        for (name, pos) in self.objects.pending_sounds.drain(..) {
-            log::trace!("world sound: {name} at {pos:?}");
-        }
-        self.sound_queue.clear();
+        // Sound events stay queued for the app loop's `pump_sounds`
+        // (form_game.rs), which drains them into the SoundMixer after
+        // each takt. Headless callers (tests, benches) clear the
+        // queues themselves.
         phase_mark(4, _pt);
         self.elapsed_ms += step_ms as i64;
     }
