@@ -15,12 +15,14 @@ image       = { version = "0.25", default-features = false, features = ["png", "
 log         = "0.4"
 anyhow      = "1"
 flate2      = "1"
+ruzstd = "0.8.3"
 
 # ── Native-only ──────────────────────────────────────────────────────────────
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 env_logger = "0.11"
 pollster   = "0.4"
 tokio      = { version = "1", features = ["rt", "fs"] }
+zstd = "0.13.3"
 
 # ── WASM-only ────────────────────────────────────────────────────────────────
 [target.'cfg(target_arch = "wasm32")'.dependencies]

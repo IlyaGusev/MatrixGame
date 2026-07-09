@@ -2,6 +2,10 @@
 //!
 //! Format: u32 file_count, then for each file:
 //!   u32 path_len, [path_len bytes UTF-8 path], u32 data_len, [data_len bytes]
+//!
+//! A bundle file may additionally be zstd-compressed as a whole
+//! (the pack examples write it that way — ~3x smaller downloads);
+//! `from_bytes` detects the zstd magic and inflates transparently.
 
 use anyhow::{bail, Result};
 use std::collections::HashMap;
@@ -43,7 +47,29 @@ impl AssetBundle {
         buf
     }
 
+    /// zstd-compress the serialized bundle (pack-time only; the C zstd
+    /// encoder doesn't build on wasm32).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn to_zstd_bytes(&self, level: i32) -> Vec<u8> {
+        zstd::encode_all(std::io::Cursor::new(self.to_bytes()), level).expect("zstd encode")
+    }
+
     pub fn from_bytes(raw: &[u8]) -> Result<Self> {
+        // Whole-file zstd frame? (magic 0xFD2FB528, little-endian)
+        let inflated;
+        let raw = if raw.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
+            use std::io::Read;
+            let mut dec = ruzstd::decoding::StreamingDecoder::new(raw)
+                .map_err(|e| anyhow::anyhow!("zstd header: {e}"))?;
+            let mut out = Vec::new();
+            dec.read_to_end(&mut out)
+                .map_err(|e| anyhow::anyhow!("zstd decode: {e}"))?;
+            inflated = out;
+            &inflated[..]
+        } else {
+            raw
+        };
+
         let mut files = HashMap::new();
         let mut pos = 0;
 
@@ -105,5 +131,25 @@ impl AssetBundle {
         let mut v: Vec<&str> = self.files.keys().map(|s| s.as_str()).collect();
         v.sort_unstable();
         v
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zstd_roundtrip() {
+        let mut b = AssetBundle::new();
+        b.add("a/b.png", vec![1, 2, 3, 4]);
+        b.add("robots.dat", vec![0; 4096]);
+        let packed = b.to_zstd_bytes(3);
+        assert!(packed.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]));
+        let back = AssetBundle::from_bytes(&packed).unwrap();
+        assert_eq!(back.read_file("a/b.png"), Some(&[1u8, 2, 3, 4][..]));
+        assert_eq!(back.read_file("robots.dat").map(|d| d.len()), Some(4096));
+        // Uncompressed bundles still parse.
+        let plain = AssetBundle::from_bytes(&b.to_bytes()).unwrap();
+        assert_eq!(plain.read_file("a/b.png"), Some(&[1u8, 2, 3, 4][..]));
     }
 }

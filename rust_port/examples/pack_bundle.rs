@@ -797,7 +797,8 @@ fn main() {
     }
     println!("  alpha-test txt siblings: {} packed", txt_count);
 
-    let bytes = bundle.to_bytes();
+    // Whole-file zstd (~3x smaller download; from_bytes inflates by magic).
+    let bytes = bundle.to_zstd_bytes(19);
     std::fs::create_dir_all("assets").ok();
     let out_path = format!("assets/{}.bundle", short_name);
     std::fs::write(&out_path, &bytes).unwrap();

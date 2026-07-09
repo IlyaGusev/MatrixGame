@@ -4899,7 +4899,7 @@ async fn load_map_async() -> (
         // Bump this whenever `pack_bundle.rs` changes the set of
         // packed keys, so the browser refetches instead of serving
         // a stale cached response.
-        format!("{bundle_url}?bv=10")
+        format!("{bundle_url}?bv=11")
     };
     log::info!("loading bundle: {}", bundle_url);
     let bundle_data = crate::gfx::loader::load_bytes(&bundle_url)
