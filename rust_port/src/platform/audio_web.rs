@@ -28,7 +28,7 @@ use web_sys::{
 };
 
 // Bump ?sv= when the packed sample set changes so browsers refetch.
-const SOUNDS_BUNDLE_URL: &str = "assets/sounds.bundle?sv=2";
+const SOUNDS_BUNDLE_URL: &str = "assets/sounds.bundle?sv=3";
 const MUSIC_DIR: &str = "assets/music/";
 const MUSIC_PLAYLIST_URL: &str = "assets/music/playlist.txt";
 /// Soundtrack sits under the SFX by default.

@@ -762,6 +762,13 @@ impl MapLogic {
             }
             self.game_over = Some(win);
             self.pending_win_loose_dialog = Some(win);
+            // "Боевая операция завершена" announcement — the SR2 host
+            // played Sound.RWin / Sound.RLoose alongside the dialog;
+            // standalone, the port is the host (keys `Win` / `Loose`
+            // in the Sounds block).
+            self.objects
+                .queue_snd_layer(if win { "Win" } else { "Loose" },
+                    crate::matrix_game::sound::SoundLayer::Interface);
         } else if self.player_side.status == SideStatus::JustWin {
             self.player_side.status = SideStatus::Active;
             self.before_win_loose_dialog_count = 1;

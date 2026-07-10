@@ -35,7 +35,7 @@ const EXTS: [&str; 3] = ["wav", "ogg", "mp3"];
 /// authoritative mapping lives in the host's encrypted Main.dat).
 /// Speech ids (order voices, base-captured lines, win/lose) have no
 /// Sound.pkg file and are absent here.
-const PKG_MAP: [(&str, &str); 51] = [
+const PKG_MAP: [(&str, &str); 88] = [
     ("Sound.WeapPlasma", "SOUND/ROBOTS/WEAPON/PLASMA.WAV"),
     ("Sound.WeapVolcano", "SOUND/ROBOTS/WEAPON/VOLCANO.WAV"),
     ("Sound.WeapMissile", "SOUND/ROBOTS/WEAPON/MISSILE.WAV"),
@@ -82,11 +82,50 @@ const PKG_MAP: [(&str, &str); 51] = [
     ("Sound.DOpen", "SOUND/ROBOTS/MAP/DOOROPEN.WAV"),
     ("Sound.DClose", "SOUND/ROBOTS/MAP/DOORCLOSE.WAV"),
     ("Sound.ButtonClick", "SOUND/ROBOTS/CLICKS/CLICK.WAV"),
-    ("Sound.Rclick1", "SOUND/ROBOTS/CLICKS/CLICK1.WAV"),
-    ("Sound.Rclick2", "SOUND/ROBOTS/CLICKS/PIK.WAV"),
+    ("Sound.Rclick1", "SOUND/ROBOTS/VOICES/ROBOTS/CLICK.WAV"),
+    ("Sound.Rclick2", "SOUND/ROBOTS/VOICES/ROBOTS/CLICK2.WAV"),
     ("Sound.Plus", "SOUND/ROBOTS/CLICKS/PLUS.WAV"),
     ("Sound.Minus", "SOUND/ROBOTS/CLICKS/MINUS.WAV"),
     ("Sound.MapWater", "SOUND/ROBOTS/MAP/WATER.WAV"),
+    // ── Speech (voicesRus.pkg — the localized announcer/robot voices) ──
+    ("Sound.GetBase", "SOUND/ROBOTS/VOICES/BASE/BAZAPROTIVNIKA.WAV"),
+    ("Sound.UnderAttack0", "SOUND/ROBOTS/VOICES/BASE/NANASNAPALI.WAV"),
+    ("Sound.UnderAttack1", "SOUND/ROBOTS/VOICES/BASE/NASATAKUUT.WAV"),
+    ("Sound.GetOurBase", "SOUND/ROBOTS/VOICES/BASE/NASHABAZA.WAV"),
+    ("Sound.KillOurBase", "SOUND/ROBOTS/VOICES/BASE/NASHABAZAUNICH.WAV"),
+    ("Sound.KillOurFactory", "SOUND/ROBOTS/VOICES/BASE/NASHZAVODUNICH.WAV"),
+    ("Sound.GetOurFactory", "SOUND/ROBOTS/VOICES/BASE/NASHZAVODZAHV.WAV"),
+    ("Sound.KillOurBuilding", "SOUND/ROBOTS/VOICES/BASE/VRAGUNICHTOJILNASHE.WAV"),
+    ("Sound.GetFactory", "SOUND/ROBOTS/VOICES/BASE/ZAHVACHENZAVODPRO.WAV"),
+    ("Sound.HelpApp", "SOUND/ROBOTS/VOICES/HELPAPPROACHING.WAV"),
+    ("Sound.Help", "SOUND/ROBOTS/VOICES/MAINTAINCE.WAV"),
+    ("Sound.RWin", "SOUND/ROBOTS/VOICES/WIN.WAV"),
+    ("Sound.RLoose", "SOUND/ROBOTS/VOICES/LOOSE.WAV"),
+    ("Sound.Armor", "SOUND/ROBOTS/VOICES/ROBOTS/ARMOR.WAV"),
+    ("Sound.Attack", "SOUND/ROBOTS/VOICES/ROBOTS/ATTACK.WAV"),
+    ("Sound.Capture", "SOUND/ROBOTS/VOICES/ROBOTS/CAPTURE.WAV"),
+    ("Sound.ArmorProg", "SOUND/ROBOTS/VOICES/ROBOTS/PROGARMOR.WAV"),
+    ("Sound.AttackProg", "SOUND/ROBOTS/VOICES/ROBOTS/PROGATTACK.WAV"),
+    ("Sound.CaptureProg", "SOUND/ROBOTS/VOICES/ROBOTS/PROGCAPTURE.WAV"),
+    ("Sound.Patrul", "SOUND/ROBOTS/VOICES/ROBOTS/GO.WAV"),
+    ("Sound.RReady", "SOUND/ROBOTS/VOICES/ROBOTS/ROBOTDONE.WAV"),
+    ("Sound.RReadyA", "SOUND/ROBOTS/VOICES/ROBOTS/ROBOTDONE1.WAV"),
+    ("Sound.BReady", "SOUND/ROBOTS/VOICES/ROBOTS/ROBOTGOTOV.WAV"),
+    ("Sound.GoPneumatic0", "SOUND/ROBOTS/VOICES/ROBOTS/CHASSIS/PNEUMATIC.WAV"),
+    ("Sound.GoPneumatic1", "SOUND/ROBOTS/VOICES/ROBOTS/CHASSIS/PNEUMATIC2.WAV"),
+    ("Sound.GoWheel0", "SOUND/ROBOTS/VOICES/ROBOTS/CHASSIS/WHEEL.WAV"),
+    ("Sound.GoWheel1", "SOUND/ROBOTS/VOICES/ROBOTS/CHASSIS/WHEEL2.WAV"),
+    ("Sound.GoTrack0", "SOUND/ROBOTS/VOICES/ROBOTS/CHASSIS/TRACK.WAV"),
+    ("Sound.GoTrack1", "SOUND/ROBOTS/VOICES/ROBOTS/CHASSIS/TRACK2.WAV"),
+    ("Sound.GoHovercraft0", "SOUND/ROBOTS/VOICES/ROBOTS/CHASSIS/HOVERCRAFT.WAV"),
+    ("Sound.GoHovercraft1", "SOUND/ROBOTS/VOICES/ROBOTS/CHASSIS/HOVERCRAFT2.WAV"),
+    ("Sound.GoAntigravi0", "SOUND/ROBOTS/VOICES/ROBOTS/CHASSIS/ANTIGRAVITY.WAV"),
+    ("Sound.GoAntigravi1", "SOUND/ROBOTS/VOICES/ROBOTS/CHASSIS/ANTIGRAVITY2.WAV"),
+    // E/H/L/R turret-built voices (t_build_0..3).
+    ("Sound.ETurel", "SOUND/ROBOTS/VOICES/TURELS/EASYWEAPON.WAV"),
+    ("Sound.HTurel", "SOUND/ROBOTS/VOICES/TURELS/HARDWEAPON.WAV"),
+    ("Sound.LTurel", "SOUND/ROBOTS/VOICES/TURELS/LAZERWEAPON.WAV"),
+    ("Sound.RTurel", "SOUND/ROBOTS/VOICES/TURELS/ROCKETWEAPON.WAV"),
 ];
 
 /// Ambience ids beyond the fixed table — AMB_LOW1..4 for MapAmb1..4,
@@ -110,28 +149,41 @@ fn pkg_map_extra(path: &str) -> Option<&'static str> {
 }
 
 fn main() {
-    let mut args = std::env::args().skip(1);
-    let Some(dir) = args.next() else {
-        eprintln!("usage: cargo run --example pack_sounds -- <dir-with-audio-files> [out.bundle]");
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.is_empty() {
+        eprintln!(
+            "usage: cargo run --example pack_sounds -- <Sound.pkg ...|dir> [out.bundle]"
+        );
         std::process::exit(2);
-    };
-    let out = args.next().unwrap_or_else(|| "assets/sounds.bundle".into());
+    }
+    let (pkg_paths, rest): (Vec<&String>, Vec<&String>) =
+        args.iter().partition(|a| a.to_lowercase().ends_with(".pkg"));
+    let dir = rest.first().filter(|a| !a.ends_with(".bundle")).cloned();
+    let out = args
+        .iter()
+        .find(|a| a.ends_with(".bundle"))
+        .cloned()
+        .unwrap_or_else(|| "assets/sounds.bundle".into());
 
     let dat = std::fs::read("../Data/robots.dat").expect("../Data/robots.dat");
     let stor = Storage::from_bytes(&dat).expect("parse robots.dat");
     let defs = SoundDefs::from_matrix_data(&stor);
 
-    let pkg = if dir.to_lowercase().ends_with(".pkg") {
-        let data = std::fs::read(&dir).expect("read Sound.pkg");
-        Some(PkgArchive::from_bytes(data).expect("parse Sound.pkg"))
-    } else {
-        None
-    };
+    let pkgs: Vec<PkgArchive> = pkg_paths
+        .iter()
+        .map(|p| {
+            let data = std::fs::read(p).unwrap_or_else(|e| panic!("read {p}: {e}"));
+            PkgArchive::from_bytes(data).unwrap_or_else(|e| panic!("parse {p}: {e}"))
+        })
+        .collect();
+    for (p, pkg) in pkg_paths.iter().zip(&pkgs) {
+        println!("{p}: {} files", pkg.list_files().len());
+    }
 
     // Folder mode: index the folder once (lowercased relative stem → path).
     let mut files: HashMap<String, std::path::PathBuf> = HashMap::new();
-    if pkg.is_none() {
-        index_dir(Path::new(&dir), Path::new(&dir), &mut files);
+    if let Some(dir) = &dir {
+        index_dir(Path::new(dir), Path::new(dir), &mut files);
         println!("{} audio files under {dir}", files.len());
     }
 
@@ -158,13 +210,13 @@ fn main() {
         if packed.contains_key(&path) {
             continue;
         }
-        if let Some(pkg) = &pkg {
+        if !pkgs.is_empty() {
             let file = PKG_MAP
                 .iter()
                 .find(|(id, _)| *id == path)
                 .map(|(_, f)| *f)
                 .or_else(|| pkg_map_extra(&path));
-            match file.and_then(|f| pkg.read_file(f).ok()) {
+            match file.and_then(|f| pkgs.iter().find_map(|pkg| pkg.read_file(f).ok())) {
                 Some(bytes) => {
                     bundle.add(&path, bytes);
                     packed.insert(path.clone(), file.unwrap().to_string());
