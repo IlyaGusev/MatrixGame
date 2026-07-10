@@ -1740,7 +1740,7 @@ impl Robot {
                         }
                     }
                     if !frozen {
-                        self.dispatch_move_to(cms, map, objs, elapsed_ms);
+                        self.dispatch_move_to(cms, map, rng, objs, elapsed_ms);
                     }
                 }
                 OrderType::MoveReturn => {
@@ -2104,7 +2104,14 @@ impl Robot {
     /// Port of the ROT_MOVE_TO / ROT_MOVE_TO_BACK dispatch case
     /// (MatrixRobot.cpp:1020-1112) — the pathfinding (non-arcade)
     /// path; the manual-drive branch is handled in `process_orders_list`.
-    fn dispatch_move_to(&mut self, cms: i32, map: &GameMap, objs: &mut Objects, elapsed_ms: i64) {
+    fn dispatch_move_to(
+        &mut self,
+        cms: i32,
+        map: &GameMap,
+        rng: &mut Rnd,
+        objs: &mut Objects,
+        elapsed_ms: i64,
+    ) {
         self.map_pos_calc(map);
         self.zone_cur_find(map);
 
@@ -2112,7 +2119,7 @@ impl Robot {
             // :1061-1066 — no zone under us: keep walking whatever
             // path remains.
             if !self.move_path.pts.is_empty() {
-                self.move_by_move_path(cms, map, objs, elapsed_ms);
+                self.move_by_move_path(cms, map, rng, objs, elapsed_ms);
             }
             return;
         }
@@ -2141,7 +2148,7 @@ impl Robot {
         }
 
         if !self.move_path.pts.is_empty() {
-            self.move_by_move_path(cms, map, objs, elapsed_ms);
+            self.move_by_move_path(cms, map, rng, objs, elapsed_ms);
             return;
         }
 
@@ -2170,7 +2177,14 @@ impl Robot {
     /// when the projected progress along the segment exceeds the
     /// segment length (stop on the final waypoint). The stuck-watchdog
     /// + terrain-Z + ONWATER flag update all live here too.
-    fn move_by_move_path(&mut self, cms: i32, map: &GameMap, objs: &mut Objects, elapsed_ms: i64) {
+    fn move_by_move_path(
+        &mut self,
+        cms: i32,
+        map: &GameMap,
+        rng: &mut Rnd,
+        objs: &mut Objects,
+        elapsed_ms: i64,
+    ) {
         let Some((sou_pt, des_pt)) = self.move_path.current_segment() else {
             self.stop_moving();
             return;
@@ -2235,6 +2249,21 @@ impl Robot {
             self.zone_path.clear();
             self.zone_path_next = -1;
             self.move_path.clear();
+            // Still pinned 6 s in: the recomputed path keeps jamming
+            // into the same same-side pile in perfect force
+            // equilibrium (desired velocities cancelled by collisions,
+            // step-aside gated off because the blocker "moves").
+            // Sidestep out via the C++'s own GetLost — the escape its
+            // authors left commented in the collision callback
+            // (MatrixRobot.cpp:2988). The AI / player-group layers
+            // re-issue the real destination on their next takt.
+            // Rewind the timer by the 2 s wipe threshold so the
+            // per-takt wipe cadence stays exactly the C++'s.
+            if elapsed_ms - self.move_test_change_ms > 6000 {
+                self.move_test_change_ms = elapsed_ms - 2000;
+                let fwd = self.forward;
+                self.get_lost(cms, map, &*objs, fwd, rng);
+            }
         }
 
         // Port of `Z_From_Pos` (MatrixObjectRobot.cpp:277-296): sample

@@ -138,15 +138,24 @@ impl Spot {
                 let v = d.dot(ey) / ey2;
                 let idx = ((gy - gy0) as usize) * w + (gx - gx0) as usize;
                 inside[idx] = (0.0..=1.0).contains(&u) && (0.0..=1.0).contains(&v);
-                // Raw heightmap point z (`mp->z`, BuildLand at
-                // MatrixEffectLandscapeSpot.cpp:342) — NOT `get_z`,
-                // whose water-cell sentinel (-1000) would sink shore
-                // vertices and punch square holes in the decal.
-                let z = if gx >= 0 && gy >= 0 && gx < stride && gy < rows {
+                // The C++ samples the raw heightmap point (`mp->z`,
+                // BuildLand at MatrixEffectLandscapeSpot.cpp:342), which
+                // in the original always matches the visible surface.
+                // Here the two can diverge: `get_z` returns a -1000
+                // sentinel on water cells (shore corners would sink),
+                // while raw points sit BELOW the rendered surface on
+                // flattened cells (building pads render at the
+                // CELLFLAG_FLAT `a1` height) — either alone buries
+                // decal quads and punches cell-sized holes. Take the
+                // higher of the two so the decal always floats on the
+                // visible surface.
+                let pz = if gx >= 0 && gy >= 0 && gx < stride && gy < rows {
                     map.points[(gy * stride + gx) as usize].z
                 } else {
                     0.0
                 };
+                let gz = map.get_z(wx, wy);
+                let z = if gz <= -999.0 { pz } else { pz.max(gz) };
                 verts.push(SpotVertex {
                     pos: Vec3::new(wx, wy, z + SPOT_ALTITUDE),
                     uv: [u.clamp(-0.5, 1.5), v.clamp(-0.5, 1.5)],

@@ -102,10 +102,19 @@ fn main() {
                             continue;
                         }
                         println!(
-                            "  team {ti}: robots={} action={:?}/r{} path={:?} target_region={} war={} stay={} wait_union={} l_ok={} region_mass={} action_time={}",
-                            t.robot_cnt, t.action.ty, t.action.region, t.action.region_path,
+                            "  team {ti}: robots={} groups={} action={:?}/r{} path={:?} target_region={} war={} stay={} wait_union={} l_ok={} region_mass={} action_time={}",
+                            t.robot_cnt, t.group_cnt, t.action.ty, t.action.region, t.action.region_path,
                             t.target_region, t.war, t.stay, t.wait_union, t.l_ok,
                             t.region_mass, t.action_time,
+                        );
+                    }
+                    for (gi, lg) in su.logic_groups.iter().enumerate() {
+                        if lg.robots_cnt <= 0 {
+                            continue;
+                        }
+                        println!(
+                            "  group {gi}: team={} robots={} strength={:.0} war={} action={:?}/r{}",
+                            lg.team, lg.robots_cnt, lg.strength, lg.war, lg.action.ty, lg.action.region,
                         );
                     }
                 }
@@ -135,6 +144,14 @@ fn main() {
                             format!("{:?}({alive},ds={})", e.enemy, e.del_slowly)
                         })
                         .collect();
+                    if r.orders.has(matrixgame_rs::matrix_game::robot::OrderType::MoveTo) {
+                        println!(
+                            "    des=({},{}) zone_cur={} zone_des={} zone_path={:?} next={} move_path_len={} cur={}",
+                            r.des_x, r.des_y, r.zone_cur, r.zone_des,
+                            r.zone_path, r.zone_path_next,
+                            r.move_path.pts.len(), r.move_path.cur,
+                        );
+                    }
                     if !env.is_empty() {
                         println!("    env: {env:?}");
                         println!(
@@ -159,4 +176,80 @@ fn main() {
         }
     }
     println!("done at t={}s", game.elapsed_ms / 1000);
+
+    // Micro-trace: find a robot with a stuck MoveTo order and follow it
+    // closely for 200 takts.
+    let now = game.elapsed_ms;
+    let stuck: Vec<_> = game
+        .objects
+        .iter_live()
+        .filter(|&id| {
+            robot_ref(&game.objects, id).is_some_and(|r| {
+                r.is_live()
+                    && r.orders.has(matrixgame_rs::matrix_game::robot::OrderType::MoveTo)
+                    && last_move
+                        .get(&format!("{id:?}"))
+                        .is_some_and(|&(_, t)| now - t > 60_000)
+            })
+        })
+        .collect();
+    let Some(&rid) = stuck.first() else {
+        println!("no stuck MoveTo robots to trace");
+        return;
+    };
+    println!("tracing {rid:?}");
+    if let Some(r) = robot_ref(&game.objects, rid) {
+        println!(
+            "  des=({},{}) map=({},{}) zone_path={:?} next={} waypoints={:?}",
+            r.des_x, r.des_y, r.map_x, r.map_y, r.zone_path, r.zone_path_next, r.move_path.pts,
+        );
+        // Passability grid around the robot (move cells, chassis mask).
+        let kind = r.chassis.kind_index();
+        let (cx, cy) = (r.map_x, r.map_y);
+        println!("  passability around ({cx},{cy}) for chassis {kind} ('.'=free '#'=blocked 'R'=robot):");
+        let robots: Vec<(i32, i32)> = game
+            .objects
+            .iter_live()
+            .filter_map(|id| robot_ref(&game.objects, id).map(|r| (r.map_x, r.map_y)))
+            .collect();
+        for dy in -10..=10 {
+            let mut row = String::new();
+            for dx in -14..=14 {
+                let (x, y) = (cx + dx, cy + dy);
+                let free = matrixgame_rs::matrix_game::logic::is_absence_wall(&map, kind, 1, x, y);
+                let has_robot = robots.iter().any(|&(rx, ry)| (rx - x).abs() < 4 && (ry - y).abs() < 4 && (rx, ry) != (cx, cy));
+                row.push(if (x, y) == (cx, cy) {
+                    '@'
+                } else if has_robot {
+                    'R'
+                } else if free {
+                    '.'
+                } else {
+                    '#'
+                });
+            }
+            println!("    {row}");
+        }
+    }
+    for step in 0..200 {
+        {
+            let _scope = MapScope::enter(&map, game.elapsed_ms);
+            game.takt(50);
+        }
+        game.objects.pending_sounds.clear();
+        game.sound_queue.clear();
+        game.objects.weapons.freed.clear();
+        let _ = matrixgame_rs::matrix_game::interface::sound::drain();
+        if step % 10 == 0 {
+            if let Some(r) = robot_ref(&game.objects, rid) {
+                println!(
+                    "  step {step}: pos=({:.1},{:.1}) vel=({:.3},{:.3}) speed={:.3} cols={} w={} w2={} colspd={:.2} path={}/{} zone_next={} orders={:?}",
+                    r.pos_x, r.pos_y, r.velocity.x, r.velocity.y, r.speed,
+                    r.cols, r.cols_weight, r.cols_weight2, r.col_speed,
+                    r.move_path.cur, r.move_path.pts.len(), r.zone_path_next,
+                    r.orders.iter().map(|o| format!("{:?}/{:?}", o.ty, o.phase)).collect::<Vec<_>>(),
+                );
+            }
+        }
+    }
 }
