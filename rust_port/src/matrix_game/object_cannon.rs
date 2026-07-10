@@ -772,6 +772,7 @@ impl MapStatic for Cannon {
                                 r.env.remove_from_list(me);
                             }
                         }
+                        objs.pending_env_purge.push(me);
                     }
                 }
             }
@@ -1202,6 +1203,7 @@ impl MapStatic for Cannon {
                 r.env.remove_from_list(self_id);
             }
         }
+        objs.pending_env_purge.push(self_id);
         true
     }
 }

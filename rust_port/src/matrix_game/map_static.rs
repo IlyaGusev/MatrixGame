@@ -557,6 +557,14 @@ pub struct Objects {
     /// synchronously; here the robot drains its entries right after
     /// `weapons_logic_takt`). `(shooter, victim (side, type), hit pos)`.
     pub pending_hit_notices: Vec<(ObjectId, Option<(ObjectId, i32, ObjectType)>, glam::Vec3)>,
+    /// Deferred env-list purge — dead unit ids scrubbed from every
+    /// robot's enemy list at a point where no robot box is checked
+    /// out. The synchronous death-cascade purge misses robots whose
+    /// box is out (e.g. the killer, mid-takt when its hitscan lands);
+    /// a leaked id keeps `enemy_cnt() > 0` and wedges the side AI in
+    /// permanent war (the C++ purge is pointer-walk synchronous and
+    /// can't miss).
+    pub pending_env_purge: Vec<ObjectId>,
     /// Self-despawn queue — an object can't `remove()` itself while
     /// its box is checked out by a takt driver, so DIP wrecks queue
     /// here and `flush_removals` (run by the takt drivers after each
@@ -686,6 +694,7 @@ impl Objects {
             debris_catalog_len: 0,
             debris_types: Vec::new(),
             pending_hit_notices: Vec::new(),
+            pending_env_purge: Vec::new(),
             pending_removals: Vec::new(),
             pending_special_deaths: Vec::new(),
             terron_dead: false,

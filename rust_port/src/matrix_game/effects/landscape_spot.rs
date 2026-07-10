@@ -113,10 +113,12 @@ impl Spot {
 
         // Covered grid rect.
         let r = ext * std::f32::consts::SQRT_2;
-        let gx0 = ((s.pos.x - r) / GLOBAL_SCALE).floor() as i32;
-        let gy0 = ((s.pos.y - r) / GLOBAL_SCALE).floor() as i32;
-        let gx1 = ((s.pos.x + r) / GLOBAL_SCALE).ceil() as i32;
-        let gy1 = ((s.pos.y + r) / GLOBAL_SCALE).ceil() as i32;
+        // Clamp to the heightmap like the C++ (mr clamp at :281-284) —
+        // out-of-map corners have no point z to sample.
+        let gx0 = (((s.pos.x - r) / GLOBAL_SCALE).floor() as i32).max(0);
+        let gy0 = (((s.pos.y - r) / GLOBAL_SCALE).floor() as i32).max(0);
+        let gx1 = (((s.pos.x + r) / GLOBAL_SCALE).ceil() as i32).min(map.size_x as i32);
+        let gy1 = (((s.pos.y + r) / GLOBAL_SCALE).ceil() as i32).min(map.size_y as i32);
         let w = (gx1 - gx0 + 1).max(0) as usize;
         let h = (gy1 - gy0 + 1).max(0) as usize;
         if w < 2 || h < 2 || w * h > 4096 {
@@ -125,6 +127,8 @@ impl Spot {
 
         let mut verts = Vec::with_capacity(w * h);
         let mut inside = vec![false; w * h];
+        let stride = map.size_x as i32 + 1;
+        let rows = map.size_y as i32 + 1;
         for gy in gy0..=gy1 {
             for gx in gx0..=gx1 {
                 let wx = gx as f32 * GLOBAL_SCALE;
@@ -134,8 +138,17 @@ impl Spot {
                 let v = d.dot(ey) / ey2;
                 let idx = ((gy - gy0) as usize) * w + (gx - gx0) as usize;
                 inside[idx] = (0.0..=1.0).contains(&u) && (0.0..=1.0).contains(&v);
+                // Raw heightmap point z (`mp->z`, BuildLand at
+                // MatrixEffectLandscapeSpot.cpp:342) — NOT `get_z`,
+                // whose water-cell sentinel (-1000) would sink shore
+                // vertices and punch square holes in the decal.
+                let z = if gx >= 0 && gy >= 0 && gx < stride && gy < rows {
+                    map.points[(gy * stride + gx) as usize].z
+                } else {
+                    0.0
+                };
                 verts.push(SpotVertex {
-                    pos: Vec3::new(wx, wy, map.get_z(wx, wy) + SPOT_ALTITUDE),
+                    pos: Vec3::new(wx, wy, z + SPOT_ALTITUDE),
                     uv: [u.clamp(-0.5, 1.5), v.clamp(-0.5, 1.5)],
                 });
             }

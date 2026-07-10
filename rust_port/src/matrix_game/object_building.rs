@@ -1810,6 +1810,7 @@ impl MapStatic for Building {
             if let Some(me) = self.self_id {
                 let ids: Vec<crate::matrix_game::map_static::ObjectId> =
                     objs.iter_units().collect();
+                objs.pending_env_purge.push(me);
                 for oid in ids {
                     if let Some(r) = crate::matrix_game::logic::robot_mut(objs, oid) {
                         if r.base == Some(me) {

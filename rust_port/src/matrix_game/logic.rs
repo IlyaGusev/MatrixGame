@@ -644,6 +644,21 @@ impl MapLogic {
         // once per outer slice so the per-building state ports 1:1
         // without threading the player Side through `proceed_logic`.
         self.accrue_resources(step_ms);
+        // Deferred env scrub: death cascades queue ids whose direct
+        // purge missed a checked-out robot box. All boxes are home
+        // here, so the sweep is complete — a leaked id would wedge the
+        // side AI in permanent war (enemy_cnt() counts stale entries).
+        if !self.objects.pending_env_purge.is_empty() {
+            let dead: Vec<_> = self.objects.pending_env_purge.drain(..).collect();
+            let ids: Vec<_> = self.objects.iter_units().collect();
+            for oid in ids {
+                if let Some(r) = robot_mut(&mut self.objects, oid) {
+                    for &d in &dead {
+                        r.env.remove_from_list(d);
+                    }
+                }
+            }
+        }
         self.refresh_side_robots();
         self.sync_side_stats();
         // Sound events stay queued for the app loop's `pump_sounds`

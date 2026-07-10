@@ -4117,6 +4117,9 @@ impl MapStatic for Robot {
                     other.env.remove_from_list(me);
                 }
             }
+            // Robots whose box is checked out right now (the killer,
+            // mid-takt) are unreachable above — scrub them later.
+            objs.pending_env_purge.push(me);
         }
         self.env.clear();
         self.env.reset();

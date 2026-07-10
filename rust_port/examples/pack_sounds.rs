@@ -1,18 +1,25 @@
 //! Pack audio files into `assets/sounds.bundle` for the WebAudio
 //! backend (SOUND_PROPOSAL.md §4). SR2 assets are proprietary, so the
-//! payloads come from a user-supplied folder — the "drop WAVs in a
-//! folder" escape hatch:
+//! payloads come from the user's SR2 installation:
 //!
-//!   cargo run --example pack_sounds -- <dir> [out.bundle]
+//!   cargo run --example pack_sounds -- <Sound.pkg | dir> [out.bundle]
 //!
-//! For every `Sounds/<key>` entry in robots.dat with a `path`
-//! (`Sound.WeapPlasma` style), the folder is probed for
+//! **Pkg mode** (arg ends in .pkg): reads SR2's `DATA/Sound.pkg` and
+//! resolves each `Sound.X` resource id through the hand-derived
+//! [`PKG_MAP`] table (the id→file tree lives in the host's encrypted
+//! Main.dat; the SOUND/ROBOTS/* names map 1:1 so the table is short).
+//!
+//! **Folder mode**: for every `Sounds/<key>` entry in robots.dat with
+//! a `path` (`Sound.WeapPlasma` style), the folder is probed for
 //!   `<dir>/<key>.{wav,ogg,mp3}`          e.g. wplasma.ogg
 //!   `<dir>/<path>.{wav,ogg,mp3}`         e.g. Sound.WeapPlasma.ogg
 //!   `<dir>/<path with . as />.{wav,ogg,mp3}`  e.g. Sound/WeapPlasma.ogg
-//! (case-insensitive on the stem). Matches are stored under the SR2
-//! resource path — the key the runtime sample cache uses. Missing
-//! entries are reported and stay silent in-game.
+//! (case-insensitive on the stem).
+//!
+//! Matches are stored under the SR2 resource path — the key the
+//! runtime sample cache uses. Missing entries are reported and stay
+//! silent in-game (the spoken voice lines are NOT in Sound.pkg; they
+//! ship with the SR2 host's speech resources).
 
 use matrixgame_rs::gfx::bundle::AssetBundle;
 use matrixgame_rs::matrix_game::config::SoundDefs;
@@ -22,6 +29,85 @@ use std::collections::HashMap;
 use std::path::Path;
 
 const EXTS: [&str; 3] = ["wav", "ogg", "mp3"];
+
+/// `Sound.X` resource id → file inside SR2's DATA/Sound.pkg. Derived
+/// by matching the id names against the SOUND/ROBOTS tree (the
+/// authoritative mapping lives in the host's encrypted Main.dat).
+/// Speech ids (order voices, base-captured lines, win/lose) have no
+/// Sound.pkg file and are absent here.
+const PKG_MAP: [(&str, &str); 51] = [
+    ("Sound.WeapPlasma", "SOUND/ROBOTS/WEAPON/PLASMA.WAV"),
+    ("Sound.WeapVolcano", "SOUND/ROBOTS/WEAPON/VOLCANO.WAV"),
+    ("Sound.WeapMissile", "SOUND/ROBOTS/WEAPON/MISSILE.WAV"),
+    ("Sound.WeapGun", "SOUND/ROBOTS/WEAPON/GUN.WAV"),
+    ("Sound.WeapLaser", "SOUND/ROBOTS/WEAPON/LASER.WAV"),
+    ("Sound.WeapLight", "SOUND/ROBOTS/WEAPON/LIGHTENING.WAV"),
+    ("Sound.WeapRem", "SOUND/ROBOTS/WEAPON/REM.WAV"),
+    ("Sound.Flame", "SOUND/ROBOTS/WEAPON/FIRE.WAV"),
+    ("Sound.Gorit", "SOUND/ROBOTS/WEAPON/ABLAZE.WAV"),
+    ("Sound.Zamknulo", "SOUND/ROBOTS/WEAPON/SHORTED.WAV"),
+    ("Sound.Splash", "SOUND/ROBOTS/WORLD/SPLASH.WAV"),
+    ("Sound.Rhit", "SOUND/ROBOTS/HIT/RHIT.WAV"),
+    ("Sound.expl1", "SOUND/EXPL/EXPL1.WAV"),
+    ("Sound.ExpMiss", "SOUND/ROBOTS/EXP/EXPMISS.WAV"),
+    ("Sound.ExpRobot", "SOUND/ROBOTS/EXP/ROBOT.WAV"),
+    ("Sound.ExpObj", "SOUND/ROBOTS/EXP/OBJECT.WAV"),
+    ("Sound.ExpBuild", "SOUND/ROBOTS/EXP/BUILDING.WAV"),
+    ("Sound.ExpBuildL", "SOUND/ROBOTS/EXP/BUILDING2.WAV"),
+    ("Sound.ExpBuildS", "SOUND/ROBOTS/EXP/SMALLBUILD.WAV"),
+    ("Sound.ExpBuildS2", "SOUND/ROBOTS/EXP/SMALLBUILD2.WAV"),
+    ("Sound.BaseDoorOpen", "SOUND/ROBOTS/BASE/BASE_DOOR_OPEN.WAV"),
+    ("Sound.BaseDoorClose", "SOUND/ROBOTS/BASE/BASE_DOOR_CLOSE.WAV"),
+    ("Sound.BasePlatformUp", "SOUND/ROBOTS/BASE/BASE_PLATFORM_UP.WAV"),
+    ("Sound.BasePlatformDown", "SOUND/ROBOTS/BASE/BASE_PLATFORM_DOWN.WAV"),
+    ("Sound.BasePlatformUpStop", "SOUND/ROBOTS/BASE/BASE_PLATFORM_UP_STOP.WAV"),
+    ("Sound.BaseAmbient", "SOUND/ROBOTS/BASE/BASE_AMB.WAV"),
+    ("Sound.ChasPne", "SOUND/ROBOTS/CHASSIS/PNEUMATIC.WAV"),
+    ("Sound.ChasWheel", "SOUND/ROBOTS/CHASSIS/WHEEL.WAV"),
+    ("Sound.ChasTrack", "SOUND/ROBOTS/CHASSIS/TRACK.WAV"),
+    ("Sound.ChasHover", "SOUND/ROBOTS/CHASSIS/HOVERCRAFT.WAV"),
+    ("Sound.ChasAnti", "SOUND/ROBOTS/CHASSIS/ANTIGRAVITY.WAV"),
+    ("Sound.HullUniv", "SOUND/ROBOTS/HULL/HULL.WAV"),
+    ("Sound.Fall", "SOUND/ROBOTS/FALL.WAV"),
+    ("Sound.Mute", "SOUND/ROBOTS/MUTE.WAV"),
+    ("Sound.Nini", "SOUND/ROBOTS/NINI.WAV"),
+    ("Sound.Resurs", "SOUND/ROBOTS/RESURS.WAV"),
+    ("Sound.TPain1", "SOUND/ROBOTS/TERRON/PAIN1.WAV"),
+    ("Sound.TPain2", "SOUND/ROBOTS/TERRON/PAIN2.WAV"),
+    ("Sound.TPain3", "SOUND/ROBOTS/TERRON/PAIN3.WAV"),
+    ("Sound.TerronDead", "SOUND/ROBOTS/TERRON/TERRONDEAD.WAV"),
+    ("Sound.Stand", "SOUND/ROBOTS/TURELL/STAND.WAV"),
+    ("Sound.VertStart", "SOUND/ROBOTS/VERTOLET/START.WAV"),
+    ("Sound.VertLoop", "SOUND/ROBOTS/VERTOLET/LOOP.WAV"),
+    ("Sound.DOpen", "SOUND/ROBOTS/MAP/DOOROPEN.WAV"),
+    ("Sound.DClose", "SOUND/ROBOTS/MAP/DOORCLOSE.WAV"),
+    ("Sound.ButtonClick", "SOUND/ROBOTS/CLICKS/CLICK.WAV"),
+    ("Sound.Rclick1", "SOUND/ROBOTS/CLICKS/CLICK1.WAV"),
+    ("Sound.Rclick2", "SOUND/ROBOTS/CLICKS/PIK.WAV"),
+    ("Sound.Plus", "SOUND/ROBOTS/CLICKS/PLUS.WAV"),
+    ("Sound.Minus", "SOUND/ROBOTS/CLICKS/MINUS.WAV"),
+    ("Sound.MapWater", "SOUND/ROBOTS/MAP/WATER.WAV"),
+];
+
+/// Ambience ids beyond the fixed table — AMB_LOW1..4 for MapAmb1..4,
+/// FANTASY/BOTTLE for the rest (best-guess; all are quiet loops).
+fn pkg_map_extra(path: &str) -> Option<&'static str> {
+    Some(match path {
+        "Sound.MapAmb1" => "SOUND/ROBOTS/MAP/AMB_LOW1.WAV",
+        "Sound.MapAmb2" => "SOUND/ROBOTS/MAP/AMB_LOW2.WAV",
+        "Sound.MapAmb3" => "SOUND/ROBOTS/MAP/AMB_LOW3.WAV",
+        "Sound.MapAmb4" => "SOUND/ROBOTS/MAP/AMB_LOW4.WAV",
+        "Sound.MapAmb5" => "SOUND/ROBOTS/MAP/FANTASY1.WAV",
+        "Sound.MapAmb6" => "SOUND/ROBOTS/MAP/FANTASY2.WAV",
+        "Sound.MapAmb7" => "SOUND/ROBOTS/MAP/BOTTLE.WAV",
+        "Sound.HangarOpen" => "SOUND/HANGAROPEN.WAV",
+        "Sound.FormShipOpen" => "SOUND/FORMSHIPOPEN.WAV",
+        "Sound.FormShipClose" => "SOUND/FORMSHIPCLOSE.WAV",
+        "Sound.FormPlanetNone1" => "SOUND/PLANET/NONE/1.WAV",
+        "Sound.FormPlanetNone3" => "SOUND/PLANET/NONE/3.WAV",
+        _ => return None,
+    })
+}
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -35,10 +121,19 @@ fn main() {
     let stor = Storage::from_bytes(&dat).expect("parse robots.dat");
     let defs = SoundDefs::from_matrix_data(&stor);
 
-    // Index the folder once: lowercased relative stem → path.
+    let pkg = if dir.to_lowercase().ends_with(".pkg") {
+        let data = std::fs::read(&dir).expect("read Sound.pkg");
+        Some(PkgArchive::from_bytes(data).expect("parse Sound.pkg"))
+    } else {
+        None
+    };
+
+    // Folder mode: index the folder once (lowercased relative stem → path).
     let mut files: HashMap<String, std::path::PathBuf> = HashMap::new();
-    index_dir(Path::new(&dir), Path::new(&dir), &mut files);
-    println!("{} audio files under {dir}", files.len());
+    if pkg.is_none() {
+        index_dir(Path::new(&dir), Path::new(&dir), &mut files);
+        println!("{} audio files under {dir}", files.len());
+    }
 
     // (key, SR2 resource path) worklist: every Sounds-block entry plus
     // the map ambience the EST_SOUND spawners play by name
@@ -61,6 +156,21 @@ fn main() {
     let mut missing: Vec<String> = Vec::new();
     for (key, path) in wanted {
         if packed.contains_key(&path) {
+            continue;
+        }
+        if let Some(pkg) = &pkg {
+            let file = PKG_MAP
+                .iter()
+                .find(|(id, _)| *id == path)
+                .map(|(_, f)| *f)
+                .or_else(|| pkg_map_extra(&path));
+            match file.and_then(|f| pkg.read_file(f).ok()) {
+                Some(bytes) => {
+                    bundle.add(&path, bytes);
+                    packed.insert(path.clone(), file.unwrap().to_string());
+                }
+                None => missing.push(format!("{key} ({path})")),
+            }
             continue;
         }
         let candidates = [
