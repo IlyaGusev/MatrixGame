@@ -120,21 +120,18 @@ fn main() {
             },
         );
     };
-    spawn(SpotKind::Voronka, cx, cy, 8.0, 0.3);
-    spawn(SpotKind::Voronka, cx - 90.0, cy + 60.0, 5.0, 1.2);
-    spawn(SpotKind::Voronka, cx + 90.0, cy - 60.0, 4.0, 2.0);
-    spawn(SpotKind::Constant, cx + 60.0, cy + 60.0, 4.0, 0.0);
-    spawn(SpotKind::Constant, cx - 60.0, cy - 60.0, 3.0, 0.7);
-    // A cluster like a real burning battlefield.
-    for i in 0..6 {
-        let a = i as f32 * 1.1;
-        spawn(
-            SpotKind::Constant,
-            cx - 30.0 + a.cos() * 35.0,
-            cy + 30.0 + a.sin() * 35.0,
-            2.0,
-            a,
-        );
+    // Carpet the area with craters + burn marks (battlefield-like),
+    // including sloped/warped cells.
+    for iy in -3..=3 {
+        for ix in -3..=3 {
+            let (fx, fy) = (cx + ix as f32 * 55.0, cy + iy as f32 * 55.0);
+            let a = (ix * 7 + iy * 3) as f32 * 0.6;
+            if (ix + iy) % 2 == 0 {
+                spawn(SpotKind::Voronka, fx, fy, 4.0 + (ix as f32).abs() * 0.8, a);
+            } else {
+                spawn(SpotKind::Constant, fx, fy, 3.0, a);
+            }
+        }
     }
     println!(
         "spawned {} spots ({} verts / {} idx in first)",

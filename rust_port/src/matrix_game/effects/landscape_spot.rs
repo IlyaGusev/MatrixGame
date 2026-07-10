@@ -176,7 +176,13 @@ impl Spot {
                 if !any_in {
                     continue;
                 }
-                indices.extend_from_slice(&[i00, i01, i10, i10, i01, i11]);
+                // Split along the MAIN diagonal (i00-i11) like both the
+                // terrain mesh (get_z's `local_y < local_x` planes) and
+                // the C++ decal strip (BuildLand emits tv1-tv2 =
+                // (x,y)-(x+1,y+1) as the shared edge). The opposite
+                // split makes the decal surface dip below warped cells
+                // mid-quad — cell-sized holes on rough ground.
+                indices.extend_from_slice(&[i00, i01, i11, i00, i11, i10]);
             }
         }
         if indices.is_empty() {
