@@ -22,14 +22,16 @@
       font-size: 13px; color: #7cff7c; text-shadow: 0 0 3px #000, 0 0 3px #000;
       pointer-events: none; user-select: none;
     }
-    #sound-btn {
-      position: fixed; top: 26px; right: 8px; z-index: 30;
+    #sound-btn, #menu-btn {
+      position: fixed; right: 8px; z-index: 30;
       font-size: 18px; line-height: 1;
       padding: 4px 6px; border-radius: 6px;
       background: rgba(0, 0, 0, 0.35); border: 1px solid rgba(200, 212, 224, 0.25);
       cursor: pointer; user-select: none;
     }
-    #sound-btn:hover { background: rgba(0, 0, 0, 0.6); }
+    #sound-btn { top: 26px; }
+    #menu-btn { top: 62px; }
+    #sound-btn:hover, #menu-btn:hover { background: rgba(0, 0, 0, 0.6); }
     #loading .spinner {
       width: 42px; height: 42px; margin-bottom: 18px;
       border: 3px solid rgba(200, 212, 224, 0.18);
@@ -39,19 +41,93 @@
     }
     #loading .label { font-size: 13px; }
     @keyframes spin { to { transform: rotate(360deg); } }
+
+    #menu {
+      position: fixed; inset: 0; z-index: 40;
+      display: flex; align-items: center; justify-content: center;
+      background: rgba(0, 0, 0, 0.55);
+      font-family: system-ui, -apple-system, Segoe UI, sans-serif;
+      color: #c8d4e0;
+    }
+    #menu[hidden] { display: none; }
+    /* Main-menu mode: shown before any map is loaded — opaque, not dismissible. */
+    #menu.main { background: #000; }
+    #menu.main #menu-close { display: none; }
+    #menu .panel {
+      width: min(440px, 92vw); max-height: 86vh; overflow-y: auto;
+      background: #0c1218; border: 1px solid rgba(200, 212, 224, 0.25);
+      border-radius: 10px; padding: 16px 20px 20px;
+      box-shadow: 0 8px 40px rgba(0, 0, 0, 0.7);
+    }
+    #menu h2 {
+      margin: 0 0 6px; font-size: 15px; letter-spacing: 0.12em;
+      text-transform: uppercase; display: flex; justify-content: space-between;
+    }
+    #menu h3 {
+      margin: 16px 0 8px; font-size: 12px; letter-spacing: 0.1em;
+      text-transform: uppercase; color: #7e93a8;
+      border-bottom: 1px solid rgba(200, 212, 224, 0.15); padding-bottom: 4px;
+    }
+    #menu-close { cursor: pointer; color: #7e93a8; }
+    #menu-close:hover { color: #fff; }
+    #levels { display: flex; flex-wrap: wrap; gap: 6px; }
+    #levels .level {
+      padding: 5px 12px; border-radius: 6px; cursor: pointer; font-size: 13px;
+      background: rgba(200, 212, 224, 0.08); border: 1px solid rgba(200, 212, 224, 0.2);
+    }
+    #levels .level:hover { background: rgba(200, 212, 224, 0.18); }
+    #levels .level.current { border-color: #7cff7c; color: #7cff7c; cursor: default; }
+    .menu-row {
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 3px 0; font-size: 13px;
+    }
+    .key-chip {
+      min-width: 54px; text-align: center; padding: 3px 8px; border-radius: 5px;
+      font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px;
+      background: rgba(200, 212, 224, 0.08); border: 1px solid rgba(200, 212, 224, 0.25);
+      cursor: pointer; user-select: none;
+    }
+    .key-chip:hover { background: rgba(200, 212, 224, 0.18); }
+    .key-chip.capturing { border-color: #7cff7c; color: #7cff7c; }
+    .key-chip.conflict { border-color: #ff6b6b; color: #ff6b6b; }
+    .key-chip.custom { border-color: #e0c268; }
+    #binds-note { font-size: 12px; color: #7e93a8; min-height: 16px; margin-top: 6px; }
+    #binds-reset {
+      margin-top: 8px; padding: 5px 12px; border-radius: 6px; font-size: 12px;
+      background: rgba(200, 212, 224, 0.08); border: 1px solid rgba(200, 212, 224, 0.25);
+      color: #c8d4e0; cursor: pointer;
+    }
+    #binds-reset:hover { background: rgba(200, 212, 224, 0.18); }
   </style>
 </head>
 <body>
   <canvas id="game-canvas"></canvas>
   <div id="fps"></div>
   <div id="sound-btn" title="Sound">🔊</div>
+  <div id="menu-btn" title="Settings">⚙️</div>
+  <div id="menu" hidden>
+    <div class="panel">
+      <h2><span id="menu-title">Settings</span> <span id="menu-close">✕</span></h2>
+      <h3>Level</h3>
+      <div id="levels"></div>
+      <h3>Sound</h3>
+      <div class="menu-row">
+        <span>Sound effects &amp; music</span>
+        <span class="key-chip" id="sound-toggle"></span>
+      </div>
+      <h3>Controls</h3>
+      <div id="binds"></div>
+      <div id="binds-note"></div>
+      <button id="binds-reset">Reset to defaults</button>
+    </div>
+  </div>
   <div id="loading">
     <div class="spinner"></div>
     <div class="label">Loading…</div>
   </div>
 
   <script type="module">
-    import init from "./pkg/matrixgame_rs.js?v=342";
+    import init from "./pkg/matrixgame_rs.js?v=344";
 
 
 
@@ -74,8 +150,235 @@
     resize();
     window.addEventListener("resize", resize);
 
+    // ───────────────────────── Settings menu ─────────────────────────
+    // Levels must have a matching pre-packed bundle in assets/
+    // (cargo run --example pack_bundle -- <name>).
+    const LEVELS = [
+      ["Atoll", "assets/atoll.bundle"],
+      ["Training", "assets/training.bundle"],
+      ["Crossfire", "assets/crossfire.bundle"],
+      ["Islands", "assets/islands.bundle"],
+      ["Reactor", "assets/reactor.bundle"],
+      ["Asylum", "assets/asylum.bundle"],
+      ["Armageddon", "assets/armagedd.bundle"],
+      ["Virus", "assets/virus.bundle"],
+    ];
 
-    await init();
+    // [id, label, default KeyboardEvent.code, context] — must mirror
+    // ACTIONS in src/matrix_game/keybinds.rs. Contexts are independent:
+    // camera and game defaults intentionally share A/S/D.
+    const KEY_ACTIONS = [
+      ["cam_forward",      "Camera forward",        "KeyW",         "camera"],
+      ["cam_back",         "Camera back",           "KeyS",         "camera"],
+      ["cam_left",         "Camera left",           "KeyA",         "camera"],
+      ["cam_right",        "Camera right",          "KeyD",         "camera"],
+      ["cam_rot_left",     "Rotate left",           "BracketLeft",  "camera"],
+      ["cam_rot_right",    "Rotate right",          "BracketRight", "camera"],
+      ["cam_pitch_up",     "Pitch up",              "PageUp",       "camera"],
+      ["cam_pitch_down",   "Pitch down",            "PageDown",     "camera"],
+      ["cam_reset",        "Reset camera",          "Backslash",    "camera"],
+      ["stop",             "Stop group",            "KeyS",         "game"],
+      ["move",             "Move order",            "KeyM",         "game"],
+      ["attack",           "Attack order",          "KeyA",         "game"],
+      ["capture",          "Capture order",         "KeyK",         "game"],
+      ["patrol",           "Patrol order",          "KeyP",         "game"],
+      ["repair",           "Repair order",          "KeyR",         "game"],
+      ["explode",          "Explode / self-destruct","KeyE",        "game"],
+      ["auto_attack",      "Auto-attack toggle",    "KeyU",         "game"],
+      ["auto_capture",     "Auto-capture toggle",   "KeyC",         "game"],
+      ["auto_defend",      "Auto-defend toggle",    "KeyD",         "game"],
+      ["enter_robot",      "Enter / leave robot",   "Enter",        "game"],
+      ["build_robot",      "Build robot",           "KeyB",         "game"],
+      ["build_turret",     "Build turret",          "KeyT",         "game"],
+      ["cancel_order",     "Cancel order",          "KeyX",         "game"],
+      ["minimap_zoom_in",  "Minimap zoom in",       "Equal",        "game"],
+      ["minimap_zoom_out", "Minimap zoom out",      "Minus",        "game"],
+      ["robot_prev",       "Previous robot",        "Comma",        "game"],
+      ["robot_next",       "Next robot",            "Period",       "game"],
+      ["pause",            "Pause",                 "Pause",        "game"],
+    ];
+    const KEYS_STORAGE = "matrixgame.keys";
+    const SOUND_STORAGE = "matrixgame.sound";
+
+    // No ?bundle= → main-menu mode: the engine is not started at all;
+    // picking a level reloads with the param set and boots the game.
+    const currentBundle = new URLSearchParams(location.search).get("bundle");
+    const inGame = !!currentBundle;
+
+    const menu = document.getElementById("menu");
+    const bindsDiv = document.getElementById("binds");
+    const bindsNote = document.getElementById("binds-note");
+    let capturing = null; // action id while waiting for a keypress
+
+    function loadOverrides() {
+      const out = {};
+      for (const pair of (localStorage.getItem(KEYS_STORAGE) || "").split(";")) {
+        const i = pair.indexOf("=");
+        if (i > 0) out[pair.slice(0, i)] = pair.slice(i + 1);
+      }
+      return out;
+    }
+    function saveOverrides(ov) {
+      const s = Object.entries(ov).map(([k, v]) => k + "=" + v).join(";");
+      if (s) localStorage.setItem(KEYS_STORAGE, s);
+      else localStorage.removeItem(KEYS_STORAGE);
+      window.dispatchEvent(new Event("matrixgame-keys-changed"));
+    }
+    function boundKey(id, ov) {
+      const a = KEY_ACTIONS.find((a) => a[0] === id);
+      return ov[id] || a[2];
+    }
+    function keyLabel(code) {
+      const special = {
+        ArrowUp: "↑", ArrowDown: "↓", ArrowLeft: "←", ArrowRight: "→",
+        BracketLeft: "[", BracketRight: "]", Backslash: "\\",
+        Equal: "=", Minus: "-", Comma: ",", Period: ".",
+        Semicolon: ";", Quote: "'", Slash: "/", Backquote: "`",
+        Space: "Space", Enter: "Enter",
+      };
+      if (special[code]) return special[code];
+      if (code.startsWith("Key")) return code.slice(3);
+      if (code.startsWith("Digit")) return code.slice(5);
+      if (code.startsWith("Numpad")) return "Num " + code.slice(6);
+      return code;
+    }
+
+    function renderBinds() {
+      const ov = loadOverrides();
+      bindsDiv.textContent = "";
+      let lastCtx = null;
+      for (const [id, label, def, ctx] of KEY_ACTIONS) {
+        if (ctx !== lastCtx) {
+          lastCtx = ctx;
+          const h = document.createElement("div");
+          h.className = "menu-row";
+          h.style.color = "#7e93a8";
+          h.style.marginTop = "6px";
+          h.textContent = ctx === "camera" ? "Camera" : "Game";
+          bindsDiv.appendChild(h);
+        }
+        const row = document.createElement("div");
+        row.className = "menu-row";
+        const name = document.createElement("span");
+        name.textContent = label;
+        const chip = document.createElement("span");
+        const key = boundKey(id, ov);
+        chip.className = "key-chip" + (key !== def ? " custom" : "");
+        chip.textContent = capturing === id ? "…" : keyLabel(key);
+        if (capturing === id) chip.classList.add("capturing");
+        chip.title = "Click, then press a key (Esc cancels)";
+        chip.onclick = () => {
+          capturing = capturing === id ? null : id;
+          bindsNote.textContent = capturing ? "Press a key… (Esc cancels)" : "";
+          renderBinds();
+        };
+        row.append(name, chip);
+        bindsDiv.appendChild(row);
+      }
+    }
+
+    function assignKey(id, code) {
+      const ov = loadOverrides();
+      const [, , def, ctx] = KEY_ACTIONS.find((a) => a[0] === id);
+      const clash = KEY_ACTIONS.find(
+        (a) => a[3] === ctx && a[0] !== id && boundKey(a[0], ov) === code
+      );
+      if (clash) {
+        bindsNote.textContent = `"${keyLabel(code)}" is already bound to "${clash[1]}"`;
+        return;
+      }
+      if (code === def) delete ov[id];
+      else ov[id] = code;
+      saveOverrides(ov);
+      bindsNote.textContent = "";
+    }
+
+    function renderSound() {
+      const on = localStorage.getItem(SOUND_STORAGE) !== "off";
+      const chip = document.getElementById("sound-toggle");
+      chip.textContent = on ? "On" : "Off";
+      chip.style.color = on ? "#7cff7c" : "#ff6b6b";
+    }
+
+    function renderLevels() {
+      const div = document.getElementById("levels");
+      div.textContent = "";
+      for (const [name, bundle] of LEVELS) {
+        const el = document.createElement("span");
+        el.className = "level" + (bundle === currentBundle ? " current" : "");
+        el.textContent = name;
+        if (bundle !== currentBundle) {
+          el.onclick = () => {
+            const p = new URLSearchParams(location.search);
+            p.set("bundle", bundle);
+            location.search = p.toString(); // reload with the new map
+          };
+        }
+        div.appendChild(el);
+      }
+    }
+
+    // While the menu is open, keystrokes must not reach the game
+    // (winit listens on the canvas); capture-phase + stopPropagation
+    // runs before its handler.
+    function menuKeydown(e) {
+      e.stopPropagation();
+      if (capturing) {
+        e.preventDefault();
+        if (e.code !== "Escape") assignKey(capturing, e.code);
+        capturing = null;
+        renderBinds();
+        if (!bindsNote.textContent.includes("bound")) bindsNote.textContent = "";
+      } else if (e.code === "Escape" && inGame) {
+        closeMenu();
+      }
+    }
+    function openMenu() {
+      menu.hidden = false;
+      renderLevels();
+      renderSound();
+      renderBinds();
+      window.addEventListener("keydown", menuKeydown, true);
+    }
+    function closeMenu() {
+      if (!inGame) return; // main menu is the whole page — nothing to close
+      menu.hidden = true;
+      capturing = null;
+      bindsNote.textContent = "";
+      window.removeEventListener("keydown", menuKeydown, true);
+    }
+    document.getElementById("menu-btn").onclick = () => (menu.hidden ? openMenu() : closeMenu());
+    document.getElementById("menu-close").onclick = closeMenu;
+    menu.onclick = (e) => { if (e.target === menu) closeMenu(); };
+    document.getElementById("sound-toggle").onclick = () => {
+      if (inGame) {
+        // The Rust audio layer owns the toggle: it binds #sound-btn,
+        // flips the master gain, and persists to localStorage.
+        document.getElementById("sound-btn").click();
+      } else {
+        // Engine not running yet — write the pref it reads at startup.
+        const on = localStorage.getItem(SOUND_STORAGE) !== "off";
+        localStorage.setItem(SOUND_STORAGE, on ? "off" : "on");
+      }
+      renderSound();
+    };
+    document.getElementById("binds-reset").onclick = () => {
+      saveOverrides({});
+      capturing = null;
+      renderBinds();
+      bindsNote.textContent = "";
+    };
+
+    if (inGame) {
+      await init();
+    } else {
+      document.getElementById("loading").style.display = "none";
+      document.getElementById("sound-btn").style.display = "none";
+      document.getElementById("menu-btn").style.display = "none";
+      document.getElementById("menu-title").textContent = "MatrixGame";
+      menu.classList.add("main");
+      openMenu();
+    }
   </script>
 </body>
 </html>

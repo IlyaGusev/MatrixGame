@@ -14,6 +14,7 @@ pub mod effects;
 pub mod flyer;
 pub mod form_game;
 pub mod interface;
+pub mod keybinds;
 pub mod logic;
 pub mod map;
 pub mod map_group;

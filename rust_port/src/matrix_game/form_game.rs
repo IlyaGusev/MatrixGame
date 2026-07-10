@@ -1124,40 +1124,59 @@ impl ApplicationHandler for App {
             // ── Keyboard (MatrixFormGame.cpp:247-282) ──
             WindowEvent::KeyboardInput { event, .. } => {
                 use crate::matrix_game::camera::KeyAction;
+                use crate::matrix_game::keybinds::{self, Ctx};
                 use winit::keyboard::{KeyCode, PhysicalKey};
                 let pressed = event.state == winit::event::ElementState::Pressed;
+                // User remaps rewrite a physical key to its action's
+                // canonical key, per context — camera and game defaults
+                // share keys (A/S/D), so each dispatch below gets its
+                // own translation. None = canonical key rebound away.
+                let cam_code = match event.physical_key {
+                    PhysicalKey::Code(c) => keybinds::map(Ctx::Camera, c),
+                    _ => None,
+                };
                 // Game-key dispatch first (MatrixFormGame.cpp:1172-1560);
                 // a consumed key never reaches the camera bindings, and
                 // its auto-repeats are swallowed too — toggles (pause,
                 // auto-orders) fire once per physical press and a held
                 // `S` must not scroll the camera after stopping a group.
                 if let PhysicalKey::Code(code) = event.physical_key {
-                    // Raw held-state for the arcade `GetAsyncKeyState`
+                    // Held-state for the arcade `GetAsyncKeyState`
                     // polls — tracked before any consumption so the
-                    // manual-drive keys can't stick.
-                    if matches!(
-                        code,
-                        KeyCode::KeyW
-                            | KeyCode::KeyA
-                            | KeyCode::KeyS
-                            | KeyCode::KeyD
-                            | KeyCode::ArrowUp
-                            | KeyCode::ArrowDown
-                            | KeyCode::ArrowLeft
-                            | KeyCode::ArrowRight
-                    ) {
-                        if pressed {
-                            state.held_keys.insert(code);
-                        } else {
-                            state.held_keys.remove(&code);
+                    // manual-drive keys can't stick. Uses the camera
+                    // translation (arcade drive shares the camera keys).
+                    if let Some(cc) = cam_code {
+                        if matches!(
+                            cc,
+                            KeyCode::KeyW
+                                | KeyCode::KeyA
+                                | KeyCode::KeyS
+                                | KeyCode::KeyD
+                                | KeyCode::ArrowUp
+                                | KeyCode::ArrowDown
+                                | KeyCode::ArrowLeft
+                                | KeyCode::ArrowRight
+                        ) {
+                            if pressed {
+                                state.held_keys.insert(cc);
+                            } else {
+                                state.held_keys.remove(&cc);
+                            }
                         }
                     }
                     if pressed {
+                        // Dialog shortcuts (E/S/R/Enter/Esc) are fixed —
+                        // skip the remap while a dialog is up.
+                        let game_code = if state.dialog.is_some() {
+                            Some(code)
+                        } else {
+                            keybinds::map(Ctx::Game, code)
+                        };
                         if event.repeat {
                             if state.consumed_keys.contains(&code) {
                                 return;
                             }
-                        } else if handle_game_key(state, code) {
+                        } else if game_code.is_some_and(|gc| handle_game_key(state, gc)) {
                             state.consumed_keys.insert(code);
                             return;
                         } else {
@@ -1167,38 +1186,29 @@ impl ApplicationHandler for App {
                         state.consumed_keys.remove(&code);
                     }
                 }
-                let action =
-                    match event.physical_key {
-                        PhysicalKey::Code(KeyCode::ArrowUp) | PhysicalKey::Code(KeyCode::KeyW) => {
-                            Some(KeyAction::MoveForward)
-                        }
-                        PhysicalKey::Code(KeyCode::ArrowDown)
-                        | PhysicalKey::Code(KeyCode::KeyS) => Some(KeyAction::MoveBack),
-                        PhysicalKey::Code(KeyCode::ArrowLeft)
-                        | PhysicalKey::Code(KeyCode::KeyA) => Some(KeyAction::MoveLeft),
-                        PhysicalKey::Code(KeyCode::ArrowRight)
-                        | PhysicalKey::Code(KeyCode::KeyD) => Some(KeyAction::MoveRight),
-                        // Yaw (KA_ROTATE_LEFT/RIGHT). Original: Home/End + `[`/`]`.
-                        PhysicalKey::Code(KeyCode::Home)
-                        | PhysicalKey::Code(KeyCode::BracketLeft) => Some(KeyAction::RotLeft),
-                        PhysicalKey::Code(KeyCode::End)
-                        | PhysicalKey::Code(KeyCode::BracketRight) => Some(KeyAction::RotRight),
-                        // Pitch (KA_ROTATE_UP/DOWN). Original: PageUp/PageDown.
-                        PhysicalKey::Code(KeyCode::PageUp) => Some(KeyAction::RotUp),
-                        PhysicalKey::Code(KeyCode::PageDown) => Some(KeyAction::RotDown),
-                        // Reset angles (KA_CAM_SETDEFAULT). Original: `\`.
-                        PhysicalKey::Code(KeyCode::Backslash) => Some(KeyAction::ResetAngles),
-                        // Shift — tracked for click-to-toggle in the
-                        // multi-selection path. Matches the C++ shift
-                        // modifier branch in `CMultiSelection::Add`
-                        // (MatrixSide.cpp:1584-1598).
-                        PhysicalKey::Code(KeyCode::ShiftLeft)
-                        | PhysicalKey::Code(KeyCode::ShiftRight) => {
-                            state.shift_down = pressed;
-                            None
-                        }
-                        _ => None,
-                    };
+                let action = match cam_code {
+                    Some(KeyCode::ArrowUp) | Some(KeyCode::KeyW) => Some(KeyAction::MoveForward),
+                    Some(KeyCode::ArrowDown) | Some(KeyCode::KeyS) => Some(KeyAction::MoveBack),
+                    Some(KeyCode::ArrowLeft) | Some(KeyCode::KeyA) => Some(KeyAction::MoveLeft),
+                    Some(KeyCode::ArrowRight) | Some(KeyCode::KeyD) => Some(KeyAction::MoveRight),
+                    // Yaw (KA_ROTATE_LEFT/RIGHT). Original: Home/End + `[`/`]`.
+                    Some(KeyCode::Home) | Some(KeyCode::BracketLeft) => Some(KeyAction::RotLeft),
+                    Some(KeyCode::End) | Some(KeyCode::BracketRight) => Some(KeyAction::RotRight),
+                    // Pitch (KA_ROTATE_UP/DOWN). Original: PageUp/PageDown.
+                    Some(KeyCode::PageUp) => Some(KeyAction::RotUp),
+                    Some(KeyCode::PageDown) => Some(KeyAction::RotDown),
+                    // Reset angles (KA_CAM_SETDEFAULT). Original: `\`.
+                    Some(KeyCode::Backslash) => Some(KeyAction::ResetAngles),
+                    // Shift — tracked for click-to-toggle in the
+                    // multi-selection path. Matches the C++ shift
+                    // modifier branch in `CMultiSelection::Add`
+                    // (MatrixSide.cpp:1584-1598).
+                    Some(KeyCode::ShiftLeft) | Some(KeyCode::ShiftRight) => {
+                        state.shift_down = pressed;
+                        None
+                    }
+                    _ => None,
+                };
                 if let Some(a) = action {
                     state.camera.on_key(a, pressed);
                 }
@@ -6047,6 +6057,7 @@ pub fn run() {
 #[cfg(target_arch = "wasm32")]
 pub fn run() {
     use winit::platform::web::EventLoopExtWebSys;
+    crate::matrix_game::keybinds::init();
     let event_loop = EventLoop::new().expect("failed to create event loop");
     let app = App {
         state: Rc::new(RefCell::new(None)),
