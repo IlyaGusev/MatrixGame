@@ -522,6 +522,11 @@ pub struct Objects {
     /// (`pump_sounds` in form_game.rs); without an audio backend the
     /// mixer is a no-op and the queue just empties.
     pub pending_sounds: Vec<SndEvent>,
+    /// Deferred ruin-smoke requests `(center, radius)` — the 20-50
+    /// temporary effect spawners the C++ scatters over a dead
+    /// building's ruins (MatrixObjectBuilding.cpp:726-755). Drained
+    /// by `MapLogic::takt` into `ambient_spawners`.
+    pub pending_ruin_smoke: Vec<(glam::Vec3, f32)>,
     /// Per-map-group flyer altitude envelope: max(terrain land max,
     /// static building/object tops). The static-scene slice of
     /// `m_GroupMaxZObjRobots` (GetZInterpolatedObjRobots,
@@ -686,6 +691,7 @@ impl Objects {
             mo_grid: std::cell::RefCell::new(std::collections::HashMap::new()),
             mo_grid_dirty: std::cell::Cell::new(true),
             pending_sounds: Vec::new(),
+            pending_ruin_smoke: Vec::new(),
             flyer_alt_grid: Vec::new(),
             pending_point_lights: Vec::new(),
             pending_light_follow: Vec::new(),
@@ -873,6 +879,11 @@ impl Objects {
     /// path for gameplay scans that never care about decoratives.
     pub fn iter_units(&self) -> impl Iterator<Item = ObjectId> + '_ {
         self.unit_ids.iter().copied()
+    }
+
+    /// Decorative / interactive map objects (terron, break props, …).
+    pub fn iter_mapobjects(&self) -> impl Iterator<Item = ObjectId> + '_ {
+        self.mapobject_ids.iter().copied()
     }
 
     fn ensure_mo_grid(&self) {

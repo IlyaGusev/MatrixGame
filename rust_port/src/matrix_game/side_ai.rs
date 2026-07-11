@@ -464,6 +464,44 @@ impl MapLogic {
         self.other_sides[idx] = side;
     }
 
+    /// The AI-side half of the spawner-bot dispatch: the C++ runs
+    /// `PGOrderAttack(RobotToLogicGroup(r), ...)` on the bot's OWN side
+    /// (MatrixObject.cpp:1452-1455), but our pg_order machinery is
+    /// player-only — so the team-less bot gets its own logic group with
+    /// an Attack action on `region`, and the war path drives it there.
+    pub(crate) fn assign_spawner_bot_group(&mut self, rid: ObjectId, region: i32) {
+        let Some(sid) = robot_ref(&self.objects, rid).map(|r| r.side) else {
+            return;
+        };
+        let Some(idx) = self.other_sides.iter().position(|s| s.id == sid) else {
+            return;
+        };
+        let mut side = std::mem::take(&mut self.other_sides[idx]);
+        for lg in side.logic_groups.iter_mut() {
+            lg.robots_cnt = 0;
+        }
+        for id in self.objects.iter_units() {
+            let Some(r) = robot_ref(&self.objects, id) else {
+                continue;
+            };
+            if r.side == sid && r.group_logic >= 0 && (r.group_logic as usize) < MAX_LOGIC_GROUP {
+                side.logic_groups[r.group_logic as usize].robots_cnt += 1;
+            }
+        }
+        if let Some(g) = side.logic_groups.iter().position(|g| g.robots_cnt <= 0) {
+            side.logic_groups[g] = Default::default();
+            side.logic_groups[g].team = -1;
+            side.logic_groups[g].robots_cnt = 1;
+            side.logic_groups[g].action.ty = LogicActionType::Attack;
+            side.logic_groups[g].action.region = region;
+            if let Some(r) = robot_mut(&mut self.objects, rid) {
+                r.set_team(-1);
+                r.group_logic = g as i32;
+            }
+        }
+        self.other_sides[idx] = side;
+    }
+
     /// `ClacSpawnTeam` (MatrixSide.cpp:2027-2088) — pick the team for a
     /// freshly spawned robot: an empty team if any, else the team of
     /// nearby friendlies (widening tolerance passes), else team 0.

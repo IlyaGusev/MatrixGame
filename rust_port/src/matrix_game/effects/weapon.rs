@@ -16,9 +16,9 @@
 //! effect death (instead of inside `weapon_hit` — same net counts, no
 //! double-release hazard).
 //!
-//! Purely visual sub-effects (CLaser / CVolcano billboards, konus
-//! muzzle flashes, gun-fire sprites, sounds) are not ported — only the
-//! gameplay-observable behavior is.
+//! Visual / audio sub-effects (konus muzzle flashes + splashes,
+//! beam / repair billboards, fire + hit sounds) are spawned from here
+//! via `pending_effects` and the snd queues.
 
 pub type Weapon = u32;
 
@@ -377,7 +377,7 @@ impl Weapons {
 }
 
 // `m_Flags` bits local to the weapon effect (WEAPFLAGS_*,
-// MatrixEffect.hpp). Sound bits are not ported.
+// MatrixEffect.hpp). The sound bits are covered by `snd_stop_pending`.
 const WEAPFLAGS_FIRE: u32 = 1 << 0;
 const WEAPFLAGS_FIREWAS: u32 = 1 << 1;
 const WEAPFLAGS_HITWAS: u32 = 1 << 2;
@@ -609,8 +609,8 @@ impl WeaponEffect {
         self.bolt = None;
     }
 
-    /// `Modify(pos, dir, speed)` — visual sub-effect repositioning is
-    /// not ported; position/direction updates are.
+    /// `Modify(pos, dir, speed)` — the C++ also repositions its
+    /// sub-effects here; ours re-derive from `pos` each takt.
     pub fn modify(&mut self, pos: Vec3, dir: Vec3, speed: Vec3) {
         self.pos = pos;
         self.dir = dir;

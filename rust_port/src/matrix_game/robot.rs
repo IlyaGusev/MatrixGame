@@ -45,9 +45,8 @@ pub enum RobotState {
     /// `ROBOT_FALLING` — released by the flyer, gravity until ground
     /// contact (MatrixRobot.cpp:570-607).
     Falling,
-    /// `ROBOT_DIP` — destroyed; the wreck decays for `dip_ttl` ms
-    /// (the unit-scatter death animation isn't ported) and then
-    /// despawns.
+    /// `ROBOT_DIP` — destroyed; the parts scatter (`init_dip_scatter`)
+    /// and the wreck decays for `dip_ttl` ms before despawning.
     Dip,
 }
 
@@ -2350,7 +2349,8 @@ impl Robot {
 
     /// Track / wheel tread decals (`soles`, MatrixRobot.cpp:732-772):
     /// stamp a directional spot every ~10 units of travel on land.
-    /// Pneumatic footprints come from foot-linking, which isn't ported.
+    /// Pneumatic footprints come from foot-linking instead
+    /// (object_robot.rs, `SPOT_SOLE_PNEUMATIC` on foot plant).
     fn stamp_sole(&mut self, map: &GameMap, objs: &mut Objects) {
         use crate::matrix_game::common::{trunc_float, CELLFLAG_BRIDGE, CELLFLAG_LAND};
         use crate::matrix_game::effects::landscape_spot::{SpotKind, SpotSpawn};
@@ -3940,10 +3940,9 @@ impl MapStatic for Robot {
     }
 
     /// Port of `CMatrixRobotAI::Damage` (MatrixRobot.cpp:1827-2118).
-    /// Not ported (visual / unported-subsystem hooks): hit sounds,
-    /// explosion + crater effects, progress-bar + minimap flashes, the
-    /// war camera, env target-switching on cannon hits, and the DIP
-    /// unit-scatter animation.
+    /// Not ported: minimap flashes and the war camera. Hit sounds live
+    /// in the weapon effects, env retaliation in `hit_to`, the HP bar
+    /// in `hitpoint_bar`, DIP scatter in `init_dip_scatter`.
     fn damage(
         &mut self,
         weap: crate::matrix_game::effects::weapon::Weapon,
@@ -4804,9 +4803,9 @@ impl Robot {
     }
 
     /// Port of `CMatrixRobotAI::HitTo` (MatrixRobot.cpp:4025-4050) —
-    /// the FIRE_END_HANDLER target. The env target-switching half
-    /// needs `SMatrixRobotAIEnv` (not ported); the hit timestamps are
-    /// the part current systems read.
+    /// the FIRE_END_HANDLER target: hit timestamps plus the env
+    /// retaliation half (victim learns the attacker, cannon-shooters
+    /// retarget onto it).
     pub fn hit_to(
         &mut self,
         hit: Option<(ObjectId, i32, ObjectType)>,

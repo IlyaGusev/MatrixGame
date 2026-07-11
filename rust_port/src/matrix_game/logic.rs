@@ -354,6 +354,7 @@ impl MapLogic {
                 min_period,
                 max_period,
                 next_time,
+                die_at: 0,
                 ttl: pf(3),
                 puff_ttl: pf(4),
                 spawn_time: pf(5),
@@ -552,6 +553,42 @@ impl MapLogic {
                 }
             }
         }
+        // Ruin smoke: 20-50 temporary spawners over a freshly dead
+        // building (MatrixObjectBuilding.cpp:726-755). Positions
+        // approximate the C++ mesh ray-pick with a radius scatter.
+        let ruins: Vec<_> = self.objects.pending_ruin_smoke.drain(..).collect();
+        for (center, radius) in ruins {
+            let n = self.rng.range(20, 50);
+            for _ in 0..n {
+                let pos = center
+                    + glam::Vec3::new(
+                        self.rng.float_range(-0.6, 0.6) as f32 * radius,
+                        self.rng.float_range(-0.6, 0.6) as f32 * radius,
+                        self.rng.float_range(0.0, 0.5) as f32 * radius,
+                    );
+                // "1,1000,5000,<700-1200>,2400,60,false,0.03,78000000",
+                // spawner lifetime FRND(15000)+5000 (:731-753).
+                self.ambient_spawners.push(AmbientSpawner {
+                    pos,
+                    fx: SpawnerFx::Smoke,
+                    min_period: 1000,
+                    max_period: 5000,
+                    next_time: self.elapsed_ms + self.rng.range(1000, 5000) as i64,
+                    die_at: self.elapsed_ms + self.rng.range(5000, 20000) as i64,
+                    ttl: self.rng.range(700, 1200) as f32,
+                    puff_ttl: 2400.0,
+                    spawn_time: 60.0,
+                    intense: false,
+                    speed: 0.03,
+                    color: 0x7800_0000,
+                    disp_factor: 0.0,
+                });
+            }
+        }
+        let now = self.elapsed_ms;
+        self.ambient_spawners
+            .retain(|s| s.die_at == 0 || now < s.die_at);
+
         // Ambient effect spawners (CEffectSpawner::Takt,
         // MatrixEffect.cpp:169-190): each fires its smoke/fire effect
         // every rnd(min,max) ms.
@@ -1444,18 +1481,19 @@ impl MapLogic {
                 .unwrap_or_else(|| req.pos.truncate());
             // C++ dispatches the order on the spawned robot's OWN side
             // (`GetSideById(r->GetSide())->PGOrderAttack(...)`,
-            // MatrixObject.cpp:1452-1455). Only the player side's logic
-            // groups are modelled here, so route player-side bots through
-            // it and leave enemy-side bots to the (unported) enemy AI —
-            // routing them through player_side would clobber real player
-            // command groups.
+            // MatrixObject.cpp:1452-1455). The pg_order machinery is
+            // player-only here, so AI-side bots get the equivalent via
+            // a dedicated Attack logic group instead.
+            let gsm = GameMap::GLOBAL_SCALE_MOVE;
+            let tp = (float2int(tp_world.x / gsm), float2int(tp_world.y / gsm));
             if bot.side == self.player_side.id {
-                let gsm = GameMap::GLOBAL_SCALE_MOVE;
-                let tp = (float2int(tp_world.x / gsm), float2int(tp_world.y / gsm));
                 self.sound_order_attack_disable = true;
                 let no = self.robot_to_logic_group(rid);
                 self.pg_order_attack(map, no, tp, target);
                 self.sound_order_attack_disable = false;
+            } else {
+                let region = get_region(map, tp.0, tp.1);
+                self.assign_spawner_bot_group(rid, region);
             }
         }
     }
@@ -3892,6 +3930,9 @@ struct AmbientSpawner {
     min_period: i32,
     max_period: i32,
     next_time: i64,
+    /// Elapsed-ms deadline after which the spawner is dropped;
+    /// 0 = immortal (map-authored). `m_TTL` of CEffectSpawner.
+    die_at: i64,
     ttl: f32,
     puff_ttl: f32,
     spawn_time: f32,

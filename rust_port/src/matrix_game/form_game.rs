@@ -2190,12 +2190,9 @@ impl ApplicationHandler for App {
 
 /// Port of `CMatrixSideUnit::PlayerAction` + the follow-on
 /// `CBuildStack::AddItem` call. Dispatches the button identified by
-/// its `Name` to the right game-state change. Currently handles
-/// `buro` (build robot) → push a default-chassis robot onto the
-/// selected base's build stack. The C++ opens the full
-/// `m_ConstructPanel` for chassis/armor/weapon selection first; the
-/// constructor UI isn't ported, so we skip straight to AddItem with
-/// a default chassis.
+/// its `Name` to the right game-state change — e.g. `buro` (build
+/// robot) opens the `RobotBuilder` constructor panel like the C++
+/// `m_ConstructPanel` (CConstructor.cpp:970-975).
 fn dispatch_ui_click(state: &mut AppState, click: &crate::matrix_game::interface::Click) {
     use crate::matrix_game::config::RobotUnitKind;
     use crate::matrix_game::interface::constructor::parse_constructor_button;
@@ -3668,7 +3665,14 @@ fn refresh_progress_bars(state: &mut AppState) {
         // Collect every armed bar (`BeforeDraw` PB blocks), gated by a
         // landscape LOS trace from the camera like the originals.
         let eye = state.camera.eye_pos_world();
-        let ids: Vec<_> = state.game.objects.iter_units().collect();
+        // Map objects included: terron / special break props carry
+        // persistent damage bars (MatrixObject.cpp:810-877).
+        let ids: Vec<_> = state
+            .game
+            .objects
+            .iter_units()
+            .chain(state.game.objects.iter_mapobjects())
+            .collect();
         for id in ids {
             let Some(obj) = state.game.objects.get(id) else {
                 continue;

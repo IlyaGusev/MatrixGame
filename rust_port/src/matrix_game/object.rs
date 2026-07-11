@@ -704,6 +704,45 @@ impl MapStatic for MapObject {
     fn is_special(&self) -> bool {
         self.object_state & OBJECT_STATE_SPECIAL != 0
     }
+    /// The map-object `m_PB` blocks of `BeforeDraw` (MatrixObject.cpp:
+    /// 810-877): terron bar once damaged; break/anim bars only for
+    /// SPECIAL (win-target) objects. Unlike units, no hover arming —
+    /// the bar stays up from first damage until destruction.
+    fn hitpoint_bar(
+        &self,
+        _map: &crate::matrix_game::map::GameMap,
+    ) -> Option<crate::matrix_game::map_static::HpBar> {
+        if self.break_hit_point <= 0
+            || self.break_hit_point_max <= 0
+            || self.break_hit_point >= self.break_hit_point_max
+        {
+            return None;
+        }
+        let fill = self.break_hit_point as f32 / self.break_hit_point_max as f32;
+        const PB_SPECIAL_WIDTH: f32 = 50.0; // MatrixProgressBar.hpp:13
+        match self.beh_flag {
+            BehFlag::Terron => {
+                let r = self.core.radius * 1.2 * 0.5;
+                Some(crate::matrix_game::map_static::HpBar {
+                    anchor: self.core.geo_center,
+                    width: self.core.radius * 1.2,
+                    fill,
+                    x_off: -r,
+                    y_off: -r * 0.5,
+                })
+            }
+            BehFlag::Break | BehFlag::Anim if self.object_state & OBJECT_STATE_SPECIAL != 0 => {
+                Some(crate::matrix_game::map_static::HpBar {
+                    anchor: self.core.geo_center + glam::Vec3::Z * 20.0,
+                    width: PB_SPECIAL_WIDTH,
+                    fill,
+                    x_off: -PB_SPECIAL_WIDTH * 0.5,
+                    y_off: -self.core.radius,
+                })
+            }
+            _ => None,
+        }
+    }
     /// Ray pick against the type's VO AABB in object space — ports the
     /// mesh precision of `CVectorObject::Pick` so shots collide with
     /// ruins/props where the C++ does (the old default was radius 0 =
@@ -938,8 +977,8 @@ impl MapStatic for MapObject {
             if self.break_hit_point > entry.mindamage {
                 self.break_hit_point -= entry.damage;
             }
-            // m_PB progress-bar instantiation (MatrixObject.cpp:197-200)
-            // — deferred: CMatrixProgressBar unported.
+            // m_PB (MatrixObject.cpp:197-200): the bar shows via
+            // `hitpoint_bar` once break_hit_point drops below max.
 
             if self.break_hit_point <= 0 {
                 if self.object_state & OBJECT_STATE_SPECIAL != 0 {
@@ -1012,8 +1051,8 @@ impl MapStatic for MapObject {
         }
 
         // BEHF_TERRON (MatrixObject.cpp:142-187). Pain animation /
-        // progress bar / music-volume not ported; HP depletion, pain
-        // voices + the death flags are.
+        // music-volume not ported; HP depletion (with `hitpoint_bar`),
+        // pain voices + the death flags are.
         if beh0 == BehFlag::Terron
             && self.object_state & crate::matrix_game::map_static::OBJECT_STATE_TERRON_EXPL == 0
         {

@@ -813,9 +813,8 @@ impl CannonDamages {
     }
 }
 
-/// Port of `g_Config.m_FlyerDamages[]` (MatrixConfig.cpp:538-566).
-/// Flyers themselves aren't ported yet, but the table is loaded so the
-/// damage subsystem is complete.
+/// Port of `g_Config.m_FlyerDamages[]` (MatrixConfig.cpp:538-566) —
+/// per-weapon damage entries applied to flyers (flyer.rs).
 #[derive(Debug, Clone, Copy)]
 pub struct FlyerDamages {
     pub table: [WeaponDamage; WEAPON_COUNT],

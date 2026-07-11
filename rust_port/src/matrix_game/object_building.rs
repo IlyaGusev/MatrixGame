@@ -150,11 +150,9 @@ pub use crate::matrix_game::config::{robot_build_time_ms, turret_build_time_ms};
 /// holds an intrusive list of `CMatrixMapStatic*` (robots / cannons /
 /// flyers) with `m_NextStackItem` / `m_PrevStackItem` pointers. We
 /// use `Vec<PendingItem>` — the list semantics aren't needed since
-/// we only ever pop the top.
-///
-/// Fully-constructed robots don't exist here yet (the robot
-/// constructor UI isn't ported), so `PendingItem` carries enough
-/// data to build a default robot at dequeue-time.
+/// we only ever pop the top. Queued robots exist only as their
+/// `RobotConfig` spec (from the constructor panel); the live `Robot`
+/// is built at dequeue-time.
 #[derive(Debug, Clone, Default)]
 pub struct BuildStack {
     items: Vec<PendingItem>,
@@ -1633,8 +1631,14 @@ impl MapStatic for Building {
                         &format!("{namet}p.vo"),
                     )));
                 }
-                // The 20-50 fire effect-spawners scattered over the ruin
-                // mesh (:726-755) need AddEffectSpawner — unported.
+                // The 20-50 temporary smoke spawners scattered over the
+                // ruin (:726-755). The C++ ray-picks the ruin mesh for
+                // exact placement; the mesh is render-side here, so the
+                // drain approximates with the building's radius.
+                objs.pending_ruin_smoke.push((
+                    glam::Vec3::new(self.pos.x, self.pos.y, z),
+                    self.core.radius.max(20.0),
+                ));
                 if let Some(id) = self.self_id {
                     // `g_MatrixMap->StaticDelete(this)` (:757); deferred
                     // because our box is checked out by the takt driver.
@@ -1733,7 +1737,7 @@ impl MapStatic for Building {
                 entry.damage
             };
             self.hit_point = (self.hit_point + amount as f32).min(self.hit_point_max);
-            // m_PB.Modify — progress bar unported.
+            // No m_PB.Modify needed — `hitpoint_bar` reads live HP.
             return false;
         }
 
@@ -1759,8 +1763,7 @@ impl MapStatic for Building {
                 entry.damage
             };
             self.hit_point -= damagek * base as f32;
-            // m_PB.Modify — progress bar unported; we still reseed the
-            // hp-bar overlay timer so the UI linger-behaviour is right.
+            // `hitpoint_bar` reads live HP; just reseed the linger timer.
             self.show_hitpoint();
         }
 
