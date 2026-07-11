@@ -290,6 +290,9 @@ fn run_sim(pkg: &PkgArchive, dat: &Storage, map_path: &str, seed: i32, opts: &Op
 
     let mut game = MapLogic::with_seed(seed);
     game.load_config(dat);
+    // MMFLAG_FULLAUTO: side 1 is AI-driven, so its capture orders get
+    // the same unbreakable guard as enemy sides (CanBreakOrder).
+    matrixgame_rs::matrix_game::map::set_full_auto(opts.player == PlayerMode::Ai);
     if opts.player == PlayerMode::Ai {
         // Park the human side on an unused id so ensure_sides picks up
         // side 1 as a regular enemy-AI side.
@@ -312,6 +315,7 @@ fn run_sim(pkg: &PkgArchive, dat: &Storage, map_path: &str, seed: i32, opts: &Op
     let mut driver = SimRng(seed as u64 ^ 0x9e3779b97f4a7c15);
     let mut next_build_ms = 15_000i64;
     let mut next_order_ms = 20_000i64;
+    let mut next_maint_ms = 60_000i64;
 
     let mut anomalies: Vec<Anomaly> = Vec::new();
     let mut kind_counts: HashMap<&'static str, usize> = HashMap::new();
@@ -340,6 +344,10 @@ fn run_sim(pkg: &PkgArchive, dat: &Storage, map_path: &str, seed: i32, opts: &Op
                     if game.elapsed_ms >= next_order_ms {
                         next_order_ms = game.elapsed_ms + 12_000 + driver.below(12_000) as i64;
                         script_order(&mut game, &map, &mut driver);
+                    }
+                    if game.elapsed_ms >= next_maint_ms {
+                        next_maint_ms = game.elapsed_ms + 90_000 + driver.below(60_000) as i64;
+                        script_maintenance(&mut game, &map, &mut driver);
                     }
                 }
                 PlayerMode::Ai | PlayerMode::Idle => {}
@@ -562,6 +570,26 @@ fn script_order(game: &mut MapLogic, map: &GameMap, rng: &mut SimRng) {
     }
 }
 
+/// Trigger base maintenance on a random player building — the repair
+/// button players click whenever it's off cooldown.
+fn script_maintenance(game: &mut MapLogic, map: &GameMap, rng: &mut SimRng) {
+    let pid = game.player_side.id;
+    let buildings: Vec<_> = game
+        .objects
+        .iter_live()
+        .filter(|&id| {
+            building_ref(&game.objects, id)
+                .map(|b| b.is_live() && b.side == pid)
+                .unwrap_or(false)
+        })
+        .collect();
+    if buildings.is_empty() {
+        return;
+    }
+    let bid = buildings[rng.below(buildings.len() as u32) as usize];
+    game.building_maintenance(map, bid);
+}
+
 fn random_passable_point(
     game: &MapLogic,
     map: &GameMap,
@@ -650,15 +678,34 @@ fn check_invariants(
             }
             if r.hit_point > r.hit_point_max * 1.001 || r.hit_point <= 0.0 || r.hit_point_max <= 0.0 {
                 push_anomaly(anomalies, counts, t, "hp-range", format!(
-                    "robot {id:?} side={} hp={}/{} (live)",
-                    r.side, r.hit_point, r.hit_point_max
+                    "robot {id:?} side={} hp={}/{} (live) state={:?} pos=({:.0},{:.0})",
+                    r.side, r.hit_point, r.hit_point_max, r.state, r.pos_x, r.pos_y,
                 ));
             }
-            if r.pos_x < -margin || r.pos_y < -margin || r.pos_x > w + margin || r.pos_y > h + margin
+            // Transport flyers deliver robots from off-map spawn points
+            // (the C++ guards off-map carried robots explicitly,
+            // MatrixObjectRobot.cpp:1188-1192) — only grounded robots
+            // are bounded by the map.
+            let airborne = matches!(
+                r.state,
+                matrixgame_rs::matrix_game::robot::RobotState::Carrying
+                    | matrixgame_rs::matrix_game::robot::RobotState::Falling
+            );
+            if !airborne
+                && (r.pos_x < -margin
+                    || r.pos_y < -margin
+                    || r.pos_x > w + margin
+                    || r.pos_y > h + margin)
             {
+                let orders: Vec<String> = r
+                    .orders
+                    .iter()
+                    .map(|o| format!("{:?}/{:?}({},{})", o.ty, o.phase, o.p1, o.p2))
+                    .collect();
                 push_anomaly(anomalies, counts, t, "oob", format!(
-                    "robot {id:?} side={} pos=({:.0},{:.0}) map=({:.0}x{:.0})",
-                    r.side, r.pos_x, r.pos_y, w, h
+                    "robot {id:?} side={} pos=({:.0},{:.0}) map=({:.0}x{:.0}) state={:?} hp={:.0} vel=({:.2},{:.2}) des=({},{}) orders={orders:?}",
+                    r.side, r.pos_x, r.pos_y, w, h, r.state, r.hit_point,
+                    r.velocity.x, r.velocity.y, r.des_x, r.des_y
                 ));
             }
         } else if let Some(c) = cannon_ref(&game.objects, id) {
@@ -740,6 +787,27 @@ fn check_stalls(
             && now - stall_reported.get(&side).copied().unwrap_or(i64::MIN / 2) > 300_000
         {
             stall_reported.insert(side, now);
+            // A side whose every manned team sits in Defence with the
+            // war flag down is in the AI's designed idle posture
+            // (Defence teams hold their places until danger) — note
+            // it, but it's not a deadlock.
+            let defence_idle = game.side_by_id(side).is_some_and(|s| {
+                s.teams
+                    .iter()
+                    .filter(|t| t.robot_cnt > 0)
+                    .all(|t| {
+                        t.action.ty
+                            == matrixgame_rs::matrix_game::side::LogicActionType::Defence
+                            && !t.war
+                    })
+            });
+            if defence_idle {
+                println!(
+                    "note: side {side} defence-idle at t={}s ({robots} robots holding places)",
+                    now / 1000
+                );
+                continue;
+            }
             push_anomaly(anomalies, counts, now, "stall", format!(
                 "side {side}: {robots} live robots, none moved for 3min"
             ));
@@ -782,8 +850,40 @@ fn dump_stalled_side(game: &MapLogic, side: i32) {
             .iter()
             .map(|o| format!("{:?}/{:?}", o.ty, o.phase))
             .collect();
+        // Capture-order detail: target building, distance, and the
+        // nearest robot within CAPTURE_RADIUS (a closer group-mate
+        // starves the capture via the nearest-robot rule).
+        let mut cap = String::new();
+        if let Some(o) = r
+            .orders
+            .iter()
+            .find(|o| o.ty == matrixgame_rs::matrix_game::robot::OrderType::CaptureFactory)
+        {
+            if let Some(b) = o.target.and_then(|t| building_ref(&game.objects, t)) {
+                let d = ((r.pos_x - b.pos.x).powi(2) + (r.pos_y - b.pos.y).powi(2)).sqrt();
+                let mut near = String::from("none");
+                let mut best = 50.0f32 * 50.0;
+                for oid in game.objects.iter_live() {
+                    if let Some(other) = robot_ref(&game.objects, oid) {
+                        if !other.is_live() {
+                            continue;
+                        }
+                        let gc = other.core().geo_center;
+                        let d2 = (gc.x - b.pos.x).powi(2) + (gc.y - b.pos.y).powi(2);
+                        if d2 < best {
+                            best = d2;
+                            near = format!("{oid:?}@{:.0}", d2.sqrt());
+                        }
+                    }
+                }
+                cap = format!(
+                    " CAPTURE tgt={:?} tside={} tpos=({:.0},{:.0}) dist={d:.0} nearest={near}",
+                    o.target, b.side, b.pos.x, b.pos.y
+                );
+            }
+        }
         println!(
-            "  robot {id:?} pos=({:.0},{:.0}) state={:?} team={} group={} orders={orders:?} place={} target={:?}",
+            "  robot {id:?} pos=({:.0},{:.0}) state={:?} team={} group={} orders={orders:?} place={} target={:?}{cap}",
             r.pos_x, r.pos_y, r.state, r.team, r.group_logic, r.env.place, r.env.target,
         );
     }

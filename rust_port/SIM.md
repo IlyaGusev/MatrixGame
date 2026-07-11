@@ -104,14 +104,46 @@ Full sweep: all 84 maps × 8 min, scripted player — 0 panics, 0 state
 corruption (nan/hp/oob/leaks), 35 legitimate LOSE outcomes (several
 maps are survival scenarios where the player spawns without a base,
 e.g. SANATORY). Determinism verified on ATOLL, DUSKBATTLE, KRATER,
-REACTOR. One open finding:
+REACTOR (script + ai modes, including back-to-back runs in one
+process).
 
-- **AI capture-region deadlock** — `--player ai --map ATOLL --seed 1
-  --minutes 25`: from t≈1180s the strongest side (24 robots) freezes;
-  all teams sit on `action=Capture/r23, stay=true, war=false`, robots
-  Idle in assigned places, some with never-progressing `MoveTo/Empty` /
-  `CaptureFactory/CaptureMoving` orders, while enemy bases still stand.
-  Needs comparison against the original `TaktHL` capture flow.
+Bugs found by this environment and fixed (see robot.rs / map.rs):
+
+- **Capture-order deadlocks** (three related mechanisms, all producing
+  side-wide AI freezes on 10+ maps): the stuck-watchdog GetLost sidestep
+  destroyed capture-approach MoveTos without saving the destination; a
+  stale pre-capture MoveReturn defeated the step-aside save-guard and
+  later yanked robots away mid-capture (ending up "Capturing" from
+  across the map, permanently claiming the factory); and
+  `can_break_order` was missing the C++ `MMFLAG_FULLAUTO` OR-term.
+  Fixes: watchdog/step-aside refresh the return point with the live
+  capture destination, `capture_factory()` clears stale MoveReturns,
+  CaptureMoving re-plots via the Empty phase when both approach and
+  return are gone (documented deviation — the C++ strands forever),
+  `map::set_full_auto` ports MMFLAG_FULLAUTO.
+- **Cross-mission time leak** — `MapScope::drop` didn't reset
+  `CURRENT_ELAPSED_MS`, so any second mission in one process seeded
+  spawn-time timers (cannon `fire_next_think_time` etc.) from the
+  previous mission's end time, diverging entire battles (also affects
+  in-app mission restarts). Found by TRIDENT stalling only as run 2.
+- **Zombie carried robots** — the robot death path didn't detach the
+  transport flyer (C++ does at MatrixRobot.cpp:1302-1310/5158-5161),
+  so a robot killed mid-delivery was later "dropped" by its flyer,
+  overwriting DIP with Falling: a live robot at negative HP. Found as
+  an `hp-range` anomaly on SUMMER4_2E seed 2 (script mode).
+
+Residual known standstills (verified to match the original C++
+behavior, not port bugs): capturer starved of approach cells by
+group-mates parked on every place near the factory; base-capture
+approach jammed against the base wall from a bad angle; passive
+TaktCaptureCandidate capture of a factory with no pathable approach
+(the port busy-retries where the C++ freezes silently).
+
+Debug aid: `MG_TRACE_CAPTURE=1` prints every event that destroys or
+replaces a capture-marked MoveTo (the recurring deadlock bug class).
+Note: a side reported as "defence-idle" (all teams Defence, war down,
+robots holding places) is the AI's designed idle posture, not a stall
+— e.g. both sides on TERRON.
 
 Related existing probes: `ai_stall_probe` (AI deadlock deep-dive),
 `heavy_battle_bench` (takt CPU cost), `attack_order_sim`,

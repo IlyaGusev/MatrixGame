@@ -157,6 +157,12 @@ impl Flyer {
         self.carrying
     }
 
+    /// Forget the cargo — the robot-death detach
+    /// (`m_CargoFlyer->GetCarryData()->m_Robot = NULL`, MatrixRobot.cpp:1310).
+    pub fn carry_detach(&mut self) {
+        self.carrying = None;
+    }
+
     /// `ProceedTrajectory` (MatrixFlyer.cpp:1640-1691) — the live part
     /// before the unconditional `return`.
     fn proceed_trajectory(&mut self, ms: f32) {

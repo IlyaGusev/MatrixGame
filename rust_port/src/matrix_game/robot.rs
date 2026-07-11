@@ -743,6 +743,16 @@ impl Robot {
     /// fresh ROT_MOVE_TO on top, clears the move-path so the
     /// dispatcher recomputes it on the next LogicTakt.
     pub fn move_to(&mut self, mx: i32, my: i32) {
+        if std::env::var_os("MG_TRACE_CAPTURE").is_some() {
+            if let Some(o) = self.orders.iter().find(|o| {
+                o.ty == OrderType::MoveTo && o.phase == OrderPhase::CaptureMoving
+            }) {
+                eprintln!(
+                    "[capture-trace] move_to({mx},{my}) replaced capture-MoveTo({},{}) of {:?} at ({:.0},{:.0})",
+                    o.p1, o.p2, self.self_id, self.pos_x, self.pos_y
+                );
+            }
+        }
         self.orders.remove_type(OrderType::MoveTo);
         self.orders.remove_type(OrderType::MoveToBack);
         self.orders.remove_type(OrderType::StopMove);
@@ -830,6 +840,14 @@ impl Robot {
     /// 4796).
     pub fn capture_factory(&mut self, factory: ObjectId) {
         self.orders.remove_type(OrderType::CaptureFactory);
+        // Deviation from the C++: drop any pre-capture MoveReturn. The
+        // C++ keeps it, and once the approach MoveTo is gone the stale
+        // return point yanks the robot away mid-capture (it can end up
+        // "Capturing" a factory from across the map, permanently
+        // claiming it and deadlocking its side). Step-asides during
+        // the approach re-save the capture destination, so nothing
+        // legitimate is lost.
+        self.orders.remove_type(OrderType::MoveReturn);
         self.orders
             .push_top(Order::set_static(OrderType::CaptureFactory, Some(factory)));
     }
@@ -1018,6 +1036,12 @@ impl Robot {
     /// (MatrixObjectRobot.cpp:1322-1330).
     pub fn carry_release(&mut self) {
         self.cargo_flyer = None;
+        // Never resurrect a dead robot into free fall — the C++ can't
+        // hit this (death detaches the carry link first), but a robot
+        // checked out of the arena mid-takt can still be reached here.
+        if self.state == RobotState::Dip {
+            return;
+        }
         self.state = RobotState::Falling;
         self.velocity = glam::Vec2::ZERO;
         self.falling_speed = 0.0;
@@ -1053,12 +1077,15 @@ impl Robot {
     /// branch are out of scope: non-player capturing robots never
     /// break, player robots only obey the automatic-mode gate.
     pub fn can_break_order(&self) -> bool {
-        if self.side != crate::matrix_game::common::PLAYER_SIDE
+        if (self.side != crate::matrix_game::common::PLAYER_SIDE
+            || crate::matrix_game::map::full_auto())
             && self.get_capture_factory().is_some()
         {
             return false; // DO NOT BREAK CAPTURING!!! NEVER!!! (C++ comment)
         }
-        !self.is_automatic_mode()
+        // `!IsAutomaticMode() && (m_Side!=PLAYER_SIDE || arcaded!=this)`
+        // (MatrixRobot.hpp:405).
+        !self.is_automatic_mode() && !self.is_arcaded
     }
 
     /// Port of `IsDisableManual` (MatrixRobot.hpp:357).
@@ -1287,6 +1314,14 @@ impl Robot {
     pub fn stop_moving(&mut self) {
         for o in self.orders.iter_mut() {
             if o.ty == OrderType::MoveTo || o.ty == OrderType::MoveToBack {
+                if o.phase == OrderPhase::CaptureMoving
+                    && std::env::var_os("MG_TRACE_CAPTURE").is_some()
+                {
+                    eprintln!(
+                        "[capture-trace] stop_moving killed capture-MoveTo({},{}) of {:?} at ({:.0},{:.0})",
+                        o.p1, o.p2, self.self_id, self.pos_x, self.pos_y
+                    );
+                }
                 *o = Order::set(OrderType::StopMove, 0.0, 0.0, 0.0, 0);
             }
         }
@@ -1925,6 +1960,20 @@ impl Robot {
                     if let Some(o) = self.orders.top_mut() {
                         o.set_phase(OrderPhase::CaptureInPosition);
                     }
+                } else if !self.orders.has(OrderType::MoveTo)
+                    && !self.orders.has(OrderType::MoveReturn)
+                    && dist.length_squared() > limit
+                {
+                    // Deviation from the C++ (which strands the order
+                    // forever here): collisions/step-asides can destroy
+                    // the approach MoveTo; once both it and any return
+                    // path are gone while still out of range, re-plot
+                    // via the Empty phase. The AI issues each capture
+                    // exactly once and the claim blocks reassignment,
+                    // so a stranded capturer deadlocks its whole side.
+                    if let Some(o) = self.orders.top_mut() {
+                        o.set_phase(OrderPhase::Empty);
+                    }
                 }
             }
             OrderPhase::CaptureInPosition => {
@@ -2261,6 +2310,25 @@ impl Robot {
             // per-takt wipe cadence stays exactly the C++'s.
             if elapsed_ms - self.move_test_change_ms > 6000 {
                 self.move_test_change_ms = elapsed_ms - 2000;
+                // Preserve the live destination across the sidestep,
+                // like the C++ step-aside does (MatrixRobot.cpp:
+                // 2969-2972) — the GetLost MoveTo replaces the current
+                // one, and a capture-move destination is issued exactly
+                // once by the AI, so losing it deadlocks the whole
+                // side. A stale MoveReturn from before this MoveTo
+                // must be refreshed, not kept: it would march the
+                // robot back to its old spot instead.
+                let tp = self.move_to_coords().unwrap_or((self.map_x, self.map_y));
+                if let Some(o) = self
+                    .orders
+                    .iter_mut()
+                    .find(|o| o.ty == OrderType::MoveReturn)
+                {
+                    o.p1 = tp.0 as f32;
+                    o.p2 = tp.1 as f32;
+                } else {
+                    self.move_return(tp.0, tp.1);
+                }
                 let fwd = self.forward;
                 self.get_lost(cms, map, &*objs, fwd, rng);
             }
@@ -2636,7 +2704,32 @@ impl Robot {
                                 // to (its move-to target, else its spot)…
                                 if let Some(o) = crate::matrix_game::logic::robot_mut(objs, id)
                                 {
-                                    if o.return_coords().is_none() {
+                                    let capture_dest = o
+                                        .orders
+                                        .iter()
+                                        .find(|x| {
+                                            x.ty == OrderType::MoveTo
+                                                && x.phase == OrderPhase::CaptureMoving
+                                        })
+                                        .map(|x| (x.p1 as i32, x.p2 as i32));
+                                    if let Some(tp) = capture_dest {
+                                        // A capture approach is sacred: a
+                                        // stale MoveReturn from before the
+                                        // capture order would march the
+                                        // robot back and strand it — point
+                                        // the return at the factory.
+                                        match o
+                                            .orders
+                                            .iter_mut()
+                                            .find(|x| x.ty == OrderType::MoveReturn)
+                                        {
+                                            Some(x) => {
+                                                x.p1 = tp.0 as f32;
+                                                x.p2 = tp.1 as f32;
+                                            }
+                                            None => o.move_return(tp.0, tp.1),
+                                        }
+                                    } else if o.return_coords().is_none() {
                                         let tp = o
                                             .move_to_coords()
                                             .unwrap_or((o.map_x, o.map_y));
@@ -4152,6 +4245,18 @@ impl MapStatic for Robot {
         }
         self.env.clear();
         self.env.reset();
+
+        // Detach the transport before dying (Damage inst_death detaches
+        // the carry data at MatrixRobot.cpp:1302-1310, ReleaseMe calls
+        // Carry(NULL) at :5158-5161) — otherwise the flyer later drops
+        // the corpse and carry_release resurrects it out of DIP.
+        if let Some(fid) = self.cargo_flyer.take() {
+            if let Some(f) = crate::matrix_game::logic::flyer_mut(objs, fid) {
+                if f.carrying_robot() == self.self_id {
+                    f.carry_detach();
+                }
+            }
+        }
 
         self.state = RobotState::Dip;
         self.dip_ttl = 5000; // FRND(3000)+2000 unit TTL ceiling

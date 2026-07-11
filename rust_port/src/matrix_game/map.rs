@@ -100,6 +100,12 @@ impl MapScope {
 impl Drop for MapScope {
     fn drop(&mut self) {
         CURRENT_MAP.with(|c| c.set(ptr::null()));
+        // Reset the clock too: mission setup runs outside any scope,
+        // and a leftover end-of-mission time from the previous game
+        // would seed spawn-time timers (e.g. cannon fire_next_think_time)
+        // differently on every mission after the first. The C++
+        // equivalent g_MatrixMap->GetTime() restarts at 0 per map.
+        CURRENT_ELAPSED_MS.with(|c| c.set(0));
     }
 }
 
@@ -133,6 +139,21 @@ thread_local! {
 /// frame by the app loop. `None` (headless sims/tests) disables culling.
 pub fn set_frustum_center(xy: [f32; 2]) {
     FRUSTUM_CENTER.with(|c| c.set(Some(xy)));
+}
+
+thread_local! {
+    static FULL_AUTO: Cell<bool> = const { Cell::new(false) };
+}
+
+/// `MMFLAG_FULLAUTO` (`g_MatrixMap->m_Flags`) — the player side is
+/// AI-driven (demo mode / headless sim). ORed with the non-player-side
+/// check in `CanBreakOrder`'s capture guard (MatrixRobot.hpp:387).
+pub fn full_auto() -> bool {
+    FULL_AUTO.with(|c| c.get())
+}
+
+pub fn set_full_auto(on: bool) {
+    FULL_AUTO.with(|c| c.set(on));
 }
 
 /// `MAX_EFFECT_DISTANCE_SQ` gate (MatrixEffect.hpp:13, guards the
