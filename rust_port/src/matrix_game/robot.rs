@@ -588,9 +588,10 @@ impl Robot {
 
     /// Port of `CMatrixRobot::SetTeam(int)` (MatrixRobot.hpp). Used by
     /// `CConstructor::ProduceRobot` / `BuildSpecialBot` to assign the
-    /// freshly-spawned robot to one of three groups.
+    /// freshly-spawned robot to one of three groups. -1 is the
+    /// "no team" sentinel resolved by `GroupNoTeamRobot`.
     pub fn set_team(&mut self, team: i32) {
-        self.team = team.clamp(0, 2);
+        self.team = team;
     }
 
     /// Port of `CMatrixRobot::m_Team` accessor.

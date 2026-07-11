@@ -1656,12 +1656,10 @@ impl MapLogic {
                 if (1..=3).contains(&inst.group) {
                     robot.set_team(inst.group - 1);
                 } else {
-                    // C++ `SetTeam(-1)` — clamp() in our setter floors
-                    // to 0 instead of preserving the deferred sentinel.
-                    // GroupNoTeamRobot (the C++ post-pass that resolves
-                    // -1 into a real team) is not ported yet, so default
-                    // to team 0 for now.
-                    robot.set_team(0);
+                    // Deferred-team sentinel; GroupNoTeamRobot resolves
+                    // these into passive Defence logic groups (this is
+                    // what keeps Training-map enemies from attacking).
+                    robot.set_team(-1);
                 }
             }
 
