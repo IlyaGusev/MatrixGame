@@ -1431,13 +1431,18 @@ struct MeshBatch {
     /// shared animation state advances to a new VO frame.
     frame_ranges: Vec<(u32, u32)>,
     current_vo_frame: usize,
+    /// GPU buffer holding only the instances inside visible map groups,
+    /// compacted from `cached_instances` whenever the visible-group mask
+    /// or the instance data changes (ports the C++ rule that DrawObjects
+    /// only walks objects of `m_VisibleGroups`, MatrixMap.cpp:1440).
     instance_buffer: wgpu::Buffer,
-    num_instances: u32,
+    num_visible: u32,
     bind_group: wgpu::BindGroup,
-    /// CPU mirror of `instance_buffer` — lets the point-light pass
-    /// retint only the instances inside the relit window and upload a
-    /// contiguous sub-range (gap entries stay valid from the mirror).
+    /// CPU mirror of ALL instances (visible or not) — the point-light
+    /// pass retints entries here; the compaction pass uploads them.
     cached_instances: Vec<InstanceData>,
+    /// Per-instance map-group index into the visible-group mask.
+    groups: Vec<u32>,
     objects: Vec<ObjectInstance>,
     /// Per-instance visibility — pre-registered break replacements start
     /// hidden; `sync_break_swaps` flips entries when the arena object's
@@ -1659,6 +1664,14 @@ pub struct ObjectsRenderer {
     /// C++ Init drops m_ShadowProj, MatrixObject.cpp:973-979).
     shadow_keys: Vec<((i32, i32), u32)>,
     shadow_visible: Vec<bool>,
+    /// Per-shadow map-group index — shadows outside the visible-group
+    /// mask are skipped (they were one draw call per object).
+    shadow_groups: Vec<u32>,
+    /// Visible-group mask the instance buffers were last compacted for.
+    last_mask: Vec<bool>,
+    /// Set when `cached_instances` changed (point-light retint / break
+    /// swap) so the next render recompacts even with an unchanged mask.
+    instances_dirty: bool,
     /// One animation runtime per VO type. `MeshBatch::anim_slot` references
     /// this vector so surfaces of the same type share one `vo_frame`.
     anims: Vec<AnimState>,
@@ -1797,6 +1810,7 @@ impl ObjectsRenderer {
         let mut batches = Vec::new();
         let mut shadow_batches = Vec::new();
         let mut shadow_keys: Vec<((i32, i32), u32)> = Vec::new();
+        let mut shadow_groups: Vec<u32> = Vec::new();
         let mut anims: Vec<AnimState> = Vec::new();
         let mut loaded_types = 0usize;
         let mut failed_types = 0usize;
@@ -1847,6 +1861,10 @@ impl ObjectsRenderer {
             let type_objects: Vec<ObjectInstance> =
                 instances.iter().map(|(obj, _)| obj.clone()).collect();
             let type_hidden: Vec<bool> = instances.iter().map(|(_, h)| *h).collect();
+            let type_groups: Vec<u32> = type_objects
+                .iter()
+                .map(|o| group_index(o.x, o.y, map))
+                .collect();
             let inst_data = batch_instance_data(&type_objects, &type_hidden, cx, cy, map, None);
             let instance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("Objects Inst VB"),
@@ -1997,9 +2015,10 @@ impl ObjectsRenderer {
                     frame_ranges: surface.frame_ranges.clone(),
                     current_vo_frame: 0,
                     instance_buffer: instance_buffer.clone(),
-                    num_instances: inst_data.len() as u32,
+                    num_visible: inst_data.len() as u32,
                     bind_group,
                     cached_instances: inst_data.clone(),
+                    groups: type_groups.clone(),
                     objects: type_objects.clone(),
                     hidden: type_hidden.clone(),
                     type_id: *type_id,
@@ -2051,6 +2070,7 @@ impl ObjectsRenderer {
                     ) {
                         shadow_batches.push(batch);
                         shadow_keys.push((pos_key(obj.0.x, obj.0.y), *type_id));
+                        shadow_groups.push(group_index(obj.0.x, obj.0.y, map));
                     }
                 }
             }
@@ -2062,7 +2082,7 @@ impl ObjectsRenderer {
             "objects: {} mesh types loaded, {} skipped, {} total instances drawn, {} projected shadows",
             loaded_types,
             failed_types,
-            batches.iter().map(|b| b.num_instances).sum::<u32>(),
+            batches.iter().map(|b| b.num_visible).sum::<u32>(),
             shadow_batches.len(),
         );
 
@@ -2083,6 +2103,9 @@ impl ObjectsRenderer {
             shadow_batches,
             shadow_keys,
             shadow_visible,
+            shadow_groups,
+            last_mask: Vec::new(),
+            instances_dirty: false,
             anims,
             uniform_buffer,
             shadow_uniform_buffer,
@@ -2099,7 +2122,7 @@ impl ObjectsRenderer {
     pub fn takt(
         &mut self,
         dt_ms: f32,
-        queue: &wgpu::Queue,
+        _queue: &wgpu::Queue,
         map: &GameMap,
         point_lights: &PointLightSystem,
     ) {
@@ -2127,9 +2150,8 @@ impl ObjectsRenderer {
         if revision != self.last_point_light_revision {
             // Retint only instances inside the relit window; same-type
             // surface batches share one instance buffer, so update it
-            // once per type. Previously this rebuilt EVERY decorative
-            // object's instance (with a light sample each) and
-            // re-uploaded all instance buffers on every relight.
+            // once per type. The GPU upload happens in render()'s
+            // visible-set compaction (instances_dirty).
             let [rx0, ry0, rx1, ry1] = point_lights.changed_rect();
             let gs = crate::matrix_game::map::GLOBAL_SCALE;
             let wx0 = (rx0 - 1) as f32 * gs;
@@ -2142,8 +2164,7 @@ impl ObjectsRenderer {
                     continue;
                 }
                 let [cx, cy] = batch.center;
-                let mut lo = usize::MAX;
-                let mut hi = 0usize;
+                let mut any = false;
                 for (i, obj) in batch.objects.iter().enumerate() {
                     if obj.x < wx0 || obj.x > wx1 || obj.y < wy0 || obj.y > wy1 {
                         continue;
@@ -2153,16 +2174,10 @@ impl ObjectsRenderer {
                     } else {
                         instance_matrix(obj, cx, cy, map, Some(point_lights))
                     };
-                    lo = lo.min(i);
-                    hi = hi.max(i);
+                    any = true;
                 }
-                if lo <= hi && lo != usize::MAX {
-                    let isz = std::mem::size_of::<InstanceData>();
-                    queue.write_buffer(
-                        &batch.instance_buffer,
-                        (lo * isz) as u64,
-                        bytemuck::cast_slice(&batch.cached_instances[lo..=hi]),
-                    );
+                if any {
+                    self.instances_dirty = true;
                 }
             }
             self.last_point_light_revision = revision;
@@ -2177,7 +2192,7 @@ impl ObjectsRenderer {
     /// logic takt (alongside the buildings sync).
     pub fn sync_break_swaps(
         &mut self,
-        queue: &wgpu::Queue,
+        _queue: &wgpu::Queue,
         objs: &Objects,
         map: &GameMap,
         point_lights: &PointLightSystem,
@@ -2230,11 +2245,7 @@ impl ObjectsRenderer {
                     map,
                     Some(point_lights),
                 );
-                queue.write_buffer(
-                    &batch.instance_buffer,
-                    0,
-                    bytemuck::cast_slice(&batch.cached_instances),
-                );
+                self.instances_dirty = true;
             }
         }
         for (i, (key, ty)) in self.shadow_keys.iter().enumerate() {
@@ -2244,13 +2255,51 @@ impl ObjectsRenderer {
         }
     }
 
+    /// `visible` is the per-frame map-group visibility mask
+    /// (`visible_groups_mask`); instances and projected shadows outside
+    /// visible groups are not drawn, matching the C++ DrawObjects walk
+    /// over `m_VisibleGroups` only.
     pub fn render<'a>(
-        &'a self,
+        &'a mut self,
         queue: &wgpu::Queue,
         pass: &mut wgpu::RenderPass<'a>,
         camera: &Camera,
         view_proj: glam::Mat4,
+        visible: &[bool],
     ) {
+        if self.instances_dirty || self.last_mask != visible {
+            let mut done_types: HashMap<u32, u32> = HashMap::new();
+            let mut scratch: Vec<InstanceData> = Vec::new();
+            for batch in &mut self.batches {
+                if let Some(&n) = done_types.get(&batch.type_id) {
+                    batch.num_visible = n;
+                    continue;
+                }
+                scratch.clear();
+                for (i, inst) in batch.cached_instances.iter().enumerate() {
+                    if batch.hidden.get(i).copied().unwrap_or(false) {
+                        continue;
+                    }
+                    let gi = batch.groups[i] as usize;
+                    if !visible.get(gi).copied().unwrap_or(true) {
+                        continue;
+                    }
+                    scratch.push(*inst);
+                }
+                if !scratch.is_empty() {
+                    queue.write_buffer(
+                        &batch.instance_buffer,
+                        0,
+                        bytemuck::cast_slice(&scratch),
+                    );
+                }
+                batch.num_visible = scratch.len() as u32;
+                done_types.insert(batch.type_id, batch.num_visible);
+            }
+            self.last_mask = visible.to_vec();
+            self.instances_dirty = false;
+        }
+
         let eye = camera.eye_pos();
         queue.write_buffer(
             &self.uniform_buffer,
@@ -2280,10 +2329,17 @@ impl ObjectsRenderer {
             }),
         );
 
-        if !self.shadow_batches.is_empty() {
+        let skip_shadows = std::env::var("MG_SKIP")
+            .map(|v| v.split(',').any(|s| s == "objshadows"))
+            .unwrap_or(false);
+        if !self.shadow_batches.is_empty() && !skip_shadows {
             pass.set_pipeline(&self.shadow_pipeline);
             for (i, batch) in self.shadow_batches.iter().enumerate() {
                 if !self.shadow_visible.get(i).copied().unwrap_or(true) {
+                    continue;
+                }
+                let gi = self.shadow_groups[i] as usize;
+                if !visible.get(gi).copied().unwrap_or(true) {
                     continue;
                 }
                 pass.set_bind_group(0, &batch.bind_group, &[]);
@@ -2296,6 +2352,9 @@ impl ObjectsRenderer {
         if !self.batches.is_empty() {
             pass.set_pipeline(&self.pipeline);
             for batch in &self.batches {
+                if batch.num_visible == 0 {
+                    continue;
+                }
                 let (offset, count) = batch
                     .frame_ranges
                     .get(batch.current_vo_frame)
@@ -2308,7 +2367,7 @@ impl ObjectsRenderer {
                 pass.set_vertex_buffer(0, batch.vertex_buffer.slice(..));
                 pass.set_vertex_buffer(1, batch.instance_buffer.slice(..));
                 pass.set_index_buffer(batch.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(offset..offset + count, 0, 0..batch.num_instances);
+                pass.draw_indexed(offset..offset + count, 0, 0..batch.num_visible);
             }
         }
     }
@@ -3045,6 +3104,16 @@ fn pos_key(x: f32, y: f32) -> (i32, i32) {
     ((x * 10.0) as i32, (y * 10.0) as i32)
 }
 
+/// Map-group index of an uncentered world position, matching the layout
+/// of `visible_groups_mask` (row-major `group_w × group_h`).
+fn group_index(x: f32, y: f32, map: &GameMap) -> u32 {
+    let gw = crate::matrix_game::common::MAP_GROUP_SIZE as f32
+        * crate::matrix_game::map::GLOBAL_SCALE;
+    let gx = ((x / gw) as i32).clamp(0, map.group_w as i32 - 1);
+    let gy = ((y / gw) as i32).clamp(0, map.group_h as i32 - 1);
+    gy as u32 * map.group_w as u32 + gx as u32
+}
+
 fn object_rotation(obj: &ObjectInstance) -> Mat3 {
     let (sx, cxr) = obj.angle_x.sin_cos();
     let (sy, cyr) = obj.angle_y.sin_cos();
@@ -3066,8 +3135,14 @@ fn resolve_texture(
     if let Some(cached) = cache.get(path) {
         return Some(cached.clone());
     }
-    let data = read_texture(path)?;
-    let rgba = decode_texture_bytes(&data)?;
+    let Some(data) = read_texture(path) else {
+        log::warn!("objects: texture not found: {path}");
+        return None;
+    };
+    let Some(rgba) = decode_texture_bytes(&data) else {
+        log::warn!("objects: texture decode failed: {path}");
+        return None;
+    };
     let view = create_texture_from_rgba(device, queue, &rgba);
     cache.insert(path.clone(), view.clone());
     Some(view)

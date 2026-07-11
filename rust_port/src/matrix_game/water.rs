@@ -79,6 +79,10 @@ struct WaterUniforms {
 
 pub struct Water {
     water_instances: Vec<WaterInstance>,
+    /// Per-instance flag: vertex-buffer contents match the current wave
+    /// phase. Off-screen groups go stale (skipped in takt) and are
+    /// refreshed when they re-enter the frustum.
+    verts_fresh: Vec<bool>,
     water_draws: Vec<WaterDraw>,
     fog_color: [f32; 4],
     vertex_buffer: wgpu::Buffer,
@@ -215,6 +219,9 @@ struct WaterDraw {
     bind_group: wgpu::BindGroup,
     index_start: u32,
     index_count: u32,
+    /// Index into the per-frame visible-group mask — the C++ WaterAlpha
+    /// loop only draws groups in `m_VisibleGroups` (MatrixMap.cpp:1743).
+    group: u32,
 }
 
 struct WaterPreset {
@@ -563,7 +570,9 @@ impl Water {
         let solid_bind_group = make_bind_group(&white_alpha_tex, "Water Solid BG");
         let idxs_per_instance = (WATER_SIZE * WATER_SIZE * 6) as u32;
         let mut water_draws = Vec::with_capacity(alpha_images.len());
-        for (group_idx, alpha_image) in alpha_images.iter().enumerate() {
+        for ((group_idx, alpha_image), &(gx, gy)) in
+            alpha_images.iter().enumerate().zip(&water_groups)
+        {
             let alpha_tex = device.create_texture_with_data(
                 queue,
                 &wgpu::TextureDescriptor {
@@ -589,6 +598,8 @@ impl Water {
                 bind_group,
                 index_start: group_idx as u32 * idxs_per_instance,
                 index_count: idxs_per_instance,
+                group: (gy / MAP_GROUP_SIZE) as u32 * map.group_w as u32
+                    + (gx / MAP_GROUP_SIZE) as u32,
             });
         }
 
@@ -746,6 +757,7 @@ impl Water {
         .ok()?;
 
         Some(Self {
+            verts_fresh: vec![true; water_instances.len()],
             water_instances,
             water_draws,
             fog_color,
@@ -790,12 +802,12 @@ impl Water {
         camera: &Camera,
         map: &GameMap,
     ) {
+        // CMatrixMap::Takt (MatrixMap.cpp:2505-2510) only iterates
+        // `m_VisibleGroups` — we replay the same check here via a full
+        // port of CalcMapGroupVisibility/CheckCandidate so off-screen
+        // waves freeze mid-animation instead of churning.
+        let visible = visible_groups_mask(camera, map);
         if let Some(inshore) = self.inshore.as_mut() {
-            // CMatrixMap::Takt (MatrixMap.cpp:2505-2510) only iterates
-            // `m_VisibleGroups` — we replay the same check here via a full
-            // port of CalcMapGroupVisibility/CheckCandidate so off-screen
-            // waves freeze mid-animation instead of churning.
-            let visible = visible_groups_mask(camera, map);
             inshore.takt(dt_ms, &visible, map.group_w);
         }
 
@@ -805,26 +817,59 @@ impl Water {
             self.accum_ms -= 60.0;
             steps += 1;
         }
-        if steps == 0 {
-            return;
-        }
 
         // CMatrixWater::Takt (MatrixWater.cpp:294-308) starts k at 1 and
         // increments once per elapsed WATER_TIME_PERIOD, so FillVB advances
         // m_angle by N+1 — in steady state that's 2 per 60 ms.
-        self.angle += steps + 1;
+        let advanced = steps > 0;
+        if advanced {
+            self.angle += steps + 1;
+        }
+
+        // Rebuild wave vertices only for on-screen groups: everything
+        // visible when the phase advanced, plus groups that just came
+        // into view holding a stale phase from when they last rendered.
+        let mut refresh: Vec<usize> = Vec::new();
+        for i in 0..self.water_instances.len() {
+            let vis = visible
+                .get(self.water_draws[i].group as usize)
+                .copied()
+                .unwrap_or(true);
+            if vis && (advanced || !self.verts_fresh[i]) {
+                refresh.push(i);
+            }
+            // A fresh instance stays fresh while the phase holds still;
+            // an advance invalidates everything not refreshed this tick.
+            self.verts_fresh[i] = if advanced { vis } else { self.verts_fresh[i] || vis };
+        }
+        if refresh.is_empty() {
+            return;
+        }
         let (lattice_z, lattice_normals) =
             build_wave_lattice(self.angle, self.water_normal_len, &self.phase_offsets);
 
-        let water_verts = build_instance_vertices(
-            &self.water_instances,
-            &lattice_z,
-            &lattice_normals,
-            self.water_scale,
-        );
-        queue.write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&water_verts));
+        // Upload contiguous runs of refreshed instances in one write each.
+        let verts_per_instance = (WATER_SIZE + 1) * (WATER_SIZE + 1);
+        let bytes_per_instance = verts_per_instance * std::mem::size_of::<WaterVertex>();
+        let mut run_start = 0usize;
+        while run_start < refresh.len() {
+            let mut run_end = run_start + 1;
+            while run_end < refresh.len() && refresh[run_end] == refresh[run_end - 1] + 1 {
+                run_end += 1;
+            }
+            let insts = &self.water_instances[refresh[run_start]..=refresh[run_end - 1]];
+            let verts =
+                build_instance_vertices(insts, &lattice_z, &lattice_normals, self.water_scale);
+            queue.write_buffer(
+                &self.vertex_buffer,
+                (refresh[run_start] * bytes_per_instance) as u64,
+                bytemuck::cast_slice(&verts),
+            );
+            run_start = run_end;
+        }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn render<'a>(
         &'a mut self,
         device: &wgpu::Device,
@@ -833,6 +878,7 @@ impl Water {
         camera: &Camera,
         view_proj: glam::Mat4,
         view: glam::Mat4,
+        visible: &[bool],
     ) {
         let world = glam::Mat4::from_scale(glam::Vec3::splat(self.water_scale));
         let normal_mat = (view * world).inverse().transpose();
@@ -888,11 +934,14 @@ impl Water {
 
         // Alpha-shoreline pass (in-map groups). Ports the first `WaterAlpha`
         // loop in MatrixMap.cpp:1743-1767 — the original runs this before
-        // the opaque off-map solid pass.
+        // the opaque off-map solid pass, and only for visible groups.
         pass.set_pipeline(&self.pipeline);
         pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
         for draw in &self.water_draws {
+            if !visible.get(draw.group as usize).copied().unwrap_or(true) {
+                continue;
+            }
             pass.set_bind_group(0, &draw.bind_group, &[]);
             pass.draw_indexed(
                 draw.index_start..(draw.index_start + draw.index_count),
@@ -1406,6 +1455,35 @@ pub(crate) fn visible_groups_mask(camera: &Camera, map: &GameMap) -> Vec<bool> {
         }
     }
     out
+}
+
+/// True when any map group overlapped by the square `pos ± r` is in the
+/// visible mask — the per-object culling test for units whose mesh can
+/// straddle a group border (robots, cannons, flyers).
+pub(crate) fn groups_visible_around(
+    visible: &[bool],
+    map: &GameMap,
+    x: f32,
+    y: f32,
+    r: f32,
+) -> bool {
+    let gw = MAP_GROUP_SIZE as f32 * GLOBAL_SCALE;
+    let gx0 = (((x - r) / gw) as i32).clamp(0, map.group_w as i32 - 1);
+    let gx1 = (((x + r) / gw) as i32).clamp(0, map.group_w as i32 - 1);
+    let gy0 = (((y - r) / gw) as i32).clamp(0, map.group_h as i32 - 1);
+    let gy1 = (((y + r) / gw) as i32).clamp(0, map.group_h as i32 - 1);
+    for gy in gy0..=gy1 {
+        for gx in gx0..=gx1 {
+            if visible
+                .get(gy as usize * map.group_w + gx as usize)
+                .copied()
+                .unwrap_or(true)
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Port of CMatrixMap::CheckCandidate (MatrixVisiCalc.cpp:470-531).

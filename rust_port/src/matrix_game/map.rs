@@ -3375,6 +3375,7 @@ impl MapRenderer {
     /// frame after `MapLogic::takt` so freshly spawned robots show
     /// up and tracks keep animating. `cms` is the per-frame delta
     /// used for the anim step.
+    #[allow(clippy::too_many_arguments)]
     pub fn sync_robots(
         &mut self,
         device: &wgpu::Device,
@@ -3385,12 +3386,14 @@ impl MapRenderer {
         cms: i32,
         ghost_cannon: Option<super::object_cannon::GhostCannon>,
         slot_markers: &[super::slot_marker::SlotMarker],
+        camera: &Camera,
     ) {
+        let visible = visible_groups_mask(camera, map);
         if let Some(robots) = &mut self.robots {
-            robots.sync_robots(device, queue, objs, map, point_lights, cms);
+            robots.sync_robots(device, queue, objs, map, point_lights, cms, &visible);
         }
         if let Some(cannons) = &mut self.cannons {
-            cannons.sync_cannons(device, queue, objs, map, ghost_cannon, &[]);
+            cannons.sync_cannons(device, queue, objs, map, ghost_cannon, &[], &visible);
         }
         if let Some(sm) = &mut self.slot_markers {
             sm.sync(queue, map, slot_markers);
@@ -3462,13 +3465,17 @@ impl MapRenderer {
             multiview_mask: None,
         });
 
+        // Diagnostic stage gate for map_render_bench: MG_SKIP=objects,water,...
+        let skip_env = std::env::var("MG_SKIP").unwrap_or_default();
+        let skip = |name: &str| skip_env.split(',').any(|s| s == name);
+
         // Sky gradient (ports DrawSky, MatrixMap.cpp:2020). Drawn before landscape
         // so terrain/water overwrite it where geometry exists.
         self.sky.render(queue, &mut pass, camera);
 
         // Bottom geometry (opaque)
         pass.set_pipeline(&self.pipeline);
-        for batch in &self.batches {
+        for batch in self.batches.iter().take(if skip("bottom") { 0 } else { usize::MAX }) {
             pass.set_bind_group(0, &batch.bind_group, &[]);
             pass.set_vertex_buffer(0, batch.vertex_buffer.slice(..));
             pass.set_index_buffer(batch.index_buffer.slice(..), batch.index_format);
@@ -3492,7 +3499,9 @@ impl MapRenderer {
         // Per-group visibility mask, matches CMatrixMap::m_VisibleGroups
         // after CalcMapGroupVisibility (MatrixVisiCalc.cpp:534-779). Surfaces
         // the C++ attached to a specific group via `g->AddSurface(this)` only
-        // draw when at least one of their owning groups is visible.
+        // draw when at least one of their owning groups is visible. The same
+        // mask culls decorative objects, their projected shadows and the
+        // per-group water passes below.
         let visible = visible_groups_mask(camera, map);
         let overlay_visible = |groups: &[u32]| -> bool {
             if groups.is_empty() {
@@ -3510,7 +3519,7 @@ impl MapRenderer {
         };
 
         // Surface overlays (alpha blended, triangle strips)
-        if !self.overlay_batches.is_empty() {
+        if !self.overlay_batches.is_empty() && !skip("overlays") {
             pass.set_pipeline(&self.overlay_pipeline);
             for batch in &self.overlay_batches {
                 if !overlay_visible(&batch.groups) {
@@ -3527,7 +3536,7 @@ impl MapRenderer {
         // Gloss pass: adds gloss*reflection weighted by atlas alpha on top of
         // the already-composited overlay (ports the stage 5 ADD(TEMP, CURRENT)
         // step of TerSurfGlossMW).
-        if !self.gloss_batches.is_empty() {
+        if !self.gloss_batches.is_empty() && !skip("gloss") {
             pass.set_pipeline(&self.gloss_pipeline);
             for batch in &self.gloss_batches {
                 if !overlay_visible(&batch.groups) {
@@ -3542,20 +3551,28 @@ impl MapRenderer {
         }
 
         // Decorative objects plus their projected shadow pass.
-        if let Some(objects) = &self.objects {
-            objects.render(queue, &mut pass, camera, view_proj);
+        if let Some(objects) = &mut self.objects {
+            if !skip("objects") {
+                objects.render(queue, &mut pass, camera, view_proj, &visible);
+            }
         }
         // Starting buildings — drawn after objects so their shadow projection
         // (when we add it) can overlay object silhouettes the way the original
         // does (MatrixMap.cpp DrawLandscape ordering).
         if let Some(robots) = &self.robots {
-            robots.render(queue, &mut pass, camera, view_proj);
+            if !skip("robots") {
+                robots.render(queue, &mut pass, camera, view_proj);
+            }
         }
         if let Some(buildings) = &self.buildings {
-            buildings.render(queue, &mut pass, camera, view_proj);
+            if !skip("buildings") {
+                buildings.render(queue, &mut pass, camera, view_proj);
+            }
         }
         if let Some(cannons) = &self.cannons {
-            cannons.render(queue, &mut pass, camera, view_proj);
+            if !skip("cannons") {
+                cannons.render(queue, &mut pass, camera, view_proj);
+            }
         }
         if let Some(sm) = &self.slot_markers {
             sm.render(queue, &mut pass, view_proj);
@@ -3565,7 +3582,9 @@ impl MapRenderer {
         self.point_lights.render(queue, &mut pass, view_proj);
 
         if let Some(water) = &mut self.water {
-            water.render(_device, &mut pass, queue, camera, view_proj, view_mat);
+            if !skip("water") {
+                water.render(_device, &mut pass, queue, camera, view_proj, view_mat, &visible);
+            }
         }
     }
 
@@ -3763,7 +3782,6 @@ pub struct Sky {
     gradient_pipeline: wgpu::RenderPipeline,
     gradient_vertex_buffer: wgpu::Buffer,
     sky_color: [f32; 3],
-    water_color: [f32; 3],
     skybox: Option<Skybox>,
 }
 
@@ -3784,14 +3802,13 @@ impl Sky {
         queue: &wgpu::Queue,
         config: &wgpu::SurfaceConfiguration,
         sky_color_rgba: u32,
-        water_color_rgba: u32,
+        _water_color_rgba: u32,
         sky_name: &str,
         sky_angle: f32,
         matrix_data: &Storage,
         read_texture: &dyn Fn(&str) -> Option<Vec<u8>>,
     ) -> Self {
         let sky_color = unpack_rgb(sky_color_rgba);
-        let water_color = unpack_rgb(water_color_rgba);
 
         let gradient_pipeline = build_gradient_pipeline(device, config);
         let gradient_vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -3819,7 +3836,6 @@ impl Sky {
             gradient_pipeline,
             gradient_vertex_buffer,
             sky_color,
-            water_color,
             skybox,
         }
     }
@@ -3869,8 +3885,14 @@ impl Sky {
             [0.0, 0.0, 0.0, 0.0]
         };
         let sky_opaque = [sr, sg, sb, 1.0];
-        let [wr, wg, wb] = self.water_color;
-        let water_opaque = [wr, wg, wb, 1.0];
+        // Below the horizon everything the geometry doesn't cover must read
+        // as fog. The original leaves those pixels holding the previous
+        // frame (no color clear in release, MatrixFormGame.cpp:149) and its
+        // linear fog converges distant geometry to m_SkyColor — so the fog
+        // color is the faithful fill. This used to be `water_color`, which
+        // is 0xFFFFFF on ARMAGEDD and turned every coverage gap (base pits,
+        // hole cells) into a glaring white "unpainted tile".
+        let water_opaque = sky_opaque;
         let water_top = bot_ndc.clamp(-1.0, 1.0);
 
         let verts = [

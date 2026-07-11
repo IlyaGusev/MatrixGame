@@ -1686,10 +1686,7 @@ impl MapLogic {
                 &robot_weapons_from_cfg(&cfg),
             );
 
-            // Team assignment (MatrixMapPrepare.cpp:1724-1732). Player
-            // side gets a `PGOrderStop` in the C++; we skip that here
-            // because the side-logic group machinery isn't wired yet —
-            // the player's initial robots will sit idle until selected.
+            // Team assignment (MatrixMapPrepare.cpp:1724-1732).
             if inst.side as i32 != PLAYER_SIDE {
                 if (1..=3).contains(&inst.group) {
                     robot.set_team(inst.group - 1);
@@ -1712,6 +1709,15 @@ impl MapLogic {
                 r.map_pos_calc(map);
             }
             self.objects.add_lt(id);
+            // Player-side pre-placed robots get a real Stop order in their
+            // own logic group (MatrixMapPrepare.cpp:1727-1731) — this is
+            // what arms auto-engagement; without it they stand inert until
+            // the player issues the first order. The C++ wraps the call in
+            // MMFLAG_SOUND_ORDER_ATTACK_DISABLE; pg_order_stop is silent.
+            if inst.side as i32 == PLAYER_SIDE {
+                let no = self.robot_to_logic_group(id);
+                self.pg_order_stop(map, no);
+            }
             ids.push(id);
         }
         // Per-side breakdown so we can verify the CMAP side byte was

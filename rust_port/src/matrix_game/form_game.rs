@@ -1567,6 +1567,7 @@ impl ApplicationHandler for App {
                     if state.is_paused { 0 } else { step_ms },
                     ghost,
                     &markers,
+                    &state.camera,
                 );
                 state.perf_acc[3] += crate::platform::now_secs() - t_sr;
 

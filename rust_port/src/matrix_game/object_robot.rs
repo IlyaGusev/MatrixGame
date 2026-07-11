@@ -1735,6 +1735,10 @@ impl RobotsRenderer {
     ///
     /// `cms` is the logic-takt delta (in ms) to advance the anim
     /// cursor by. Passed in from `form_game.rs` once per frame.
+    /// `visible` is the per-frame map-group mask; off-screen robots keep
+    /// their full logic sync (animation advance, weapon-mount write-back)
+    /// but skip draw and shadow emission, like the C++ visible-object
+    /// draw lists.
     pub fn sync_robots(
         &mut self,
         device: &wgpu::Device,
@@ -1743,6 +1747,7 @@ impl RobotsRenderer {
         map: &GameMap,
         point_lights: &PointLightSystem,
         cms: i32,
+        visible: &[bool],
     ) {
         let [cx, cy] = self.center;
         self.draws.clear();
@@ -1781,6 +1786,12 @@ impl RobotsRenderer {
                 };
                 let kidx = fl.kind.clamp(0, 3) as usize;
                 if self.flyer_bodies.get(kidx).map(|o| o.is_none()).unwrap_or(true) {
+                    continue;
+                }
+                // Generous radius: flyers hover high above the group AABBs.
+                if !crate::matrix_game::water::groups_visible_around(
+                    visible, map, fl.pos.x, fl.pos.y, 100.0,
+                ) {
                     continue;
                 }
                 let (s, c) = fl.angle.sin_cos();
@@ -1840,11 +1851,21 @@ impl RobotsRenderer {
                 continue;
             }
             let robot: &mut Robot = unsafe { &mut *(obj as *mut dyn MapStatic as *mut Robot) };
+            let on_screen = crate::matrix_game::water::groups_visible_around(
+                visible,
+                map,
+                robot.pos_x,
+                robot.pos_y,
+                40.0,
+            );
             // DIP robots render their own part meshes tumbling at the
             // wreck-piece transforms (CMatrixRobot::Draw DIP branch,
             // MatrixObjectRobot.cpp:1045-1061). Texture factor is the
             // fixed 0xFF808080 gray; no shadows.
             if robot.state == crate::matrix_game::robot::RobotState::Dip {
+                if !on_screen {
+                    continue;
+                }
                 use crate::matrix_game::robot::DipPart;
                 let [sr, sg, sb] = crate::matrix_game::side::side_color_rgb(robot.side);
                 let side_color = [sr, sg, sb, 1.0];
@@ -2043,7 +2064,11 @@ impl RobotsRenderer {
             // bit (MatrixObjectRobot.cpp:984), so stationary robots
             // pay nothing each frame. The silhouette texture is baked
             // once on first sight (cached by ObjectId).
-            if let Some(source) = chassis_gpu.shadow_source.as_ref() {
+            if !on_screen {
+                // Keep the baked silhouette + batch caches alive so
+                // re-entering the frustum doesn't re-bake.
+                alive_shadow_ids.insert(id);
+            } else if let Some(source) = chassis_gpu.shadow_source.as_ref() {
                 let sig = ShadowSig::from_robot(robot);
                 if let Some(cached) = self.shadow_cache.get(&id) {
                     if cached.sig.close_enough(&sig) {
@@ -2290,6 +2315,10 @@ impl RobotsRenderer {
                                  vo_frame: usize,
                                  invert: bool|
              -> bool {
+                if !on_screen {
+                    // Culled: report success so callers proceed normally.
+                    return true;
+                }
                 if *offset >= cap {
                     return false;
                 }

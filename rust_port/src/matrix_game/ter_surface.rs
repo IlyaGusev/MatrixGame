@@ -272,13 +272,14 @@ pub fn build_surface_overlays(
             }
 
             if !tex_cache.contains_key(&tex_path) {
-                if let Some(data) = read_texture(&tex_path) {
-                    if let Some(rgba) = decode_texture_bytes(&data) {
+                match read_texture(&tex_path).and_then(|d| decode_texture_bytes(&d)) {
+                    Some(rgba) => {
                         tex_cache.insert(
                             tex_path.clone(),
                             create_texture_from_rgba_mipped(device, queue, &rgba, 6),
                         );
                     }
+                    None => log::warn!("surface: texture failed to load: '{}'", tex_path),
                 }
             }
 

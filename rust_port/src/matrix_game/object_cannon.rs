@@ -1498,6 +1498,11 @@ pub struct CannonsRenderer {
     /// orientation matches the projection's axes. Stale entries are evicted
     /// at the start of every `sync_cannons`.
     shadow_textures: HashMap<ObjectId, wgpu::TextureView>,
+    /// Per-cannon ready-to-draw shadow batch. Cannons never move, so the
+    /// ground-projected geometry is built once per cannon and cloned into
+    /// `shadow_batches` each frame (it used to allocate fresh GPU buffers
+    /// for every cannon every frame).
+    shadow_geo_cache: HashMap<ObjectId, ShadowBatch>,
     /// Per-cannon ground-projection mesh, rebuilt per frame from the
     /// live cannon list inside `sync_cannons`.
     shadow_batches: Vec<ShadowBatch>,
@@ -1732,6 +1737,7 @@ impl CannonsRenderer {
             dip_draws: Vec::new(),
             shadow_system,
             shadow_textures: HashMap::new(),
+            shadow_geo_cache: HashMap::new(),
             shadow_batches: Vec::new(),
         })
     }
@@ -1757,6 +1763,7 @@ impl CannonsRenderer {
         map: &GameMap,
         ghost: Option<GhostCannon>,
         markers: &[TurretSlotMarker],
+        visible: &[bool],
     ) {
         let [cx, cy] = self.center;
         self.draws.clear();
@@ -1787,6 +1794,14 @@ impl CannonsRenderer {
             }
             let c: &Cannon = unsafe { &*(obj as *const dyn MapStatic as *const Cannon) };
             let k = ((c.kind - 1).max(0) as usize).min(3);
+            if !crate::matrix_game::water::groups_visible_around(
+                visible, map, c.pos.x, c.pos.y, 40.0,
+            ) {
+                // Off-screen: emit nothing, keep the silhouette / geometry
+                // caches warm for when the cannon scrolls back into view.
+                alive_shadow_ids.insert(id);
+                continue;
+            }
             // DIP wrecks: each surviving piece gets its own
             // single-sub-mesh draw with a tumble transform; no shadow
             // (the C++ flips SHADOW_OFF at inst_death).
@@ -1860,7 +1875,11 @@ impl CannonsRenderer {
             // world rotation so the texture's projector axes match the
             // ground-projection's axes. Bake is one-shot (cached by
             // ObjectId); the ground geometry rebuilds per frame.
-            if let Some(kind_gpu) = self.kinds.get(k) {
+            if let Some(cached) = self.shadow_geo_cache.get(&id) {
+                // Static cannon, static light: reuse the built batch.
+                self.shadow_batches.push(cached.clone());
+                alive_shadow_ids.insert(id);
+            } else if let Some(kind_gpu) = self.kinds.get(k) {
                 if let Some(src) = kind_gpu.shadow_source.as_ref() {
                     let world_uc = cannon_world_uncentered(c);
                     let local_pts: Vec<Vec3> = src
@@ -1914,6 +1933,7 @@ impl CannonsRenderer {
                             6,
                             [cx, cy],
                         ) {
+                            self.shadow_geo_cache.insert(id, batch.clone());
                             self.shadow_batches.push(batch);
                         }
                         alive_shadow_ids.insert(id);
@@ -1993,6 +2013,8 @@ impl CannonsRenderer {
         // (destroyed). Without this the cache leaks one texture per dead
         // cannon for the renderer's lifetime.
         self.shadow_textures
+            .retain(|id, _| alive_shadow_ids.contains(id));
+        self.shadow_geo_cache
             .retain(|id, _| alive_shadow_ids.contains(id));
     }
 
