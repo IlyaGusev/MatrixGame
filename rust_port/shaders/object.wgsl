@@ -19,6 +19,9 @@ struct M {
     scroll: vec4<f32>,
 };
 @group(0) @binding(6) var<uniform> m: M;
+// WRAP sampler for the scrolling back texture — its UV offset grows past
+// [0,1] and must repeat (obj_ord4 pass 1 sets D3DTADDRESS_WRAP).
+@group(0) @binding(7) var s_scroll: sampler;
 
 struct VIn {
     @location(0) position: vec3<f32>,
@@ -68,15 +71,6 @@ struct VOut {
     let ndotl = max(dot(n, l), 0.0);
     let lighting = clamp(u.ambient_color.rgb + u.light_color.rgb * ndotl, vec3<f32>(0.0), vec3<f32>(1.0));
     var rgb = tex.rgb * in.terrain_color * lighting;
-    let scroll_uv = in.uv + m.scroll.xy * u.time_ms.x;
-
-    if (m.flags.z != 0u) {
-        let mask = textureSample(t_mask, s_diffuse, scroll_uv);
-        let back = textureSample(t_back, s_diffuse, scroll_uv);
-        let back_rgb = back.rgb * in.terrain_color * lighting;
-        let blend = max(mask.a, max(mask.r, max(mask.g, mask.b)));
-        rgb = mix(rgb, back_rgb, clamp(blend, 0.0, 1.0));
-    }
 
     if (m.flags.x != 0u) {
         let gloss = textureSample(t_gloss, s_diffuse, in.uv).rgb;
@@ -84,6 +78,17 @@ struct VOut {
         let fresnel = pow(1.0 - max(dot(view_dir, n), 0.0), 4.0);
         let reflection = mix(u.fog_color.rgb, vec3<f32>(1.0), fresnel);
         rgb += gloss * reflection;
+    }
+
+    // Mask/back pass (obj_ord4 pass 1, MatrixSkinManager.cpp:1502-1533):
+    // the raw back texture is alpha-blended over the lit+gloss result using
+    // the mask's ALPHA channel only — mask RGB is often plain white
+    // (detail03_mask) and must not drive the blend. The scroll transform
+    // sits on the back stage alone; the mask samples static UVs.
+    if (m.flags.z != 0u) {
+        let mask_a = textureSample(t_mask, s_diffuse, in.uv).a;
+        let back = textureSample(t_back, s_scroll, in.uv + m.scroll.xy * u.time_ms.x);
+        rgb = mix(rgb, back.rgb, mask_a);
     }
 
     let fog_f = clamp((u.fog_params.y - in.view_dist) / (u.fog_params.y - u.fog_params.x), 0.0, 1.0);

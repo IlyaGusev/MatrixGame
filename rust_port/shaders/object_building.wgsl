@@ -93,16 +93,16 @@ struct VOut {
     let base = tex.rgb * in.terrain_color;
     let tinted = mix(in.side_color, base, tex.a);
     var rgb = tinted * lighting;
-    let scroll_uv = in.uv + m.scroll.xy * u.time_ms.x;
 
+    // Mask/back stages (obj_side6, MatrixSkinManager.cpp:378-397): stage 5
+    // blends the raw back texture — unlit, no side tint — over the lit
+    // result using the mask's ALPHA channel only (mask RGB is often plain
+    // white). Only the back stage scrolls; the mask samples static UVs.
+    // Gloss (stage 6 ADD) comes after this blend, matching the order below.
     if (m.flags.z != 0u) {
-        let mask = textureSample(t_mask, s_diffuse, scroll_uv);
-        let back = textureSample(t_back, s_diffuse, scroll_uv);
-        let back_base = back.rgb * in.terrain_color;
-        let back_tinted = mix(in.side_color, back_base, back.a);
-        let back_rgb = back_tinted * lighting;
-        let blend = max(mask.a, max(mask.r, max(mask.g, mask.b)));
-        rgb = mix(rgb, back_rgb, clamp(blend, 0.0, 1.0));
+        let mask_a = textureSample(t_mask, s_diffuse, in.uv).a;
+        let back = textureSample(t_back, s_diffuse, in.uv + m.scroll.xy * u.time_ms.x);
+        rgb = mix(rgb, back.rgb, mask_a);
     }
 
     if (m.flags.x != 0u) {

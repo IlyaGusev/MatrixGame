@@ -1800,6 +1800,19 @@ impl ObjectsRenderer {
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             ..Default::default()
         });
+        // WRAP sampler for the scrolling back texture only (obj_ord4 pass 1
+        // sets D3DTADDRESS_WRAP): its UV offset accumulates past [0,1] and
+        // clamping freezes the scroll. The clamp sampler above stays on
+        // everything else — projected-shadow quads and static material UVs
+        // must not wrap.
+        let scroll_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            ..Default::default()
+        });
 
         let pipeline = create_objects_pipeline(device, config, &objects_bgl);
         let shadow_pipeline = create_shadow_pipeline(device, config, &shadow_bgl);
@@ -2011,6 +2024,10 @@ impl ObjectsRenderer {
                         wgpu::BindGroupEntry {
                             binding: 6,
                             resource: mat_uniform.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 7,
+                            resource: wgpu::BindingResource::Sampler(&scroll_sampler),
                         },
                     ],
                 });
@@ -2530,6 +2547,12 @@ fn create_objects_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
                     has_dynamic_offset: false,
                     min_binding_size: None,
                 },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 7,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                 count: None,
             },
         ],

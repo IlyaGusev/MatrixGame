@@ -2977,6 +2977,104 @@ impl MapRenderer {
                 .map(|&m| m.count_ones() >= 14)
                 .collect();
 
+            // Compiled-mesh z per heightmap point, from vertices actually
+            // referenced by textured triangles (cliff faces stack several
+            // verts per point — keep the top edge). Filler corners snap to
+            // these so the quads seam with the real mesh.
+            let mut real_z: std::collections::HashMap<(usize, usize), f32> =
+                std::collections::HashMap::new();
+            for (verts, idxs, coords) in batches_by_tex
+                .iter()
+                .filter(|(&tex, _)| tex != u32::MAX)
+                .map(|(_, b)| b)
+            {
+                for &i in idxs {
+                    let z = verts[i as usize].position[2];
+                    real_z
+                        .entry(coords[i as usize])
+                        .and_modify(|m| *m = m.max(z))
+                        .or_insert(z);
+                }
+            }
+
+            // Lowest surface-overlay z per cell (center-sampled). Hole cells
+            // can keep heightfield mounds the compiled mesh omits; whether
+            // the filler may follow one depends on what's above: under an
+            // overlay it must stay below the overlay plane (training hides a
+            // z≈2.3 mound under its flat base platform — following it pokes
+            // dirt patches through), while an uncovered mound is scenery
+            // (Armageddon's snow mesa under the landing pad).
+            let mut overlay_floor: Vec<Option<f32>> = vec![None; sx * map.size_y];
+            for (name, vert_size) in [("surfacesM", 32usize), ("surfaces", 24)] {
+                let Some(buf) = stor.get_buf(name, "Data") else {
+                    continue;
+                };
+                for i in 0..buf.arrays_count() {
+                    let raw = buf.get_bytes(i);
+                    if raw.len() < 32 {
+                        continue;
+                    }
+                    let rd_u32 =
+                        |o: usize| u32::from_le_bytes(raw[o..o + 4].try_into().unwrap());
+                    let rd_f32 =
+                        |o: usize| f32::from_le_bytes(raw[o..o + 4].try_into().unwrap());
+                    let vcnt = rd_u32(12) as usize;
+                    let idxsz = rd_u32(16) as usize;
+                    let disp_x = rd_f32(24);
+                    let disp_y = rd_f32(28);
+                    let vend = 32 + vcnt * vert_size;
+                    if vend + idxsz > raw.len() {
+                        continue;
+                    }
+                    let pt = |vi: usize| {
+                        [
+                            rd_f32(32 + vi * vert_size) + disp_x,
+                            rd_f32(32 + vi * vert_size + 4) + disp_y,
+                            rd_f32(32 + vi * vert_size + 8),
+                        ]
+                    };
+                    let idx: Vec<usize> = (0..idxsz / 2)
+                        .map(|k| {
+                            u16::from_le_bytes(
+                                raw[vend + k * 2..vend + k * 2 + 2].try_into().unwrap(),
+                            ) as usize
+                        })
+                        .collect();
+                    for w in idx.windows(3) {
+                        if w[0] == w[1]
+                            || w[1] == w[2]
+                            || w[0] == w[2]
+                            || w.iter().any(|&v| v >= vcnt)
+                        {
+                            continue;
+                        }
+                        let (a, b, c) = (pt(w[0]), pt(w[1]), pt(w[2]));
+                        let tri_min_z = a[2].min(b[2]).min(c[2]);
+                        let x0 = (a[0].min(b[0]).min(c[0]) / GLOBAL_SCALE).floor() as i32;
+                        let x1 = (a[0].max(b[0]).max(c[0]) / GLOBAL_SCALE).ceil() as i32;
+                        let y0 = (a[1].min(b[1]).min(c[1]) / GLOBAL_SCALE).floor() as i32;
+                        let y1 = (a[1].max(b[1]).max(c[1]) / GLOBAL_SCALE).ceil() as i32;
+                        for gy in y0.max(0)..y1.min(map.size_y as i32) {
+                            for gx in x0.max(0)..x1.min(sx as i32) {
+                                let px = (gx as f32 + 0.5) * GLOBAL_SCALE;
+                                let py = (gy as f32 + 0.5) * GLOBAL_SCALE;
+                                let e = |p: &[f32; 3], q: &[f32; 3]| {
+                                    (q[0] - p[0]) * (py - p[1]) - (q[1] - p[1]) * (px - p[0])
+                                };
+                                let (e0, e1, e2) = (e(&a, &b), e(&b, &c), e(&c, &a));
+                                if (e0 >= 0.0 && e1 >= 0.0 && e2 >= 0.0)
+                                    || (e0 <= 0.0 && e1 <= 0.0 && e2 <= 0.0)
+                                {
+                                    let slot = &mut overlay_floor[gy as usize * sx + gx as usize];
+                                    *slot =
+                                        Some(slot.map_or(tri_min_z, |m: f32| m.min(tri_min_z)));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             #[derive(Default)]
             struct FillSet {
                 verts: Vec<Vertex>,
@@ -3065,13 +3163,24 @@ impl MapRenderer {
                         None => ([0.5, 0.5], [0.5, 0.5]),
                     };
                     let base = set.verts.len() as u32;
-                    for (dx, dy) in [(0usize, 0usize), (1, 0), (0, 1), (1, 1)] {
+                    // Corner z: seam to the real mesh where it has a vertex;
+                    // elsewhere follow the heightfield, but never rise past
+                    // the covering overlay (see overlay_floor above).
+                    const CORNERS: [(usize, usize); 4] = [(0, 0), (1, 0), (0, 1), (1, 1)];
+                    let seam: [Option<f32>; 4] =
+                        CORNERS.map(|(dx, dy)| real_z.get(&(x + dx, y + dy)).copied());
+                    let cap = overlay_floor[y * sx + x].map(|z| z - 0.5);
+                    for (k, &(dx, dy)) in CORNERS.iter().enumerate() {
                         let p = map.point(x + dx, y + dy);
+                        let z = seam[k].unwrap_or_else(|| match cap {
+                            Some(c) => p.z.min(c),
+                            None => p.z,
+                        });
                         set.verts.push(Vertex {
                             position: [
                                 (x + dx) as f32 * GLOBAL_SCALE - cx,
                                 (y + dy) as f32 * GLOBAL_SCALE - cy,
-                                p.z,
+                                z,
                             ],
                             color: [
                                 p.r as f32 / 255.0,
