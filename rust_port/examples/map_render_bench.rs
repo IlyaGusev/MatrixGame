@@ -176,6 +176,29 @@ fn main() {
         if std::env::var("MG_SHOT").is_ok() {
             save_png(&device, &queue, &color, W, H, &format!("shot_{name}.png"));
         }
+
+        // MG_PICK=px,py[,z]: unproject the screen pixel onto the z plane
+        // (default derived by scanning plane heights) and print world pos.
+        if let Ok(pick) = std::env::var("MG_PICK") {
+            let mut it = pick.split(',').filter_map(|v| v.trim().parse::<f32>().ok());
+            let (px, py) = (it.next().unwrap_or(0.0), it.next().unwrap_or(0.0));
+            let zp = it.next().unwrap_or(92.0);
+            let inv = camera.view_proj().inverse();
+            let ndc_x = px / W as f32 * 2.0 - 1.0;
+            let ndc_y = 1.0 - py / H as f32 * 2.0;
+            let p0 = inv.project_point3(glam::Vec3::new(ndc_x, ndc_y, 0.0));
+            let p1 = inv.project_point3(glam::Vec3::new(ndc_x, ndc_y, 0.9));
+            let dir = (p1 - p0).normalize();
+            let t = (zp - p0.z) / dir.z;
+            let hit = p0 + dir * t;
+            println!(
+                "MG_PICK ({px},{py}) z={zp}: world ({:.1}, {:.1}) cell ({}, {})",
+                hit.x + map.world_width() * 0.5,
+                hit.y + map.world_height() * 0.5,
+                ((hit.x + map.world_width() * 0.5) / 20.0) as i32,
+                ((hit.y + map.world_height() * 0.5) / 20.0) as i32,
+            );
+        }
     }
 }
 

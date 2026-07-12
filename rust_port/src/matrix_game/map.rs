@@ -2871,6 +2871,256 @@ impl MapRenderer {
             total_tris
         );
 
+        // Fill cells that have NO bottom geometry at all (authored pits
+        // under bases / factories / ruin sites) with flat vertex-colored
+        // quads. The C++ leaves these pixels undrawn and relies on never
+        // clearing the color target in release (MatrixFormGame.cpp:149),
+        // so they self-heal with the previous frame's contents; our WebGL
+        // swapchain has no stable previous frame, and the gaps showed as
+        // sky-colored "unpainted" patches wherever a building mesh or its
+        // projected shadow didn't fully cover the hole. Water cells are
+        // excluded (the water passes own them); depth-only sentinel cells
+        // count as covered (their carve is intentional).
+        {
+            let cx = map.world_width() * 0.5;
+            let cy = map.world_height() * 0.5;
+            // A cell counts as covered when the bottom triangles blanket
+            // (nearly) all of a 4x4 sample grid inside it — exact enough
+            // for the cell-quad geometry and robust against the down-cell
+            // -normal*0.5 nudges and cliff-face triangles.
+            let sx = map.size_x;
+            let mut samples = vec![0u16; sx * map.size_y];
+            // Per covered cell: the atlas tile (page + uv rect) drawn there,
+            // so filler cells can borrow the nearest neighbor's tile and
+            // read as continued ground instead of a flat color patch.
+            let mut cell_tile: Vec<Option<(u32, [f32; 2], [f32; 2])>> =
+                vec![None; sx * map.size_y];
+            // The -1 sentinel batch (depth-only carve) draws no color, so
+            // its cells still need visible fill — don't count it.
+            for (&tex, (verts, idxs, _)) in
+                batches_by_tex.iter().filter(|(&tex, _)| tex != u32::MAX)
+            {
+                for t in idxs.chunks_exact(3) {
+                    let p: Vec<[f32; 2]> = t
+                        .iter()
+                        .map(|&i| {
+                            let v = &verts[i as usize].position;
+                            [v[0] + cx, v[1] + cy]
+                        })
+                        .collect();
+                    let (x0, x1) = (
+                        p.iter().map(|q| q[0]).fold(f32::MAX, f32::min),
+                        p.iter().map(|q| q[0]).fold(f32::MIN, f32::max),
+                    );
+                    let (y0, y1) = (
+                        p.iter().map(|q| q[1]).fold(f32::MAX, f32::min),
+                        p.iter().map(|q| q[1]).fold(f32::MIN, f32::max),
+                    );
+                    let step = GLOBAL_SCALE / 4.0;
+                    let gx0 = ((x0 / step).floor() as i32).max(0);
+                    let gx1 = ((x1 / step).ceil() as i32).min((sx * 4) as i32 - 1);
+                    let gy0 = ((y0 / step).floor() as i32).max(0);
+                    let gy1 = ((y1 / step).ceil() as i32).min((map.size_y * 4) as i32 - 1);
+                    let edge = |a: &[f32; 2], b: &[f32; 2], px: f32, py: f32| {
+                        (b[0] - a[0]) * (py - a[1]) - (b[1] - a[1]) * (px - a[0])
+                    };
+                    for gy in gy0..=gy1 {
+                        for gx in gx0..=gx1 {
+                            let px = (gx as f32 + 0.5) * step;
+                            let py = (gy as f32 + 0.5) * step;
+                            let e0 = edge(&p[0], &p[1], px, py);
+                            let e1 = edge(&p[1], &p[2], px, py);
+                            let e2 = edge(&p[2], &p[0], px, py);
+                            if (e0 >= 0.0 && e1 >= 0.0 && e2 >= 0.0)
+                                || (e0 <= 0.0 && e1 <= 0.0 && e2 <= 0.0)
+                            {
+                                let cell = (gy / 4) as usize * sx + (gx / 4) as usize;
+                                let bit = ((gy % 4) * 4 + (gx % 4)) as u16;
+                                samples[cell] |= 1 << bit;
+                            }
+                        }
+                    }
+                    // Record / expand this cell's tile uv rect (the cell's
+                    // two triangles together span the full tile).
+                    let ccx = ((p[0][0] + p[1][0] + p[2][0]) / 3.0 / GLOBAL_SCALE) as i32;
+                    let ccy = ((p[0][1] + p[1][1] + p[2][1]) / 3.0 / GLOBAL_SCALE) as i32;
+                    if ccx >= 0 && ccy >= 0 && (ccx as usize) < sx && (ccy as usize) < map.size_y
+                    {
+                        let slot = &mut cell_tile[ccy as usize * sx + ccx as usize];
+                        let mut u0 = [f32::MAX; 2];
+                        let mut u1 = [f32::MIN; 2];
+                        for &i in t {
+                            let uv = verts[i as usize].uv;
+                            u0[0] = u0[0].min(uv[0]);
+                            u0[1] = u0[1].min(uv[1]);
+                            u1[0] = u1[0].max(uv[0]);
+                            u1[1] = u1[1].max(uv[1]);
+                        }
+                        match slot {
+                            Some((stex, s0, s1)) if *stex == tex => {
+                                s0[0] = s0[0].min(u0[0]);
+                                s0[1] = s0[1].min(u0[1]);
+                                s1[0] = s1[0].max(u1[0]);
+                                s1[1] = s1[1].max(u1[1]);
+                            }
+                            Some(_) => {}
+                            None => *slot = Some((tex, u0, u1)),
+                        }
+                    }
+                }
+            }
+            let cell_covered: Vec<bool> = samples
+                .iter()
+                .map(|&m| m.count_ones() >= 14)
+                .collect();
+
+            #[derive(Default)]
+            struct FillSet {
+                verts: Vec<Vertex>,
+                idxs: Vec<u32>,
+                coords: Vec<(usize, usize)>,
+            }
+            let macro_step = 1.0 / map.macro_texture_size.max(1) as f32;
+            let mut per_tex: std::collections::HashMap<u32, FillSet> =
+                std::collections::HashMap::new();
+            let mut fallback = FillSet::default();
+            let mut filler_cells = 0usize;
+            for y in 0..map.size_y {
+                for x in 0..map.size_x {
+                    if cell_covered[y * sx + x] {
+                        continue;
+                    }
+                    if map.unit(x, y).flags & crate::matrix_game::common::CELLFLAG_WATER != 0 {
+                        continue;
+                    }
+                    // Nearest covered cell's tile, expanding square rings.
+                    let mut tile: Option<(u32, [f32; 2], [f32; 2])> = None;
+                    'ring: for r in 1i32..=10 {
+                        for ny in (y as i32 - r)..=(y as i32 + r) {
+                            for nx in (x as i32 - r)..=(x as i32 + r) {
+                                if (ny - y as i32).abs() != r && (nx - x as i32).abs() != r {
+                                    continue;
+                                }
+                                if nx < 0
+                                    || ny < 0
+                                    || nx as usize >= sx
+                                    || ny as usize >= map.size_y
+                                {
+                                    continue;
+                                }
+                                if let Some(t) = cell_tile[ny as usize * sx + nx as usize] {
+                                    tile = Some(t);
+                                    break 'ring;
+                                }
+                            }
+                        }
+                    }
+                    let set = match tile {
+                        Some((tex, _, _)) => per_tex.entry(tex).or_default(),
+                        None => &mut fallback,
+                    };
+                    let (uv0, uv1) = match tile {
+                        Some((_, a, b)) => (a, b),
+                        None => ([0.5, 0.5], [0.5, 0.5]),
+                    };
+                    let base = set.verts.len() as u32;
+                    for (dx, dy) in [(0usize, 0usize), (1, 0), (0, 1), (1, 1)] {
+                        let p = map.point(x + dx, y + dy);
+                        set.verts.push(Vertex {
+                            position: [
+                                (x + dx) as f32 * GLOBAL_SCALE - cx,
+                                (y + dy) as f32 * GLOBAL_SCALE - cy,
+                                p.z,
+                            ],
+                            color: [
+                                p.r as f32 / 255.0,
+                                p.g as f32 / 255.0,
+                                p.b as f32 / 255.0,
+                                1.0,
+                            ],
+                            uv: [
+                                if dx == 0 { uv0[0] } else { uv1[0] },
+                                if dy == 0 { uv0[1] } else { uv1[1] },
+                            ],
+                            macro_uv: [
+                                macro_step * (x + dx) as f32,
+                                macro_step * (y + dy) as f32,
+                            ],
+                        });
+                        set.coords.push((x + dx, y + dy));
+                    }
+                    set.idxs
+                        .extend([base, base + 1, base + 2, base + 2, base + 1, base + 3]);
+                    filler_cells += 1;
+                }
+            }
+            if filler_cells > 0 {
+                log::info!("terrain bottom: {} pit-filler cells", filler_cells);
+            }
+            // Fallback tone for cells with no textured neighbor in range:
+            // vertex_color * 0.44 reads as shadowed pit interior.
+            let dark = create_solid_texture(device, queue, [112, 112, 112, 255]);
+            let mut fill_batches: Vec<(Option<u32>, FillSet)> = per_tex
+                .into_iter()
+                .map(|(tex, set)| (Some(tex), set))
+                .collect();
+            if !fallback.idxs.is_empty() {
+                fill_batches.push((None, fallback));
+            }
+            for (tex, set) in fill_batches {
+                let tex_view: &wgpu::TextureView =
+                    match tex.and_then(|t| atlas_views.get(t as usize)) {
+                        Some(v) => v,
+                        None => &dark,
+                    };
+                let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Bottom Filler VB"),
+                    contents: bytemuck::cast_slice(&set.verts),
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                });
+                let ib = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Bottom Filler IB"),
+                    contents: bytemuck::cast_slice(&set.idxs),
+                    usage: wgpu::BufferUsages::INDEX,
+                });
+                let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("Bottom Filler BG"),
+                    layout: &bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: uniform_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(tex_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Sampler(&sampler),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::TextureView(&macro_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: wgpu::BindingResource::Sampler(&macro_sampler),
+                        },
+                    ],
+                });
+                batches.push(DrawBatch {
+                    bind_group: bg,
+                    vertex_buffer: vb,
+                    index_buffer: ib,
+                    num_indices: set.idxs.len() as u32,
+                    index_format: wgpu::IndexFormat::Uint32,
+                    cpu_vertices: Some(set.verts),
+                    point_coords: Some(set.coords),
+                });
+            }
+        }
+
         // Reflection texture for the gloss pass — the per-sky `Reflection`
         // param from the Sky block (MatrixMapPrepare.cpp:1137), defaulting
         // to TEXTURE_PATH_REFLECTION (StringConstants.hpp:124) when absent.
