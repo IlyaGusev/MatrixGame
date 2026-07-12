@@ -64,7 +64,7 @@ ALWAYS build with opt-level 3: `Cargo.toml` sets `[profile.dev] opt-level = 3` s
 
 ## Rust Port File Structure (mirrors original C++)
 
-The layout mirrors the original tree; `rust_port/src/CROSSREF.md` is the
+The layout mirrors the original tree; `rust_port/CROSSREF.md` is the
 authoritative per-file mapping — when adding a Rust file, place it where
 that table predicts and extend the table in the same change.
 
