@@ -505,10 +505,19 @@ impl MapStatic for Flyer {
         let d = angle_dist(self.pitch, self.target_pitch);
         self.pitch += d * mul;
 
-        // Altitude tracking (1374-1382).
+        // Altitude tracking (1374-1382). The C++ uses `td.mul`
+        // (1-0.998^ms) here, but `proceed_trajectory` resets pos.z to
+        // the spline every takt, so the blend never accumulates — the
+        // rendered z is just `spline_z + (env_z - spline_z)*mul(ms of
+        // the LAST sub-takt)`. With the frame remainder sub-takt (0-9
+        // ms) that offset changes frame to frame and the flyer visibly
+        // bobs. Use the fixed 10 ms blend factor instead so the offset
+        // matches the whole-takt C++ value and stays frame-rate
+        // independent.
         ensure_flyer_alt_grid(objs, map);
         let newz = self.calc_z_in_point(map, objs, self.pos.x, self.pos.y);
-        self.pos.z += (newz - self.pos.z) * mul;
+        let alt_mul = (1.0 - 0.998f64.powi(crate::matrix_game::logic::LOGIC_TAKT_PERIOD_MS)) as f32;
+        self.pos.z += (newz - self.pos.z) * alt_mul;
         self.core.geo_center = self.pos;
     }
 }

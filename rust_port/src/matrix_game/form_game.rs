@@ -1171,6 +1171,17 @@ impl ApplicationHandler for App {
                                 );
                                 return;
                             }
+                            // HURRY (MatrixFormGame.cpp:975-987):
+                            // finish the reinforcements cooldown now.
+                            if state.cheat_keys.ends_with("HURRY") {
+                                state.cheat_keys.clear();
+                                if !state.game.maintenance_disabled()
+                                    && state.game.maintenance_time > 0
+                                {
+                                    state.game.maintenance_time = 1;
+                                }
+                                return;
+                            }
                         }
                     }
                     // Held-state for the arcade `GetAsyncKeyState`
@@ -4541,6 +4552,15 @@ fn refresh_interface_visibility(state: &mut AppState) {
         turret_disabled,
         buca_disabled,
         maintenance_cooling: state.game.maintenance_disabled() || state.game.maintenance_time > 0,
+        maintenance_t: if state.game.maintenance_disabled() {
+            0.0
+        } else {
+            // `BeforMaintenanceTimeT` (MatrixMap.hpp:471).
+            let cfg = crate::matrix_game::config::global();
+            let total = cfg.difficulty.k_time_before_maintenance
+                * (cfg.timings.maintenance_period * state.game.maintenance_prc / 100) as f32;
+            1.0 - state.game.maintenance_time as f32 / total.max(1.0)
+        },
         installed_turret_kinds,
         building_stack_turret_kinds: stack_kinds,
         building_stack_robot_atlas_keys: stack_robot_keys,

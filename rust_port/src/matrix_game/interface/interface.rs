@@ -140,6 +140,10 @@ pub struct MainVisibilityCtx {
     /// `callhell` DISABLED flag — maintenance off or its cooldown
     /// running (CInterface.cpp:1609-1613).
     pub maintenance_cooling: bool,
+    /// `BeforMaintenanceTimeT()` (MatrixMap.hpp:471) — elapsed fraction
+    /// of the reinforcements cooldown (0 just called → 1 ready), 0 when
+    /// maintenance is disabled. Drives the callhell drum wipe.
+    pub maintenance_t: f32,
     /// Per-slot installed turret kind (1..=4) for the building's
     /// physical turret slots. `Some(k)` ⇒ slot is occupied with a
     /// cannon of kind `k` (`m_TurretsPlaces[i].m_CannonType`). `None` ⇒
@@ -558,9 +562,13 @@ impl CInterface {
                         if ctx.maintenance_cooling {
                             e.cur_state = ElementState::Disabled;
                             e.def_state = ElementState::Disabled;
-                        } else if matches!(e.cur_state, ElementState::Disabled) {
-                            e.cur_state = ElementState::Normal;
-                            e.def_state = ElementState::Normal;
+                            e.drum_t = Some(ctx.maintenance_t);
+                        } else {
+                            e.drum_t = None;
+                            if matches!(e.cur_state, ElementState::Disabled) {
+                                e.cur_state = ElementState::Normal;
+                                e.def_state = ElementState::Normal;
+                            }
                         }
                     }
                     "baseln" => e.set_visible(true),
@@ -799,6 +807,7 @@ impl CInterface {
                 animation: None,
                 visible_alpha: None,
                 ramka_color: None,
+                drum_t: None,
             });
         }
 
@@ -871,6 +880,7 @@ impl CInterface {
                     animation: None,
                     visible_alpha: None,
                     ramka_color: None,
+                    drum_t: None,
                 });
             }
         }
@@ -966,6 +976,7 @@ impl CInterface {
                                 animation: None,
                                 visible_alpha: None,
                                 ramka_color: None,
+                                drum_t: None,
                             });
                         }
                     }
@@ -1016,37 +1027,17 @@ impl CInterface {
                             .map(|i| (i.w, i.h))
                             .unwrap_or((32.0, 32.0));
                         let (px, py) = DWEAPON[slot];
-                        self.elements.push(IFaceElement {
-                            name: format!("_dynweap_{}", slot),
-                            kind: ElementKind::Static,
-                            button_type: ButtonType::default(),
-                            // DYNAMIC_WEAPON_ON_ID (CInterface.h).
-                            id: 650 + slot as i32,
-                            group: 0,
-                            flags: IFEF_VISIBLE,
-                            param1: 0.0,
-                            param2: 0.0,
-                            i_param: 0,
-                            pos_x: px,
-                            pos_y: py,
-                            pos_z: 0.0000001,
-                            size_x: iw,
-                            size_y: ih,
-                            images,
-                            labels: Vec::new(),
-                            cur_state: ElementState::Normal,
-                            def_state: ElementState::Normal,
-                            hint_template: String::new(),
-                            hint_offset_x: 0,
-                            hint_offset_y: 0,
-                            animation: None,
-                            visible_alpha: None,
-                            ramka_color: None,
-                        });
+                        // Draw order ports the C++ z-sort: the icon is
+                        // created at z=1e-7, the overheat overlay at
+                        // z=1e-6, and SortElementsByZ orders DESCENDING
+                        // with the list rendered first→last — so the
+                        // red `ovhe` square draws FIRST and the weapon
+                        // icon lands ON TOP of it. The heat shows as a
+                        // fading red glow around the icon, never hiding
+                        // it. We render in vector order, so push the
+                        // overlay before the icon.
                         if heat_alpha > 0.0 {
-                            if let Some(oh) =
-                                self.elements.iter().position(|e| e.name == "ovhe")
-                            {
+                            if let Some(oh) = self.elements.iter().position(|e| e.name == "ovhe") {
                                 let images = self.elements[oh].images.clone();
                                 let (ow, ohh) = images
                                     .first()
@@ -1078,9 +1069,38 @@ impl CInterface {
                                     animation: None,
                                     visible_alpha: Some(heat_alpha),
                                     ramka_color: None,
+                                    drum_t: None,
                                 });
                             }
                         }
+                        self.elements.push(IFaceElement {
+                            name: format!("_dynweap_{}", slot),
+                            kind: ElementKind::Static,
+                            button_type: ButtonType::default(),
+                            // DYNAMIC_WEAPON_ON_ID (CInterface.h).
+                            id: 650 + slot as i32,
+                            group: 0,
+                            flags: IFEF_VISIBLE,
+                            param1: 0.0,
+                            param2: 0.0,
+                            i_param: 0,
+                            pos_x: px,
+                            pos_y: py,
+                            pos_z: 0.0000001,
+                            size_x: iw,
+                            size_y: ih,
+                            images,
+                            labels: Vec::new(),
+                            cur_state: ElementState::Normal,
+                            def_state: ElementState::Normal,
+                            hint_template: String::new(),
+                            hint_offset_x: 0,
+                            hint_offset_y: 0,
+                            animation: None,
+                            visible_alpha: None,
+                            ramka_color: None,
+                            drum_t: None,
+                        });
                     }
                     if let Some(wsl) = self.elements.iter_mut().find(|e| e.name == "wsl") {
                         wsl.set_visible(true);
@@ -1166,6 +1186,7 @@ impl CInterface {
                         animation: None,
                         visible_alpha: None,
                         ramka_color: None,
+                        drum_t: None,
                     });
                 }
 
@@ -1216,6 +1237,7 @@ impl CInterface {
                         animation: None,
                         visible_alpha: None,
                         ramka_color: None,
+                        drum_t: None,
                     });
                 }
             }
@@ -1938,6 +1960,7 @@ impl CInterface {
                 animation: None,
                 visible_alpha: None,
                 ramka_color: None,
+                drum_t: None,
             });
         };
 
@@ -2005,6 +2028,7 @@ impl CInterface {
                         animation: None,
                         visible_alpha: None,
                         ramka_color: None,
+                        drum_t: None,
                     });
                 }
             }
@@ -2430,6 +2454,7 @@ fn load_element(stor: &Storage, rec: &str, kind: ElementKind) -> Option<IFaceEle
         animation,
         visible_alpha: None,
         ramka_color: None,
+        drum_t: None,
     })
 }
 

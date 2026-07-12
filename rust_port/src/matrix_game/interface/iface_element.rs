@@ -206,6 +206,11 @@ pub struct IFaceElement {
     /// CInterface.cpp:4198-4206) — NORMAL_RAMKA green / CRITICAL_RAMKA
     /// orange stamped onto constructor pylons every frame.
     pub ramka_color: Option<[f32; 4]>,
+    /// `IF_CALLHELL_ID` cooldown drum (CIFaceElement.cpp:172-208):
+    /// while DISABLED, the bottom `t` fraction of the icon shows the
+    /// atlas image one icon-width to the right (the charged variant)
+    /// rising as `BeforMaintenanceTimeT` goes 0→1.
+    pub drum_t: Option<f32>,
 }
 
 /// `CAnimation` payload: the frame rects live in the same atlas as the

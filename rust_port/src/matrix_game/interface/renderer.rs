@@ -1035,6 +1035,43 @@ impl InterfaceRenderer {
                     let v0 = (img.y + 0.5) / img.tex_h;
                     let u1 = (img.x + img.w - 0.5) / img.tex_w;
                     let v1 = (img.y + img.h - 0.5) / img.tex_h;
+                    // Reinforcements cooldown drum (CIFaceElement.cpp:
+                    // 172-208): while DISABLED, the icon's bottom `t`
+                    // fraction shows the atlas image one icon-width to
+                    // the right (the charged green variant) rising as
+                    // the timer elapses. Drawn untinted like the C++
+                    // (which renders state art as-is).
+                    if let (Some(t), ElementState::Disabled) = (elem.drum_t, elem.cur_state) {
+                        let t = t.clamp(0.0, 1.0);
+                        open_run(
+                            &key,
+                            &all_verts,
+                            &mut current_key,
+                            &mut current_start,
+                            &mut self.draw_groups,
+                        );
+                        let tint = [1.0, 1.0, 1.0, 1.0];
+                        let ysplit = y + h * (1.0 - t);
+                        let vsplit = v1 - (v1 - v0) * t;
+                        let du = img.w / img.tex_w;
+                        let quads = [
+                            // Top (1-t): dark disabled art.
+                            ([x, y, x + w, ysplit], [u0, v0, u1, vsplit]),
+                            // Bottom t: charged art (+1 icon width in the atlas).
+                            ([x, ysplit, x + w, y + h], [u0 + du, vsplit, u1 + du, v1]),
+                        ];
+                        for ([qx0, qy0, qx1, qy1], [qu0, qv0, qu1, qv1]) in quads {
+                            all_verts.extend_from_slice(&[
+                                Vertex { pos: [qx0, qy0], uv: [qu0, qv0], tint },
+                                Vertex { pos: [qx1, qy0], uv: [qu1, qv0], tint },
+                                Vertex { pos: [qx0, qy1], uv: [qu0, qv1], tint },
+                                Vertex { pos: [qx1, qy0], uv: [qu1, qv0], tint },
+                                Vertex { pos: [qx1, qy1], uv: [qu1, qv1], tint },
+                                Vertex { pos: [qx0, qy1], uv: [qu0, qv1], tint },
+                            ]);
+                        }
+                        continue;
+                    }
                     let mut tint = match elem.cur_state {
                         ElementState::Focused => [1.0, 1.0, 1.0, 1.0],
                         ElementState::Pressed => [0.8, 0.8, 0.8, 1.0],
