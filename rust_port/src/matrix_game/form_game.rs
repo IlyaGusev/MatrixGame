@@ -1557,18 +1557,31 @@ impl ApplicationHandler for App {
                 // `CMatrixRobotAI::RNeed`'s per-robot matrix update —
                 // MatrixObjectRobot.cpp:359-480).
                 let t_sr = crate::platform::now_secs();
-                state.terrain.sync_robots(
-                    &state.gfx.device,
-                    &state.gfx.queue,
-                    &mut state.game.objects,
-                    &state.map,
-                    &state.point_lights,
-                    // Chassis walk-anim cursors freeze while paused.
-                    if state.is_paused { 0 } else { step_ms },
-                    ghost,
-                    &markers,
-                    &state.camera,
-                );
+                {
+                    // The sync runs after the logic MapScope closed, but
+                    // do_chassis_animation / link_pneumatic / DIP tumble
+                    // read `current_elapsed_ms()`. Without a scope that
+                    // clock reads 0, the Move-anim cursor never advances,
+                    // and pneumatic walkers — whose movement is foot-
+                    // anchored to anim frames — freeze on the base pad
+                    // and get killed there (robot_stuck.log repro).
+                    let _scope = crate::matrix_game::map::MapScope::enter(
+                        &state.map,
+                        state.game.elapsed_ms,
+                    );
+                    state.terrain.sync_robots(
+                        &state.gfx.device,
+                        &state.gfx.queue,
+                        &mut state.game.objects,
+                        &state.map,
+                        &state.point_lights,
+                        // Chassis walk-anim cursors freeze while paused.
+                        if state.is_paused { 0 } else { step_ms },
+                        ghost,
+                        &markers,
+                        &state.camera,
+                    );
+                }
                 state.perf_acc[3] += crate::platform::now_secs() - t_sr;
 
                 // Bake the minimap background the first time — ports

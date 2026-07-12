@@ -177,6 +177,171 @@ fn main() {
             save_png(&device, &queue, &color, W, H, &format!("shot_{name}.png"));
         }
 
+        // MG_SPAWNTEST=1: queue a robot on the player base and capture
+        // frames of the spawn sequence — headless repro of "robot can't
+        // leave the pod".
+        if std::env::var("MG_SPAWNTEST").is_ok() {
+            use matrixgame_rs::matrix_game::config::RobotUnitKind;
+            use matrixgame_rs::matrix_game::interface::constructor::{RobotConfig, Unit};
+            use matrixgame_rs::matrix_game::logic::{building_mut, building_ref};
+            use matrixgame_rs::matrix_game::map_static::MapStatic;
+            use matrixgame_rs::matrix_game::object_robot::RobotUnitType;
+            let base_id = game
+                .objects
+                .iter_live()
+                .find(|&id| {
+                    building_ref(&game.objects, id)
+                        .map(|b| b.is_live() && b.is_base() && b.side == game.player_side.id)
+                        .unwrap_or(false)
+                })
+                .expect("no player base");
+            let base_pos = building_ref(&game.objects, base_id).map(|b| b.pos).unwrap();
+            camera.set_xy_strategy([base_pos.x, base_pos.y]);
+            camera.takt(10_000.0);
+            let mut cfg = RobotConfig::new();
+            cfg.chassis = Unit {
+                ty: RobotUnitType::Chassis,
+                kind: RobotUnitKind(1),
+                price: Default::default(),
+            };
+            cfg.hull.unit = Unit {
+                ty: RobotUnitType::Armor,
+                kind: RobotUnitKind(6),
+                price: Default::default(),
+            };
+            cfg.head = Unit {
+                ty: RobotUnitType::Head,
+                kind: RobotUnitKind(0),
+                price: Default::default(),
+            };
+            for i in 0..4 {
+                cfg.weapon[i] = Unit {
+                    ty: RobotUnitType::Weapon,
+                    kind: RobotUnitKind(3),
+                    price: Default::default(),
+                };
+            }
+            building_mut(&mut game.objects, base_id)
+                .map(|b| b.queue_robot(cfg))
+                .unwrap();
+            let step_ms: i32 = std::env::var("MG_STEP")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(50);
+            let mut shot_no = 0;
+            for step in 0..(16_000 / step_ms * 1) {
+                {
+                    let _scope = MapScope::enter(&map, game.elapsed_ms);
+                    matrixgame_rs::matrix_game::map::set_frustum_center([base_pos.x, base_pos.y]);
+                    game.takt(step_ms);
+                    game.graphic_takt(step_ms);
+                }
+                game.objects.pending_sounds.clear();
+                game.sound_queue.clear();
+                game.objects.weapons.freed.clear();
+                game.objects.pending_spots.clear();
+                game.objects.pending_point_lights.clear();
+                game.objects.pending_light_follow.clear();
+                game.objects.pending_light_kill.clear();
+                let _ = matrixgame_rs::matrix_game::interface::sound::drain();
+                {
+                    // MG_NOSCOPE=1 replicates form_game's bug: syncs ran
+                    // outside the MapScope, so current_elapsed_ms() == 0.
+                    let _scope = if std::env::var("MG_NOSCOPE").is_err() {
+                        Some(MapScope::enter(&map, game.elapsed_ms))
+                    } else {
+                        None
+                    };
+                    terrain.takt(step_ms as f32, &map, &point_lights, &camera, &device, &queue);
+                    terrain.sync_building_animation(
+                        &queue,
+                        &game.objects,
+                        &map,
+                        &point_lights,
+                    );
+                    terrain.sync_robots(
+                        &device,
+                        &queue,
+                        &mut game.objects,
+                        &map,
+                        &point_lights,
+                        step_ms,
+                        None,
+                        &[],
+                        &camera,
+                    );
+                    let vp = camera.view_proj();
+                    let vm = camera.view_matrix();
+                    let mut encoder = device.create_command_encoder(&Default::default());
+                    terrain.render(
+                        &device,
+                        &mut encoder,
+                        &color_view,
+                        &queue,
+                        &camera,
+                        vp,
+                        vm,
+                        &map,
+                    );
+                    queue.submit([encoder.finish()]);
+                    device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+                }
+                // At t=8s: select the robot and order it 300 units north
+                // through the real pg_order path (the user's scenario).
+                if (step * step_ms) <= 8000 && ((step + 1) * step_ms) > 8000 {
+                    let rid = game.objects.iter_live().find(|&id| {
+                        matrixgame_rs::matrix_game::logic::robot_ref(&game.objects, id)
+                            .map(|r| r.side == game.player_side.id)
+                            .unwrap_or(false)
+                    });
+                    if let Some(rid) = rid {
+                        let _scope = MapScope::enter(&map, game.elapsed_ms);
+                        let no = game.robot_to_logic_group(rid);
+                        let (tx, ty) = {
+                            let r = matrixgame_rs::matrix_game::logic::robot_ref(&game.objects, rid)
+                                .unwrap();
+                            (
+                                (r.pos_x / GameMap::GLOBAL_SCALE_MOVE) as i32,
+                                (r.pos_y / GameMap::GLOBAL_SCALE_MOVE) as i32 - 30,
+                            )
+                        };
+                        game.pg_order_move_to(&map, no, (tx, ty));
+                        println!("t={}ms ORDER move to ({tx},{ty})", game.elapsed_ms);
+                    }
+                }
+                if (step * step_ms) % 1000 < step_ms {
+                    let mut seen = false;
+                    for id in game.objects.iter_live().collect::<Vec<_>>() {
+                        if let Some(r) =
+                            matrixgame_rs::matrix_game::logic::robot_ref(&game.objects, id)
+                        {
+                            if r.side == game.player_side.id {
+                                seen = true;
+                                println!(
+                                    "t={}ms robot pos=({:.0},{:.0},{:.1}) hp={:.0} state={:?}",
+                                    game.elapsed_ms, r.pos_x, r.pos_y, r.pos_z, r.hit_point, r.state
+                                );
+                            }
+                        }
+                    }
+                    if !seen {
+                        println!("t={}ms NO PLAYER ROBOT ALIVE", game.elapsed_ms);
+                    }
+                }
+                if (step * step_ms) % 2000 < step_ms {
+                    shot_no += 1;
+                    save_png(
+                        &device,
+                        &queue,
+                        &color,
+                        W,
+                        H,
+                        &format!("spawn_{name}_{shot_no:02}.png"),
+                    );
+                }
+            }
+        }
+
         // MG_PICK=px,py[,z]: unproject the screen pixel onto the z plane
         // (default derived by scanning plane heights) and print world pos.
         if let Ok(pick) = std::env::var("MG_PICK") {

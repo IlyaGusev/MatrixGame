@@ -2993,6 +2993,44 @@ impl MapRenderer {
                     if map.unit(x, y).flags & crate::matrix_game::common::CELLFLAG_WATER != 0 {
                         continue;
                     }
+                    // Cells inside a base's 3x3 footprint are the robot
+                    // construction shaft: the platform sinks 66 units and
+                    // rises through the opening (sub_unit_offset), so a
+                    // ground-level filler would read as a dirt lid the pod
+                    // pokes through. Sink those to shaft-floor depth with
+                    // the dark pit tone instead.
+                    let wx_c = x as f32 * GLOBAL_SCALE + GLOBAL_SCALE * 0.5;
+                    let wy_c = y as f32 * GLOBAL_SCALE + GLOBAL_SCALE * 0.5;
+                    let base_pit = map.buildings.iter().any(|b| {
+                        b.kind == 0 && (b.x - wx_c).abs() <= 35.0 && (b.y - wy_c).abs() <= 35.0
+                    });
+                    if base_pit {
+                        let base = fallback.verts.len() as u32;
+                        for (dx, dy) in [(0usize, 0usize), (1, 0), (0, 1), (1, 1)] {
+                            let p = map.point(x + dx, y + dy);
+                            fallback.verts.push(Vertex {
+                                position: [
+                                    (x + dx) as f32 * GLOBAL_SCALE - cx,
+                                    (y + dy) as f32 * GLOBAL_SCALE - cy,
+                                    p.z - 70.0,
+                                ],
+                                color: [
+                                    p.r as f32 / 255.0,
+                                    p.g as f32 / 255.0,
+                                    p.b as f32 / 255.0,
+                                    1.0,
+                                ],
+                                uv: [0.5, 0.5],
+                                macro_uv: [0.0, 0.0],
+                            });
+                            fallback.coords.push((x + dx, y + dy));
+                        }
+                        fallback
+                            .idxs
+                            .extend([base, base + 1, base + 2, base + 2, base + 1, base + 3]);
+                        filler_cells += 1;
+                        continue;
+                    }
                     // Nearest covered cell's tile, expanding square rings.
                     let mut tile: Option<(u32, [f32; 2], [f32; 2])> = None;
                     'ring: for r in 1i32..=10 {

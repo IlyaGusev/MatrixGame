@@ -3633,6 +3633,10 @@ impl MapStatic for Robot {
                 if b.state == BaseState::Opened {
                     // MatrixRobot.cpp:780-783 — transition to move-out.
                     self.state = RobotState::BaseMoveOut;
+                    log::debug!(
+                        "spawn: robot -> BaseMoveOut at ({:.0},{:.0},{:.1}) fwd=({:.2},{:.2})",
+                        self.pos_x, self.pos_y, self.pos_z, self.forward.x, self.forward.y
+                    );
                 }
             }
             RobotState::BaseMoveOut => {
@@ -3698,6 +3702,12 @@ impl MapStatic for Robot {
                 self.core.geo_center.z = self.pos_z + 9.0;
                 self.rchange |= MR_MATRIX;
 
+                if crate::matrix_game::map::current_elapsed_ms() % 1000 < cms as i64 {
+                    log::debug!(
+                        "spawn: BaseMoveOut d={:.0} pos=({:.0},{:.0},{:.1}) colliding={}",
+                        dist_sq.sqrt(), self.pos_x, self.pos_y, self.pos_z, self.is_colliding()
+                    );
+                }
                 if dist_sq >= BASE_DIST * BASE_DIST {
                     // MatrixRobot.cpp:797-811 — far enough: close
                     // the base, issue a `GetLost` order so the
@@ -3719,6 +3729,10 @@ impl MapStatic for Robot {
                     self.object_state &= !ROBOT_FLAG_DISABLE_MANUAL;
                     self.base = None;
                     self.state = RobotState::Idle;
+                    log::debug!(
+                        "spawn: robot cleared pad -> Idle at ({:.0},{:.0},{:.1})",
+                        self.pos_x, self.pos_y, self.pos_z
+                    );
                     self.get_lost(cms, map, &*objs, self.forward, rng);
                 }
             }
@@ -3958,6 +3972,13 @@ impl MapStatic for Robot {
 
         if self.state == RobotState::Dip {
             return true;
+        }
+
+        if self.side == crate::matrix_game::common::PLAYER_SIDE {
+            log::debug!(
+                "player robot damage: weap={:?} attacker_side={} hp={:.0} state={:?} pos=({:.0},{:.0},{:.1})",
+                weap, attacker_side, self.hit_point, self.state, self.pos_x, self.pos_y, self.pos_z
+            );
         }
 
         let cfg = crate::matrix_game::config::global();
