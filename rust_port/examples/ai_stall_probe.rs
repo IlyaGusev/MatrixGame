@@ -2,6 +2,8 @@
 //! minutes and log per-side robot activity. A side whose live robots
 //! all sit still (no position change, no orders in flight) for 60 s+
 //! is flagged as stalled, with a dump of each robot's order state.
+//!
+//!   cargo run --example ai_stall_probe
 
 use matrixgame_rs::matrix_game::logic::{robot_ref, MapLogic};
 use matrixgame_rs::matrix_game::map_static::MapStatic;

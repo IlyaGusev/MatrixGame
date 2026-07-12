@@ -1,5 +1,7 @@
-//! Observe turret behavior in a real AI battle: per-cannon aim/fire
-//! ratios over simulated minutes.
+//! Observe turret behavior in a real AI battle on ATOLL: per-cannon
+//! aim/fire ratios over simulated minutes.
+//!
+//!   cargo run --example rocket_battle_probe
 
 use matrixgame_rs::matrix_game::logic::MapLogic;
 use matrixgame_rs::matrix_game::map::{GameMap, MapScope};

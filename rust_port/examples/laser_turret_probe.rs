@@ -1,6 +1,8 @@
 //! Headless probe for the laser turret (cannon kind 3, WEAPON_CANNON2)
 //! on the real map + real config: logs fire state, beam endpoints and
 //! shots over time.
+//!
+//!   cargo run --example laser_turret_probe
 
 use matrixgame_rs::matrix_game::logic::{robot_mut, robot_ref, MapLogic};
 use matrixgame_rs::matrix_game::map::{GameMap, MapScope};

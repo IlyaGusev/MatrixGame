@@ -1,4 +1,7 @@
-//! Dump texture union atlases as PNG files for visual inspection.
+//! Dump ATOLL's texture union atlases as PNG files for visual
+//! inspection.
+//!
+//!   cargo run --example dump_atlas     # writes assets/atlas_<n>.png
 use matrixgame_rs::matrix_game::map::GameMap;
 use matrixgame_rs::matrix_lib::base::pack::PkgArchive;
 use matrixgame_rs::matrix_lib::base::storage::Storage;

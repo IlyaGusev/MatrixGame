@@ -254,22 +254,42 @@ e.g. both sides on TERRON.
 
 ## Where the existing harnesses live
 
-- `examples/game_sim.rs` — the autonomous full-game simulator above.
+Reproducers with pass/fail semantics live in `tests/` and run under
+`cargo test`; `examples/` holds only diagnostic and measurement CLIs
+(things a human reads output from). A reproduced bug should leave its
+reproducer behind — as a test.
+
+Tests (all skip gracefully when `Data/` is absent):
+
 - `tests/test_ai.rs` — end-to-end AI acceptance: real map, 4 sim-min,
-  asserts AI sides build robots, form teams, pick actions. Slow (~30s),
-  skips gracefully when `Data/` is absent.
+  asserts AI sides build robots, form teams, pick actions. Slow (~30s).
+- `tests/test_gameplay.rs` — gameplay regressions on real maps: attack
+  order opens fire, robots never enter blocked cells, robot stops
+  firing at a dead turret, ruin smoke on building death, spawner-bot
+  Attack dispatch, TRAINING pre-placed enemies stay passive, fly-cam
+  chases war pairs, hostile clumps/columns engage (standoff bug).
+- `tests/test_data.rs` — data-loading checks: building CVOs resolve,
+  effect spawners load, reinforcement cooldown seeded, ItemChars/turret
+  props parse.
+- `src/matrix_game/object_cannon.rs` `cannon_tables_match_shipped_assets`
+  — the hardcoded fire-bone/pivot/bounds tables match the shipped VOs.
+- `src/matrix_game/side_ai.rs` `#[cfg(test)]` — synthetic 2-region road
+  network fixture (`map_with_regions`) for fast AI unit tests.
+
+Diagnostic/measurement examples:
+
+- `examples/game_sim.rs` — the autonomous full-game simulator above.
 - `examples/ai_stall_probe.rs` — AI deadlock deep-dive (order state,
   passability grid around a stuck robot, per-takt movement trace).
+- `examples/capture_stall_probe.rs` — capture-order deadlock trace
+  (replays a game_sim finding, dumps live capture state per second).
 - `examples/heavy_battle_bench.rs` — takt CPU cost.
+- `examples/map_render_bench.rs` — headless per-map render frame cost.
 - `examples/rocket_battle_probe.rs` — full-map AI battle + per-turret
   aim/fire statistics + takt timing.
 - `examples/rocket_turret_probe.rs` / `laser_turret_probe.rs` — single
   turret vs robot matrix (distance/height/motion scans).
-- `examples/attack_order_sim.rs`, `collision_sim.rs` — older
-  order/movement sims, same pattern.
-- `src/matrix_game/side_ai.rs` `#[cfg(test)]` — synthetic 2-region road
-  network fixture (`map_with_regions`) for fast AI unit tests.
-
-Probes are kept in-tree on purpose (repo convention — dozens of
-`probe_*.rs` / `*_sim.rs` examples): a reproduced bug should leave its
-reproducer behind.
+- `examples/sound_sim.rs` — which voices actually start, with volumes.
+- `examples/spot_screenshot.rs` — headless PNG of burn-decal rendering.
+- `examples/dump_atlas.rs` — texture-union atlases as PNGs.
+- `examples/pack_bundle.rs` / `pack_sounds.rs` — WASM asset packers.

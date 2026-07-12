@@ -3,6 +3,10 @@
 //! before the stall onset, dump every capture order's live state each
 //! game second — holder pos/state, target factory, distance vs the
 //! BASE_DIST gate, companion MoveTo presence, and place assignment.
+//!
+//!   cargo run --example capture_stall_probe -- [map] [seed] [from_s] [to_s]
+//!
+//! Defaults: ATOLL 1 1050 1130 (the original finding's stall window).
 
 use matrixgame_rs::matrix_game::logic::{building_ref, robot_ref, MapLogic};
 use matrixgame_rs::matrix_game::map::{GameMap, MapScope};

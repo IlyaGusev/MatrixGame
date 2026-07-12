@@ -539,11 +539,12 @@ impl Cannon {
 }
 
 /// Fire matrices (bone ids 50-59) per shaft model — extracted from
-/// `Matrix\Cannon\Shaft{1..4}.vo` (see examples/probe_cannon_barrels.rs).
+/// `Matrix\Cannon\Shaft{1..4}.vo` (verified against the assets by the
+/// `cannon_tables_match_shipped_assets` test below).
 /// Shaft1 + Shaft4 are twin-barrel; 2 + 3 single.
 const FIRE_BARRELS: [usize; 4] = [2, 1, 1, 2];
-/// Shaft-space fire-bone translations per kind (same probe); twin
-/// barrels carry two entries, singles repeat theirs.
+/// Shaft-space fire-bone translations per kind; twin barrels carry two
+/// entries, singles repeat theirs.
 const FIRE_BONES: [[Vec3; 2]; 4] = [
     [
         Vec3::new(-3.27, 20.51, -0.35),
@@ -558,8 +559,7 @@ const FIRE_BONES: [[Vec3; 2]; 4] = [
 ];
 /// Shaft pivot offset in cannon space — `Basis.matrix(20)` +
 /// `Turret{n}.matrix(20)` translations (the mount chain of
-/// `CMatrixCannon::RNeed`, MatrixObjectCannon.cpp:282-329; probed via
-/// examples/probe_cannon_barrels.rs companions).
+/// `CMatrixCannon::RNeed`, MatrixObjectCannon.cpp:282-329).
 const SHAFT_PIVOT: [Vec3; 4] = [
     Vec3::new(-0.113, -1.509, 26.751),
     Vec3::new(-0.838, 7.652, 20.588),
@@ -567,14 +567,12 @@ const SHAFT_PIVOT: [Vec3; 4] = [
     Vec3::new(-0.113, -10.955, 22.409),
 ];
 /// `Basis.vo` matrix-20 translation — the turret unit's mount in
-/// cannon space (probed via examples/probe_basis_mount.rs).
-/// `SHAFT_PIVOT[k] = BASIS_MOUNT + Turret{k+1}.matrix(20)`.
+/// cannon space. `SHAFT_PIVOT[k] = BASIS_MOUNT + Turret{k+1}.matrix(20)`.
 const BASIS_MOUNT: Vec3 = Vec3::new(-0.113, 0.103, 11.446);
 
 /// Mesh-AABB center height + half-diagonal per kind — the C++ derives
 /// `m_GeoCenter` / `m_Radius` from `CalcBounds` over Basis+Turret+Shaft
-/// (`JoinToGroup`, MatrixMapStatic.cpp:160-178); probed via
-/// examples/probe_cannon_bounds.rs. The trace sphere keeps the tighter
+/// (`JoinToGroup`, MatrixMapStatic.cpp:160-178). The trace sphere keeps the tighter
 /// hand-tuned 20 (the AABB half-diagonal over-covers as a *final* hit
 /// test, which is all our sphere pick is), but the HP bar lifts by the
 /// real mesh radius like the original.
@@ -2820,5 +2818,65 @@ mod tests {
         c.begin_fire_animation();
         assert_eq!(c.shaft_anim.anim, 0);
         assert!(c.shaft_anim.looped);
+    }
+
+    /// The asset-derived tables (`FIRE_BARRELS` / `FIRE_BONES` /
+    /// `SHAFT_PIVOT` / `BASIS_MOUNT` / `CANNON_GEO_Z` /
+    /// `CANNON_MESH_RADIUS`) must match the shipped Matrix\Cannon VOs.
+    #[test]
+    fn cannon_tables_match_shipped_assets() {
+        use crate::matrix_lib::base::pack::PkgArchive;
+        use crate::matrix_lib::three_g::vector_object::parse_vo;
+
+        let Ok(data) = std::fs::read("../Data/robots.pkg") else {
+            eprintln!("skipping: ../Data/robots.pkg not present");
+            return;
+        };
+        let pkg = PkgArchive::from_bytes(data).expect("parse pkg");
+        let load = |p: String| parse_vo(&pkg.read_file(&format!("Matrix\\Cannon\\{p}.vo")).expect(&p)).expect(&p);
+        let t = |m: [f32; 16]| Vec3::new(m[12], m[13], m[14]);
+
+        let basis = load("Basis".into());
+        let bm = t(basis.matrix_by_id(20, 0).unwrap());
+        assert!(bm.distance(BASIS_MOUNT) < 0.01, "basis mount {bm}");
+
+        for k in 0..4usize {
+            let shaft = load(format!("Shaft{}", k + 1));
+            let bones: Vec<Vec3> = shaft
+                .matrices
+                .iter()
+                .filter(|m| (50..=59).contains(&m.id))
+                .filter_map(|m| shaft.matrix_by_id(m.id, 0))
+                .map(t)
+                .collect();
+            assert_eq!(bones.len(), FIRE_BARRELS[k], "Shaft{} barrel count", k + 1);
+            for i in 0..2 {
+                let b = bones[i.min(bones.len() - 1)];
+                assert!(b.distance(FIRE_BONES[k][i]) < 0.01, "Shaft{} bone {i}: {b}", k + 1);
+            }
+
+            let turret = load(format!("Turret{}", k + 1));
+            let tm = t(turret.matrix_by_id(20, 0).unwrap());
+            assert!((bm + tm).distance(SHAFT_PIVOT[k]) < 0.01, "kind {} shaft pivot", k + 1);
+
+            // AABB over Basis + Turret (at basis mount) + Shaft (at pivot),
+            // like CalcBounds in JoinToGroup (MatrixMapStatic.cpp:160-178).
+            let mut mn = Vec3::splat(f32::MAX);
+            let mut mx = Vec3::splat(f32::MIN);
+            let mut acc = |verts: &[crate::matrix_lib::three_g::vector_object::VoVertex], off: Vec3| {
+                for v in verts {
+                    let p = Vec3::from(v.position) + off;
+                    mn = mn.min(p);
+                    mx = mx.max(p);
+                }
+            };
+            acc(&basis.vertices, Vec3::ZERO);
+            acc(&turret.vertices, bm);
+            acc(&shaft.vertices, bm + tm);
+            let c = (mn + mx) * 0.5;
+            let r = (mx - mn).length() * 0.5;
+            assert!((c.z - CANNON_GEO_Z[k]).abs() < 0.06, "kind {} geo z {}", k + 1, c.z);
+            assert!((r - CANNON_MESH_RADIUS[k]).abs() < 0.06, "kind {} radius {}", k + 1, r);
+        }
     }
 }

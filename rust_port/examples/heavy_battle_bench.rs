@@ -1,5 +1,7 @@
 //! Heavy-battle CPU bench: two armed AI packs fight at close range on
-//! the real map. Prints takt cost + effect histogram over time.
+//! ATOLL. Prints takt cost + effect histogram over time.
+//!
+//!   cargo run --release --example heavy_battle_bench
 
 use matrixgame_rs::matrix_game::config::RobotUnitKind;
 use matrixgame_rs::matrix_game::object_robot::RobotUnitType;

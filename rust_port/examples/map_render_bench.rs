@@ -4,6 +4,12 @@
 //! expose map-dependent render hot spots.
 //!
 //!   cargo run --example map_render_bench -- [frames] [map...]
+//!
+//! Defaults: 30 frames over a fixed 6-map spread. Env knobs:
+//! MG_CAM=x,y,dist,angz,angx (camera override), MG_SHOT=1 (save a PNG
+//! per map), MG_SPAWNTEST=1 (queue a robot build), MG_STEP=ms (logic
+//! step), MG_NOSCOPE=1 (replicate the missing-MapScope sync bug),
+//! MG_PICK=px,py[,z] (unproject a screen pixel).
 
 use matrixgame_rs::matrix_game::camera::Camera;
 use matrixgame_rs::matrix_game::effects::point_light::PointLightSystem;

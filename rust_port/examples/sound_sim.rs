@@ -2,6 +2,8 @@
 //! drain the sound queues through the mixer with a listener parked at
 //! the player start base — print every voice that actually starts
 //! (key, volume, distance) so mis-attenuated keys stand out.
+//!
+//!   cargo run --example sound_sim
 
 use matrixgame_rs::matrix_game::config::SoundDefs;
 use matrixgame_rs::matrix_game::logic::MapLogic;
