@@ -22,7 +22,7 @@ use matrixgame_rs::matrix_game::logic::{
     building_mut, building_ref, cannon_ref, is_absence_wall, robot_ref, MapLogic,
 };
 use matrixgame_rs::matrix_game::map::{GameMap, MapScope};
-use matrixgame_rs::matrix_game::map_static::{MapStatic, ObjectType};
+use matrixgame_rs::matrix_game::map_static::{MapStatic, ObjectId, ObjectType};
 use matrixgame_rs::matrix_game::side::{CurrSel, Side, SideStatus};
 use matrixgame_rs::matrix_lib::base::pack::PkgArchive;
 use matrixgame_rs::matrix_lib::base::storage::Storage;
@@ -323,6 +323,7 @@ fn run_sim(pkg: &PkgArchive, dat: &Storage, map_path: &str, seed: i32, opts: &Op
     // Per-robot (id, last pos, last time it moved) for stall detection.
     let mut last_move: HashMap<String, (glam::Vec2, i64)> = HashMap::new();
     let mut stall_reported: HashMap<i32, i64> = HashMap::new();
+    let mut pair_seen: HashMap<(ObjectId, ObjectId), (i64, f32, f32)> = HashMap::new();
     let mut lone_since: Option<i64> = None;
     let mut outcome = String::from("TIMEOUT");
 
@@ -374,6 +375,7 @@ fn run_sim(pkg: &PkgArchive, dat: &Storage, map_path: &str, seed: i32, opts: &Op
             &mut anomalies,
             &mut kind_counts,
         );
+        check_no_fire_standoff(&game, &mut pair_seen, &mut anomalies, &mut kind_counts);
         if game.elapsed_ms % 10_000 < 1000 {
             hash_trace.push((game.elapsed_ms, state_hash(&game)));
         }
@@ -816,6 +818,63 @@ fn check_stalls(
     }
 }
 
+/// Hostile robots sitting in each other's laps without exchanging fire.
+/// The war logic should make adjacent enemy columns engage (and thereby
+/// clear chokepoint jams); a pair that stays adjacent for 60s+ with
+/// neither losing HP is the "enemies stuck, not shooting" screenshot.
+fn check_no_fire_standoff(
+    game: &MapLogic,
+    pair_seen: &mut HashMap<(ObjectId, ObjectId), (i64, f32, f32)>,
+    anomalies: &mut Vec<Anomaly>,
+    counts: &mut HashMap<&'static str, usize>,
+) {
+    let now = game.elapsed_ms;
+    // (id, side, pos, "fired recently": a live FIRE order this sweep).
+    let robots: Vec<(ObjectId, i32, glam::Vec2, bool)> = game
+        .objects
+        .iter_live()
+        .filter_map(|id| {
+            robot_ref(&game.objects, id).filter(|r| r.is_live()).map(|r| {
+                let firing = r
+                    .orders
+                    .iter()
+                    .any(|o| o.ty == matrixgame_rs::matrix_game::robot::OrderType::Fire);
+                (id, r.side, glam::Vec2::new(r.pos_x, r.pos_y), firing)
+            })
+        })
+        .collect();
+    // Value = 1.0 when either of the pair is firing — folded into the
+    // "reset" comparison below so a shooting pair never trips.
+    let mut current: HashMap<(ObjectId, ObjectId), (f32, f32)> = HashMap::new();
+    for (i, &(ida, sa, pa, fa)) in robots.iter().enumerate() {
+        for &(idb, sb, pb, fb) in robots.iter().skip(i + 1) {
+            if sa == sb || (pa - pb).length() > 60.0 {
+                continue;
+            }
+            let key = (ida.min(idb), ida.max(idb));
+            let firing = (fa || fb) as i32 as f32;
+            current.insert(key, (firing, firing));
+        }
+    }
+    pair_seen.retain(|k, _| current.contains_key(k));
+    for (key, (firing, _)) in current {
+        match pair_seen.get(&key) {
+            // Either of the pair firing resets the clock.
+            Some(&(since, _, _)) if firing < 0.5 => {
+                if now - since > 60_000 {
+                    push_anomaly(anomalies, counts, now, "no-fire-standoff", format!(
+                        "robot pair {key:?} adjacent 60s+, neither firing"
+                    ));
+                    pair_seen.insert(key, (now, firing, firing)); // re-arm
+                }
+            }
+            _ => {
+                pair_seen.insert(key, (now, firing, firing));
+            }
+        }
+    }
+}
+
 /// AI-state dump for a stalled side (condensed ai_stall_probe format):
 /// team actions, live logic groups, and each frozen robot's orders.
 fn dump_stalled_side(game: &MapLogic, side: i32) {
@@ -882,9 +941,26 @@ fn dump_stalled_side(game: &MapLogic, side: i32) {
                 );
             }
         }
+        let mut nearest_enemy = String::from("none");
+        let mut best = f32::MAX;
+        for oid in game.objects.iter_live() {
+            if let Some(other) = robot_ref(&game.objects, oid) {
+                if !other.is_live() || other.side == side {
+                    continue;
+                }
+                let d2 = (other.pos_x - r.pos_x).powi(2) + (other.pos_y - r.pos_y).powi(2);
+                if d2 < best {
+                    best = d2;
+                    nearest_enemy = format!("{oid:?}@{:.0}", d2.sqrt());
+                }
+            }
+        }
         println!(
-            "  robot {id:?} pos=({:.0},{:.0}) state={:?} team={} group={} orders={orders:?} place={} target={:?}{cap}",
+            "  robot {id:?} pos=({:.0},{:.0}) state={:?} team={} group={} orders={orders:?} place={} target={:?} env_enemies={} maxfd={:.0} nearest_enemy={nearest_enemy} des=({},{}) zone_path={}/{} path_pts={} cur={}{cap}",
             r.pos_x, r.pos_y, r.state, r.team, r.group_logic, r.env.place, r.env.target,
+            r.env.enemy_cnt(), r.max_fire_dist,
+            r.des_x, r.des_y, r.zone_path_next, r.zone_path.len(),
+            r.move_path.pts.len(), r.move_path.cur,
         );
     }
 }

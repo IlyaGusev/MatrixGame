@@ -57,7 +57,8 @@ number of runs with findings (0 = clean), capped at 100.
 | `robot-leak` | > 200 live robots |
 | `fx-leak` | > 8000 live effects |
 | `neg-res` | Active side with a negative resource amount |
-| `stall` | AI-driven side with ≥ 2 live robots where none moved > 2 units in 3 min (AI deadlock detector, from `ai_stall_probe`). A scripted/idle player side is exempt — standing guard is legitimate. On detection the side's full AI state is dumped: team actions, logic groups, and each frozen robot's orders/place/target |
+| `stall` | AI-driven side with ≥ 2 live robots where none moved > 2 units in 3 min (AI deadlock detector, from `ai_stall_probe`). A scripted/idle player side is exempt — standing guard is legitimate. On detection the side's full AI state is dumped: team actions, logic groups, and each frozen robot's orders/place/target/env/nearest-enemy/path state |
+| `no-fire-standoff` | Hostile robot pair within 60 units for 60s+ with neither holding a FIRE order (the "wedged columns ignoring each other" screenshot) |
 | `nondet` | `--check-determinism` found a state-hash divergence between two identical runs |
 | PANIC | Any panic — caught per run, reported with location + repro command; a sweep continues with the next run |
 
@@ -131,6 +132,23 @@ Bugs found by this environment and fixed (see robot.rs / map.rs):
   so a robot killed mid-delivery was later "dropped" by its flyer,
   overwriting DIP with Falling: a live robot at negative HP. Found as
   an `hp-range` anomaly on SUMMER4_2E seed 2 (script mode).
+- **Upper-path wedge / no-fire standoff** (user screenshot on ATOLL;
+  `stall` repro: atoll seed 3 script) — three cooperating fixes:
+  (1) zone pathfinding routed size-4 robots through links narrower
+  than the robot footprint (`near_zone_connect_size` < 4 — authored
+  map data the C++ loads but never reads), so columns marched into a
+  gap `FindLocalPath` can never walk and froze; `link_blocked` in
+  road_network.rs now skips narrow links (documented deviation).
+  (2) A MoveTo whose local path keeps failing for 3s — impassable even
+  with no robot blockers — now poisons its place and reteams
+  (`local_path_escape`, robot.rs) instead of grinding forever like the
+  C++. (3) GatherInfo AddIgnored enemies at point-blank range when
+  PlaceList couldn't reach them through the blocked pass; an enemy
+  inside fire range with clear LOS is now always added (gather_info,
+  logic.rs). Also guarded `find_path_in_zone` against zone -1 (was an
+  index panic; C++ is UB/ERROR_E there).
+  Debug aid: `MG_TRACE_STALL=1` prints zone-path and local-path
+  failures with a no-blockers retry verdict.
 
 Residual known standstills (verified to match the original C++
 behavior, not port bugs): capturer starved of approach cells by

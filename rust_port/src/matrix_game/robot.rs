@@ -263,6 +263,14 @@ pub struct Robot {
     /// AI-side "can't reach destination" marker (MatrixRobot.cpp:
     /// 1601-1604) — the side AI reassigns team + logic group.
     pub zone_path_fail_reteam: bool,
+    /// Deviation from the C++ (which grinds forever): first time
+    /// `ZoneMoveCalc` produced no local path, -1 while it succeeds.
+    /// After 3s of continuous failure that is impassable even with no
+    /// robot blockers, the robot poisons its place and (AI) reteams —
+    /// the C++ has no escape because its zone paths never route
+    /// through a size-4-impassable corridor... except they do on
+    /// ATOLL's upper path, wedging whole columns.
+    local_path_fail_since: i64,
 
     /// `m_CollAvoid` (MatrixRobot.hpp — per-instance). Unit vector the
     /// WallAvoid hint pushes Seek to steer along when hugging a wall.
@@ -542,6 +550,7 @@ impl Robot {
             group_logic: -1,
             group_road_path: None,
             zone_path_fail_reteam: false,
+            local_path_fail_since: -1,
             animation: Animation::Off,
             chassis_anim: Default::default(),
             armor_anim: Default::default(),
@@ -1590,6 +1599,14 @@ impl Robot {
         {
             self.zone_path_fail_reteam = true;
         }
+        if std::env::var_os("MG_TRACE_STALL").is_some() && self.zone_path.is_empty() {
+            eprintln!(
+                "[stall-trace] zone_path_calc FAIL {:?} side={} team={} group={} chassis={} zone {}->{} des=({},{})",
+                self.self_id, self.side, self.team, self.group_logic,
+                self.chassis.kind_index(), self.zone_cur, self.zone_des,
+                self.des_x, self.des_y,
+            );
+        }
     }
 
     /// Port of `CMatrixRobotAI::ZoneMoveCalc` (MatrixRobot.cpp:1607-
@@ -1694,6 +1711,11 @@ impl Robot {
             &others,
         );
         let mut path = result.path;
+        if path.is_empty() {
+            self.local_path_escape(map, elapsed_ms, &window, others.len());
+        } else {
+            self.local_path_fail_since = -1;
+        }
         logic::optimize_move_path(
             map,
             chassis,
@@ -1707,6 +1729,63 @@ impl Robot {
         self.move_path.followed_len = 0.0;
         self.move_path.pts = path;
         self.move_path.cur = 0;
+    }
+
+    /// Deviation from the C++: escape hatch for a MoveTo whose LOCAL
+    /// path keeps failing while the zone path claims the route is fine
+    /// (a zone-graph corridor that is size-4-impassable at cell level,
+    /// e.g. ATOLL's upper path). The C++ retries forever; whole
+    /// columns freeze nose-to-nose. After 3s of continuous failure
+    /// that persists even with no robot blockers (so congestion never
+    /// triggers it), poison the current place and let the AI reteam.
+    fn local_path_escape(
+        &mut self,
+        map: &GameMap,
+        elapsed_ms: i64,
+        window: &[i32],
+        blockers: usize,
+    ) {
+        if self.local_path_fail_since < 0 {
+            self.local_path_fail_since = elapsed_ms;
+            return;
+        }
+        if elapsed_ms - self.local_path_fail_since < 3000 {
+            return;
+        }
+        self.local_path_fail_since = elapsed_ms;
+
+        let zone_rect_of = |z: i32| logic::zone_move_rect(map, z);
+        let retry = logic::find_local_path(
+            map,
+            self.chassis.kind_index(),
+            ROBOT_MOVECELLS_PER_SIZE,
+            self.map_x,
+            self.map_y,
+            window,
+            &zone_rect_of,
+            self.des_x,
+            self.des_y,
+            &[],
+        );
+        if std::env::var_os("MG_TRACE_STALL").is_some() {
+            eprintln!(
+                "[stall-trace] local_path 3s FAIL {:?} side={} pos=({},{}) des=({},{}) window={:?} blockers={blockers} without_blockers={}pts -> {}",
+                self.self_id, self.side, self.map_x, self.map_y, self.des_x, self.des_y,
+                &window[..window.len().min(4)], retry.path.len(),
+                if retry.path.is_empty() { "escape" } else { "congestion, wait" },
+            );
+        }
+        if !retry.path.is_empty() {
+            return;
+        }
+        let place = self.env.place;
+        if place >= 0 {
+            self.env.add_bad_place(place);
+        }
+        self.env.place = -1;
+        if self.side != crate::matrix_game::common::PLAYER_SIDE && self.side != 0 {
+            self.zone_path_fail_reteam = true;
+        }
     }
 
     /// Port of the order-dispatch loop at MatrixRobot.cpp:1011-1342:

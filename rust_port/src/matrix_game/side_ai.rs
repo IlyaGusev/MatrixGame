@@ -634,6 +634,12 @@ impl MapLogic {
                 )
             };
             let team = self.clac_spawn_team(map, side, region, nsh);
+            if std::env::var_os("MG_TRACE_STALL").is_some() {
+                eprintln!(
+                    "[stall-trace] reteam {rid:?} side={} region={region} -> team={team}",
+                    side.id,
+                );
+            }
             if let Some(r) = robot_mut(&mut self.objects, rid) {
                 r.zone_path_fail_reteam = false;
                 r.set_team(team);

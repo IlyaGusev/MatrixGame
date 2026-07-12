@@ -1500,6 +1500,17 @@ impl RoadNetwork {
         }
     }
 
+    /// Deviation from the C++: zone-path traversal also skips links
+    /// narrower than the 4-cell robot footprint
+    /// (`near_zone_connect_size`, authored map data the C++ loads but
+    /// never reads at runtime). The C++ happily routes robots through
+    /// 1-cell gaps that `FindLocalPath` can never walk at size 4 —
+    /// whole columns then wedge forever at the gap (ATOLL upper path).
+    fn link_blocked(&self, zi: usize, i: usize, mask: u8) -> bool {
+        self.zones[zi].near_zone_move[i] & mask != 0
+            || self.zones[zi].near_zone_connect_size[i] < 4
+    }
+
     /// The marking walk shared by the "found road from end" and
     /// "found road from start" branches of FindPathInZone
     /// (MatrixLogic.cpp:1575-1614 and 1652-1691 — the two blocks are
@@ -1520,7 +1531,7 @@ impl RoadNetwork {
             let zi = curzone as usize;
             let mut ok = false;
             for i in 0..self.zones[zi].near_zone.len() {
-                if self.zones[zi].near_zone_move[i] & mask != 0 {
+                if self.link_blocked(zi, i, mask) {
                     continue;
                 }
                 let newzone = self.zones[zi].near_zone[i];
@@ -1583,7 +1594,7 @@ impl RoadNetwork {
             let zi = curzone as usize;
             let mut found = false;
             for i in 0..self.zones[zi].near_zone.len() {
-                if self.zones[zi].near_zone_move[i] & mask != 0 {
+                if self.link_blocked(zi, i, mask) {
                     continue;
                 }
                 let newzone = self.zones[zi].near_zone[i];
@@ -1632,6 +1643,16 @@ impl RoadNetwork {
         if zstart == zend {
             return 0;
         }
+        // The C++ indexes m_Zone[-1] (UB) when ZoneFindNear failed —
+        // e.g. a MoveTo destination outside the map. No path is the
+        // sane answer.
+        if zstart < 0
+            || zend < 0
+            || zstart as usize >= self.zones.len()
+            || zend as usize >= self.zones.len()
+        {
+            return 0;
+        }
 
         self.prepare_buf();
 
@@ -1640,9 +1661,12 @@ impl RoadNetwork {
         let ze = zend as usize;
 
         // End in a directly adjacent zone — no chassis filter, as in
-        // the original.
+        // the original (but a footprint-narrow link falls through to
+        // the waves, see `link_blocked`).
         for i in 0..self.zones[zs].near_zone.len() {
-            if self.zones[zs].near_zone[i] == zend {
+            if self.zones[zs].near_zone[i] == zend
+                && self.zones[zs].near_zone_connect_size[i] >= 4
+            {
                 path[0] = zstart;
                 path[1] = zend;
                 return 2;
@@ -1722,7 +1746,7 @@ impl RoadNetwork {
         while sme < cnt {
             let zi = self.zone_index[sme] as usize;
             for i in 0..self.zones[zi].near_zone.len() {
-                if self.zones[zi].near_zone_move[i] & mask != 0 {
+                if self.link_blocked(zi, i, mask) {
                     continue;
                 }
                 let newzone = self.zones[zi].near_zone[i];
@@ -1783,7 +1807,7 @@ impl RoadNetwork {
         while sme < cnt {
             let zi = self.zone_index[sme] as usize;
             for i in 0..self.zones[zi].near_zone.len() {
-                if self.zones[zi].near_zone_move[i] & mask != 0 {
+                if self.link_blocked(zi, i, mask) {
                     continue;
                 }
                 let newzone = self.zones[zi].near_zone[i];
@@ -1836,7 +1860,7 @@ impl RoadNetwork {
         while sme < cnt {
             let zi = self.zone_index[sme] as usize;
             for i in 0..self.zones[zi].near_zone.len() {
-                if self.zones[zi].near_zone_move[i] & mask != 0 {
+                if self.link_blocked(zi, i, mask) {
                     continue;
                 }
                 let newzone = self.zones[zi].near_zone[i];
@@ -2205,10 +2229,13 @@ mod tests {
         let mut zones = vec![Zone::default(); 3];
         zones[0].near_zone = vec![1];
         zones[0].near_zone_move = vec![0];
+        zones[0].near_zone_connect_size = vec![5];
         zones[1].near_zone = vec![0, 2];
         zones[1].near_zone_move = vec![0, 0];
+        zones[1].near_zone_connect_size = vec![5, 5];
         zones[2].near_zone = vec![1];
         zones[2].near_zone_move = vec![0];
+        zones[2].near_zone_connect_size = vec![5];
         rn.zones = zones;
 
         let mut path = [0i32; 3];
@@ -2222,6 +2249,15 @@ mod tests {
         let cnt = rn.find_path_in_zone(0, 0, 1, None, &mut path);
         assert_eq!(cnt, 2);
         assert_eq!(&path[..2], &[0, 1]);
+
+        // A link narrower than the 4-cell footprint is not traversable
+        // (the ATOLL upper-path wedge).
+        rn.zones[1].near_zone_connect_size = vec![5, 1];
+        rn.zones[2].near_zone_connect_size = vec![1];
+        let cnt = rn.find_path_in_zone(0, 0, 2, None, &mut path);
+        assert_eq!(cnt, 0);
+        rn.zones[1].near_zone_connect_size = vec![5, 5];
+        rn.zones[2].near_zone_connect_size = vec![5];
 
         // Chassis 1 blocked through zone 1 → no path.
         rn.zones[1].move_mask = 2;

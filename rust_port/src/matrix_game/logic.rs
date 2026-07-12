@@ -1031,25 +1031,38 @@ impl MapLogic {
                                 }
                                 if !known && is_logic_visible(map, &self.objects, rid, oid, 0.0)
                                 {
-                                    let p_to = (other.map_x, other.map_y);
-                                    let (st, dist) = place_list(
-                                        map,
-                                        my_chassis,
-                                        my_map,
-                                        p_to,
-                                        float2int(my_maxfd / gs),
-                                        false,
-                                        &mut place_buf,
-                                    );
-                                    let d2 = {
-                                        let dx = (my_map.0 - p_to.0) as i64;
-                                        let dy = (my_map.1 - p_to.1) as i64;
-                                        dx * dx + dy * dy
-                                    };
-                                    if st != 0 && ((dist / 4) as i64).pow(2) < d2 {
+                                    if dist_enemy <= my_maxfd * my_maxfd {
+                                        // Deviation from the C++: an enemy
+                                        // already inside our fire range with
+                                        // clear LOS is engageable no matter
+                                        // what PlaceList says. The C++ gate
+                                        // below AddIgnores point-blank enemies
+                                        // across an impassable choke — two
+                                        // wedged columns then permanently
+                                        // ignore each other (ATOLL upper-path
+                                        // standoff).
                                         acts.push(Act::Add(oid));
                                     } else {
-                                        acts.push(Act::AddIgnore(oid));
+                                        let p_to = (other.map_x, other.map_y);
+                                        let (st, dist) = place_list(
+                                            map,
+                                            my_chassis,
+                                            my_map,
+                                            p_to,
+                                            float2int(my_maxfd / gs),
+                                            false,
+                                            &mut place_buf,
+                                        );
+                                        let d2 = {
+                                            let dx = (my_map.0 - p_to.0) as i64;
+                                            let dy = (my_map.1 - p_to.1) as i64;
+                                            dx * dx + dy * dy
+                                        };
+                                        if st != 0 && ((dist / 4) as i64).pow(2) < d2 {
+                                            acts.push(Act::Add(oid));
+                                        } else {
+                                            acts.push(Act::AddIgnore(oid));
+                                        }
                                     }
                                 }
                             } else {
@@ -1098,6 +1111,10 @@ impl MapLogic {
                                         let z = (cgeo.z - my_geo.z).abs();
                                         if z / (d * gs) >= BARREL_TO_SHOT_ANGLE.tan() {
                                             acts.push(Act::AddIgnore(oid));
+                                        } else if dist_enemy <= my_maxfd * my_maxfd {
+                                            // Same in-fire-range deviation as
+                                            // the robot arm above.
+                                            acts.push(Act::Add(oid));
                                         } else {
                                             let (st, dist) = place_list(
                                                 map,
