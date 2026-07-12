@@ -291,19 +291,18 @@ impl IFaceElement {
     /// C++ `GetStateImage` which just reads the slot directly but
     /// most elements only ship `sNormal`.
     pub fn current_image(&self) -> Option<&StateImage> {
-        // An attached CAnimation overrides the Normal image while the
-        // element is in its default state (CIFaceElement render path —
-        // the C++ draws m_Animation->GetCurrentFrame() instead).
-        if self.cur_state == ElementState::Normal {
-            if let Some(f) = self.animation.as_ref().and_then(|a| a.current_frame()) {
-                return Some(f);
-            }
-        }
         let idx = self.cur_state as usize;
         if let Some(img) = self.images.get(idx).and_then(|x| x.as_ref()) {
             return Some(img);
         }
         self.images[ElementState::Normal as usize].as_ref()
+    }
+
+    /// Current `CAnimation` frame, if any. The C++ draws it ON TOP of
+    /// the state art every frame (CIFaceElement.cpp:233-236) — the
+    /// frames are near-transparent glow sweeps, not replacement icons.
+    pub fn animation_image(&self) -> Option<&StateImage> {
+        self.animation.as_ref().and_then(|a| a.current_frame())
     }
 
     /// Screen-space pixel rect given the parent panel's top-left

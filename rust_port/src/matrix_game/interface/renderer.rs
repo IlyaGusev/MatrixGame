@@ -1124,6 +1124,28 @@ impl InterfaceRenderer {
                             tint,
                         },
                     ]);
+                    // CAnimation frame — drawn ON TOP of the state art
+                    // (CIFaceElement.cpp:233-236); the frames are
+                    // near-transparent glow sweeps over the button.
+                    // Anchored at m_xPos+1 with the Frames-header size
+                    // (CInterface.cpp:499-502). Same atlas as sNormal,
+                    // so it stays inside the current draw run.
+                    if let Some(f) = elem.animation_image() {
+                        let fx = x + scale;
+                        let (fw, fh) = (f.w * scale, f.h * scale);
+                        let fu0 = (f.x + 0.5) / f.tex_w;
+                        let fv0 = (f.y + 0.5) / f.tex_h;
+                        let fu1 = (f.x + f.w - 0.5) / f.tex_w;
+                        let fv1 = (f.y + f.h - 0.5) / f.tex_h;
+                        all_verts.extend_from_slice(&[
+                            Vertex { pos: [fx, y], uv: [fu0, fv0], tint },
+                            Vertex { pos: [fx + fw, y], uv: [fu1, fv0], tint },
+                            Vertex { pos: [fx, y + fh], uv: [fu0, fv1], tint },
+                            Vertex { pos: [fx + fw, y], uv: [fu1, fv0], tint },
+                            Vertex { pos: [fx + fw, y + fh], uv: [fu1, fv1], tint },
+                            Vertex { pos: [fx, y + fh], uv: [fu0, fv1], tint },
+                        ]);
+                    }
                     // Affordability outline — `CreateElementRamka`
                     // (CInterface.cpp:4198-4206) draws a 1 px frame in
                     // the element rect; we emit 4 flat-colour strips.
