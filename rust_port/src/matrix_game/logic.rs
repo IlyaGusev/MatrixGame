@@ -4,11 +4,10 @@
 //! per-side state, and the cell-level place / wall helpers used by
 //! the robot AI.
 //!
-//! Also the module root for `Logic/*.cpp` ports — `ai_group.rs`
-//! (Logic/MatrixAIGroup.cpp) and future siblings declare here.
+//! Also the module root for `Logic/*.cpp` ports.
 
-pub mod ai_group;
 pub mod environment;
+pub mod road_network;
 
 use crate::matrix_game::camera::Camera;
 use crate::matrix_game::common::{PLAYER_SIDE, TRACE_ANYOBJECT};
@@ -2095,14 +2094,13 @@ impl MapLogic {
         (base_i, fa_i)
     }
 
-    /// Force-up lookup keyed by side id. Only the player side is
-    /// modelled for now; other sides fall back to `100` (unmodified).
+    /// Force-up lookup keyed by side id — every side carries its own
+    /// `m_BaseResForce` (`su->GetResourceForceUp()`,
+    /// MatrixObjectBuilding.cpp:645).
     fn side_force_up(&self, side_id: i32) -> i32 {
-        if side_id == self.player_side.id {
-            self.player_side.get_resource_force_up()
-        } else {
-            100
-        }
+        self.side_by_id(side_id)
+            .map(|s| s.get_resource_force_up())
+            .unwrap_or(100)
     }
 
     /// Tally bases and non-base buildings owned by `side_id`. Shared
@@ -3990,7 +3988,7 @@ pub fn cannon_rn_place(map: &GameMap, wx: f32, wy: f32) -> i32 {
     map.road_network
         .as_ref()
         .map(|rn| {
-            rn.lock().unwrap().find_in_pl(&crate::matrix_game::road_network::Point {
+            rn.lock().unwrap().find_in_pl(&crate::matrix_game::logic::road_network::Point {
                 x: float2int(wx / gsm),
                 y: float2int(wy / gsm),
             })
@@ -4089,7 +4087,7 @@ pub fn get_region(map: &GameMap, x: i32, y: i32) -> i32 {
             }
         }
     }
-    rn.find_nerest_region(&crate::matrix_game::road_network::Point { x, y })
+    rn.find_nerest_region(&crate::matrix_game::logic::road_network::Point { x, y })
 }
 
 /// Port of `CMatrixMapLogic::IsLogicVisible` (MatrixLogic.cpp:
@@ -4191,7 +4189,7 @@ pub fn find_near_place(map: &GameMap, mm: u8, mappos: (i32, i32)) -> i32 {
 }
 
 pub(crate) fn find_near_place_impl(
-    rn: &crate::matrix_game::road_network::RoadNetwork,
+    rn: &crate::matrix_game::logic::road_network::RoadNetwork,
     map: &GameMap,
     mm: u8,
     mappos: (i32, i32),
@@ -4203,7 +4201,7 @@ pub(crate) fn find_near_place_impl(
     if zone < 0 || zone as usize >= rn.zones.len() {
         return -1;
     }
-    let d2 = |p: &crate::matrix_game::road_network::Point| -> i64 {
+    let d2 = |p: &crate::matrix_game::logic::road_network::Point| -> i64 {
         let dx = (mappos.0 - p.x) as i64;
         let dy = (mappos.1 - p.y) as i64;
         dx * dx + dy * dy
@@ -4266,7 +4264,7 @@ pub fn place_list(
         return (0, 0);
     }
 
-    let dist2 = |a: (i32, i32), b: &crate::matrix_game::road_network::Point| -> i64 {
+    let dist2 = |a: (i32, i32), b: &crate::matrix_game::logic::road_network::Point| -> i64 {
         let dx = (a.0 - b.x) as i64;
         let dy = (a.1 - b.y) as i64;
         dx * dx + dy * dy
@@ -4374,7 +4372,7 @@ pub fn place_list(
     list.clear();
     index.clear();
 
-    let rc = crate::matrix_game::road_network::Rect {
+    let rc = crate::matrix_game::logic::road_network::Rect {
         left: to.0 - radius - ROBOT_MOVECELLS_PER_SIZE,
         top: to.1 - radius - ROBOT_MOVECELLS_PER_SIZE,
         right: to.0 + radius + ROBOT_MOVECELLS_PER_SIZE,
@@ -4565,7 +4563,7 @@ pub fn place_list_grow(map: &GameMap, mm: u8, list: &mut Vec<i32>, growcnt: i32)
 }
 
 /// Wrapper over `CMatrixMapLogic::FindPathInZone` (MatrixLogic.cpp:
-/// 1446+, ported in [`crate::matrix_game::road_network`]) returning
+/// 1446+, ported in [`crate::matrix_game::logic::road_network`]) returning
 /// the zone path as a Vec. Empty when no road network is loaded or no
 /// path exists.
 pub fn find_path_in_zone(
@@ -4573,7 +4571,7 @@ pub fn find_path_in_zone(
     nsh: usize,
     zstart: i32,
     zend: i32,
-    route: Option<(&crate::matrix_game::road_network::RoadRoute, usize)>,
+    route: Option<(&crate::matrix_game::logic::road_network::RoadRoute, usize)>,
 ) -> Vec<i32> {
     let Some(rn) = map.road_network.as_ref() else {
         return Vec::new();

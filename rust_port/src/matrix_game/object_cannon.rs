@@ -1042,15 +1042,17 @@ impl MapStatic for Cannon {
     }
 
     /// Port of `CMatrixCannon::Damage` (MatrixObjectCannon.cpp:
-    /// 1353-1541). Sounds, progress-bar updates, minimap flashes and
-    /// the war-camera hook are not ported.
+    /// 1353-1541). Hit sounds are queued centrally by
+    /// `Objects::apply_damage`, the HP bar lives in `hitpoint_bar`,
+    /// the under-attack blink in `mini_map_flash_time`, war-camera
+    /// pairs in `pending_war_pairs`.
     fn damage(
         &mut self,
         weap: crate::matrix_game::effects::weapon::Weapon,
         _pos: Vec3,
         _dir: Vec3,
         attacker_side: i32,
-        _attacker: Option<ObjectId>,
+        attacker: Option<ObjectId>,
         self_id: ObjectId,
         objs: &mut Objects,
     ) -> bool {
@@ -1107,6 +1109,12 @@ impl MapStatic for Cannon {
                 // MatrixObjectCannon.cpp:1397-1398.
                 if !friendly_fire {
                     self.mini_map_flash_time = 1000; // FLASH_PERIOD
+                }
+                // War-camera pair (MatrixObjectCannon.cpp:1399-1403).
+                if objs.fly_cam {
+                    if let Some(a) = attacker {
+                        objs.pending_war_pairs.push((self_id, a));
+                    }
                 }
             }
 

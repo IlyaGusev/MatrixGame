@@ -293,8 +293,8 @@ impl BuildStack {
     /// 1665-1717) for the robot branch only. Advances the timer;
     /// when it hits `UNIT_ROBOT_BUILD_TIME_MS` and the parent base
     /// is CLOSED, dequeues the head, produces a `Robot` at the
-    /// base's spawn position, inserts it into the arena, and calls
-    /// `JoinToGroup` (not ported).
+    /// base's spawn position and inserts it into the arena
+    /// (`JoinToGroup`'s geo-center/radius setup lives in `Robot::new`).
     ///
     /// Returns the new robot's `ObjectId` on production — caller can
     /// use it to attach point lights / effects for visibility.
@@ -516,6 +516,24 @@ pub const BUILDING_SELECTION_SIZE: f32 = 50.0;
 /// `_11/_12` (x-axis-world) to shear sideways for asymmetric kinds
 /// like BASE.
 ///
+/// The `CSound::AddSound(S_DOORS_* / S_PLATFORM_*)` pairs inside
+/// `Open()` / `Close()` (MatrixObjectBuilding.hpp:255-256, 263-264).
+/// Queued by the caller after [`Building::open`]/[`Building::close`]
+/// report a state flip.
+pub fn queue_base_door_sounds(
+    objs: &mut crate::matrix_game::map_static::Objects,
+    pos: glam::Vec3,
+    opening: bool,
+) {
+    if opening {
+        objs.queue_snd_at("base_doors_open", pos);
+        objs.queue_snd_at("base_platform_up", pos);
+    } else {
+        objs.queue_snd_at("base_doors_close", pos);
+        objs.queue_snd_at("base_platform_down", pos);
+    }
+}
+
 /// Returns `(ring_center_world, ring_radius)`. `pos` is the
 /// building's `m_Pos` (robot-pad anchor); `build_z` seeds the
 /// ring plane Z at `m_Matrix._43 + 5`.
@@ -592,9 +610,7 @@ pub struct TurretPlace {
     pub cannon_type: i32,
 }
 
-/// Port of `CMatrixBuilding`. Minimal field set for now — the
-/// capture / selection / progress-bar / turret-placement state lands
-/// with its owning subsystems.
+/// Port of `CMatrixBuilding`.
 pub struct Building {
     core: ObjectCore,
     rchange: u32,
@@ -931,25 +947,30 @@ impl Building {
 
     /// Port of `Open()` (MatrixObjectBuilding.hpp:251-257). Ignored for
     /// DIP/DIP_EXPLODED states; otherwise flips the state machine.
-    /// Sound effects deferred.
-    pub fn open(&mut self) {
+    /// Returns true when it did — the caller queues the door sounds
+    /// ([`queue_base_door_sounds`]; the box-checkout pattern keeps
+    /// `Objects` out of reach here).
+    pub fn open(&mut self) -> bool {
         if matches!(self.state, BaseState::Dip | BaseState::DipExploded) {
-            return;
+            return false;
         }
         self.state = BaseState::Opening;
+        true
     }
 
     /// Port of `Close()` (MatrixObjectBuilding.hpp:258-265). Also
     /// guarded by the `BUILDING_SPAWNBOT` flag — can't close while a
-    /// robot is spawning.
-    pub fn close(&mut self) {
+    /// robot is spawning. Returns true when the state flipped — see
+    /// [`Building::open`].
+    pub fn close(&mut self) -> bool {
         if matches!(self.state, BaseState::Dip | BaseState::DipExploded) {
-            return;
+            return false;
         }
         if self.object_state & crate::matrix_game::map_static::OBJECT_STATE_BUILDING_SPAWNBOT != 0 {
-            return;
+            return false;
         }
         self.state = BaseState::Closing;
+        true
     }
 
     /// `IsBase()` (MatrixObjectBuilding.hpp:189).
@@ -1322,7 +1343,9 @@ impl MapStatic for Building {
                 // BUILDING_SPAWNBOT flag and open the base so the
                 // platform starts rising with the robot on top.
                 self.object_state |= crate::matrix_game::map_static::OBJECT_STATE_BUILDING_SPAWNBOT;
-                self.open();
+                if self.open() {
+                    queue_base_door_sounds(objs, self.core.geo_center, true);
+                }
                 // STAT_ROBOT_BUILD (MatrixRobot.cpp:2224).
                 if self.side != 0 {
                     objs.inc_side_stat(self.side, |s| s.robot_build += 1);
@@ -1687,18 +1710,14 @@ impl MapStatic for Building {
         }
     }
 
-    /// Port of `CMatrixBuilding::Damage` (MatrixObjectBuilding.cpp:254-344).
-    ///
-    /// Implements: already-DIP early-out, friendly-fire detection,
-    /// WEAPON_REPAIR heal path, `mindamage`-floored HP decrement with
-    /// `friend_damage` column selection, HP≤0 → BASE → DIP transition
-    /// with explosion-sequence timers primed at 0.
-    ///
-    /// Deferred: difficulty scaling (k_damage_enemy_to_player /
-    /// k_friendly_fire), sound effects, per-side kill-stat increments,
-    /// effect-spawner cleanup (`RemoveEffectSpawnerByObject`),
-    /// `ReleaseMe` side-resource unbinding, and the progress-bar
-    /// update on HP change.
+    /// Port of `CMatrixBuilding::Damage` (MatrixObjectBuilding.cpp:254-344):
+    /// already-DIP early-out, friendly-fire detection + difficulty
+    /// scaling, WEAPON_REPAIR heal path, `mindamage`-floored HP
+    /// decrement with `friend_damage` column selection, under-attack
+    /// voice + kill sounds/stats, HP≤0 → BASE → DIP transition with
+    /// explosion-sequence timers primed at 0 (the `ReleaseMe` cascade
+    /// runs from `logic_takt`). `RemoveEffectSpawnerByObject` has no
+    /// port equivalent — effect spawners here are terrain-owned.
     ///
     /// Returns `true` iff the call destroyed the building (matches the
     /// original's contract used by attacker-side code to stop tracking

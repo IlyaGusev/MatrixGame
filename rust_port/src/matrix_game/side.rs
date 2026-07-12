@@ -18,7 +18,7 @@
 
 use crate::matrix_game::config::{Resource, MAX_RESOURCES};
 use crate::matrix_game::map_static::{ObjectId, ObjectType};
-use crate::matrix_game::road_network::RoadRoute;
+use crate::matrix_game::logic::road_network::RoadRoute;
 
 /// `MAX_ROBOTS` (MatrixSide.hpp:14).
 pub const MAX_ROBOTS: usize = 60;

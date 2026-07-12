@@ -64,32 +64,30 @@ ALWAYS build with opt-level 3: `Cargo.toml` sets `[profile.dev] opt-level = 3` s
 
 ## Rust Port File Structure (mirrors original C++)
 
+The layout mirrors the original tree; `rust_port/src/CROSSREF.md` is the
+authoritative per-file mapping — when adding a Rust file, place it where
+that table predicts and extend the table in the same change.
+
 ```
 rust_port/src/
-├── app.rs                    ← MatrixFormGame.cpp (input, game loop)
-├── lib.rs                    ← WASM entry point
-├── main.rs                   ← native entry point
-├── assets/
-│   ├── bundle.rs             ← asset bundle for WASM delivery
-│   ├── loader.rs             ← platform-split file loading
-│   ├── pkg_reader.rs         ← Pack.cpp (.pkg archive reader)
-│   └── storage.rs            ← CStorage.cpp (STRG/CMAP parser)
-├── game/
-│   ├── bitmap.rs             ← CBitmap.cpp (MergeByMask, MergeWithAlpha)
-│   ├── common.rs             ← Common.hpp (constants, CELLFLAG_*, binary helpers)
-│   ├── map.rs                ← MatrixMapPrepare.cpp (map loading, PointCalcNormals)
-│   ├── map_prepare.rs        ← MatrixMapPrepare.cpp (BuildTexUnions)
-│   └── world.rs              ← game state stub
-├── platform/
-│   └── mod.rs                ← platform time abstraction
-└── renderer/
-    ├── camera.rs             ← MatrixCamera.cpp (view matrix, input)
-    ├── context.rs            ← wgpu device/surface init
-    ├── ter_surface.rs        ← MatrixTerSurface.cpp (overlay surfaces LoadM)
-    ├── terrain.rs            ← MatrixMapGroup.cpp (BuildBottom) + MatrixMap.cpp (Draw)
-    ├── texture.rs            ← DDS decode, mipmap gen, GPU texture creation
-    └── water.rs              ← MatrixWater.cpp (wave animation, alpha, rendering)
+├── lib.rs / main.rs   ← WASM / native entry points (no C++ analogue)
+├── gfx/               ← wgpu device/surface, asset bundle, file loading
+│                        (replaces the DirectX/Windows platform layer)
+├── platform/          ← time + WebAudio/native audio glue
+├── matrix_lib/        ← MatrixLib/
+│   ├── base/          ←   Base/   (blockpar, pack, storage, wstr)
+│   ├── bitmap/        ←   Bitmap/
+│   └── three_g/       ←   3G/     (billboard, math3d, texture, vector_object)
+└── matrix_game/       ← MatrixGame/src/  (one file per Matrix*.cpp:
+    │                    camera, config, form_game, logic, map*, minimap,
+    │                    object*, robot, side*, sound, water, …)
+    ├── effects/       ←   Effects/    (one file per MatrixEffect*.cpp)
+    ├── interface/     ←   Interface/  (one file per C*.cpp interface class)
+    └── logic/         ←   Logic/      (environment, road_network)
 ```
+
+WGSL shaders live in `rust_port/shaders/` (the original uses D3D9
+fixed-function state; see the table at the end of CROSSREF.md).
 
 ## Original C++ Architecture
 
@@ -139,6 +137,13 @@ The original uses **X right, Y forward, Z up** (D3D left-handed). The Rust port 
 - **`queue.write_buffer` on WebGL**: May not reliably update vertex buffers for the current frame. Shader-based animation (via time uniform) is more reliable than CPU buffer updates.
 - **WebGL texture limits**: Max dimension 2048px. Canvas and surface config must be clamped. Mipmap uploads via `create_texture_with_data` with `MipMajor` ordering.
 
-## No Test Suite
+## Testing
 
-No automated tests. Validation through visual comparison with original game screenshots.
+The original C++ has no tests. The Rust port has:
+
+- `cargo test --lib` — unit tests (~236) embedded in the modules
+- `rust_port/tests/` — integration tests against real `Data/` files
+- `rust_port/examples/` — headless probes/sims (`game_sim.rs` is the
+  autonomous battle harness; see `rust_port/SIM.md`)
+
+Rendering is still validated visually against original game screenshots.

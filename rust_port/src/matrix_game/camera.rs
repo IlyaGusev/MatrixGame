@@ -21,10 +21,12 @@
 //!     the robot heading (CalcLinkPoint, MatrixCamera.cpp:895-931);
 //!     mode changes ease with `1 - 0.995^ms`.
 //!
-//! Behaviors deliberately omitted here: fly-cam (MMFLAG_FLYCAM).
+//!   - Fly-cam (MMFLAG_FLYCAM): [`AutoFlyData`] at the bottom of this
+//!     file; toggled by typing "FLYCAM" (MatrixFormGame.cpp:937-947).
 
 use glam::{Mat4, Vec2, Vec3};
 
+use crate::matrix_game::map_static::{ObjectId, Objects};
 use crate::matrix_lib::base::storage::Storage;
 
 /// MatrixCamera.hpp defines `CAM_HFOV = 60°`, but the original feeds that
@@ -961,6 +963,383 @@ pub enum KeyAction {
     RotUp,
     RotDown,
     ResetAngles,
+}
+
+// ── Fly-cam — port of SAutoFlyData (MatrixCamera.{hpp:66-140,cpp:21-641}),
+// the MMFLAG_FLYCAM spectator autopilot ─────────────────────────────
+
+pub const MAX_WAR_PAIRS: usize = 16;
+const RECALC_DEST_ANGZ_PERIOD: f32 = 150.0;
+const WAR_PAIR_TTL: f32 = 1000.0;
+const OBZOR_TIME: f32 = 12500.0;
+
+#[derive(Clone, Copy)]
+struct WarPair {
+    target: ObjectId,
+    attacker: ObjectId,
+    ttl: f32,
+}
+
+/// The FLYCAM autopilot: damage sites feed attacker/victim pairs in,
+/// the takt flies the camera between the hottest pairs and pans a slow
+/// "obzor" panorama when the battlefield is quiet.
+///
+/// The C++ `SObjectCore*` tombstones become `ObjectId` validity
+/// checks. `m_Status` / `m_RotSpeedZ` / `m_NewDist` are write-only in
+/// the original and are dropped; `Stat()` belongs to the automatic
+/// demo mode (MMFLAG_AUTOMATIC_MODE), which is not ported.
+pub struct AutoFlyData {
+    /// Uncentered world coords, like every `GeoCenter`.
+    cur: Vec3,
+    cur_dist: f32,
+    cur_ang_z: f32,
+    cur_ang_x: f32,
+    new: Vec3,
+    new_ang_z: f32,
+    new_ang_x: f32,
+    rot_speed_x: f32,
+    speed: f32,
+    war_pairs: Vec<WarPair>,
+    war_pair_current: Option<WarPair>,
+    last_obzor_time: i32,
+    calc_dest_ang_z_time: f32,
+    obzor_time: f32,
+    before_obzor_ang_x: f32,
+    // The function-local `static float prev_da / last_da` in Takt.
+    prev_da: f32,
+    last_da: f32,
+    /// CAM_SELECTED_TARGET — roaming toward a random object.
+    selected_target: bool,
+}
+
+impl AutoFlyData {
+    /// Alloc + seed on flag rise (MatrixCamera.cpp:942-949). The C++
+    /// zero-inits `m_New*`; we seed them from the camera so the first
+    /// takts (before `FindAutoFlyTarget` picks a target) hold pose
+    /// instead of swinging toward the world origin.
+    pub fn new(cam: &Camera) -> Self {
+        let cur = cam.link_point + Vec3::new(cam.map_cx, cam.map_cy, 0.0);
+        Self {
+            cur,
+            cur_dist: cam.dist,
+            cur_ang_z: cam.angle_z,
+            cur_ang_x: cam.angle_x,
+            new: cur,
+            new_ang_z: cam.angle_z,
+            new_ang_x: cam.angle_x,
+            rot_speed_x: 0.0,
+            speed: 0.0,
+            war_pairs: Vec::new(),
+            war_pair_current: None,
+            last_obzor_time: 0,
+            calc_dest_ang_z_time: 0.0,
+            obzor_time: 0.0,
+            before_obzor_ang_x: 0.0,
+            prev_da: 0.0,
+            last_da: 0.0,
+            selected_target: false,
+        }
+    }
+
+    /// `SAutoFlyData::AddWarPair` (MatrixCamera.cpp:66-105): refresh
+    /// the TTL of a duplicate, prune tombstoned pairs, cap the pool.
+    pub fn add_war_pair(&mut self, target: ObjectId, attacker: ObjectId, objs: &Objects) {
+        if let Some(p) = self
+            .war_pairs
+            .iter_mut()
+            .find(|p| p.target == target && p.attacker == attacker)
+        {
+            p.ttl = WAR_PAIR_TTL;
+            return;
+        }
+        self.war_pairs
+            .retain(|p| objs.is_valid(p.target) && objs.is_valid(p.attacker));
+        if self.war_pairs.len() < MAX_WAR_PAIRS {
+            self.war_pairs.push(WarPair {
+                target,
+                attacker,
+                ttl: WAR_PAIR_TTL,
+            });
+        }
+    }
+
+    /// `SAutoFlyData::Takt` (MatrixCamera.cpp:222-467). Owns the
+    /// camera for the frame — the normal input takt must be skipped
+    /// (the C++ returns straight after this, MatrixCamera.cpp:953).
+    #[allow(clippy::too_many_arguments)]
+    pub fn takt(
+        &mut self,
+        ms: f32,
+        cam: &mut Camera,
+        map: &crate::matrix_game::map::GameMap,
+        objs: &Objects,
+        rng: &mut crate::matrix_game::logic::Rnd,
+        time_ms: i32,
+        dialog_open: bool,
+    ) {
+        use crate::matrix_game::common::{TRACE_CANNON, TRACE_LANDSCAPE, TRACE_ROBOT};
+
+        for p in self.war_pairs.iter_mut() {
+            p.ttl -= ms;
+        }
+        self.war_pairs
+            .retain(|p| p.ttl >= 0.0 && objs.is_valid(p.target) && objs.is_valid(p.attacker));
+
+        self.obzor_time -= ms;
+        if self.obzor_time <= 0.0 {
+            self.obzor_time = 0.0;
+            self.find_auto_fly_target(objs, rng, time_ms, dialog_open);
+        }
+
+        self.calc_dest_ang_z_time -= ms;
+        if self.calc_dest_ang_z_time < 0.0 {
+            self.calc_dest_ang_z_time += RECALC_DEST_ANGZ_PERIOD;
+            if self.calc_dest_ang_z_time < 0.0 {
+                self.calc_dest_ang_z_time = RECALC_DEST_ANGZ_PERIOD;
+            }
+            // SeekCamObjects (MatrixCamera.cpp:197-220): weight nearby
+            // robots/cannons by missing HP, face the hottest direction.
+            let mut acc = Vec3::ZERO;
+            objs.find_objects(
+                Vec2::new(self.cur.x, self.cur.y),
+                700.0,
+                1.0,
+                TRACE_ROBOT | TRACE_CANNON,
+                None,
+                |_, id| {
+                    if let Some(obj) = objs.get(id) {
+                        let dir = (obj.core().geo_center - self.cur).normalize_or_zero();
+                        acc += dir * (1.1 - hp_ratio(obj));
+                    }
+                    crate::matrix_game::map_static::Control::Continue
+                },
+            );
+            if acc.length_squared() > 0.00001 {
+                self.new_ang_z = (-acc.x).atan2(acc.y) + std::f32::consts::PI;
+            }
+        }
+
+        // Flight toward m_New with soft acceleration.
+        let mul = 1.0 - 0.999f32.powf(ms);
+        let tovec = self.new - self.cur;
+        let len = tovec.length();
+        self.speed += ms * 0.1;
+        if self.speed > len {
+            self.speed = len;
+        }
+        if self.speed > 400.0 {
+            self.speed = 400.0;
+        }
+        let ilen = if len > 0.0001 { 1.0 / len } else { 0.0 };
+        self.cur += tovec * (ilen * self.speed * mul);
+
+        let mut da = angle_dist(self.cur_ang_z, self.new_ang_z);
+        if self.obzor_time > 0.0 {
+            // Panorama pan decays; cancels early when terrain blocks
+            // the view 200 units ahead (MatrixCamera.cpp:365-372).
+            let fc = cam.eye_pos_world();
+            let dir = cam.forward();
+            let (stop, _) = crate::matrix_game::map_trace::trace(
+                map,
+                objs,
+                fc,
+                fc + dir * 200.0,
+                TRACE_LANDSCAPE,
+                None,
+            );
+            if stop != crate::matrix_game::map_trace::TraceStop::None {
+                self.obzor_time = 0.0;
+            }
+            da = self.last_da;
+            self.last_da *= 0.9995f32.powf(ms);
+        } else {
+            self.last_da = da;
+        }
+        // Yaw jerk damping via previous-delta feedback
+        // (MatrixCamera.cpp:379-381).
+        da *= 1.0 - (self.prev_da - da).abs() / std::f32::consts::TAU;
+        self.prev_da = da;
+        self.cur_ang_z += da * mul;
+
+        if self.obzor_time > 0.0 {
+            let k = ((1.0 - self.obzor_time / OBZOR_TIME) * 2.0).min(1.0);
+            self.cur_ang_x =
+                self.before_obzor_ang_x + (self.new_ang_x - self.before_obzor_ang_x) * k;
+            self.rot_speed_x = 0.0;
+            self.cur.z += ms * 0.0001;
+        } else {
+            let da = angle_dist(self.cur_ang_x, self.new_ang_x).clamp(-1.0, 1.0);
+            self.rot_speed_x = (self.rot_speed_x + da * ms * 0.001).clamp(-0.1, 0.1);
+            self.cur_ang_x += self.rot_speed_x * ms * 0.001;
+            // Pitch follows the terrain height behind the eye
+            // (MatrixCamera.cpp:427-431). GetZ yields -1000 over
+            // water/off-map; the C++ feeds that sentinel straight into
+            // the formula and pitches past vertical — clamp to sea
+            // level instead.
+            let z = map
+                .get_z(
+                    self.cur.x + (-self.cur_ang_z).sin() * self.cur_dist,
+                    self.cur.y + (-self.cur_ang_z).cos() * self.cur_dist,
+                )
+                .max(0.0);
+            self.new_ang_x =
+                (50f32.to_radians() - z * 0.002 * 70f32.to_radians()).max(10f32.to_radians());
+        }
+
+        cam.link_point = self.cur - Vec3::new(cam.map_cx, cam.map_cy, 0.0);
+        cam.dist = self.cur_dist;
+        cam.angle_z = self.cur_ang_z;
+        cam.angle_x = self.cur_ang_x;
+    }
+
+    /// `FindAutoFlyTarget` (MatrixCamera.cpp:470-641).
+    fn find_auto_fly_target(
+        &mut self,
+        objs: &Objects,
+        rng: &mut crate::matrix_game::logic::Rnd,
+        time_ms: i32,
+        dialog_open: bool,
+    ) {
+        // Dialog branch (MatrixCamera.cpp:474-497): the C++ flies to
+        // the finale big-boom and then auto-leaves the dialog — the
+        // automatic demo-mode outro. Under the FLYCAM cheat we hold
+        // the current target so menus stay usable.
+        if dialog_open {
+            return;
+        }
+
+        if self.war_pairs.is_empty() && self.war_pair_current.is_none() {
+            self.seek_nothing(objs, rng, time_ms);
+            return;
+        }
+        self.selected_target = false;
+        if self.resolve_current_pair(objs) {
+            return;
+        }
+        if self.maybe_begin_obzor(rng, time_ms) {
+            return;
+        }
+        if self.war_pairs.is_empty() {
+            self.seek_nothing(objs, rng, time_ms);
+            return;
+        }
+        // Nearest pair by victim distance (MatrixCamera.cpp:597-614).
+        let mut idx = 0;
+        let mut best = f32::INFINITY;
+        for (i, p) in self.war_pairs.iter().enumerate() {
+            if let Some(o) = objs.get(p.target) {
+                let d2 = (o.core().geo_center - self.cur).length_squared();
+                if d2 < best {
+                    best = d2;
+                    idx = i;
+                }
+            }
+        }
+        self.war_pair_current = Some(self.war_pairs.swap_remove(idx));
+        self.resolve_current_pair(objs);
+    }
+
+    /// `check_again` (MatrixCamera.cpp:549-583): aim at the current
+    /// pair's midpoint; when half of it died, chase a pool pair that
+    /// still involves the survivor. Returns true when `new` was set.
+    fn resolve_current_pair(&mut self, objs: &Objects) -> bool {
+        while let Some(p) = self.war_pair_current {
+            let t_alive = objs.is_valid(p.target);
+            let a_alive = objs.is_valid(p.attacker);
+            if t_alive && a_alive {
+                let tg = objs.get(p.target).unwrap().core().geo_center;
+                let ag = objs.get(p.attacker).unwrap().core().geo_center;
+                self.new = (tg + ag) * 0.5;
+                return true;
+            }
+            self.war_pair_current = None;
+            let survivor = if t_alive {
+                Some(p.target)
+            } else if a_alive {
+                Some(p.attacker)
+            } else {
+                None
+            };
+            if let Some(s) = survivor {
+                if let Some(i) = self
+                    .war_pairs
+                    .iter()
+                    .position(|w| w.attacker == s || w.target == s)
+                {
+                    self.war_pair_current = Some(self.war_pairs.swap_remove(i));
+                }
+            }
+        }
+        false
+    }
+
+    /// The 80%-every-15s panorama roll shared by both idle branches
+    /// (MatrixCamera.cpp:507-516, 585-593).
+    fn maybe_begin_obzor(
+        &mut self,
+        rng: &mut crate::matrix_game::logic::Rnd,
+        time_ms: i32,
+    ) -> bool {
+        use crate::matrix_game::effects::smoke_and_fire::frnd;
+        if time_ms - self.last_obzor_time > 15000 && frnd(rng, 1.0) < 0.8 {
+            self.obzor_time = OBZOR_TIME;
+            self.new = self.cur;
+            self.new_ang_x = 70f32.to_radians();
+            self.before_obzor_ang_x = self.cur_ang_x;
+            self.last_obzor_time = time_ms;
+            return true;
+        }
+        false
+    }
+
+    /// `seek_nothing` (MatrixCamera.cpp:500-541): no war anywhere —
+    /// roam to a random live object; arriving within 10 units re-arms
+    /// the next pick.
+    fn seek_nothing(
+        &mut self,
+        objs: &Objects,
+        rng: &mut crate::matrix_game::logic::Rnd,
+        time_ms: i32,
+    ) {
+        if !self.selected_target {
+            if self.maybe_begin_obzor(rng, time_ms) {
+                return;
+            }
+            self.selected_target = true;
+            // `GetFirstLogic` walks the logic-temp list (units always,
+            // decoratives only while ablaze) — mirror via `in_lt`.
+            let ids: Vec<ObjectId> = objs.iter_live().filter(|&id| objs.in_lt(id)).collect();
+            if !ids.is_empty() {
+                let pick = rng.range(0, ids.len() as i32 - 1) as usize;
+                if let Some(o) = objs.get(ids[pick]) {
+                    self.new = o.core().geo_center;
+                }
+            }
+        } else if (self.cur - self.new).length_squared() < 100.0 {
+            self.selected_target = false;
+        }
+    }
+}
+
+/// The per-class HP weighting of `SeekCamObjects`
+/// (MatrixCamera.cpp:206-217).
+fn hp_ratio(obj: &dyn crate::matrix_game::map_static::MapStatic) -> f32 {
+    use crate::matrix_game::map_static::{MapStatic, ObjectType};
+    match obj.core().obj_type {
+        ObjectType::RobotAi => {
+            let r: &crate::matrix_game::robot::Robot = unsafe {
+                &*(obj as *const dyn MapStatic as *const crate::matrix_game::robot::Robot)
+            };
+            r.hit_point / r.hit_point_max.max(1.0)
+        }
+        ObjectType::Cannon => {
+            let c: &crate::matrix_game::object_cannon::Cannon = unsafe {
+                &*(obj as *const dyn MapStatic as *const crate::matrix_game::object_cannon::Cannon)
+            };
+            c.hit_point / c.hit_point_max.max(1.0)
+        }
+        _ => 1.0,
+    }
 }
 
 #[cfg(test)]

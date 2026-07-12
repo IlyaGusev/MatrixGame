@@ -315,7 +315,7 @@ impl MapLogic {
             p.underfire = 0;
         }
         for e in envs {
-            let rect = crate::matrix_game::road_network::Rect {
+            let rect = crate::matrix_game::logic::road_network::Rect {
                 left: e.tp.0 - e.firedist,
                 top: e.tp.1 - e.firedist,
                 right: e.tp.0 + ROBOT_MOVECELLS_PER_SIZE + e.firedist,
@@ -355,7 +355,7 @@ impl MapLogic {
     /// the blast; robots covering a friendly bomb-carrier stay put.
     pub(crate) fn escape_from_bomb(&mut self, map: &GameMap, sid: i32) {
         use crate::matrix_game::common::float2int;
-        use crate::matrix_game::road_network::Point;
+        use crate::matrix_game::logic::road_network::Point;
         use crate::matrix_game::side::PlayerOrder;
 
         const ESCAPE_RADIUS: f32 = 250.0 * 1.2;
@@ -3134,7 +3134,7 @@ impl MapLogic {
         let mut found: Option<i32> = None;
         if let Some(rn_lock) = map.road_network.as_ref() {
             let rn = rn_lock.lock().unwrap();
-            let rect = crate::matrix_game::road_network::Rect {
+            let rect = crate::matrix_game::logic::road_network::Rect {
                 left: p.0 - 4,
                 top: p.1 - 4,
                 right: p.0 + 4,

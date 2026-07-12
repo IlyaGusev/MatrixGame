@@ -1,8 +1,8 @@
 //! Port of `MatrixGame/src/` — game-specific code (camera, map, water, ...).
 //!
 //! File names are intentionally kept close to the original C++ files
-//! (e.g. `camera.rs` <- `MatrixCamera.cpp`). See CROSSREF.md at the
-//! project root for the full mapping.
+//! (e.g. `camera.rs` <- `MatrixCamera.cpp`). See `src/CROSSREF.md`
+//! for the full mapping.
 
 pub mod camera;
 #[cfg(test)]
@@ -27,11 +27,9 @@ pub mod object;
 pub mod object_building;
 pub mod object_cannon;
 pub mod object_robot;
-pub mod particles;
 pub mod pause_overlay;
 pub mod progress_bar;
 pub mod render_pipeline;
-pub mod road_network;
 pub mod robot;
 pub mod shadow;
 pub mod side;

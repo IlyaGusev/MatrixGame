@@ -384,7 +384,7 @@ pub struct GameMap {
     /// (`FindPathInZone`) mutate scratch fields inside the network
     /// while callers only hold `&GameMap`, and `GameMap` must stay
     /// `Sync` for the render-side closures.
-    pub road_network: Option<std::sync::Mutex<crate::matrix_game::road_network::RoadNetwork>>,
+    pub road_network: Option<std::sync::Mutex<crate::matrix_game::logic::road_network::RoadNetwork>>,
 }
 
 impl GameMap {
@@ -1557,7 +1557,7 @@ fn load_road_network(
     stor: &crate::matrix_lib::base::storage::Storage,
     size_move_x: usize,
     size_move_y: usize,
-) -> Result<Option<crate::matrix_game::road_network::RoadNetwork>> {
+) -> Result<Option<crate::matrix_game::logic::road_network::RoadNetwork>> {
     let Some(buf) = stor.get_buf("roads", "Data") else {
         return Ok(None);
     };
@@ -1577,7 +1577,7 @@ fn load_road_network(
         bail!("roads/Data version {} unsupported (expected 27)", ver);
     }
 
-    let mut rn = crate::matrix_game::road_network::RoadNetwork::new();
+    let mut rn = crate::matrix_game::logic::road_network::RoadNetwork::new();
     rn.load(&data[4..]).context("loading road network")?;
     rn.init_pl(size_move_x as i32, size_move_y as i32);
     log::info!(
@@ -1593,8 +1593,8 @@ fn load_road_network(
 
 /// Convenience wrapper matching the `Option<Mutex<...>>` field shape.
 fn wrap_road_network(
-    rn: Option<crate::matrix_game::road_network::RoadNetwork>,
-) -> Option<std::sync::Mutex<crate::matrix_game::road_network::RoadNetwork>> {
+    rn: Option<crate::matrix_game::logic::road_network::RoadNetwork>,
+) -> Option<std::sync::Mutex<crate::matrix_game::logic::road_network::RoadNetwork>> {
     rn.map(std::sync::Mutex::new)
 }
 

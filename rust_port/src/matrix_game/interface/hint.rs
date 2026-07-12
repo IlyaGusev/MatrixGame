@@ -36,7 +36,6 @@
 //!
 //! ## What's deferred
 //!
-//! * Sound (`_SOUNDIN:` / `_SOUNDOUT:`) — UI sound backend is stubbed.
 //! * `_TEXTP:` modifiers (`L`/`B`/`C`/`CR`/`CL`/`COPY`/`T:N`) — we
 //!   collapse these onto the default text layout. Resource-bar hints
 //!   (Top panel) don't use them; turret hints use `L`/`B` which the

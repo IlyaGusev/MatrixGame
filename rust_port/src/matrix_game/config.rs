@@ -32,9 +32,8 @@ pub struct WeaponDamage {
 }
 
 /// Per-category lookup indexed by `weap_to_index(weap)`. Ports
-/// `m_ObjectDamages[WEAPON_COUNT]` for now; sibling arrays (robot /
-/// cannon / building / flyer) will land when their subclasses need
-/// them.
+/// `m_ObjectDamages[WEAPON_COUNT]`; the robot / cannon / building /
+/// flyer siblings have their own structs below.
 #[derive(Debug, Clone, Copy)]
 pub struct ObjectDamages {
     pub table: [WeaponDamage; WEAPON_COUNT],

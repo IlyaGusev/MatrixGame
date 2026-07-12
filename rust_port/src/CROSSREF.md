@@ -7,6 +7,7 @@ there is no row yet, extend the table in the same PR.
 Layout mirrors the original tree:
 
     MatrixLib/Base/      <-> matrix_lib/base/
+    MatrixLib/Bitmap/    <-> matrix_lib/bitmap/
     MatrixLib/3G/        <-> matrix_lib/three_g/
     MatrixGame/src/      <-> matrix_game/
     MatrixGame/src/Effects/    <-> matrix_game/effects/
@@ -21,7 +22,7 @@ layer.
 
 | Rust file                         | Original                        |
 |-----------------------------------|---------------------------------|
-| matrix_lib/base/bitmap.rs         | MatrixLib/Bitmap/src/CBitmap.cpp|
+| matrix_lib/bitmap/mod.rs          | MatrixLib/Bitmap/src/CBitmap.cpp|
 | matrix_lib/base/blockpar.rs       | MatrixLib/Base/src/CBlockPar.cpp|
 | matrix_lib/base/pack.rs           | MatrixLib/Base/src/Pack.cpp     |
 | matrix_lib/base/storage.rs        | MatrixLib/Base/src/CStorage.cpp |
@@ -40,14 +41,14 @@ only the read-only field-parsing helpers are in `wstr.rs`.)
 | matrix_lib/three_g/texture.rs           | MatrixLib/3G/src/Texture.cpp       |
 | matrix_lib/three_g/vector_object.rs     | MatrixLib/3G/src/VectorObject.cpp  |
 
-Not yet ported: 3g, BigIB, BigVB, Cache, CBillboard, DeviceState,
+Not yet ported: 3g, BigIB, BigVB, Cache, DeviceState,
 Form, Helper, ShadowProj, ShadowStencil. (Math3D partial — CTrajectory.)
 
 ## matrix_game/ (MatrixGame/src/)
 
 | Rust file                     | Original                          |
 |-------------------------------|-----------------------------------|
-| matrix_game/camera.rs         | MatrixCamera.cpp                  |
+| matrix_game/camera.rs         | MatrixCamera.cpp (strategy/arcade modes + SAutoFlyData FLYCAM autopilot) |
 | matrix_game/common.rs         | Common.hpp                        |
 | matrix_game/config.rs         | MatrixConfig.cpp (damage/radius/cooldown/overheat tables, cannon props, difficulty; gamma/keybind/sound deferred) |
 | matrix_game/cursor.rs         | MatrixCursor.cpp (software cursor: Cursors block, frame anim, CalcUV; drawn via interface renderer) |
@@ -63,12 +64,11 @@ Form, Helper, ShadowProj, ShadowStencil. (Math3D partial — CTrajectory.)
 | matrix_game/object_robot.rs   | MatrixObjectRobot.cpp (chassis-only RNeed + per-frame instance sync) |
 | matrix_game/logic.rs          | MatrixLogic.cpp (CMatrixMapLogic: Takt driver, Rnd (Park–Miller LCG), Place*/PlaceFindNearReturn/IsAbsenceWall, win/lose CheckStatus; also module root for Logic/ subsystems) |
 | matrix_game/map_trace.rs      | MatrixMapTrace.cpp (CMatrixMap::Trace hitscan + FindLocalPath A* + OptimizeMovePath) |
-| matrix_game/particles.rs      | (empty stub — superseded by Effects/) |
 | matrix_game/flyer.rs          | MatrixFlyer.cpp (FO_GIVE_BOT delivery flyers + Damage/HP bar) |
+| matrix_game/keybinds.rs       | (no direct peer — user-remappable key translation in front of the form_game match arms) |
 | matrix_game/multi_selection.rs| MatrixMultiSelection.cpp (marquee drag-select) |
 | matrix_game/object_cannon.rs  | MatrixObjectCannon.cpp (turrets: seek/aim/fire + fire animation, damage, DIP wrecks, renderer) |
 | matrix_game/pause_overlay.rs  | (no direct peer — dim quad behind the C++ pause hint) |
-| matrix_game/road_network.rs   | Logic/MatrixRoadNetwork.cpp (zones/roads graph, FindPathInZone) |
 | matrix_game/shadow.rs         | MatrixShadowManager.cpp (projected-shadow system) |
 | matrix_game/slot_marker.rs    | (no direct peer — turret-slot place markers, CreatePlacesShow visuals) |
 | matrix_game/progress_bar.rs   | MatrixProgressBar.cpp (3-segment bar + LIC color, atlas-backed) |
@@ -79,7 +79,7 @@ Form, Helper, ShadowProj, ShadowStencil. (Math3D partial — CTrajectory.)
 | matrix_game/ter_surface.rs    | MatrixTerSurface.cpp              |
 | matrix_game/robot.rs          | MatrixRobot.cpp (CMatrixRobotAI — full order pool (SOrder), spawn/move-out, MoveTo + collision callback + step-aside, GetLost, SBotWeapon fire control / heat / Damage / DOT) |
 | matrix_game/sound.rs          | MatrixSoundManager.cpp (CSound/CSoundArray mixer: CalcPanVol, 16-slot eviction, layers, Pos2Key dedup, ttl/fade; voices go to the `SoundOutput` host table — WebAudio in platform/audio_web.rs, silent on native like the NULL-g_RangersInterface original) |
-| matrix_game/water.rs          | MatrixWater.cpp + BuildWater in MatrixMapGroup.cpp + WaterAlpha_t3 in MatrixRenderPipeline.cpp — will split in Stage 2 part 2 |
+| matrix_game/water.rs          | MatrixWater.cpp + BuildWater in MatrixMapGroup.cpp + WaterAlpha_t3 in MatrixRenderPipeline.cpp |
 
 N/A-by-design (D3D9 infrastructure replaced by the wgpu glue):
 MatrixInstantDraw, MatrixMapTexture, MatrixSampleStateManager,
@@ -143,12 +143,14 @@ sites exist in the original — dead code).
 
 | Rust file                               | Original                        |
 |-----------------------------------------|---------------------------------|
-| matrix_game/logic/ai_group.rs           | MatrixAIGroup.cpp (stub)        |
-
 | matrix_game/logic/environment.rs        | Logic/MatrixEnvironment.{cpp,h} (CInfo/CEnemy robot sensing) |
+| matrix_game/logic/road_network.rs       | Logic/MatrixRoadNetwork.cpp (zones/roads graph, FindPathInZone) |
 
-Out of scope (enemy AI by project decision): MatrixLogicSlot,
-MatrixRule, MatrixState, MatrixTactics.
+MatrixAIGroup.cpp's `CMatrixGroup` is ported as the plain-`Vec` side
+groups in side.rs / side_player.rs. The MatrixLogicSlot / MatrixRule /
+MatrixState / MatrixTactics class family is dead code in the original
+(every call site is commented out; the live enemy AI is MatrixSide.cpp
+→ side_ai.rs) and is not ported.
 
 ## Top-level files
 
@@ -166,6 +168,8 @@ MatrixRule, MatrixState, MatrixTactics.
 | gfx/loader.rs    | Platform-split file loading                 |
 | platform/native.rs | Native-specific time / fs                 |
 | platform/web.rs  | WASM-specific time / fs                     |
+| platform/audio.rs | `SoundOutput` host table (the `g_RangersInterface` sound fn-pointers) |
+| platform/audio_web.rs | WebAudio backend (samples from `assets/sounds.bundle`, music playlist) |
 
 ## shaders/ (WGSL pulled out of the fused renderer files)
 

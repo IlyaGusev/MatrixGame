@@ -287,12 +287,6 @@ impl IFaceList {
     /// Load the canonical set of panels from `robots.dat`. Ports the
     /// MatrixGame.cpp:474-510 sequence of `pInterface->Load(bpi, IF_*)`.
     /// Panels that fail to load (missing block) are skipped.
-    ///
-    /// For now show only `Main` — the other panels render at design
-    /// positions that overlap with the minimap (MiniM / Radar occupy
-    /// the bottom-left where our existing minimap renderer already
-    /// owns the space) or need selection-aware visibility (Base /
-    /// Hints). Flip them back on as the game-state plumbing catches up.
     pub fn load_default_panels(matrix_data: &Storage) -> Self {
         let mut list = Self::new();
         // Tooltip templates + baseline replacements — loaded once and

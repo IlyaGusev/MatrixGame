@@ -4366,7 +4366,7 @@ mod tests {
     };
     use crate::matrix_game::map::BuildingInstance;
     use crate::matrix_game::object_building::{Building, BuildingType};
-    use crate::matrix_game::road_network::{Place, Point, Region, RoadNetwork};
+    use crate::matrix_game::logic::road_network::{Place, Point, Region, RoadNetwork};
     use crate::matrix_game::robot::{ChassisKind, Robot, RobotState};
 
     fn spawn_robot(game: &mut MapLogic, side: i32, x: f32, y: f32) -> ObjectId {

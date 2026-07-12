@@ -1,12 +1,8 @@
-//! Minimal chassis-only renderer for `CMatrixRobotAI`.
-//!
-//! Ports the chassis branch of `CMatrixRobot::RNeed` at
-//! MatrixObjectRobot.cpp:299-357: each robot's `m_Unit[MRT_CHASSIS]`
-//! calls `LoadObject(Matrix\\Robot\\ChassisN.vo)` where N is the
-//! `ERobotUnitKind`. Armor / weapons / head are deferred — they
-//! compose additional sub-VOs the original anchors to bones on the
-//! chassis, and a faithful port needs the per-frame anchor table
-//! from `CVectorObjectAnim::m_Animation`.
+//! Renderer for `CMatrixRobotAI` — ports `CMatrixRobot::RNeed`
+//! (MatrixObjectRobot.cpp:299-357): the chassis `m_Unit[MRT_CHASSIS]`
+//! VO (`Matrix\\Robot\\ChassisN.vo` by `ERobotUnitKind`) plus the
+//! armor / head / weapon sub-VOs anchored to the chassis matrix
+//! per each robot's `RobotConfig`.
 //!
 //! Instance buffers are rebuilt each frame from the live arena so
 //! robots that get spawned mid-session immediately render.

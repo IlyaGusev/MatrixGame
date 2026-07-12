@@ -100,10 +100,10 @@ impl ChassisKind {
     }
 }
 
-/// Port of the per-instance fields of `CMatrixRobotAI`. The AI state
-/// machine, weapon unit array, group membership, environment scan,
-/// capture plans — all deferred. Fields present here are what the
-/// Damage / selection / spatial-query paths read.
+/// Port of the per-instance fields of `CMatrixRobotAI`: the order
+/// pool (`SOrder`), movement/pathfinding state, the `SBotWeapon`
+/// array, environment scan (`env`), group membership, capture state,
+/// plus everything the Damage / selection / spatial-query paths read.
 pub struct Robot {
     core: ObjectCore,
     rchange: u32,
@@ -259,7 +259,7 @@ pub struct Robot {
     /// (MatrixRobot.cpp:1587-1588); the arena split makes that
     /// borrow impossible, so the PG layer hands each group member an
     /// `Arc` of the route whenever it changes.
-    pub group_road_path: Option<std::sync::Arc<crate::matrix_game::road_network::RoadRoute>>,
+    pub group_road_path: Option<std::sync::Arc<crate::matrix_game::logic::road_network::RoadRoute>>,
     /// AI-side "can't reach destination" marker (MatrixRobot.cpp:
     /// 1601-1604) — the side AI reassigns team + logic group.
     pub zone_path_fail_reteam: bool,
@@ -610,13 +610,17 @@ impl Robot {
     /// Port of `CMatrixRobot::SwitchAnimation(EAnimation a)`
     /// (MatrixObjectRobot.cpp:1368-1506). Direct translation of
     /// the transition graph:
-    ///   - MOVE : from STAY/ENDMOVE/OFF/ROTATE/(back variants) →
-    ///     BeginMove (one-shot), then Move (looped). From
-    ///     BeginMove → Move when the one-shot ends.
+    ///   - MOVE / MOVE_BACK : from a standing / rotate / opposite-
+    ///     direction state → BeginMove[Back] (one-shot), then
+    ///     Move[Back] (looped). From the begin one-shot → looped
+    ///     when it ends.
     ///   - STAY : from MOVE/BeginMove → EndMove (one-shot), then
-    ///     Stay. From ROTATE/OFF → Stay directly.
+    ///     Stay; same for the back variants. From ROTATE/OFF →
+    ///     Stay directly.
     ///   - OFF  : `m_Animation = a`, no anim change.
-    ///   - others: stubbed as direct-set for now.
+    ///   - others: direct-set (the C++ final else, :1503-1505; its
+    ///     ROTATE branch is only requested from a commented-out call
+    ///     site, MatrixRobot.cpp:2306).
     pub fn switch_animation(
         &mut self,
         vo: &crate::matrix_lib::three_g::vector_object::VoMesh,
@@ -626,6 +630,11 @@ impl Robot {
         // the cursor; just record the state.
         if matches!(target, Animation::Off) {
             self.animation = Animation::Off;
+            return;
+        }
+        // :1378-1382 — dead / carried / shorted robots freeze their
+        // current animation.
+        if matches!(self.state, RobotState::Dip | RobotState::Carrying) || self.shorted_ttl > 0 {
             return;
         }
         // MatrixObjectRobot.cpp:1383-1389 — on any non-OFF target
@@ -663,6 +672,29 @@ impl Robot {
                 if self.chassis_anim.is_anim_end(vo) {
                     self.animation = Animation::Move;
                     self.chassis_anim.set_anim_by_name(vo, "Move", true);
+                }
+            }
+        } else if target == Animation::MoveBack {
+            // :1421-1453 — mirror of the MOVE branch for reversing.
+            if matches!(
+                self.animation,
+                Animation::Stay
+                    | Animation::EndMove
+                    | Animation::Off
+                    | Animation::Rotate
+                    | Animation::BeginMove
+                    | Animation::EndMoveBack
+                    | Animation::Move
+            ) {
+                self.animation = Animation::BeginMoveBack;
+                if self.chassis_anim.set_anim_by_name(vo, "BeginMoveBack", false) {
+                    self.animation = Animation::MoveBack;
+                    self.chassis_anim.set_anim_by_name(vo, "MoveBack", true);
+                }
+            } else if self.animation == Animation::BeginMoveBack {
+                if self.chassis_anim.is_anim_end(vo) {
+                    self.animation = Animation::MoveBack;
+                    self.chassis_anim.set_anim_by_name(vo, "MoveBack", true);
                 }
             }
         } else if target == Animation::Stay {
@@ -2063,10 +2095,18 @@ impl Robot {
                     // watchdog kills the capturer before the descent.
                     self.set_base(fid);
                     if f_state != BaseState::Opened && f_state != BaseState::Opening {
+                        let mut opened_at = None;
                         if let Some(bm) = objs.get_mut(fid) {
                             let b: &mut Building =
                                 unsafe { &mut *(bm as *mut dyn MapStatic as *mut Building) };
-                            b.open();
+                            if b.open() {
+                                opened_at = Some(b.core().geo_center);
+                            }
+                        }
+                        if let Some(p) = opened_at {
+                            crate::matrix_game::object_building::queue_base_door_sounds(
+                                objs, p, true,
+                            );
                         }
                         return CaptureOutcome::Normal;
                     } else if f_state != BaseState::Opened {
@@ -2125,10 +2165,18 @@ impl Robot {
                 if f_is_base {
                     if f_state != BaseState::Closed && f_state != BaseState::Closing {
                         self.state = RobotState::BaseCapture;
+                        let mut closed_at = None;
                         if let Some(bm) = objs.get_mut(fid) {
                             let b: &mut Building =
                                 unsafe { &mut *(bm as *mut dyn MapStatic as *mut Building) };
-                            b.close();
+                            if b.close() {
+                                closed_at = Some(b.core().geo_center);
+                            }
+                        }
+                        if let Some(p) = closed_at {
+                            crate::matrix_game::object_building::queue_base_door_sounds(
+                                objs, p, false,
+                            );
                         }
                     } else if f_state == BaseState::Closed {
                         // S_ENEMY_BASE_CAPTURED / S_PLAYER_BASE_CAPTURED
@@ -4033,16 +4081,17 @@ impl MapStatic for Robot {
     }
 
     /// Port of `CMatrixRobotAI::Damage` (MatrixRobot.cpp:1827-2118).
-    /// Not ported: minimap flashes and the war camera. Hit sounds live
-    /// in the weapon effects, env retaliation in `hit_to`, the HP bar
-    /// in `hitpoint_bar`, DIP scatter in `init_dip_scatter`.
+    /// Hit sounds live in the weapon effects, env retaliation in
+    /// `hit_to`, the HP bar in `hitpoint_bar`, DIP scatter in
+    /// `init_dip_scatter`, the under-attack minimap flash in
+    /// `mini_map_flash_time`, war-camera pairs in `pending_war_pairs`.
     fn damage(
         &mut self,
         weap: crate::matrix_game::effects::weapon::Weapon,
         _pos: glam::Vec3,
         _dir: glam::Vec3,
         attacker_side: i32,
-        _attacker: Option<ObjectId>,
+        attacker: Option<ObjectId>,
         self_id: ObjectId,
         objs: &mut Objects,
     ) -> bool {
@@ -4093,7 +4142,7 @@ impl MapStatic for Robot {
             // Cannon attacker → enemy list + retarget when idle
             // (MatrixRobot.cpp:1870-1878).
             if !friendly_fire {
-                if let Some(att) = _attacker {
+                if let Some(att) = attacker {
                     let attacker_is_enemy_cannon =
                         crate::matrix_game::logic::cannon_ref(objs, att)
                             .map(|c| {
@@ -4141,6 +4190,12 @@ impl MapStatic for Robot {
                 // `m_MiniMapFlashTime = FLASH_PERIOD` (MatrixRobot.cpp:1896).
                 if !friendly_fire {
                     self.mini_map_flash_time = 1000;
+                }
+                // War-camera pair (MatrixRobot.cpp:1898-1902).
+                if objs.fly_cam {
+                    if let Some(a) = attacker {
+                        objs.pending_war_pairs.push((self_id, a));
+                    }
                 }
             }
 
@@ -4282,6 +4337,7 @@ impl MapStatic for Robot {
         // (MatrixRobot.cpp:2026-2036 gates on IsDisableManual, not state).
         if self.is_disable_manual() {
             if let Some(base_id) = self.base {
+                let mut closed_at = None;
                 if let Some(obj_mut) = objs.get_mut(base_id) {
                     if matches!(obj_mut.core().obj_type, ObjectType::Building) {
                         let b: &mut crate::matrix_game::object_building::Building = unsafe {
@@ -4293,8 +4349,13 @@ impl MapStatic for Robot {
                                 crate::matrix_game::map_static::OBJECT_STATE_BUILDING_SPAWNBOT,
                             );
                         }
-                        b.close();
+                        if b.close() {
+                            closed_at = Some(b.core().geo_center);
+                        }
                     }
+                }
+                if let Some(p) = closed_at {
+                    crate::matrix_game::object_building::queue_base_door_sounds(objs, p, false);
                 }
             }
         }
@@ -4871,23 +4932,30 @@ impl Robot {
             .collect();
         let disable_manual = self.is_disable_manual();
         for fid in captures {
-            let Some(b) = crate::matrix_game::logic::building_mut(objs, fid) else {
-                continue;
-            };
-            if b.capturer.is_some() && b.capturer == my_id {
-                b.reset_captured();
-                if !disable_manual {
-                    if b.is_base()
-                        && !matches!(
-                            b.state,
-                            crate::matrix_game::object_building::BaseState::Closed
-                        )
-                    {
-                        b.close();
+            let mut closed_at = None;
+            {
+                let Some(b) = crate::matrix_game::logic::building_mut(objs, fid) else {
+                    continue;
+                };
+                if b.capturer.is_some() && b.capturer == my_id {
+                    b.reset_captured();
+                    if !disable_manual {
+                        if b.is_base()
+                            && !matches!(
+                                b.state,
+                                crate::matrix_game::object_building::BaseState::Closed
+                            )
+                            && b.close()
+                        {
+                            closed_at = Some(b.core().geo_center);
+                        }
+                    } else {
+                        self.must_die = true;
                     }
-                } else {
-                    self.must_die = true;
                 }
+            }
+            if let Some(p) = closed_at {
+                crate::matrix_game::object_building::queue_base_door_sounds(objs, p, false);
             }
         }
         self.orders.clear();

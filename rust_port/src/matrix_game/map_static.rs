@@ -527,6 +527,14 @@ pub struct Objects {
     /// building's ruins (MatrixObjectBuilding.cpp:726-755). Drained
     /// by `MapLogic::takt` into `ambient_spawners`.
     pub pending_ruin_smoke: Vec<(glam::Vec3, f32)>,
+    /// MMFLAG_FLYCAM mirror — gates the war-pair pushes below
+    /// (MatrixRobot.cpp:1898, MatrixObjectCannon.cpp:1399).
+    pub fly_cam: bool,
+    /// `m_Camera.AddWarPair(this, attaker)` calls queued from the
+    /// damage paths `(target, attacker)`; drained into the fly-cam's
+    /// [`AutoFlyData`](crate::matrix_game::camera::AutoFlyData) each
+    /// frame.
+    pub pending_war_pairs: Vec<(ObjectId, ObjectId)>,
     /// Per-map-group flyer altitude envelope: max(terrain land max,
     /// static building/object tops). The static-scene slice of
     /// `m_GroupMaxZObjRobots` (GetZInterpolatedObjRobots,
@@ -692,6 +700,8 @@ impl Objects {
             mo_grid_dirty: std::cell::Cell::new(true),
             pending_sounds: Vec::new(),
             pending_ruin_smoke: Vec::new(),
+            fly_cam: false,
+            pending_war_pairs: Vec::new(),
             flyer_alt_grid: Vec::new(),
             pending_point_lights: Vec::new(),
             pending_light_follow: Vec::new(),
@@ -1166,13 +1176,14 @@ impl Objects {
     /// `callback` return type at MatrixMap.hpp:84.
     ///
     /// Differences from the original:
-    /// * No spatial group index yet — we linear-scan all live objects.
-    ///   For atoll object counts this is trivial; when a group-indexed
-    ///   variant lands it will share this contract.
-    /// * `m_IntersectFlagFindObjects` re-visit guard isn't needed in the
-    ///   linear path (each slot visited exactly once).
+    /// * Instead of the C++ map-group index we scan the `unit_ids`
+    ///   index (plus the `mo_grid` cells when the mask asks for
+    ///   TRACE_OBJECT).
+    /// * `m_IntersectFlagFindObjects` re-visit guard isn't needed —
+    ///   each candidate is visited exactly once.
     /// * Flyer's `GetCarryingRobot` promotion (MatrixMap.cpp:2699-2710)
-    ///   is deferred until the flyer subclass lands.
+    ///   is redundant here: a carried robot stays in `unit_ids` and its
+    ///   position tracks the flyer, so it is enumerated directly.
     pub fn find_objects(
         &self,
         pos: Vec2,
@@ -1403,10 +1414,10 @@ impl Objects {
 
     /// Ports the per-object pass inside `CMatrixMapStatic::SortEndGraphicTakt`
     /// (MatrixMapStatic.cpp:755-765). Calls `takt(cms, rng)` on every
-    /// live object. Visibility culling (the `objects_left/objects_rite`
-    /// sorted window) is deferred until the vis-list arrives; for now
-    /// we dispatch to all live slots — Takt bodies are cheap no-ops for
-    /// BEHF_STATIC objects and the atoll-size object count is trivial.
+    /// live object. The C++ visibility pre-cull (the
+    /// `objects_left/objects_rite` sorted window) is skipped — frustum
+    /// culling lives in the renderers here, Takt bodies are cheap
+    /// no-ops for BEHF_STATIC objects, and the object count is trivial.
     ///
     /// Unlike `proceed_logic`, this does NOT snapshot a `next` cursor:
     /// the C++ graphic takt walks a fixed index range filled during
@@ -1468,12 +1479,10 @@ impl<'a> Iterator for LogicIter<'a> {
 }
 
 /// Port of `CMatrixMapStatic::StaticTakt` (MatrixMapStatic.cpp:107-143).
-/// Decrements ablaze/shorted TTLs then delegates to the subclass'
+/// Decrements ablaze/shorted TTLs (including the robots'
+/// `SwitchAnimation(ANIMATION_STAY)` on SHORTED→clear,
+/// MatrixMapStatic.cpp:133) then delegates to the subclass'
 /// `logic_takt`.
-///
-/// The `SwitchAnimation(ANIMATION_STAY)` side effect on SHORTED→clear
-/// (MatrixMapStatic.cpp:133) is deferred: it sits inside
-/// `if (IsRobot())`, and no robot subclass exists yet in this port.
 pub(crate) fn static_takt(objs: &mut Objects, id: ObjectId, ms: i32, rng: &mut Rnd) {
     // Take-the-box pattern — see `proceed_logic`. This also handles the
     // case where `id` points at a freed slot (returns early, same as
@@ -1501,9 +1510,20 @@ pub(crate) fn static_takt(objs: &mut Objects, id: ObjectId, ms: i32, rng: &mut R
         boxed.set_shorted_ttl(ttl);
         if ttl == 0 {
             boxed.object_state_clear(OBJECT_STATE_SHORTED);
-            // Robot-specific:
-            //   if (IsRobot()) AsRobot()->SwitchAnimation(ANIMATION_STAY);
-            // Lands with the robot subclass port.
+            // `if (IsRobot()) SwitchAnimation(ANIMATION_STAY)`
+            // (MatrixMapStatic.cpp:133). No chassis VO = headless run,
+            // where animation state is render-only anyway.
+            if boxed.core().obj_type == ObjectType::RobotAi {
+                let r: &mut crate::matrix_game::robot::Robot = unsafe {
+                    &mut *(boxed.as_mut() as *mut dyn MapStatic
+                        as *mut crate::matrix_game::robot::Robot)
+                };
+                if let Some(vo) = crate::matrix_lib::three_g::vector_object::chassis_vo(
+                    r.chassis.kind_index(),
+                ) {
+                    r.switch_animation(&vo, crate::matrix_game::robot::Animation::Stay);
+                }
+            }
         }
     }
     boxed.logic_takt(ms, rng, objs);

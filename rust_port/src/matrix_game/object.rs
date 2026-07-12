@@ -314,10 +314,10 @@ impl MapObject {
             obj_type: ObjectType::MapObject,
             ..Default::default()
         };
-        // Seed `m_Matrix._41..43` with the placement so a later `r_need`
-        // call (not ported in scope B) can rebuild the full rotation
-        // around it — matches MatrixObject.cpp:382 which reads the
-        // translation out of the current matrix before rebuilding.
+        // Seed `m_Matrix._41..43` with the placement — matches
+        // MatrixObject.cpp:382, which reads the translation out of the
+        // current matrix before rebuilding the rotation around it (the
+        // rebuild itself lives in the renderer's per-instance matrices).
         core.matrix.w_axis.x = inst.x;
         core.matrix.w_axis.y = inst.y;
         core.matrix.w_axis.z = inst.z;
@@ -842,14 +842,17 @@ impl MapStatic for MapObject {
             );
             self.core.inv_matrix = self.core.matrix.inverse();
 
-            // `JoinToGroup()` at MatrixObject.cpp:416 — needs the map-group
-            // arena from `GameMap`; deferred with the group subsystem port.
+            // `JoinToGroup()` at MatrixObject.cpp:416 enrolls the object
+            // into map groups for culling — covered here by the
+            // `mo_grid` spatial hash + renderer frustum culling.
         }
 
-        // MR_GRAPH / MR_SHADOW_* / MR_MINIMAP branches all depend on
-        // `LoadObject` / `CVOShadowStencil` / `CMatrixShadowProj` /
-        // `CMinimap::RenderObjectToBackground`. Stubbed for scope B —
-        // clear the dirty bits so the next `r_need` doesn't spin on them.
+        // MR_GRAPH / MR_SHADOW_* / MR_MINIMAP: the D3D resource
+        // rebuilds they trigger (`LoadObject` / `CVOShadowStencil` /
+        // `CMatrixShadowProj` / `CMinimap::RenderObjectToBackground`)
+        // live in the wgpu renderers, which resync from game state
+        // every frame — just clear the dirty bits so the next
+        // `r_need` doesn't spin on them.
         if need & MR_GRAPH != 0 {
             self.rchange &= !MR_GRAPH;
         }
@@ -902,15 +905,8 @@ impl MapStatic for MapObject {
         self_id: ObjectId,
         objs: &mut Objects,
     ) -> bool {
-        // Port of `CMatrixMapObject::Damage` (MatrixObject.cpp:101-293).
-        //
-        // Only BEHF_BURN is fully implemented — that branch is
-        // self-contained (just state + TTL + AddLT). BEHF_TERRON /
-        // BEHF_BREAK / BEHF_ANIM depend on `g_Config.m_ObjectDamages`,
-        // `CMatrixProgressBar`, per-instance anim, effects, and the
-        // side/win-count state machine; the original bodies stay
-        // commented below with line refs so the port can fill them in
-        // when those subsystems land.
+        // Port of `CMatrixMapObject::Damage` (MatrixObject.cpp:101-293):
+        // BEHF_BURN, BEHF_TERRON, BEHF_BREAK and BEHF_ANIM branches.
 
         self.self_id = Some(self_id);
 
@@ -922,8 +918,8 @@ impl MapStatic for MapObject {
 
         if self.beh_flag == BehFlag::Burn {
             if weap == WEAPON_ABLAZE {
-                // MatrixObject.cpp:111 — CSound::AddSound(S_WEAPON_HIT_ABLAZE).
-                // Deferred until CSound lands.
+                // MatrixObject.cpp:111 — S_WEAPON_HIT_ABLAZE (whablaze)
+                // is queued centrally by `Objects::damage_object`.
             } else if is_fire_weapon(weap) {
                 // MatrixObject.cpp:115-141.
                 if self.object_state & OBJECT_STATE_ABLAZE == 0 {
@@ -1050,9 +1046,9 @@ impl MapStatic for MapObject {
             }
         }
 
-        // BEHF_TERRON (MatrixObject.cpp:142-187). Pain animation /
-        // music-volume not ported; HP depletion (with `hitpoint_bar`),
-        // pain voices + the death flags are.
+        // BEHF_TERRON (MatrixObject.cpp:142-187). Pain animation not
+        // ported (no per-instance `m_Graph`); HP depletion (with
+        // `hitpoint_bar`), pain voices, the music duck + death flags are.
         if beh0 == BehFlag::Terron
             && self.object_state & crate::matrix_game::map_static::OBJECT_STATE_TERRON_EXPL == 0
         {

@@ -141,7 +141,9 @@ pub enum ElementKind {
     /// `CIFaceImage` — atlas reference; never rendered directly in the
     /// C++ (it's a source handle for other elements).
     Image = 3,
-    /// Counter / progress (`CIFaceCounter`) — stubbed for now.
+    /// Counter / progress (`CIFaceCounter`) — its digit display is
+    /// ported as the digit-static toggling in
+    /// `CInterface::refresh_base_visibility_with`.
     Counter = 4,
 }
 

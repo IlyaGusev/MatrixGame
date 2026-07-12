@@ -5,8 +5,8 @@
 //!
 //! The per-preset point-light flash is ported via
 //! `PointLightSystem::add_transient_light_anim` (queued through
-//! `Objects::pending_point_lights`); sounds are deferred with the audio
-//! backend.
+//! `Objects::pending_point_lights`); the per-preset sound key is
+//! queued when the spawn drains in `effects_takt`.
 
 use glam::Vec3;
 

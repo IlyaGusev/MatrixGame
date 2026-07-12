@@ -112,6 +112,12 @@ struct AppState {
     /// auto-repeats must not leak into the camera bindings (held `S`
     /// would both issue a stop order and scroll the camera otherwise).
     consumed_keys: std::collections::HashSet<winit::keyboard::KeyCode>,
+    /// Recently typed letters — the `m_LastScans` ring the C++ matches
+    /// cheat words against (MatrixFormGame.cpp:888-947). Only the
+    /// FLYCAM word is ported.
+    cheat_keys: String,
+    /// `m_AFD` — live while MMFLAG_FLYCAM (`objects.fly_cam`) is set.
+    fly_cam: Option<crate::matrix_game::camera::AutoFlyData>,
     /// Physical movement keys currently held — the port of the
     /// `GetAsyncKeyState(KA_UNIT_*)` polls the arcade branches read
     /// (WASD + arrows; see `sync_arcade_input`).
@@ -385,6 +391,8 @@ impl ApplicationHandler for App {
                 dialog: None,
                 exit_state: 0,
                 consumed_keys: Default::default(),
+                cheat_keys: String::new(),
+                fly_cam: None,
                 held_keys: Default::default(),
                 lmb_down: false,
                 main_panel_arcade: false,
@@ -621,6 +629,8 @@ impl ApplicationHandler for App {
                     dialog: None,
                     exit_state: 0,
                     consumed_keys: Default::default(),
+                    cheat_keys: String::new(),
+                    fly_cam: None,
                     held_keys: Default::default(),
                     lmb_down: false,
                     main_panel_arcade: false,
@@ -1141,6 +1151,28 @@ impl ApplicationHandler for App {
                 // auto-orders) fire once per physical press and a held
                 // `S` must not scroll the camera after stopping a group.
                 if let PhysicalKey::Code(code) = event.physical_key {
+                    // Cheat-word ring (MatrixFormGame.cpp:888-947):
+                    // typing FLYCAM toggles the spectator autopilot.
+                    // Recorded before any dispatch, like `m_LastScans`.
+                    if pressed && !event.repeat {
+                        let name = format!("{code:?}");
+                        if let Some(letter) = name.strip_prefix("Key").filter(|s| s.len() == 1) {
+                            state.cheat_keys.push_str(letter);
+                            if state.cheat_keys.len() > 6 {
+                                let cut = state.cheat_keys.len() - 6;
+                                state.cheat_keys.drain(..cut);
+                            }
+                            if state.cheat_keys == "FLYCAM" {
+                                state.cheat_keys.clear();
+                                state.game.objects.fly_cam = !state.game.objects.fly_cam;
+                                log::info!(
+                                    "flycam {}",
+                                    if state.game.objects.fly_cam { "on" } else { "off" }
+                                );
+                                return;
+                            }
+                        }
+                    }
                     // Held-state for the arcade `GetAsyncKeyState`
                     // polls — tracked before any consumption so the
                     // manual-drive keys can't stick. Uses the camera
@@ -1440,7 +1472,7 @@ impl ApplicationHandler for App {
 
                 // Per-frame interface visibility dispatch — ports the
                 // `CInterface::LogicTakt` branch at
-                // CInterface.cpp:1214-1635. Only `if/Main` for now.
+                // CInterface.cpp:1214-1635 (Main / Base / Top gating).
                 // Also selects the cursor mode (CInterface.cpp:2957).
                 refresh_interface_visibility(state);
 
@@ -1507,7 +1539,32 @@ impl ApplicationHandler for App {
 
                 let t_logic_end = crate::platform::now_secs();
 
-                state.camera.takt(dt * 1000.0); // camera update (ms)
+                // MMFLAG_FLYCAM branch of `CMatrixCamera::Takt`
+                // (MatrixCamera.cpp:937-965): the autopilot owns the
+                // camera and the normal input takt is skipped; the
+                // AFD is freed as soon as the flag drops.
+                if state.game.objects.fly_cam {
+                    let pairs: Vec<_> = state.game.objects.pending_war_pairs.drain(..).collect();
+                    let afd = state.fly_cam.get_or_insert_with(|| {
+                        crate::matrix_game::camera::AutoFlyData::new(&state.camera)
+                    });
+                    for (target, attacker) in pairs {
+                        afd.add_war_pair(target, attacker, &state.game.objects);
+                    }
+                    afd.takt(
+                        dt * 1000.0,
+                        &mut state.camera,
+                        &state.map,
+                        &state.game.objects,
+                        &mut state.game.rng,
+                        state.game.elapsed_ms as i32,
+                        state.dialog.is_some(),
+                    );
+                } else {
+                    state.fly_cam = None;
+                    state.game.objects.pending_war_pairs.clear();
+                    state.camera.takt(dt * 1000.0); // camera update (ms)
+                }
 
                 // Progress bars — panel clones (build stack / building
                 // HP) + the floating HP bars over objects. Runs AFTER
@@ -4756,7 +4813,10 @@ fn sync_selection_ring(state: &mut AppState, step_ms: f32) {
     use crate::matrix_game::map_static::{ObjectId, ObjectType};
     use crate::matrix_game::object_building::{selection_placement, Building, BuildingType};
 
-    let color = side_selection_color(state.game.player_side.id);
+    // Every C++ CreateSelection call site uses the default green — the
+    // SetColor(SEL_COLOR_TMP) calls at MatrixSide.cpp:1750-1753 are
+    // commented out in the shipping code.
+    let color = crate::matrix_game::effects::selection::SEL_COLOR_DEFAULT;
     let mut desired: Vec<(ObjectId, glam::Vec3, f32, u32)> = Vec::new();
     let ids: Vec<ObjectId> = state.game.player_side.selected.clone();
     for id in ids {
@@ -4805,24 +4865,6 @@ fn sync_selection_ring(state: &mut AppState, step_ms: f32) {
     state
         .selection_ring
         .takt(step_ms, |x, y| state.map.get_z(x, y));
-}
-
-/// Pick a highlight color for the selection ring by side. The C++
-/// defaults every selection to `SEL_COLOR_DEFAULT` (green) regardless
-/// of side — the enemy-ring color change is a runtime tint handled
-/// elsewhere (the `SetColor(SEL_COLOR_TMP)` calls at MatrixSide.cpp:
-/// 1750-1753 are commented out in the shipping code). We keep a
-/// per-side tint as a placeholder for when the full side integration
-/// lands; for the player case we match the original exactly.
-fn side_selection_color(side: i32) -> u32 {
-    use crate::matrix_game::effects::selection::SEL_COLOR_DEFAULT;
-    match side {
-        1 => SEL_COLOR_DEFAULT, // player — green
-        2 => 0xFFFF_3333,       // enemy red (placeholder)
-        3 => 0xFFFF_AA00,       // enemy orange (placeholder)
-        4 => 0xFFFF_FF33,       // enemy yellow (placeholder)
-        _ => 0xFFFF_FFFF,       // neutral / default — white
-    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -5074,12 +5116,20 @@ fn build_dialog_hint(
         total_w,
         total_h,
         copy_pos,
+        sound_in,
+        sound_out,
         ..
     } = built;
     if parts.is_empty() {
         return None;
     }
     center_text_parts(&mut parts, state.iface_renderer.glyph_atlas_mut());
+    // Both C++ call paths show the hint right after build —
+    // Show()/SetVisible(true) fires SoundIn (MatrixHint.hpp:145-159,
+    // the Menu fires it explicitly at MatrixMap.cpp:3491).
+    if let Some(s) = &sound_in {
+        crate::matrix_game::interface::sound::play_hint_sound(s);
+    }
     Some((
         crate::matrix_game::interface::Hint {
             parts,
@@ -5089,7 +5139,7 @@ fn build_dialog_hint(
             otstup,
             screen_x: 0.0,
             screen_y: 0.0,
-            sound_out: None,
+            sound_out,
         },
         copy_pos,
     ))
@@ -5208,10 +5258,16 @@ fn enter_dialog_mode(state: &mut AppState, name: &str) {
 }
 
 /// Port of `CMatrixMap::LeaveDialogMode` (MatrixMap.cpp:3261-3283).
-/// SoundOut for the Menu is skipped — the UI sound backend is stubbed.
 fn leave_dialog_mode(state: &mut AppState) {
-    if state.dialog.take().is_none() {
+    let Some(dialog) = state.dialog.take() else {
         return;
+    };
+    // The Menu fires its hint's SoundOut on leave (MatrixMap.cpp:3267);
+    // other dialogs just Release their hints, which is silent.
+    if dialog.is_menu() {
+        if let Some(s) = dialog.hints.first().and_then(|h| h.sound_out.as_ref()) {
+            crate::matrix_game::interface::sound::play_hint_sound(s);
+        }
     }
     state.is_paused = false; // Pause(false)
     sync_dialog_buttons(state); // HideHintButtons
