@@ -2608,6 +2608,9 @@ pub struct MapRenderer {
     gloss_uniform_buffer: wgpu::Buffer,
     depth_texture: wgpu::TextureView,
     last_point_light_revision: u64,
+    /// Stencil shadow volume accumulator + darken pass — the
+    /// `CMatrixMap::DrawShadows` composition (MatrixMap.cpp:1865).
+    stencil_shadows: super::shadow::StencilShadowRenderer,
 }
 
 impl MapRenderer {
@@ -3345,7 +3348,7 @@ impl MapRenderer {
                 ..Default::default()
             },
             depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
+                format: crate::matrix_lib::three_g::texture::DEPTH_FORMAT,
                 depth_write_enabled: true,
                 depth_compare: wgpu::CompareFunction::Less,
                 stencil: Default::default(),
@@ -3386,7 +3389,7 @@ impl MapRenderer {
                 ..Default::default()
             },
             depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
+                format: crate::matrix_lib::three_g::texture::DEPTH_FORMAT,
                 depth_write_enabled: true,
                 depth_compare: wgpu::CompareFunction::Less,
                 stencil: Default::default(),
@@ -3435,7 +3438,7 @@ impl MapRenderer {
                 ..Default::default()
             },
             depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
+                format: crate::matrix_lib::three_g::texture::DEPTH_FORMAT,
                 depth_write_enabled: false,
                 depth_compare: wgpu::CompareFunction::LessEqual,
                 stencil: Default::default(),
@@ -3501,7 +3504,7 @@ impl MapRenderer {
                 ..Default::default()
             },
             depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
+                format: crate::matrix_lib::three_g::texture::DEPTH_FORMAT,
                 depth_write_enabled: false,
                 depth_compare: wgpu::CompareFunction::LessEqual,
                 stencil: Default::default(),
@@ -3517,6 +3520,7 @@ impl MapRenderer {
         });
 
         let depth_texture = create_depth_texture(device, config);
+        let stencil_shadows = super::shadow::StencilShadowRenderer::new(device, config);
 
         let sky = Sky::new(
             device,
@@ -3554,6 +3558,7 @@ impl MapRenderer {
             uniform_buffer,
             gloss_uniform_buffer,
             depth_texture,
+            stencil_shadows,
             last_point_light_revision: 0,
             buildings,
             robots,
@@ -3677,11 +3682,39 @@ impl MapRenderer {
         camera: &Camera,
     ) {
         let visible = visible_groups_mask(camera, map);
+        if let Some(objects) = &mut self.objects {
+            objects.sync_visibility(queue, &visible);
+        }
+        self.stencil_shadows.begin_frame();
+        if let Some(objects) = &self.objects {
+            objects.push_stencil_shadows(&mut self.stencil_shadows, &visible);
+        }
+        if let Some(buildings) = &mut self.buildings {
+            buildings.push_stencil_shadows(&mut self.stencil_shadows);
+        }
         if let Some(robots) = &mut self.robots {
-            robots.sync_robots(device, queue, objs, map, point_lights, cms, &visible);
+            robots.sync_robots(
+                device,
+                queue,
+                objs,
+                map,
+                point_lights,
+                cms,
+                &visible,
+                &mut self.stencil_shadows,
+            );
         }
         if let Some(cannons) = &mut self.cannons {
-            cannons.sync_cannons(device, queue, objs, map, ghost_cannon, &[], &visible);
+            cannons.sync_cannons(
+                device,
+                queue,
+                objs,
+                map,
+                ghost_cannon,
+                &[],
+                &visible,
+                &mut self.stencil_shadows,
+            );
         }
         if let Some(sm) = &mut self.slot_markers {
             sm.sync(queue, map, slot_markers);
@@ -3729,6 +3762,9 @@ impl MapRenderer {
             );
         }
 
+        self.stencil_shadows
+            .upload(_device, queue, view_proj, map.shadow_color);
+
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("Terrain Pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -3746,7 +3782,10 @@ impl MapRenderer {
                     load: wgpu::LoadOp::Clear(1.0),
                     store: wgpu::StoreOp::Store,
                 }),
-                stencil_ops: None,
+                stencil_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(0),
+                    store: wgpu::StoreOp::Store,
+                }),
             }),
             timestamp_writes: None,
             occlusion_query_set: None,
@@ -3838,10 +3877,11 @@ impl MapRenderer {
             }
         }
 
-        // Decorative objects plus their projected shadow pass.
-        if let Some(objects) = &mut self.objects {
+        // Decorative objects (their shadows now land in the stencil
+        // phase after water, like the C++ DrawShadows).
+        if let Some(objects) = &self.objects {
             if !skip("objects") {
-                objects.render(queue, &mut pass, camera, view_proj, &visible);
+                objects.render(queue, &mut pass, camera, view_proj);
             }
         }
         // Starting buildings — drawn after objects so their shadow projection
@@ -3872,6 +3912,20 @@ impl MapRenderer {
         if let Some(water) = &mut self.water {
             if !skip("water") {
                 water.render(_device, &mut pass, queue, camera, view_proj, view_mat, &visible);
+            }
+        }
+
+        // `DrawShadows` (MatrixMap.cpp:2285): stencil-count the shadow
+        // volumes, mark the proj silhouettes (colour writes off), then
+        // darken everything at stencil >= 1 with one fullscreen quad.
+        if !skip("shadows") {
+            self.stencil_shadows.render_volumes(&mut pass);
+            let mut marked = self.stencil_shadows.has_volumes();
+            if let Some(objects) = &self.objects {
+                marked |= objects.render_shadows_stencil(&mut pass, &visible);
+            }
+            if marked {
+                self.stencil_shadows.render_darken(&mut pass);
             }
         }
     }
@@ -3940,7 +3994,10 @@ impl MapRenderer {
                     load: wgpu::LoadOp::Clear(1.0),
                     store: wgpu::StoreOp::Store,
                 }),
-                stencil_ops: None,
+                stencil_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(0),
+                    store: wgpu::StoreOp::Store,
+                }),
             }),
             timestamp_writes: None,
             occlusion_query_set: None,
@@ -4321,7 +4378,7 @@ fn build_gradient_pipeline(
             ..Default::default()
         },
         depth_stencil: Some(wgpu::DepthStencilState {
-            format: wgpu::TextureFormat::Depth32Float,
+            format: crate::matrix_lib::three_g::texture::DEPTH_FORMAT,
             depth_write_enabled: false,
             depth_compare: wgpu::CompareFunction::Always,
             stencil: Default::default(),
@@ -4455,7 +4512,7 @@ fn load_skybox(
             ..Default::default()
         },
         depth_stencil: Some(wgpu::DepthStencilState {
-            format: wgpu::TextureFormat::Depth32Float,
+            format: crate::matrix_lib::three_g::texture::DEPTH_FORMAT,
             depth_write_enabled: false,
             depth_compare: wgpu::CompareFunction::Always,
             stencil: Default::default(),

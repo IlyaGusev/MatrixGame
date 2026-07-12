@@ -141,7 +141,7 @@ The original uses **X right, Y forward, Z up** (D3D left-handed). The Rust port 
 
 The original C++ has no tests. The Rust port has:
 
-- `cargo test --lib` — unit tests (~236) embedded in the modules
+- `cargo test --lib` — unit tests (~247) embedded in the modules
 - `rust_port/tests/` — integration tests against real `Data/` files
 - `rust_port/examples/` — headless probes/sims (`game_sim.rs` is the
   autonomous battle harness; see `rust_port/SIM.md`)

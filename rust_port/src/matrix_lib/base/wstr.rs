@@ -7,8 +7,8 @@
 //! characters — matching the C++ semantics of
 //! `GetStrPar(n, delims)` which splits on *any* char in `delims`.
 //!
-//! Not ported (yet): the buffer / refcounting / format helpers
-//! on CWStr. Those land if callers need them.
+//! CWStr's buffer / refcounting / format machinery is replaced by
+//! `String` — these field parsers are the part with real behavior.
 
 /// Count of `*`/`,`/…-separated parts in `s`. Mirrors
 /// `CWStr::GetCountPar` (CWStr.cpp:548-566). An empty string returns 0;

@@ -3,6 +3,10 @@
 pub const TEX_BOTTOM_SIZE: usize = 64;
 pub const MAP_GROUP_SIZE: i32 = 10;
 pub const WATER_LEVEL: f32 = -2.0;
+/// `m_GroundZ` / `m_GroundZBase` (MatrixMap.cpp:60-61) — stencil shadow
+/// extrusion floors; the base variant reaches under base craters.
+pub const GROUND_Z: f32 = WATER_LEVEL;
+pub const GROUND_Z_BASE: f32 = WATER_LEVEL - 64.0;
 pub const WATER_SIZE: usize = 16;
 pub const WATER_ALPHA_SIZE: usize = 64;
 pub const WATER_TEXTURE_SCALE: f32 = 1.0 / 16.0;

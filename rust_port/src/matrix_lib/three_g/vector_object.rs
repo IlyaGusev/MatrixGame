@@ -43,6 +43,10 @@ pub struct VoMesh {
     /// VectorObject.cpp:1769-1858): billboard lights whose colour animates
     /// over the interval table.
     pub lights: Vec<VoLight>,
+    /// `frames/edges` (VectorObject.cpp:284-288) — silhouette-edge
+    /// adjacency for stencil shadow volumes. Empty when the mesh has no
+    /// edge chunk (then it casts no stencil shadow, like the C++).
+    pub edges: Vec<VoEdge>,
 }
 
 /// One `$`-bone light: a billboard at bone `matid` whose colour LERPs
@@ -176,6 +180,23 @@ pub struct VoFrame {
     pub geo_center: [f32; 3],
     pub radius: f32,
     pub surfaces: Vec<VoSurfaceMesh>,
+    /// This frame's slice of `VoMesh::edges` (SVOKadr m_EdgeStart/m_EdgeCnt).
+    pub edge_start: usize,
+    pub edge_cnt: usize,
+}
+
+/// Ports `SVOKadrEdge` (VectorObject.hpp:267) — one mesh edge shared by
+/// two triangles, with both face normals in `SVONormal` compressed form.
+/// `v0`/`v1` are indices into `VoMesh::vertices` (the on-disk byte
+/// displacements divided by the 32-byte SVOVertex stride).
+#[derive(Clone, Copy, Debug)]
+pub struct VoEdge {
+    pub v0: u32,
+    pub v1: u32,
+    /// `SVONormal` — abs xyz scaled to 0..255 plus a sign-bit mask
+    /// (bit0=x, bit1=y, bit2=z) in the fourth byte.
+    pub n0: [u8; 4],
+    pub n1: [u8; 4],
 }
 
 /// Ports SVOAnimation (VectorObject.hpp:237). `frames` resolves the raw
@@ -258,6 +279,7 @@ pub fn parse_vo(data: &[u8]) -> Result<VoMesh> {
     let frames = parse_frames(&stor, &indices).context("parsing VO frames")?;
     let animations = parse_animations(&stor);
     let (matrices, all_matrices) = parse_matrices(&stor);
+    let edges = parse_edges(&stor);
     let surfaces = frames
         .first()
         .map(|f| f.surfaces.clone())
@@ -272,7 +294,36 @@ pub fn parse_vo(data: &[u8]) -> Result<VoMesh> {
         matrices,
         all_matrices,
         lights,
+        edges,
     })
+}
+
+/// Port of the `frames/edges` reader (VectorObject.cpp:284-288). Each
+/// on-disk SVOKadrEdge is 16 bytes under /Zp1: two i32 vertex byte
+/// displacements + two 4-byte SVONormals. Displacements convert to
+/// vertex indices (÷32, the SVOVertex stride) here.
+fn parse_edges(stor: &Storage) -> Vec<VoEdge> {
+    let Some(buf) = stor.get_buf("frames", "edges") else {
+        return Vec::new();
+    };
+    if buf.arrays_count() == 0 {
+        return Vec::new();
+    }
+    let raw = buf.get_bytes(0);
+    let count = raw.len() / 16;
+    let mut edges = Vec::with_capacity(count);
+    for i in 0..count {
+        let off = i * 16;
+        let v0 = read_i32(raw, off).max(0) as u32 / 32;
+        let v1 = read_i32(raw, off + 4).max(0) as u32 / 32;
+        edges.push(VoEdge {
+            v0,
+            v1,
+            n0: [raw[off + 8], raw[off + 9], raw[off + 10], raw[off + 11]],
+            n1: [raw[off + 12], raw[off + 13], raw[off + 14], raw[off + 15]],
+        });
+    }
+    edges
 }
 
 /// Port of the `matrices/{name,id,disp,data}` buffer reader at
@@ -532,6 +583,8 @@ fn parse_frames(stor: &Storage, indices: &[u16]) -> Result<Vec<VoFrame>> {
         let radius = read_f32(frame_data, off + 36);
         let union_start = read_i32(frame_data, off + 40).max(0) as usize;
         let union_count = read_i32(frame_data, off + 44).max(0) as usize;
+        let edge_start = read_i32(frame_data, off + 48).max(0) as usize;
+        let edge_cnt = read_i32(frame_data, off + 52).max(0) as usize;
 
         let mut surfs: Vec<VoSurfaceMesh> = (0..surface_count)
             .map(|i| VoSurfaceMesh {
@@ -588,6 +641,8 @@ fn parse_frames(stor: &Storage, indices: &[u16]) -> Result<Vec<VoFrame>> {
             geo_center,
             radius,
             surfaces,
+            edge_start,
+            edge_cnt,
         });
     }
 

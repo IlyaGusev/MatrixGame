@@ -511,7 +511,7 @@ impl PointLightRenderer {
                 ..Default::default()
             },
             depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
+                format: crate::matrix_lib::three_g::texture::DEPTH_FORMAT,
                 depth_write_enabled: false,
                 depth_compare: wgpu::CompareFunction::LessEqual,
                 stencil: Default::default(),

@@ -245,7 +245,7 @@ impl SlotMarkerRenderer {
                 ..Default::default()
             },
             depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
+                format: crate::matrix_lib::three_g::texture::DEPTH_FORMAT,
                 // Don't write — but DO test against terrain so the spot
                 // doesn't show through hills.
                 depth_write_enabled: false,

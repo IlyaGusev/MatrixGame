@@ -263,7 +263,7 @@ impl Minimap {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Depth32Float,
+            format: crate::matrix_lib::three_g::texture::DEPTH_FORMAT,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
         });

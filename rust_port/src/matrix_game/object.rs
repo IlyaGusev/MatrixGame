@@ -1660,6 +1660,13 @@ pub struct ObjectsRenderer {
     /// C++ Init drops m_ShadowProj, MatrixObject.cpp:973-979).
     shadow_keys: Vec<((i32, i32), u32)>,
     shadow_visible: Vec<bool>,
+    /// Stencil-typed object volumes (centered world space), one per
+    /// instance, built at load. Parallel key/visible/group lists follow
+    /// the proj-shadow liveness handling.
+    stencil_volumes: Vec<(Vec<[f32; 3]>, Vec<u16>)>,
+    stencil_keys: Vec<((i32, i32), u32)>,
+    stencil_visible: Vec<bool>,
+    stencil_groups: Vec<u32>,
     /// Per-shadow map-group index — shadows outside the visible-group
     /// mask are skipped (they were one draw call per object).
     shadow_groups: Vec<u32>,
@@ -1807,6 +1814,9 @@ impl ObjectsRenderer {
         let mut shadow_batches = Vec::new();
         let mut shadow_keys: Vec<((i32, i32), u32)> = Vec::new();
         let mut shadow_groups: Vec<u32> = Vec::new();
+        let mut stencil_volumes: Vec<(Vec<[f32; 3]>, Vec<u16>)> = Vec::new();
+        let mut stencil_keys: Vec<((i32, i32), u32)> = Vec::new();
+        let mut stencil_groups: Vec<u32> = Vec::new();
         let mut anims: Vec<AnimState> = Vec::new();
         let mut loaded_types = 0usize;
         let mut failed_types = 0usize;
@@ -2071,6 +2081,41 @@ impl ObjectsRenderer {
                 }
             }
 
+            // `Shadow=Stencil` object types (MatrixObject.cpp:530-560):
+            // static instances + fixed light, so the volume mesh is
+            // built once at load in centered world space. len =
+            // radius*2 + world z - m_GroundZ.
+            if matches!(paths.shadow.kind, ShadowKind::Stencil) && !mesh.edges.is_empty() {
+                let light_world = glam::Vec3::new(
+                    map.light_main_dir[0],
+                    map.light_main_dir[1],
+                    map.light_main_dir[2],
+                );
+                for (obj, _) in instances.iter().filter(|(_, hidden)| !hidden) {
+                    let sc = obj.scale.max(0.0001);
+                    let world = Mat4::from_translation(glam::Vec3::new(
+                        obj.x - cx,
+                        obj.y - cy,
+                        obj.z,
+                    )) * Mat4::from_mat3(object_rotation(obj) * sc);
+                    let light_local = world.inverse().transform_vector3(light_world);
+                    let radius = mesh.frames.first().map(|f| f.radius).unwrap_or(0.0) * sc;
+                    let len = radius * 2.0 + obj.z - crate::matrix_game::common::GROUND_Z;
+                    let mut ss =
+                        crate::matrix_lib::three_g::shadow_stencil::ShadowStencil::new();
+                    ss.build(&mesh, 0, light_local, len, false);
+                    if let Some((v, i)) = ss.geometry() {
+                        let verts: Vec<[f32; 3]> = v
+                            .iter()
+                            .map(|p| world.transform_point3(glam::Vec3::from(*p)).to_array())
+                            .collect();
+                        stencil_volumes.push((verts, i.to_vec()));
+                        stencil_keys.push((pos_key(obj.x, obj.y), *type_id));
+                        stencil_groups.push(group_index(obj.x, obj.y, map));
+                    }
+                }
+            }
+
             loaded_types += 1;
         }
 
@@ -2092,6 +2137,7 @@ impl ObjectsRenderer {
         );
 
         let shadow_visible = vec![true; shadow_batches.len()];
+        let stencil_visible = vec![true; stencil_volumes.len()];
         Some(Self {
             pipeline,
             shadow_pipeline,
@@ -2100,6 +2146,10 @@ impl ObjectsRenderer {
             shadow_keys,
             shadow_visible,
             shadow_groups,
+            stencil_volumes,
+            stencil_keys,
+            stencil_visible,
+            stencil_groups,
             last_mask: Vec::new(),
             instances_dirty: false,
             anims,
@@ -2249,20 +2299,41 @@ impl ObjectsRenderer {
                 self.shadow_visible[i] = t == *ty as i32;
             }
         }
+        for (i, (key, ty)) in self.stencil_keys.iter().enumerate() {
+            if let Some(&t) = live.get(key) {
+                self.stencil_visible[i] = t == *ty as i32;
+            }
+        }
+    }
+
+    /// Push the live Stencil-typed objects' volumes into this frame's
+    /// accumulator, gated by the group visibility mask.
+    pub fn push_stencil_shadows(
+        &self,
+        stencil: &mut crate::matrix_game::shadow::StencilShadowRenderer,
+        visible: &[bool],
+    ) {
+        for (i, (verts, inds)) in self.stencil_volumes.iter().enumerate() {
+            if !self.stencil_visible.get(i).copied().unwrap_or(true) {
+                continue;
+            }
+            let gi = self.stencil_groups[i] as usize;
+            if !visible.get(gi).copied().unwrap_or(true) {
+                continue;
+            }
+            stencil.push_volume(glam::Mat4::IDENTITY, verts, inds);
+        }
     }
 
     /// `visible` is the per-frame map-group visibility mask
     /// (`visible_groups_mask`); instances and projected shadows outside
     /// visible groups are not drawn, matching the C++ DrawObjects walk
     /// over `m_VisibleGroups` only.
-    pub fn render<'a>(
-        &'a mut self,
-        queue: &wgpu::Queue,
-        pass: &mut wgpu::RenderPass<'a>,
-        camera: &Camera,
-        view_proj: glam::Mat4,
-        visible: &[bool],
-    ) {
+    /// Refresh per-batch visible-instance buffers when the group mask
+    /// or instance set changed. Split out of `render` so the render
+    /// pass can borrow the renderer immutably (the stencil-shadow
+    /// phase re-enters it later in the same pass).
+    pub fn sync_visibility(&mut self, queue: &wgpu::Queue, visible: &[bool]) {
         if self.instances_dirty || self.last_mask != visible {
             let mut done_types: HashMap<u32, u32> = HashMap::new();
             let mut scratch: Vec<InstanceData> = Vec::new();
@@ -2295,7 +2366,15 @@ impl ObjectsRenderer {
             self.last_mask = visible.to_vec();
             self.instances_dirty = false;
         }
+    }
 
+    pub fn render<'a>(
+        &'a self,
+        queue: &wgpu::Queue,
+        pass: &mut wgpu::RenderPass<'a>,
+        camera: &Camera,
+        view_proj: glam::Mat4,
+    ) {
         let eye = camera.eye_pos();
         queue.write_buffer(
             &self.uniform_buffer,
@@ -2325,26 +2404,6 @@ impl ObjectsRenderer {
             }),
         );
 
-        let skip_shadows = std::env::var("MG_SKIP")
-            .map(|v| v.split(',').any(|s| s == "objshadows"))
-            .unwrap_or(false);
-        if !self.shadow_batches.is_empty() && !skip_shadows {
-            pass.set_pipeline(&self.shadow_pipeline);
-            for (i, batch) in self.shadow_batches.iter().enumerate() {
-                if !self.shadow_visible.get(i).copied().unwrap_or(true) {
-                    continue;
-                }
-                let gi = self.shadow_groups[i] as usize;
-                if !visible.get(gi).copied().unwrap_or(true) {
-                    continue;
-                }
-                pass.set_bind_group(0, &batch.bind_group, &[]);
-                pass.set_vertex_buffer(0, batch.vertex_buffer.slice(..));
-                pass.set_index_buffer(batch.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..batch.num_indices, 0, 0..1);
-            }
-        }
-
         if !self.batches.is_empty() {
             pass.set_pipeline(&self.pipeline);
             for batch in &self.batches {
@@ -2366,6 +2425,40 @@ impl ObjectsRenderer {
                 pass.draw_indexed(offset..offset + count, 0, 0..batch.num_visible);
             }
         }
+    }
+    /// Draw the CMAP-baked proj-shadow silhouettes into the stencil
+    /// buffer (part of the `DrawShadows` composition — MatrixMap.cpp:
+    /// 1917-1961). Returns true when anything was marked so the caller
+    /// knows to run the darken quad.
+    pub fn render_shadows_stencil<'a>(
+        &'a self,
+        pass: &mut wgpu::RenderPass<'a>,
+        visible: &[bool],
+    ) -> bool {
+        let skip_shadows = std::env::var("MG_SKIP")
+            .map(|v| v.split(',').any(|s| s == "objshadows"))
+            .unwrap_or(false);
+        if self.shadow_batches.is_empty() || skip_shadows {
+            return false;
+        }
+        let mut marked = false;
+        pass.set_pipeline(&self.shadow_pipeline);
+        pass.set_stencil_reference(1);
+        for (i, batch) in self.shadow_batches.iter().enumerate() {
+            if !self.shadow_visible.get(i).copied().unwrap_or(true) {
+                continue;
+            }
+            let gi = self.shadow_groups[i] as usize;
+            if !visible.get(gi).copied().unwrap_or(true) {
+                continue;
+            }
+            pass.set_bind_group(0, &batch.bind_group, &[]);
+            pass.set_vertex_buffer(0, batch.vertex_buffer.slice(..));
+            pass.set_index_buffer(batch.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..batch.num_indices, 0, 0..1);
+            marked = true;
+        }
+        marked
     }
 }
 
@@ -2606,7 +2699,7 @@ fn create_objects_pipeline(
             ..Default::default()
         },
         depth_stencil: Some(wgpu::DepthStencilState {
-            format: wgpu::TextureFormat::Depth32Float,
+            format: crate::matrix_lib::three_g::texture::DEPTH_FORMAT,
             depth_write_enabled: true,
             depth_compare: wgpu::CompareFunction::Less,
             stencil: Default::default(),
@@ -2658,11 +2751,15 @@ fn create_shadow_pipeline(
         },
         fragment: Some(wgpu::FragmentState {
             module: &shader,
-            entry_point: Some("fs_main"),
+            // Stencil-mark variant: DrawShadows draws proj silhouettes
+            // with colour writes off, alpha test >= 8/255 and stencil
+            // REPLACE ref 1 (MatrixMap.cpp:1917-1961); the shared darken
+            // quad applies the colour.
+            entry_point: Some("fs_stencil"),
             targets: &[Some(wgpu::ColorTargetState {
                 format: config.format,
-                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                write_mask: wgpu::ColorWrites::ALL,
+                blend: None,
+                write_mask: wgpu::ColorWrites::empty(),
             })],
             compilation_options: Default::default(),
         }),
@@ -2674,10 +2771,25 @@ fn create_shadow_pipeline(
             ..Default::default()
         },
         depth_stencil: Some(wgpu::DepthStencilState {
-            format: wgpu::TextureFormat::Depth32Float,
+            format: crate::matrix_lib::three_g::texture::DEPTH_FORMAT,
             depth_write_enabled: false,
             depth_compare: wgpu::CompareFunction::LessEqual,
-            stencil: Default::default(),
+            stencil: wgpu::StencilState {
+                front: wgpu::StencilFaceState {
+                    compare: wgpu::CompareFunction::Always,
+                    fail_op: wgpu::StencilOperation::Keep,
+                    depth_fail_op: wgpu::StencilOperation::Keep,
+                    pass_op: wgpu::StencilOperation::Replace,
+                },
+                back: wgpu::StencilFaceState {
+                    compare: wgpu::CompareFunction::Always,
+                    fail_op: wgpu::StencilOperation::Keep,
+                    depth_fail_op: wgpu::StencilOperation::Keep,
+                    pass_op: wgpu::StencilOperation::Replace,
+                },
+                read_mask: 0xFF,
+                write_mask: 0xFF,
+            },
             bias: Default::default(),
         }),
         multisample: Default::default(),

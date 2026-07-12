@@ -31,3 +31,13 @@ struct VOut {
     if (a <= 0.01) { discard; }
     return vec4<f32>(u.shadow_color.rgb, a);
 }
+
+// Stencil-mark variant — the DrawShadows composition (MatrixMap.cpp:
+// 1917-1961) draws proj silhouettes with color writes off, alpha test
+// `texture.a >= 8/255` (D3DRS_ALPHAREF 0x8 / GREATEREQUAL, alpha op
+// SELECT TEXTURE) and D3DSTENCILOP_REPLACE ref 1; the shared darken
+// quad then applies the color wherever stencil >= 1.
+@fragment fn fs_stencil(in: VOut) -> @location(0) vec4<f32> {
+    if (textureSample(t_shadow, s_shadow, in.uv).a < 8.0 / 255.0) { discard; }
+    return vec4<f32>(0.0);
+}

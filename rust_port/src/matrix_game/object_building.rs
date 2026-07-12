@@ -11,10 +11,10 @@
 //! composes it with its local animation matrix. We currently draw frame-0 of
 //! each sub-VO, which matches the at-rest pose the original ships with.
 //!
-//! Projected shadows are wired through the shared `ShadowSystem`
-//! (matrix_game::shadow). Each instance gets a baked silhouette texture and a
-//! one-shot ground-projection mesh built against the terrain at spawn — the
-//! `SHADOW_PROJ_STATIC` path in MatrixObjectBuilding.cpp:194-243.
+//! Buildings cast stencil shadow volumes (`m_ShadowType` from the CMAP,
+//! SHADOW_STENCIL on shipped maps — MatrixObjectBuilding.cpp:167-179):
+//! one volume per building built at load from the group's sub-unit VOs
+//! and pushed into the shared `StencilShadowRenderer` each frame.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -33,7 +33,8 @@ use crate::matrix_game::map_static::{
     MapStatic, ObjectCore, ObjectId, ObjectType, Objects, MR_ALL,
 };
 use crate::matrix_game::robot::{ChassisKind, Robot};
-use crate::matrix_game::shadow::{ShadowBatch, ShadowMeshSurface, ShadowMeshVertex, ShadowSystem};
+use crate::matrix_game::shadow::StencilShadowRenderer;
+use crate::matrix_lib::three_g::shadow_stencil::ShadowStencil;
 use crate::matrix_lib::three_g::texture::{
     create_solid_texture, create_texture_from_rgba, decode_texture_bytes,
 };
@@ -2008,16 +2009,12 @@ pub struct BuildingsRenderer {
     ambient_color: [f32; 4],
     light_color: [f32; 4],
     light_dir: [f32; 4],
-    /// Cached `m_ShadowColor` from the map (DATA_SHADOWCOLOR), packed as
-    /// 0xAARRGGBB and forwarded to `ShadowSystem::update_view` each frame.
-    shadow_color: u32,
     time_ms: f32,
     last_point_light_revision: u64,
-    /// Projected shadow infrastructure (pipelines, sampler, shared UB).
-    shadow_system: ShadowSystem,
-    /// One ground-projection mesh per building instance. Built once at spawn —
-    /// buildings don't move, so the geometry doesn't need to refresh per frame.
-    shadow_batches: Vec<ShadowBatch>,
+    /// Per-building stencil shadow volume (centered world space),
+    /// built once at load. Pushed into the frame accumulator by
+    /// `push_stencil_shadows` while the building lives.
+    shadow_volumes: Vec<(Vec<[f32; 3]>, Vec<u16>)>,
     /// Pos-key of the building owning each `shadow_batches` entry —
     /// lets the sync hide the shadow when the building dies.
     shadow_keys: Vec<(i32, i32)>,
@@ -2096,16 +2093,12 @@ impl BuildingsRenderer {
         let mut loaded_kinds = 0usize;
         let mut missing_kinds = 0usize;
 
-        // Per-kind pooled mesh data used to bake the silhouette texture and
-        // size the projector. Concatenates every sub-unit's frame-0 mesh into
-        // a single buffer (sub-units share the building's local frame at rest;
-        // the floor / door slide animations are runtime-only so the static
-        // bake at frame-0 matches the original's `m_GroupVO`-sourced shadow).
-        struct ShadowKindMesh {
-            vertices: Vec<ShadowMeshVertex>,
-            surfaces: Vec<ShadowMeshSurface>,
-        }
-        let mut shadow_kinds: HashMap<u8, ShadowKindMesh> = HashMap::new();
+        // Per-kind sub-unit VOs kept for the stencil-shadow edge walk
+        // (`m_GGraph->ShadowStencilOn`, MatrixObjectBuilding.cpp:167-179).
+        // Volumes bake at frame 0 — the floor / door slide animations are
+        // runtime-only, same static-rest simplification the projected
+        // bake used before.
+        let mut stencil_meshes: HashMap<u8, Vec<vector_object::VoMesh>> = HashMap::new();
 
         for (kind, instances) in &by_kind {
             let cvo_path = match building_cvo_path(*kind) {
@@ -2174,33 +2167,6 @@ impl BuildingsRenderer {
                 // overrides from the CVO still win, mirroring the composed
                 // skin the original builds at VectorObject.cpp:2513.
                 let cvo_dir = cvo_path.rsplit_once('/').map(|(d, _)| format!("{d}/"));
-                // Silhouette source — only the first unit in the CVO group
-                // contributes. Filtering on `id` alone is not enough: e.g.
-                // `b0.cvo` (BASE) lists `b0_anim.vo` (the landing pod) as an
-                // anonymous unit with no `Id`, and `b1.cvo`/`b2.cvo`/`b4.cvo`
-                // each have an anonymous `platform.vo` with no `Id`. Both
-                // would pool into the silhouette and project a phantom shadow
-                // next to the body. The original's commented-out projected-
-                // shadow path uses `m_GGraph->m_Unit[0]` — i.e. the first
-                // unit — as the body, so we mirror that.
-                let is_body = !shadow_kinds.contains_key(kind);
-                let shadow_vertex_offset = if is_body {
-                    let shadow_mesh = shadow_kinds.entry(*kind).or_insert_with(|| ShadowKindMesh {
-                        vertices: Vec::new(),
-                        surfaces: Vec::new(),
-                    });
-                    let off = shadow_mesh.vertices.len() as u32;
-                    shadow_mesh
-                        .vertices
-                        .extend(vertices.iter().map(|v| ShadowMeshVertex {
-                            position: v.position,
-                            normal: v.normal,
-                            uv: v.uv,
-                        }));
-                    Some(off)
-                } else {
-                    None
-                };
                 for surf in &frame0.surfaces {
                     if surf.indices.is_empty() {
                         continue;
@@ -2221,21 +2187,6 @@ impl BuildingsRenderer {
                     let (diffuse_view, alpha_test) =
                         resolve_diffuse(&material, device, queue, &mut tex_cache, read_texture)
                             .unwrap_or_else(|| (fallback_tex.clone(), false));
-                    // Mirror this body surface into the silhouette source,
-                    // re-indexed to point into the pooled vertex array.
-                    // Skipped for animated sub-units (platform / doors) —
-                    // their `shadow_vertex_offset` is None.
-                    if let Some(offset) = shadow_vertex_offset {
-                        let shadow_mesh = shadow_kinds
-                            .get_mut(kind)
-                            .expect("body offset implies kind already inserted");
-                        let remapped: Vec<u32> = surf.indices.iter().map(|i| i + offset).collect();
-                        shadow_mesh.surfaces.push(ShadowMeshSurface {
-                            indices: remapped,
-                            diffuse: diffuse_view.clone(),
-                            alpha_test,
-                        });
-                    }
                     let gloss_view = resolve_texture(
                         material.gloss.as_ref(),
                         device,
@@ -2347,6 +2298,7 @@ impl BuildingsRenderer {
                         unit_id: unit.id,
                     });
                 }
+                stencil_meshes.entry(*kind).or_default().push(mesh);
             }
 
             vector_object::set_building_boxes(*kind, pick_boxes);
@@ -2510,8 +2462,14 @@ impl BuildingsRenderer {
         // default the original passes to `ShadowProjBuild` for buildings
         // (MatrixObjectBuilding.cpp:214). Shadow texture size mirrors the
         // building's `m_ShadowSize` (default 128, MatrixObjectBuilding.cpp:40).
-        let shadow_system = ShadowSystem::new(device, config);
-        let mut shadow_batches: Vec<ShadowBatch> = Vec::new();
+        // Load-time stencil shadow volumes — buildings never move and the
+        // light is fixed, so each building's volume mesh is built once
+        // (frame 0) and re-pushed into the frame accumulator while the
+        // building lives. `m_GGraph->ShadowStencilOn(true)` with
+        // len = |unit z - GroundZ(Base)| (MatrixObjectBuilding.cpp:167-179,
+        // VectorObject.cpp:2096-2108). Volumes are pre-transformed into
+        // centered render space.
+        let mut shadow_volumes: Vec<(Vec<[f32; 3]>, Vec<u16>)> = Vec::new();
         let mut shadow_keys: Vec<(i32, i32)> = Vec::new();
         let light_world = Vec3::new(
             map.light_main_dir[0],
@@ -2519,45 +2477,48 @@ impl BuildingsRenderer {
             map.light_main_dir[2],
         );
         for b in &map.buildings {
-            let Some(mesh) = shadow_kinds.get(&b.kind) else {
-                continue;
-            };
-            if mesh.vertices.is_empty() || mesh.surfaces.is_empty() {
+            // Map data drives the type (DATA_BUILDINGS_SHADOW); shipped
+            // maps use 3 (SHADOW_STENCIL) or 0 (off).
+            if b.shadow_kind != 3 {
                 continue;
             }
-            let world_matrix = building_world_matrix(b);
-            let local_pts: Vec<Vec3> = mesh
-                .vertices
-                .iter()
-                .map(|v| Vec3::from_array(v.position))
-                .collect();
-            let Some(proj) = shadow_system.calc_proj(&local_pts, light_world, world_matrix) else {
+            let Some(unit_meshes) = stencil_meshes.get(&b.kind) else {
                 continue;
             };
-            let texture_size = b.shadow_size.max(32) as u32;
-            let Some(tex) = shadow_system.bake_texture(
-                device,
-                queue,
-                &mesh.vertices,
-                &mesh.surfaces,
-                &proj,
-                texture_size,
-            ) else {
-                continue;
+            let world = Mat4::from_translation(Vec3::new(-cx, -cy, 0.0)) * building_world_matrix(b);
+            let light_local = world.inverse().transform_vector3(light_world);
+            let ground = if b.kind == 0 {
+                crate::matrix_game::common::GROUND_Z_BASE
+            } else {
+                crate::matrix_game::common::GROUND_Z
             };
-            if let Some(batch) =
-                shadow_system.build_geometry(device, map, &proj, &tex, 10, [cx, cy])
-            {
-                shadow_batches.push(batch);
+            let len = (world.w_axis.z - ground).abs();
+            let mut vol_verts: Vec<[f32; 3]> = Vec::new();
+            let mut vol_inds: Vec<u16> = Vec::new();
+            for vo in unit_meshes {
+                if vo.edges.is_empty() {
+                    continue;
+                }
+                let mut ss = ShadowStencil::new();
+                ss.build(vo, 0, light_local, len, false);
+                if let Some((v, i)) = ss.geometry() {
+                    let base = vol_verts.len() as u16;
+                    vol_verts.extend(
+                        v.iter()
+                            .map(|p| world.transform_point3(Vec3::from(*p)).to_array()),
+                    );
+                    vol_inds.extend(i.iter().map(|&x| x + base));
+                }
+            }
+            if !vol_inds.is_empty() {
+                shadow_volumes.push((vol_verts, vol_inds));
                 shadow_keys.push(pos_key(b.x, b.y));
             }
         }
-        log::info!(
-            "buildings: {} projected shadows built",
-            shadow_batches.len()
-        );
+        log::info!("buildings: {} stencil shadows built", shadow_volumes.len());
 
-        let shadow_visible = vec![true; shadow_batches.len()];
+        let shadow_visible = vec![true; shadow_volumes.len()];
+
         Some(Self {
             pipeline,
             batches,
@@ -2567,11 +2528,9 @@ impl BuildingsRenderer {
             ambient_color,
             light_color,
             light_dir,
-            shadow_color: map.shadow_color,
             time_ms: 0.0,
             last_point_light_revision: 0,
-            shadow_system,
-            shadow_batches,
+            shadow_volumes,
             shadow_keys,
             shadow_visible,
             logic_buildings_seen: false,
@@ -2829,6 +2788,17 @@ impl BuildingsRenderer {
         }
     }
 
+    /// Push the live buildings' pre-built stencil volumes into this
+    /// frame's accumulator (part of the DrawShadows composition).
+    pub fn push_stencil_shadows(&self, stencil: &mut StencilShadowRenderer) {
+        for (i, (verts, inds)) in self.shadow_volumes.iter().enumerate() {
+            if !self.shadow_visible.get(i).copied().unwrap_or(true) {
+                continue;
+            }
+            stencil.push_volume(Mat4::IDENTITY, verts, inds);
+        }
+    }
+
     pub fn render<'a>(
         &'a self,
         queue: &wgpu::Queue,
@@ -2851,14 +2821,6 @@ impl BuildingsRenderer {
                 time_ms: [self.time_ms, 0.0, 0.0, 0.0],
             }),
         );
-
-        // Shadows go down first so the building meshes overdraw their bases.
-        // This mirrors `DrawShadowsProjFast` running before the object pass in
-        // the original's per-frame order (MatrixMap.cpp:2283).
-        self.shadow_system
-            .update_view(queue, view_proj, self.shadow_color);
-        self.shadow_system
-            .render_visible(pass, &self.shadow_batches, &self.shadow_visible);
 
         pass.set_pipeline(&self.pipeline);
         for batch in &self.batches {
@@ -3177,7 +3139,7 @@ fn create_pipeline(
             ..Default::default()
         },
         depth_stencil: Some(wgpu::DepthStencilState {
-            format: wgpu::TextureFormat::Depth32Float,
+            format: crate::matrix_lib::three_g::texture::DEPTH_FORMAT,
             depth_write_enabled: true,
             depth_compare: wgpu::CompareFunction::Less,
             stencil: Default::default(),

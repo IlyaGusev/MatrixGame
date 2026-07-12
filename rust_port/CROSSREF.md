@@ -27,30 +27,42 @@ layer.
 | matrix_lib/base/storage.rs        | MatrixLib/Base/src/CStorage.cpp |
 | matrix_lib/base/wstr.rs           | MatrixLib/Base/src/CWStr.cpp (field parsers only: `GetStrPar`, `GetIntPar`, `GetDoublePar`, `GetCountPar`, `CompareFirst`) |
 
-Not yet ported: CBuf, CDWORDMap, CException, CFile, CHeap, CList,
-CMain, CRC32, CReminder, CStr, CWStrFormat, Mem, Registry, Tracer.
-(CWStr partial — only the read-only field-parsing helpers are in
-`wstr.rs`.)
+N/A-by-design (C++/Win32 infrastructure replaced by Rust std):
+CBuf/CFile (buffered file IO → `Vec<u8>` + gfx/loader.rs), CDWORDMap/
+CList (containers → std collections), CException/Tracer (SEH + DTRACE
+call-stack tracer → Result/panic), CHeap/Mem (allocator bookkeeping →
+the Rust allocator), CMain (static-init base class), CStr/CWStrFormat
+(string classes → `String`; CWStr's read-only field parsers are the
+part with real behavior and live in `wstr.rs`), Registry (Win32
+registry persistence — no game-code callers), CReminder (delayed
+D3D-resource-eviction timers; wgpu resources are kept for the session),
+CRC32 (only callers are `CStorage::Save`/`CalcUniqID` and
+`CBitmap::Hash`, none reachable from the game).
 
 ## matrix_lib/bitmap/ (MatrixLib/Bitmap/)
 
 | Rust file                         | Original                        |
 |-----------------------------------|---------------------------------|
 | matrix_lib/bitmap/mod.rs          | MatrixLib/Bitmap/src/CBitmap.cpp|
-
-Not yet ported: sharpen.cpp / asharpen.asm (texture sharpen filter).
+| matrix_lib/bitmap/sharpen.rs      | MatrixLib/Bitmap/src/sharpen.cpp + asharpen.asm (CPU reference; shaders/icon_sharpen.wgsl mirrors it for the robot-icon mip chain) |
 
 ## matrix_lib/three_g/ (MatrixLib/3G/)
 
 | Rust file                               | Original                           |
 |-----------------------------------------|------------------------------------|
 | matrix_lib/three_g/billboard.rs         | MatrixLib/3G/src/CBillboard.cpp (queue + quad/line expansion; GPU flush in effects_renderer.rs) |
-| matrix_lib/three_g/math3d.rs            | MatrixLib/3G/src/Math3D.cpp (CTrajectory + VecToMatrixX/Y) |
+| matrix_lib/three_g/math3d.rs            | MatrixLib/3G/src/Math3D.cpp (CTrajectory + VecToMatrixX/Y; the other live helpers — IntersectTriangle, CalcPick, IsIntersectSphere, BuildRotateMatrix, Vec3Projection — are inlined at their Rust call sites: map_trace.rs, camera.rs, side_player.rs, lightening.rs, robot.rs. IsIntersectRect / IntersectLine / DistLinePoint have no live C++ callers.) |
+| matrix_lib/three_g/shadow_stencil.rs    | MatrixLib/3G/src/ShadowStencil.cpp (CVOShadowStencil::Build; GPU passes in matrix_game/shadow.rs `StencilShadowRenderer`) |
 | matrix_lib/three_g/texture.rs           | MatrixLib/3G/src/Texture.cpp       |
 | matrix_lib/three_g/vector_object.rs     | MatrixLib/3G/src/VectorObject.cpp  |
 
-Not yet ported: 3g, BigIB, BigVB, Cache, DeviceState,
-Form, Helper, ShadowProj, ShadowStencil. (Math3D partial — CTrajectory.)
+N/A-by-design (D3D9/Win32 infrastructure replaced by the wgpu glue):
+3g (device init/state → gfx/context.rs), BigIB/BigVB (pooled D3D
+buffers → wgpu buffers), Cache (resource cache → bundle/loader),
+DeviceState (render-state cache → baked pipelines), Form (Win32 window
+→ winit glue), Helper (debug-only draw helper, compiled out of
+release). ShadowProj (CVOShadowProj) is ported as part of
+matrix_game/shadow.rs.
 
 ## matrix_game/ (MatrixGame/src/)
 
@@ -77,7 +89,7 @@ Form, Helper, ShadowProj, ShadowStencil. (Math3D partial — CTrajectory.)
 | matrix_game/multi_selection.rs| MatrixMultiSelection.cpp (marquee drag-select) |
 | matrix_game/object_cannon.rs  | MatrixObjectCannon.cpp (turrets: seek/aim/fire + fire animation, damage, DIP wrecks, renderer) |
 | matrix_game/pause_overlay.rs  | (no direct peer — dim quad behind the C++ pause hint) |
-| matrix_game/shadow.rs         | MatrixShadowManager.cpp (projected-shadow system) |
+| matrix_game/shadow.rs         | MatrixShadowManager.cpp + 3G/ShadowProj.cpp (projected-shadow system) + the CMatrixMap::DrawShadows stencil composition (MatrixMap.cpp:1865 — `StencilShadowRenderer`: volume INCR/DECR pass, proj-in-stencil marks, fullscreen darken quad) |
 | matrix_game/slot_marker.rs    | (no direct peer — turret-slot place markers, CreatePlacesShow visuals) |
 | matrix_game/progress_bar.rs   | MatrixProgressBar.cpp (3-segment bar + LIC color, atlas-backed) |
 | matrix_game/render_pipeline.rs| MatrixRenderPipeline.cpp          |
@@ -205,3 +217,5 @@ not embedded as raw-string constants.
 | shaders/selection_ring.wgsl          | matrix_game/effects/selection.rs |
 | shaders/billboard.wgsl               | matrix_game/effects/effects_renderer.rs |
 | shaders/effect_mesh.wgsl             | matrix_game/effects/effects_renderer.rs |
+| shaders/icon_sharpen.wgsl            | matrix_game/interface/robot_icons.rs (GPU mirror of matrix_lib/bitmap/sharpen.rs) |
+| shaders/shadow_stencil.wgsl          | matrix_game/shadow.rs (StencilShadowRenderer) |

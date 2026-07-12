@@ -337,7 +337,7 @@ impl ApplicationHandler for App {
                     &gfx.device,
                     &gfx.queue,
                     &gfx.config,
-                    wgpu::TextureFormat::Depth32Float,
+                    crate::matrix_lib::three_g::texture::DEPTH_FORMAT,
                     &matrix_data,
                     &tex_reader,
                 );
@@ -346,7 +346,7 @@ impl ApplicationHandler for App {
                     &gfx.device,
                     &gfx.queue,
                     &gfx.config,
-                    wgpu::TextureFormat::Depth32Float,
+                    crate::matrix_lib::three_g::texture::DEPTH_FORMAT,
                     &matrix_data,
                     &tex_reader,
                 );
@@ -574,7 +574,7 @@ impl ApplicationHandler for App {
                         &gfx.device,
                         &gfx.queue,
                         &gfx.config,
-                        wgpu::TextureFormat::Depth32Float,
+                        crate::matrix_lib::three_g::texture::DEPTH_FORMAT,
                         &matrix_data,
                         &read,
                     );
@@ -583,7 +583,7 @@ impl ApplicationHandler for App {
                         &gfx.device,
                         &gfx.queue,
                         &gfx.config,
-                        wgpu::TextureFormat::Depth32Float,
+                        crate::matrix_lib::three_g::texture::DEPTH_FORMAT,
                         &matrix_data,
                         &read,
                     );
@@ -1897,7 +1897,10 @@ impl ApplicationHandler for App {
                                             load: wgpu::LoadOp::Load,
                                             store: wgpu::StoreOp::Store,
                                         }),
-                                        stencil_ops: None,
+                                        stencil_ops: Some(wgpu::Operations {
+                                            load: wgpu::LoadOp::Load,
+                                            store: wgpu::StoreOp::Store,
+                                        }),
                                     },
                                 ),
                                 timestamp_writes: None,
@@ -2149,7 +2152,10 @@ impl ApplicationHandler for App {
                                                     load: wgpu::LoadOp::Clear(1.0),
                                                     store: wgpu::StoreOp::Store,
                                                 }),
-                                                stencil_ops: None,
+                                                stencil_ops: Some(wgpu::Operations {
+                                                    load: wgpu::LoadOp::Load,
+                                                    store: wgpu::StoreOp::Store,
+                                                }),
                                             },
                                         ),
                                         timestamp_writes: None,

@@ -475,6 +475,12 @@ pub fn create_texture_from_rgba_mipped(
     texture.create_view(&Default::default())
 }
 
+/// Depth-stencil format shared by every pass that draws the world. The
+/// stencil aspect carries the shadow-volume counts of `DrawShadows`
+/// (MatrixMap.cpp:1865); D3D9 requires a stencil-capable Z buffer the
+/// same way (GFLAG_STENCILAVAILABLE).
+pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24PlusStencil8;
+
 pub fn create_depth_texture(
     device: &wgpu::Device,
     config: &wgpu::SurfaceConfiguration,
@@ -489,7 +495,7 @@ pub fn create_depth_texture(
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Depth32Float,
+        format: DEPTH_FORMAT,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
         view_formats: &[],
     });
