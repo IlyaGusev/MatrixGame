@@ -1,10 +1,11 @@
 //! Partial port of `CMatrixConfig` (MatrixConfig.{cpp,hpp}).
 //!
-//! The original config struct covers gamma/keybinds/sound volumes as
-//! well as the weapon-damage lookup tables. This file only ports the
-//! weapon-damage portion of that — specifically the per-weapon damage
-//! table used by `CMatrixMapObject::Damage` (MatrixObject.cpp:145 etc).
-//! Other parts of `g_Config` land with their call sites.
+//! Ports the robots.dat-driven tables of `g_Config`: weapon
+//! damage/radius/cooldown/overheat, chassis chars, constructor
+//! prices/timings, cannon/turret props, difficulty, string tables, and
+//! the `Sounds`/`ChassisSounds` blocks. The original's gamma/keybind/
+//! volume settings (registry-backed) are not ported; remaining
+//! `g_Config` parts land with their call sites.
 //!
 //! The tables are loaded from `robots.dat` via the CStorage-backed
 //! BlockPar accessors on [`Storage`]. Tests can construct the structs

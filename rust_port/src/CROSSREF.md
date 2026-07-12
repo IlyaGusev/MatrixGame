@@ -22,15 +22,23 @@ layer.
 
 | Rust file                         | Original                        |
 |-----------------------------------|---------------------------------|
-| matrix_lib/bitmap/mod.rs          | MatrixLib/Bitmap/src/CBitmap.cpp|
 | matrix_lib/base/blockpar.rs       | MatrixLib/Base/src/CBlockPar.cpp|
 | matrix_lib/base/pack.rs           | MatrixLib/Base/src/Pack.cpp     |
 | matrix_lib/base/storage.rs        | MatrixLib/Base/src/CStorage.cpp |
 | matrix_lib/base/wstr.rs           | MatrixLib/Base/src/CWStr.cpp (field parsers only: `GetStrPar`, `GetIntPar`, `GetDoublePar`, `GetCountPar`, `CompareFirst`) |
 
 Not yet ported: CBuf, CDWORDMap, CException, CFile, CHeap, CList,
-CMain, CRC32, CReminder, CStr, Mem, Registry, Tracer. (CWStr partial —
-only the read-only field-parsing helpers are in `wstr.rs`.)
+CMain, CRC32, CReminder, CStr, CWStrFormat, Mem, Registry, Tracer.
+(CWStr partial — only the read-only field-parsing helpers are in
+`wstr.rs`.)
+
+## matrix_lib/bitmap/ (MatrixLib/Bitmap/)
+
+| Rust file                         | Original                        |
+|-----------------------------------|---------------------------------|
+| matrix_lib/bitmap/mod.rs          | MatrixLib/Bitmap/src/CBitmap.cpp|
+
+Not yet ported: sharpen.cpp / asharpen.asm (texture sharpen filter).
 
 ## matrix_lib/three_g/ (MatrixLib/3G/)
 
@@ -50,7 +58,7 @@ Form, Helper, ShadowProj, ShadowStencil. (Math3D partial — CTrajectory.)
 |-------------------------------|-----------------------------------|
 | matrix_game/camera.rs         | MatrixCamera.cpp (strategy/arcade modes + SAutoFlyData FLYCAM autopilot) |
 | matrix_game/common.rs         | Common.hpp                        |
-| matrix_game/config.rs         | MatrixConfig.cpp (damage/radius/cooldown/overheat tables, cannon props, difficulty; gamma/keybind/sound deferred) |
+| matrix_game/config.rs         | MatrixConfig.cpp (damage/radius/cooldown/overheat tables, cannon props, difficulty, Sounds/ChassisSounds defs; gamma/keybind settings deferred) |
 | matrix_game/cursor.rs         | MatrixCursor.cpp (software cursor: Cursors block, frame anim, CalcUV; drawn via interface renderer) |
 | matrix_game/form_game.rs      | MatrixFormGame.cpp (+ MatrixGame.cpp entry glue) |
 | matrix_game/map.rs            | MatrixMap.cpp (map data + `MapRenderer` draw orchestration + DrawSky/skybox)|
@@ -86,7 +94,8 @@ MatrixInstantDraw, MatrixMapTexture, MatrixSampleStateManager,
 MatrixSkinManager (vector_object.rs handles materials), MatrixVisiCalc
 (frustum culling lives in the renderers),
 MatrixLoadProgress / MatrixTransition (index.html spinner + CSS fade),
-MatrixDebugInfo + DevConsole (dev/cheat tooling).
+MatrixDebugInfo + DevConsole (dev/cheat tooling),
+MatrixGameDll (SR2-host DLL export shim).
 StringConstants: inlined per use.
 
 ## matrix_game/effects/ (MatrixGame/src/Effects/)
@@ -114,7 +123,8 @@ StringConstants: inlined per use.
 
 Done-by-design: MatrixEffect base (GameEffect enum + effects_takt +
 enforce_limits port the list/limits), Shleif (AddSmoke/AddFire map to
-standalone Smoke/Fire spawns at the same call sites), Path (no spawn
+standalone Smoke/Fire spawns at the same call sites), Repair (the
+repair-beam visuals live in weapon.rs), Path (no spawn
 sites exist in the original — dead code).
 
 ## matrix_game/interface/ (MatrixGame/src/Interface/)
@@ -126,7 +136,7 @@ sites exist in the original — dead code).
 | matrix_game/interface/history.rs        | CHistory.{cpp,h}                                   |
 | matrix_game/interface/dialog.rs         | MatrixMap.cpp:3259-3575 dialog mode (menu/win/lose/stat dialogs, confirmations) + MatrixLogic.cpp:2527-2586 stat replacements |
 | matrix_game/interface/iface_button.rs   | CIFaceButton.{cpp,h} |
-| matrix_game/interface/iface_element.rs  | CIFaceElement.{cpp,h} |
+| matrix_game/interface/iface_element.rs  | CIFaceElement.{cpp,h} (+ folded CAnimation.{cpp,h} frame animation) |
 | matrix_game/interface/iface_image.rs    | CIFaceImage.{cpp,h} |
 | matrix_game/interface/iface_static.rs   | CIFaceStatic.{cpp,h} |
 | matrix_game/interface/iface_list.rs     | CInterface.h::CIFaceList (panel container + events + BeginBuildTurret placement state)|

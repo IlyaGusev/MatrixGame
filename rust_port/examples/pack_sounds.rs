@@ -1,5 +1,5 @@
 //! Pack audio files into `assets/sounds.bundle` for the WebAudio
-//! backend (SOUND_PROPOSAL.md §4). SR2 assets are proprietary, so the
+//! backend. SR2 assets are proprietary, so the
 //! payloads come from the user's SR2 installation:
 //!
 //!   cargo run --example pack_sounds -- <Sound.pkg | dir> [out.bundle]

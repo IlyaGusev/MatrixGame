@@ -1,4 +1,4 @@
-//! WebAudio implementation of [`SoundOutput`] (SOUND_PROPOSAL.md §3).
+//! WebAudio implementation of [`SoundOutput`].
 //!
 //! Graph: `AudioBufferSourceNode → GainNode → StereoPannerNode → sfx
 //! gain → master gain → destination`, one chain per voice. Samples
@@ -11,7 +11,7 @@
 //! Autoplay policy: the AudioContext starts suspended until the first
 //! pointer / key gesture resumes it; until then plays are dropped.
 //!
-//! Music (§6): `assets/music/playlist.txt` lists files (one per line,
+//! Music: `assets/music/playlist.txt` lists files (one per line,
 //! relative to `assets/music/`); they loop shuffled through a
 //! dedicated gain the `SetMusicVolume` hook fades over ~1 s.
 

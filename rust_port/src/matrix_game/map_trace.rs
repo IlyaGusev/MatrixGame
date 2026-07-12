@@ -1,7 +1,7 @@
 //! Port of `MatrixMapTrace.cpp` — the landscape / object ray-cast side
 //! of `CMatrixMap::Trace`. This file is the Rust mirror of the C++
-//! tracing module; the `CMatrixMap::Trace` object-scan branch is
-//! slated for import from `map_static.rs::pick_object` (FS_DIFF).
+//! tracing module; the object-scan branch is implemented as
+//! `Objects::pick_object` in map_static.rs and re-exported here.
 //!
 //! Local pathfinding (`CMatrixMap::FindLocalPath` +
 //! `OptimizeMovePath`) used to live here; it now lives in `logic.rs`

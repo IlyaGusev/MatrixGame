@@ -1,4 +1,4 @@
-//! Platform selection for the sound backend (SOUND_PROPOSAL.md §3).
+//! Platform selection for the sound backend.
 //! WASM gets the WebAudio graph; native stays silent (the native
 //! binary is a dev tool — rodio is an explicit non-goal).
 

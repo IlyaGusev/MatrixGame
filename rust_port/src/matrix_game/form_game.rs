@@ -147,7 +147,7 @@ struct AppState {
     /// Drained with the FPS log so heavy-battle slowdowns are attributable.
     perf_acc: [f64; 6],
     /// CSound port — consumes the queued [`SndEvent`]s each frame
-    /// (SOUND_PROPOSAL.md §3: logic produces, the app loop mixes).
+    /// (logic produces, the app loop mixes).
     sounds: crate::matrix_game::sound::SoundMixer,
 }
 
@@ -5012,7 +5012,7 @@ async fn load_map_async() -> (
 }
 
 /// Drain all queued sound events into the mixer — the app-loop side
-/// of the split in SOUND_PROPOSAL.md §3: game logic and UI code queue
+/// of the split: game logic and UI code queue
 /// [`SndEvent`]s, this pump feeds them to the `CSound` port with the
 /// current camera listener. Runs every frame, pause included.
 fn pump_sounds(state: &mut AppState) {
