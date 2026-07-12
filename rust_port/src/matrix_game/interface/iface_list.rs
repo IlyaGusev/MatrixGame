@@ -320,6 +320,22 @@ impl IFaceList {
                 list.panels.push(p);
             }
         }
+        // Deliberate deviation from the authored data: the enter-robot
+        // button caption is just "Ручное" in LabelsText; show the full
+        // "Ручное управление" on two lines instead (user preference).
+        // The forced \n keeps it two lines at any font metrics; the
+        // authored y/sme_y offsets centre a single line, so zero them
+        // and let the wrapped block centre on the button middle.
+        if let Some(main) = list.panels.iter_mut().find(|p| p.name == "Main") {
+            if let Some(e) = main.elements.iter_mut().find(|e| e.name == "inro") {
+                for l in &mut e.labels {
+                    l.text = "Ручное\nуправление".to_string();
+                    l.wrap = true;
+                    l.y = 0.0;
+                    l.sme_y = 0.0;
+                }
+            }
+        }
         list
     }
 
