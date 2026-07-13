@@ -16,14 +16,26 @@ fn main() {
     let pkg = PkgArchive::from_bytes(pkg_data).unwrap();
 
     let requested = std::env::args().nth(1).unwrap_or_else(|| "atoll".into());
-    let short_name = requested
-        .trim()
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or("")
-        .trim_end_matches(".cmap")
-        .trim_end_matches(".CMAP")
-        .to_lowercase();
+    // Slug matches lang_dat.py / briefing_stem(): "MANSION (E)" → mansion_e.
+    let short_name: String = {
+        let stem = requested
+            .trim()
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or("")
+            .trim_end_matches(".cmap")
+            .trim_end_matches(".CMAP")
+            .to_lowercase();
+        let mut out = String::new();
+        for c in stem.chars() {
+            if c.is_ascii_alphanumeric() {
+                out.push(c);
+            } else if !out.ends_with('_') {
+                out.push('_');
+            }
+        }
+        out.trim_matches('_').to_string()
+    };
     let map_name = if requested.contains('/') || requested.contains('\\') {
         requested.replace('\\', "/").to_uppercase()
     } else {
@@ -95,15 +107,11 @@ fn main() {
             if let Ok(data) = pkg.read_file(candidate) {
                 // Store with the original path (no extension if it didn't have one)
                 // so the renderer can look it up by the same key
+                let len = data.len();
                 bundle.add(&path, data);
                 tex_count += 1;
                 found = true;
-                println!(
-                    "  {} -> {} ({} bytes)",
-                    path,
-                    candidate,
-                    bundle.to_bytes().len()
-                );
+                println!("  {} -> {} ({} bytes)", path, candidate, len);
                 break;
             }
         }

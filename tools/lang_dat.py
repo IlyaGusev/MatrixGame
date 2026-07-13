@@ -156,8 +156,33 @@ def clean(text):
     return text.replace("\t", " ").strip()
 
 
+def slug(s):
+    out = "".join(c if c.isalnum() else "_" for c in s.lower())
+    while "__" in out:
+        out = out.replace("__", "_")
+    return out.strip("_")
+
+
+def category(fields):
+    """original = the 2004 campaign maps (Group=0: Учебная, missions,
+    Террон). addon = Group=1 Access<=9 (Резиденция Лякуши … Рудники).
+    other = the remaining skirmish block (Access>=10, Аль-Кагул …
+    Зенит). extra = demo / story-PB / service maps the menu hides."""
+    group = fields.get("Group", [""])[0]
+    if group == "0":
+        return "original"
+    if group == "1":
+        return "addon" if int(fields.get("Access", ["99"])[0]) <= 9 else "other"
+    return "extra"
+
+
 def write_maps(root, out_path):
     robots_map = next(v for name, v in root if name == "RobotsMap")
+    # Length 0..4 → the labels the quick-launch form shows in the
+    # right column («Малая» … «Большая»), from the FormLoadRobot block.
+    form = next((v for name, v in root if name == "FormLoadRobot"), [])
+    form_pars = {n: v for n, v in form if isinstance(v, str)}
+    length_labels = {str(i): form_pars.get(f"Length{i}", "") for i in range(5)}
     lines = []
     for _, entry in robots_map:
         if isinstance(entry, str):
@@ -166,11 +191,14 @@ def write_maps(root, out_path):
         for name, val in entry:
             if isinstance(val, str):
                 fields.setdefault(name, []).append(val)
-        stem = fields.get("Map", [""])[0].rsplit(".", 1)[0].lower()
+        stem = fields.get("Map", [""])[0].rsplit(".", 1)[0]
         if not stem:
             continue
-        lines.append(f"map\t{stem}")
+        lines.append(f"map\t{slug(stem)}")
         lines.append(f"name\t{fields.get('Name', [''])[0]}")
+        lines.append(f"cat\t{category(fields)}")
+        lines.append(f"side\t{fields.get('Side', [''])[0]}")
+        lines.append(f"dif\t{length_labels.get(fields.get('Length', [''])[0], '')}")
         for tag, field in (
             ("desc", "GovTextStart"),
             ("begin", "RobotsStart"),
@@ -178,7 +206,10 @@ def write_maps(root, out_path):
             ("loose", "RobotsLoss"),
         ):
             for text in fields.get(field, []):
-                lines.append(f"{tag}\t{clean(text)}")
+                # The HD story-PB maps (Mansion/Sanatory/Asylum) ship
+                # literal placeholders; drop them so consumers fall back.
+                if not text.startswith("Плейсхолдер"):
+                    lines.append(f"{tag}\t{clean(text)}")
         lines.append("")
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))

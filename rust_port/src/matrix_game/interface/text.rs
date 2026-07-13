@@ -185,6 +185,28 @@ impl AftFont {
             .or_else(|| self.glyphs.get(&('?' as u32)))
     }
 
+    /// Export accessors for tooling (menu_assets font atlas):
+    /// all codepoints, and per-glyph metrics + 8bpp alpha bitmap
+    /// `(width, height, bearing_x, bearing_y, advance, pixels)`.
+    pub fn codepoints(&self) -> Vec<u32> {
+        let mut v: Vec<u32> = self.glyphs.keys().copied().collect();
+        v.sort_unstable();
+        v
+    }
+
+    pub fn glyph_data(&self, codepoint: u32) -> Option<(u32, u32, i32, i32, u32, &[u8])> {
+        self.glyphs.get(&codepoint).map(|g| {
+            (
+                g.width,
+                g.height,
+                g.bearing_x,
+                g.bearing_y,
+                g.advance,
+                g.pixels.as_slice(),
+            )
+        })
+    }
+
     /// Pixel advance of `text` at this font's native size.
     pub fn measure(&self, text: &str) -> u32 {
         text.chars()

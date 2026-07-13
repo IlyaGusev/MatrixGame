@@ -177,34 +177,162 @@ fn main() {
         bg.height()
     );
 
+    // Every CMAP in robots.pkg: preview jpg (shipped or heightmap
+    // fallback) + a levels.txt manifest line `slug\tsize_x\tsize_y`
+    // that index.html uses to build the map list.
     let robots_pkg =
         PkgArchive::from_bytes(std::fs::read("../Data/robots.pkg").expect("read robots.pkg"))
             .expect("parse robots.pkg");
-    for name in [
-        "ATOLL",
-        "TRAINING",
-        "CROSSFIRE",
-        "ISLANDS",
-        "REACTOR",
-        "ASYLUM",
-        "ARMAGEDD",
-        "VIRUS",
-    ] {
-        let dst = format!("assets/menu/maps/{}.jpg", name.to_lowercase());
-        if let Ok(data) = robots_pkg.read_file(&format!("MATRIX/MAP/{name}.JPG")) {
+    let mut cmaps: Vec<String> = robots_pkg
+        .list_files()
+        .iter()
+        .filter(|f| {
+            let up = f.to_uppercase();
+            up.starts_with("MATRIX/MAP/") && up.ends_with(".CMAP")
+        })
+        .map(|f| f.to_string())
+        .collect();
+    cmaps.sort();
+    let mut levels = String::new();
+    for path in &cmaps {
+        let stem = &path["MATRIX/MAP/".len()..path.len() - ".CMAP".len()];
+        let slug = slugify(stem);
+        let cmap = robots_pkg.read_file(path).expect(path);
+        let map = GameMap::from_cmap_bytes(&cmap).unwrap_or_else(|e| panic!("{path}: {e}"));
+        levels.push_str(&format!("{slug}\t{}\t{}\n", map.size_x, map.size_y));
+
+        let dst = format!("assets/menu/maps/{slug}.jpg");
+        let jpg_key = format!("MATRIX/MAP/{stem}.JPG");
+        if let Ok(data) = robots_pkg.read_file(&jpg_key) {
             std::fs::write(&dst, &data).unwrap();
-            println!("MATRIX/MAP/{name}.JPG -> {dst} ({} bytes)", data.len());
+            println!("{jpg_key} -> {dst} ({} bytes)", data.len());
         } else {
-            // No shipped preview (e.g. ASYLUM) — shade the heightmap.
-            let cmap = robots_pkg
-                .read_file(&format!("MATRIX/MAP/{name}.CMAP"))
-                .expect(name);
-            let img = heightmap_preview(&GameMap::from_cmap_bytes(&cmap).unwrap());
+            let img = heightmap_preview(&map);
             let mut f = std::io::BufWriter::new(std::fs::File::create(&dst).unwrap());
             image::codecs::jpeg::JpegEncoder::new_with_quality(&mut f, 88)
                 .encode_image(&img)
                 .unwrap();
-            println!("MATRIX/MAP/{name}.CMAP -> {dst} (heightmap fallback)");
+            println!("{path} -> {dst} (heightmap fallback)");
         }
     }
+    std::fs::write("assets/menu/levels.txt", &levels).unwrap();
+    println!("assets/menu/levels.txt: {} maps", cmaps.len());
+
+    // SR2HD quick-launch form art (the screen index.html recreates) +
+    // the shell bitmap fonts it uses, from forms.pkg.
+    let forms_pkg =
+        PkgArchive::from_bytes(std::fs::read("../Data/forms.pkg").expect("read forms.pkg"))
+            .expect("parse forms.pkg");
+    for (src, dst) in [
+        ("DATA/FORMLOADROBOT/2BG.GI", "assets/menu/form_bg.png"),
+        ("DATA/FORMLOADROBOT/2SLOTNORMAL.GI", "assets/menu/slot_normal.png"),
+        ("DATA/FORMLOADROBOT/2SLOTACTIVE.GI", "assets/menu/slot_active.png"),
+        ("DATA/FORMLOADROBOT/2SLOTONMOUSE.GI", "assets/menu/slot_hover.png"),
+        ("DATA/FORMLOADROBOT/2ICONBLAZER.GI", "assets/menu/icon_blazer.png"),
+        ("DATA/FORMLOADROBOT/2ICONKELLER.GI", "assets/menu/icon_keller.png"),
+        ("DATA/FORMLOADROBOT/2ICONTERRON.GI", "assets/menu/icon_terron.png"),
+        ("DATA/FORMLOADROBOT/2ICONPLAYER.GI", "assets/menu/icon_player.png"),
+    ] {
+        let img = decode_gi(&forms_pkg.read_file(src).expect(src));
+        img.save(dst).unwrap();
+        println!("{src} -> {dst} ({}x{})", img.width(), img.height());
+    }
+    // RANGER_6 = the blocky chrome font (title/tabs/buttons, caps 6px);
+    // VERDANA *_SMOOTH = the list/label font. Matches the shipped shell.
+    // Vertical scrollbar art (common.pkg) for the list's scrollbar:
+    // up/down arrow buttons + the thumb piece set (top/center/bottom).
+    let common_pkg =
+        PkgArchive::from_bytes(std::fs::read("../Data/common.pkg").expect("read common.pkg"))
+            .expect("parse common.pkg");
+    for (src, dst) in [
+        ("DATA/SCROLLBAR/2V1_UPN.GI", "assets/menu/sb_up.png"),
+        ("DATA/SCROLLBAR/2V1_DOWNN.GI", "assets/menu/sb_down.png"),
+        ("DATA/SCROLLBAR/2V1_UPA.GI", "assets/menu/sb_up_a.png"),
+        ("DATA/SCROLLBAR/2V1_DOWNA.GI", "assets/menu/sb_down_a.png"),
+        ("DATA/SCROLLBAR/2V1_TOPN.GI", "assets/menu/sb_top.png"),
+        ("DATA/SCROLLBAR/2V1_CENTERN.GI", "assets/menu/sb_center.png"),
+        ("DATA/SCROLLBAR/2V1_BOTTOMN.GI", "assets/menu/sb_bottom.png"),
+    ] {
+        let img = decode_gi(&common_pkg.read_file(src).expect(src));
+        img.save(dst).unwrap();
+        println!("{src} -> {dst} ({}x{})", img.width(), img.height());
+    }
+
+    for font in [
+        "RANGER_6",
+        "VERDANA_09_2_SMOOTH",
+        "VERDANA_10_2_SMOOTH",
+        "VERDANA_11_3_SMOOTH",
+    ] {
+        let bytes = forms_pkg
+            .read_file(&format!("DATA/FONT/{font}.AFT"))
+            .expect(font);
+        export_font(font, &bytes);
+    }
+}
+
+/// Rasterize an AFT bitmap font into a white-on-transparent glyph
+/// atlas (`font_<name>.png`) + metrics (`font_<name>.txt`: first line
+/// `line_height ascent atlas_w atlas_h` in 1x units, then `code x y w
+/// h bearing_x bearing_y advance` per glyph). The PNG is stored at 2x
+/// (Catmull-Rom supersample) and index.html shows it via CSS mask
+/// with `mask-size` at the 1x dims — much crisper on fractional-DPR
+/// displays than a 1x atlas.
+fn export_font(name: &str, bytes: &[u8]) {
+    use matrixgame_rs::matrix_game::interface::text::AftFont;
+    let font = AftFont::parse(bytes).expect("AFT parse");
+    let codes = font.codepoints();
+    let cell_w = codes
+        .iter()
+        .filter_map(|&c| font.glyph_data(c).map(|g| g.0))
+        .max()
+        .unwrap_or(1)
+        + 1;
+    let cell_h = codes
+        .iter()
+        .filter_map(|&c| font.glyph_data(c).map(|g| g.1))
+        .max()
+        .unwrap_or(1)
+        + 1;
+    let cols = 16u32;
+    let rows = (codes.len() as u32).div_ceil(cols);
+    let (aw, ah) = (cols * cell_w, rows * cell_h);
+    let mut img = image::RgbaImage::new(aw, ah);
+    let mut metrics = format!("{} {} {aw} {ah}\n", font.line_height, font.ascent);
+    for (i, &code) in codes.iter().enumerate() {
+        let (w, h, bx, by, adv, px) = font.glyph_data(code).unwrap();
+        let (cx, cy) = (i as u32 % cols * cell_w, i as u32 / cols * cell_h);
+        for y in 0..h {
+            for x in 0..w {
+                let a = px[(y * w + x) as usize];
+                if a != 0 {
+                    img.put_pixel(cx + x, cy + y, image::Rgba([255, 255, 255, a]));
+                }
+            }
+        }
+        metrics.push_str(&format!("{code} {cx} {cy} {w} {h} {bx} {by} {adv}\n"));
+    }
+    let img2x = image::imageops::resize(&img, aw * 2, ah * 2, image::imageops::FilterType::CatmullRom);
+    let slug = name.to_lowercase();
+    img2x.save(format!("assets/menu/font_{slug}.png")).unwrap();
+    std::fs::write(format!("assets/menu/font_{slug}.txt"), metrics).unwrap();
+    println!(
+        "DATA/FONT/{name}.AFT -> assets/menu/font_{slug}.png ({} glyphs, lh={}, 2x atlas)",
+        codes.len(),
+        font.line_height
+    );
+}
+
+/// Same rule as tools/lang_dat.py and pack_bundle.rs:
+/// "MANSION (E)" → "mansion_e".
+fn slugify(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.to_lowercase().chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c);
+        } else if !out.ends_with('_') {
+            out.push('_');
+        }
+    }
+    out.trim_matches('_').to_string()
 }

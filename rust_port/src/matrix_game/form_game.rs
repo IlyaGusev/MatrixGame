@@ -2809,16 +2809,24 @@ struct MapTexts {
     loose: String,
 }
 
-/// Lowercased file stem of the loaded map — "MATRIX/MAP/ATOLL.CMAP"
-/// and "assets/atoll.bundle?bv=11" both yield "atoll". Matches the
-/// `map\t<stem>` keys in maps.txt.
+/// Slug of the loaded map's file stem — "MATRIX/MAP/ATOLL.CMAP" and
+/// "assets/atoll.bundle?bv=11" both yield "atoll", "MANSION (E)" →
+/// "mansion_e". Same rule as tools/lang_dat.py and pack_bundle.rs;
+/// matches the `map\t<slug>` keys in maps.txt.
 fn briefing_stem() -> String {
     let name = crate::matrix_game::map::map_name();
     let name = name.split('?').next().unwrap_or("");
     let name = name.rsplit(['/', '\\']).next().unwrap_or("");
-    name.rsplit_once('.')
-        .map_or(name, |(stem, _)| stem)
-        .to_lowercase()
+    let stem = name.rsplit_once('.').map_or(name, |(stem, _)| stem);
+    let mut out = String::new();
+    for c in stem.to_lowercase().chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c);
+        } else if !out.ends_with('_') {
+            out.push('_');
+        }
+    }
+    out.trim_matches('_').to_string()
 }
 
 /// Parse the `tag\tvalue` lines of maps.txt for one map's entry.

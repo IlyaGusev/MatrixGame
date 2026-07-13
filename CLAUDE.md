@@ -42,7 +42,10 @@ rustup target add wasm32-unknown-unknown
 cargo install wasm-pack
 wasm-pack build --target web --out-dir pkg
 
-# Pack assets for WASM (extracts textures from robots.pkg)
+# Pack assets for WASM (extracts textures from robots.pkg); one bundle per map,
+# named by slug (lowercase, non-alnum → _). Pack every map the menu lists with:
+#   for m in $(cargo run --example pkg_ls -- ../Data/robots.pkg 2>/dev/null \
+#     | grep -i '^MATRIX/MAP/.*CMAP$'); do cargo run --example pack_bundle -- "$m"; done
 cargo run --example pack_bundle
 
 # Main-menu art for index.html (decodes .GI from mainmenu.pkg + map previews)

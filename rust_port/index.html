@@ -42,202 +42,168 @@
     #loading .label { font-size: 13px; }
     @keyframes spin { to { transform: rotate(360deg); } }
 
-    /* ───────────── SR2-style main menu ───────────── */
+    /* ─────────── SR2HD quick-launch screen (FORMLOADROBOT art) ─────────── */
     #menu {
       position: fixed; inset: 0; z-index: 40;
-      display: flex; flex-direction: column; align-items: center;
-      background: #02060c;
-      font-family: Verdana, "Segoe UI", sans-serif;
-      color: #c8e6f5; overflow: hidden;
+      background: #02060c; overflow: hidden;
+      font-family: Verdana, "Segoe UI", sans-serif; color: #c8e6f5;
     }
     #menu[hidden] { display: none; }
-    #art-bg { /* nebula shifted toward the classic teal palette */
+    #art-bg {
       position: absolute; inset: 0; width: 100%; height: 100%;
       object-fit: cover;
-      filter: hue-rotate(155deg) saturate(0.62) brightness(0.72);
+      filter: hue-rotate(155deg) saturate(0.62) brightness(0.6);
     }
-    #menu::before { /* vignette so the blue panel reads over the nebula */
+    #menu::before { /* vignette */
       content: ""; position: absolute; inset: 0;
-      background:
-        radial-gradient(ellipse at 50% 45%, rgba(2, 8, 14, 0.25) 30%, rgba(1, 4, 9, 0.78) 100%),
-        linear-gradient(rgba(2, 6, 12, 0.35), rgba(2, 6, 12, 0.35));
+      background: radial-gradient(ellipse at 50% 42%, rgba(2, 8, 14, 0.2) 30%, rgba(1, 4, 9, 0.8) 100%);
     }
-    .art { position: absolute; pointer-events: none; user-select: none; }
-    #art-planet {
-      left: -6vw; bottom: -18vh; width: 40vh; opacity: 0.9;
-      mix-blend-mode: screen;
+
+    /* Fixed-size design (logo + 973×701 form art), scaled to fit. */
+    #stage {
+      position: absolute; left: 50%; top: 6px;
+      width: 973px; transform-origin: top center;
     }
-    #art-ship {
-      left: -3vw; bottom: -6vh; width: 52vh; max-width: 38vw;
-      filter: drop-shadow(0 0 26px rgba(0, 0, 0, 0.85)) brightness(0.85);
-    }
-    #art-circle { right: 3vw; top: 12vh; width: 30vh; opacity: 0.28; }
-    #art-microtext { right: 1.2vw; bottom: 4vh; height: 42vh; opacity: 0.4; }
     #art-logo {
-      position: relative; z-index: 2; margin-top: 1.5vh; height: 13vh;
-      max-width: 92vw; object-fit: contain;
+      display: block; margin: 0 auto 4px; height: 118px;
       filter: drop-shadow(0 4px 18px rgba(0, 0, 0, 0.9));
       pointer-events: none; user-select: none;
     }
+    #panel {
+      position: relative; width: 973px; height: 701px;
+      background: url("assets/menu/form_bg.png");
+    }
+    #panel .abs { position: absolute; }
 
-    .panel {
-      position: relative; z-index: 2; margin-top: 2.2vh;
-      width: min(1020px, 94vw); height: min(628px, 76vh);
-      border: 3px solid #2f8fc0; border-radius: 26px;
-      background: linear-gradient(160deg, #0a2a44 0%, #06192c 55%, #04121f 100%);
-      box-shadow:
-        0 0 26px rgba(45, 140, 200, 0.5), 0 12px 60px rgba(0, 0, 0, 0.8),
-        inset 0 0 70px rgba(20, 90, 140, 0.35), inset 0 2px 12px rgba(140, 220, 255, 0.25);
+    /* Bitmap-font text (in-game .AFT glyphs via CSS mask). */
+    .bmp { position: relative; display: inline-block; flex: none; }
+    .bmp i {
+      position: absolute; display: block;
+      mask-repeat: no-repeat; -webkit-mask-repeat: no-repeat;
     }
-    .panel::before {
-      content: ""; position: absolute; inset: 5px; border-radius: 19px;
-      border: 1px solid rgba(120, 200, 240, 0.28); pointer-events: none;
-    }
-    .title-tab {
-      position: absolute; top: -15px; left: 50%; transform: translateX(-50%);
-      padding: 6px 30px; white-space: nowrap;
-      background: linear-gradient(#0a2438, #04101c);
-      border: 2px solid #45c8f2; border-radius: 15px;
-      color: #a9e9ff; font-size: 12px; font-weight: bold;
-      letter-spacing: 0.28em; text-transform: uppercase;
-      text-shadow: 0 0 8px rgba(90, 210, 255, 0.8);
-      box-shadow: 0 0 14px rgba(69, 200, 242, 0.55), inset 0 0 10px rgba(69, 200, 242, 0.3);
-    }
-    #art-guard {
-      left: -74px; top: -74px; width: 165px; z-index: 3;
-      filter: drop-shadow(0 6px 14px rgba(0, 0, 0, 0.8));
-      display: none;
-    }
-    @media (min-width: 1360px) { #art-guard { display: block; } }
-    #menu-close {
-      position: absolute; top: 12px; right: 18px; z-index: 4;
-      color: #5d9cbf; cursor: pointer; font-size: 16px;
-    }
-    #menu-close:hover { color: #d8f6ff; }
+    .glow { filter: drop-shadow(0 0 5px rgba(80, 220, 255, 0.75)); }
 
-    .panel-body {
-      position: absolute; inset: 26px 26px 24px 26px;
-      display: flex; gap: 22px;
+    #title {
+      left: 375px; top: 63px; width: 210px; height: 22px;
+      display: flex; align-items: center; justify-content: center;
     }
-    .col-maps { flex: 1.25; display: flex; flex-direction: column; min-width: 0; }
-    .col-side { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 
-    .tabs { display: flex; gap: 8px; justify-content: center; margin-bottom: 12px; }
+    #tabs { /* right of the baked robot art, like the reference */
+      left: 168px; top: 100px; width: 392px; height: 24px;
+      display: flex; gap: 10px; align-items: center;
+    }
     .tab {
-      padding: 5px 18px; border-radius: 12px; font-size: 11px; font-weight: bold;
-      letter-spacing: 0.14em; text-transform: uppercase; white-space: nowrap;
-      border: 1px solid #1d4a63; background: linear-gradient(#07202f, #051622);
-      color: #4f7f9c;
+      box-sizing: border-box; /* min-width includes padding/border */
+      height: 23px; min-width: 120px; padding: 0 10px; border-radius: 12px;
+      cursor: pointer; display: flex; align-items: center; justify-content: center;
+      border: 1px solid #1d5b7a; background: linear-gradient(#083048, #051d2e);
+      box-shadow: inset 0 1px 3px rgba(120, 200, 240, 0.15);
     }
-    .tab.active {
-      border: 1px solid #55d6ff; color: #dff7ff;
-      background: linear-gradient(#12628f, #0a3a5c);
-      box-shadow: 0 0 12px rgba(85, 214, 255, 0.45), inset 0 1px 6px rgba(160, 230, 255, 0.35);
-      text-shadow: 0 0 6px rgba(140, 230, 255, 0.9);
+    .tab:hover { border-color: #2f8fc0; }
+    .tab.active { /* the reference's active tab: light pill, dark text */
+      border: 1px solid #9df0ff; cursor: default;
+      background: linear-gradient(180deg, #b9f2ff, #5fd2f2 55%, #2fa9d8);
+      box-shadow: 0 0 12px rgba(120, 225, 255, 0.7), inset 0 1px 4px rgba(255, 255, 255, 0.7);
     }
-    .tab.disabled { opacity: 0.55; }
 
     #levels {
-      flex: 1; min-height: 0; overflow-y: auto; padding-right: 8px;
-      scrollbar-width: thin; scrollbar-color: #2f8fc0 #062033;
+      left: 41px; top: 150px; width: 521px; height: 457px;
+      overflow-y: auto; overflow-x: hidden;
+      scrollbar-width: none; /* the DOM scrollbar below replaces it */
     }
-    #levels::-webkit-scrollbar { width: 8px; }
-    #levels::-webkit-scrollbar-track { background: #062033; border-radius: 4px; }
-    #levels::-webkit-scrollbar-thumb { background: #2f8fc0; border-radius: 4px; }
+    #levels::-webkit-scrollbar { display: none; }
+    /* SR2 vertical scrollbar (DATA/SCROLLBAR/2V1_* art) as DOM — the
+       native one is overlay-styled on some platforms and can't tile art. */
+    .sbar { width: 17px; display: flex; flex-direction: column; }
+    #panel .sbar[hidden] { display: none !important; }
+    .sb-up, .sb-down { height: 22px; flex: none; cursor: pointer; }
+    .sb-up { background: url("assets/menu/sb_up.png") no-repeat center / 17px 22px; }
+    .sb-down { background: url("assets/menu/sb_down.png") no-repeat center / 17px 22px; }
+    .sb-up:hover { background-image: url("assets/menu/sb_up_a.png"); }
+    .sb-down:hover { background-image: url("assets/menu/sb_down_a.png"); }
+    .sb-track { flex: 1; position: relative; margin: 2px 0; }
+    .sb-thumb {
+      position: absolute; left: 0; width: 17px;
+      background: url("assets/menu/sb_center.png") repeat-y center / 17px 5px;
+    }
+    .sb-thumb:hover { filter: brightness(1.25); }
+    .sb-thumb::before, .sb-thumb::after {
+      content: ""; position: absolute; left: 0; width: 17px; height: 3px;
+    }
+    .sb-thumb::before { top: 0; background: url("assets/menu/sb_top.png") no-repeat center / 17px 3px; }
+    .sb-thumb::after { bottom: 0; background: url("assets/menu/sb_bottom.png") no-repeat center / 17px 3px; }
+    #sbar { left: 570px; top: 150px; height: 457px; }
+    #sbar .sb-track { background: #030d15; border-radius: 6px; }
+    #sbar-desc { left: 908px; top: 292px; height: 258px; }
+    #sbar-desc .sb-track { background: rgba(40, 80, 105, 0.22); border-radius: 6px; }
     .level {
-      display: flex; justify-content: space-between; align-items: center;
-      margin: 8px 1px; padding: 14px; cursor: pointer;
-      border: 1px solid #1c4f6e; border-radius: 7px;
-      background: linear-gradient(180deg, #0a2c46, #061c30);
-      color: #9fd1e8; font-size: 13px;
+      position: relative; width: 519px; height: 37px; margin-bottom: 5px;
+      background: url("assets/menu/slot_normal.png"); cursor: pointer;
     }
-    .level:hover { border-color: #3ba7dc; color: #cdeaf8; }
-    .level.selected {
-      border: 2px solid #6fe0ff; padding: 13px;
-      background: linear-gradient(180deg, #10405f, #0a2a46);
-      color: #ecfaff; box-shadow: 0 0 12px rgba(110, 220, 255, 0.4);
-      text-shadow: 0 0 6px rgba(140, 230, 255, 0.7);
-    }
-    .level .size { font-size: 11px; color: #5f96b6; letter-spacing: 0.06em; }
-    .level.selected .size { color: #9fd8f0; }
-    .level .cur { color: #7cff9c; font-size: 10px; letter-spacing: 0.1em; margin-left: 8px; }
-    .list-hint {
-      margin-top: 8px; text-align: center; font-size: 10px;
-      color: rgba(140, 190, 215, 0.5); letter-spacing: 0.14em; text-transform: uppercase;
-    }
+    .level:first-child { margin-top: 12px; }
+    .level:hover { background: url("assets/menu/slot_hover.png"); }
+    .level.selected { background: url("assets/menu/slot_active.png"); }
+    .level .name { position: absolute; left: 21px; top: 12px; }
+    .level img.side { position: absolute; top: 6px; height: 24px; }
+    .level .size { position: absolute; top: 13px; }
 
-    .side-top { display: flex; gap: 14px; }
     #map-preview {
-      width: 158px; height: 158px; object-fit: cover; flex: none;
-      border: 2px solid #2d7ba6; border-radius: 5px;
-      background: #04121f; box-shadow: 0 0 14px rgba(0, 0, 0, 0.7);
-      image-rendering: auto;
+      left: 629px; top: 106px; width: 146px; height: 146px;
+      object-fit: cover; background: #04121f;
     }
-    .opts { flex: 1; min-width: 0; font-size: 11px; }
-    .opts-title {
-      color: #8fd4f0; font-size: 10px; font-weight: bold; letter-spacing: 0.18em;
-      text-transform: uppercase; margin: 2px 0 8px;
-      text-shadow: 0 0 6px rgba(90, 200, 250, 0.6);
-    }
+    #opts { left: 792px; top: 104px; width: 140px; height: 156px; }
+    #opts .hdr { margin: 2px 0 6px; }
     .radio {
-      display: flex; align-items: center; gap: 8px; margin: 6px 0;
-      cursor: pointer; color: #a8d8ee;
+      display: flex; align-items: center; gap: 7px; margin: 5px 0;
+      cursor: pointer;
     }
-    .radio:hover { color: #dff5ff; }
     .radio .dot {
-      width: 12px; height: 12px; flex: none; border-radius: 50%;
-      border: 2px solid #3ba7dc; background: #041623;
+      width: 11px; height: 11px; flex: none; border-radius: 50%;
+      border: 2px solid #2f8fc0; background: #041623;
     }
     .radio.checked .dot {
       background: radial-gradient(circle, #aef1ff 0%, #38c6f4 55%, #0a3a5c 100%);
-      box-shadow: 0 0 8px rgba(110, 220, 255, 0.8);
+      box-shadow: 0 0 7px rgba(110, 220, 255, 0.8);
     }
-    .radio.checked { color: #e4f8ff; }
     .mini-btn {
-      margin-top: 8px; padding: 6px 14px; cursor: pointer;
-      border: 1px solid #45c8f2; border-radius: 11px;
+      margin-top: 7px; height: 21px; padding: 0 12px; cursor: pointer;
+      display: inline-flex; align-items: center;
+      border: 1px solid #45c8f2; border-radius: 10px;
       background: linear-gradient(#0d4a74, #072c49);
-      color: #cdeffd; font-family: inherit; font-size: 10px; font-weight: bold;
-      letter-spacing: 0.16em; text-transform: uppercase;
-      box-shadow: 0 0 8px rgba(69, 200, 242, 0.35);
+      box-shadow: 0 0 7px rgba(69, 200, 242, 0.35);
     }
     .mini-btn:hover { filter: brightness(1.3); }
 
     #map-desc {
-      flex: 1; min-height: 0; margin-top: 14px; padding: 10px 13px;
-      overflow-y: auto; border-radius: 9px;
-      background: linear-gradient(#d5e7f4, #c3dbec);
-      border: 1px solid #8fb8d4; color: #17334a;
-      font-size: 12px; line-height: 1.5;
-      scrollbar-width: thin; scrollbar-color: #6d9cbe #b9d2e4;
+      left: 640px; top: 294px; width: 258px; height: 252px;
+      padding: 2px 6px 2px 2px; overflow-y: auto;
+      color: #17334a; font-size: 12px; line-height: 1.45;
+      scrollbar-width: none; /* the DOM scrollbar replaces it */
     }
-    #map-desc::-webkit-scrollbar { width: 8px; }
-    #map-desc::-webkit-scrollbar-track { background: #b9d2e4; border-radius: 4px; }
-    #map-desc::-webkit-scrollbar-thumb { background: #6d9cbe; border-radius: 4px; }
-    #map-desc b { color: #0d2334; }
+    #map-desc::-webkit-scrollbar { display: none; }
 
-    .actions { display: flex; gap: 14px; margin-top: 16px; justify-content: center; }
-    .big-btn {
-      width: 138px; padding: 9px 0; cursor: pointer;
-      border: 2px solid #45c8f2; border-radius: 17px;
-      background: linear-gradient(180deg, #0e527f, #072c49 60%, #051f35);
-      color: #d5f4ff; font-family: inherit; font-size: 12px; font-weight: bold;
-      letter-spacing: 0.24em; text-transform: uppercase;
-      text-shadow: 0 0 6px rgba(120, 220, 255, 0.8);
-      box-shadow: 0 0 12px rgba(69, 200, 242, 0.45), inset 0 1px 8px rgba(150, 230, 255, 0.35);
+    .big-btn { /* light pill, dark text — like the active tab */
+      display: flex; align-items: center; justify-content: center; cursor: pointer;
+      border: 1px solid #9df0ff; border-radius: 15px;
+      background: linear-gradient(180deg, #b9f2ff, #5fd2f2 55%, #2fa9d8);
+      box-shadow: 0 0 11px rgba(120, 225, 255, 0.6), inset 0 1px 4px rgba(255, 255, 255, 0.7);
     }
     .big-btn:hover { filter: brightness(1.25); }
     .big-btn:active { filter: brightness(0.9); }
+    #panel [hidden] { display: none !important; }
+    /* Sized to exactly cover the art's two button sockets. */
+    #start-btn { left: 635px; top: 583px; width: 116px; height: 40px; border-radius: 20px; }
+    #cancel-btn { left: 635px; top: 635px; width: 114px; height: 29px; border-radius: 14px; }
 
-    /* Keybinds view swaps in over the panel body. */
+    /* Keybinds view swaps in over the form. */
     #binds-view {
-      position: absolute; inset: 12px; z-index: 5;
+      position: absolute; left: 30px; top: 92px; width: 908px; height: 566px; z-index: 5;
       display: flex; flex-direction: column;
-      background: linear-gradient(160deg, #092740 , #04121f);
-      border-radius: 18px;
+      background: rgba(4, 17, 28, 0.97);
+      border: 1px solid #1c4f6e; border-radius: 14px; padding: 10px 14px;
     }
     #binds-view[hidden] { display: none; }
-    #binds-view .opts-title { text-align: center; font-size: 12px; margin-bottom: 10px; }
+    #binds-view .head { display: flex; justify-content: center; margin: 2px 0 8px; }
     #binds {
       flex: 1; min-height: 0; overflow-y: auto; padding: 0 10px;
       column-width: 340px; column-gap: 28px;
@@ -261,7 +227,7 @@
     .key-chip.conflict { border-color: #ff6b6b; color: #ff6b6b; }
     .key-chip.custom { border-color: #e0c268; }
     #binds-note { font-size: 11px; color: #6da4c0; min-height: 15px; margin: 6px 10px 0; }
-    #binds-view .actions { margin: 10px 10px 4px; }
+    #binds-view .actions { display: flex; gap: 14px; justify-content: center; margin: 8px 0 2px; }
 
     #menu .footer {
       position: absolute; right: 16px; bottom: 8px; z-index: 2;
@@ -276,50 +242,35 @@
   <div id="menu-btn" title="Menu">⚙️</div>
   <div id="menu" hidden>
     <img id="art-bg" src="assets/menu/bg.jpg" alt="" />
-    <img class="art" id="art-planet" src="assets/menu/planet.png" alt="" />
-    <img class="art" id="art-ship" src="assets/menu/ship.png" alt="" />
-    <img class="art" id="art-circle" src="assets/menu/circle.png" alt="" />
-    <img class="art" id="art-microtext" src="assets/menu/microtext.png" alt="" />
-    <img id="art-logo" src="assets/menu/logo.png" alt="Космические Рейнджеры 2" />
-    <div class="panel">
-      <div class="title-tab">Бои: быстрый запуск</div>
-      <img class="art" id="art-guard" src="assets/menu/gaalship.png" alt="" />
-      <span id="menu-close">✕</span>
-      <div class="panel-body">
-        <div class="col-maps">
-          <div class="tabs">
-            <span class="tab active">Оригинальные</span>
-            <span class="tab disabled">Карты аддона</span>
-            <span class="tab disabled">Свои</span>
-          </div>
-          <div id="levels"></div>
-          <div class="list-hint">двойной клик или Enter — запуск боя</div>
+    <div id="stage">
+      <img id="art-logo" src="assets/menu/logo.png" alt="Космические Рейнджеры 2" />
+      <div id="panel">
+        <div class="abs glow" id="title"></div>
+        <div class="abs" id="tabs"></div>
+        <div class="abs" id="levels"></div>
+        <div class="abs sbar" id="sbar" hidden>
+          <div class="sb-up"></div>
+          <div class="sb-track"><div class="sb-thumb"></div></div>
+          <div class="sb-down"></div>
         </div>
-        <div class="col-side">
-          <div class="side-top">
-            <img id="map-preview" src="" alt="" />
-            <div class="opts">
-              <div class="opts-title">Звук</div>
-              <div class="radio" id="sound-on"><span class="dot"></span>Включён</div>
-              <div class="radio" id="sound-off"><span class="dot"></span>Выключен</div>
-              <div class="opts-title" style="margin-top: 14px;">Управление</div>
-              <button class="mini-btn" id="binds-open">Настроить…</button>
-            </div>
-          </div>
-          <div id="map-desc"></div>
+        <div class="abs sbar" id="sbar-desc" hidden>
+          <div class="sb-up"></div>
+          <div class="sb-track"><div class="sb-thumb"></div></div>
+          <div class="sb-down"></div>
+        </div>
+        <img class="abs" id="map-preview" src="" alt="" />
+        <div class="abs" id="opts"></div>
+        <div class="abs" id="map-desc"></div>
+        <div class="abs big-btn" id="start-btn"></div>
+        <div class="abs big-btn" id="cancel-btn"></div>
+        <div id="binds-view" hidden>
+          <div class="head" id="binds-title"></div>
+          <div id="binds"></div>
+          <div id="binds-note"></div>
           <div class="actions">
-            <button class="big-btn" id="start-btn">Старт</button>
-            <button class="big-btn" id="cancel-btn" hidden>Отмена</button>
+            <span class="mini-btn" id="binds-reset"></span>
+            <span class="mini-btn" id="binds-back"></span>
           </div>
-        </div>
-      </div>
-      <div id="binds-view" hidden>
-        <div class="opts-title" style="margin-top: 8px;">Управление</div>
-        <div id="binds"></div>
-        <div id="binds-note"></div>
-        <div class="actions">
-          <button class="mini-btn" id="binds-reset">Сбросить</button>
-          <button class="mini-btn" id="binds-back">Назад</button>
         </div>
       </div>
     </div>
@@ -331,9 +282,7 @@
   </div>
 
   <script type="module">
-    import init from "./pkg/matrixgame_rs.js?v=370";
-
-
+    import init from "./pkg/matrixgame_rs.js?v=371";
 
     // Render-resolution cap. GPU cost is ~linear in pixel count, so we
     // render at most RENDER_MAX px on the long edge and let CSS upscale the
@@ -350,56 +299,147 @@
       const s = Math.min(1, RENDER_MAX / Math.max(iw, ih));
       canvas.width  = Math.max(1, Math.floor(iw * s));
       canvas.height = Math.max(1, Math.floor(ih * s));
+      // Menu stage: fixed 973×830 design, scaled down to fit.
+      const stage = document.getElementById("stage");
+      const k = Math.min(1, iw / 990, ih / 845);
+      stage.style.transform = `translateX(-50%) scale(${k})`;
     }
     resize();
     window.addEventListener("resize", resize);
 
-    // ───────────────────────── Main menu ─────────────────────────
-    // Levels must have a matching pre-packed bundle in assets/
-    // (cargo run --example pack_bundle -- <name>) and preview art in
-    // assets/menu/ (cargo run --example menu_assets).
-    const LEVELS = [
-      ["Атолл", "assets/atoll.bundle", "atoll", "180×176",
-       "Кольцо суши посреди океана. Узкие перешейки решают всё: кто удержит броды — тот удержит и атолл. Захватывайте нейтральные заводы по периметру кольца, но не оставляйте свою базу без прикрытия — противник любит десант с тыла."],
-      ["Учебная", "assets/training.bundle", "training", "128×199",
-       "Полигон для отработки тактики боя против роботов. Вам передан завод по производству роботов: соберите отряд, уничтожьте боевые макеты противника и разрушьте его базу. Помните — с машинами должны драться машины, а ваша задача заключается в том, чтобы ими управлять."],
-      ["Перекрёстный огонь", "assets/crossfire.bundle", "crossfire", "264×201",
-       "Открытая равнина с пересекающимися коридорами атак. Следите за флангами: огонь ведётся со всех направлений. Турели на перекрёстках окупаются быстрее, чем лишний робот в отряде."],
-      ["Острова", "assets/islands.bundle", "islands", "219×245",
-       "Архипелаг, связанный мелководьем. Контроль над островами с заводами приносит победу: каждый захваченный завод — это новый поток роботов к линии фронта. Гусеничные шасси уверенно чувствуют себя на бродах."],
-      ["Реактор", "assets/reactor.bundle", "reactor", "178×259",
-       "Индустриальная зона вокруг энергетического ядра. Узкие проходы и плотная застройка — рай для засад: короткоствольное оружие здесь эффективнее дальнобойного. Держите ремонтника позади ударной группы."],
-      ["Убежище", "assets/asylum.bundle", "asylum", "199×228",
-       "Скалистое плато с укреплённой цитаделью посреди лавовых полей. Лобовой штурм обречён — ищите обходные пути и расшатывайте оборону рейдами по добывающим заводам противника."],
-      ["Армагеддон", "assets/armagedd.bundle", "armagedd", "178×256",
-       "Выжженная пустошь под багровым небом. Ресурсов мало, а значит — столкновения неизбежны. Экономьте каждую единицу титана: потерянный в бессмысленной атаке робот здесь не восполняется."],
-      ["Вирус", "assets/virus.bundle", "virus", "206×192",
-       "Заражённые земли: техника здесь долго не живёт. Быстрые рейды эффективнее долгих осад — собирайте дешёвые манёвренные машины и бейте по заводам, пока противник копит тяжёлый кулак."],
-    ];
-
-    // Real SR2 names/descriptions from Lang.dat (RobotsMap), generated
-    // by `python3 ../tools/lang_dat.py ../Data/Lang.dat --maps
-    // assets/menu/maps.txt`. Keyed by map stem (= LEVELS img key).
-    // The hardcoded LEVELS texts remain as fallback if the fetch fails.
-    const MAPTEXT = {};
-    async function loadMapTexts() {
-      try {
-        const r = await fetch("assets/menu/maps.txt");
-        if (!r.ok) return;
-        let cur = null;
-        for (const line of (await r.text()).split("\n")) {
-          const i = line.indexOf("\t");
-          if (i < 0) continue;
-          const tag = line.slice(0, i), val = line.slice(i + 1);
-          if (tag === "map") cur = MAPTEXT[val] = { desc: [] };
-          else if (!cur) continue;
-          else if (tag === "name") cur.name = val;
-          else if (tag === "desc") cur.desc.push(val);
-        }
-        if (!menu.hidden) { renderLevels(); renderSide(); }
-      } catch {}
+    // ─────────────────── In-game bitmap fonts (.AFT) ───────────────────
+    // Exported by menu_assets as white glyph atlases + metrics; drawn as
+    // CSS-mask spans so they can be tinted. RANGER = the shell caps font
+    // (title/tabs/buttons), STOROPIA = the rounded list font.
+    const FONTS = {}; // name → {lh, asc, g: {code: [x,y,w,h,bx,by,adv]}}
+    async function loadFont(name) {
+      const r = await fetch(`assets/menu/font_${name}.txt`);
+      if (!r.ok) return;
+      const lines = (await r.text()).trim().split("\n");
+      const [lh, asc, aw, ah] = lines[0].split(" ").map(Number);
+      const g = {};
+      for (const l of lines.slice(1)) {
+        const v = l.split(" ").map(Number);
+        g[v[0]] = v.slice(1);
+      }
+      FONTS[name] = { lh, asc, aw, ah, g };
     }
-    loadMapTexts();
+    function bmpText(text, fname, color, tracking = 0) {
+      const f = FONTS[fname];
+      const el = document.createElement("span");
+      el.className = "bmp";
+      if (!f) { // fonts missing — plain-text fallback
+        el.textContent = text;
+        el.style.color = color;
+        el.style.font = "11px Verdana";
+        return el;
+      }
+      el.style.height = f.lh + "px";
+      let pen = 0;
+      for (const ch of String(text)) {
+        const m = f.g[ch.codePointAt(0)] || f.g[63];
+        if (!m) { pen += 3 + tracking; continue; }
+        const [x, y, w, h, bx, by, adv] = m;
+        if (w && h) {
+          const i = document.createElement("i");
+          const mask = `url("assets/menu/font_${fname}.png")`;
+          // The atlas PNG is 2x — mask-size at the 1x dims maps it back.
+          i.style.cssText =
+            `left:${pen + bx}px;top:${f.asc + by}px;width:${w}px;height:${h}px;` +
+            `background-color:${color};` +
+            `mask-image:${mask};mask-position:${-x}px ${-y}px;mask-size:${f.aw}px ${f.ah}px;` +
+            `-webkit-mask-image:${mask};-webkit-mask-position:${-x}px ${-y}px;-webkit-mask-size:${f.aw}px ${f.ah}px;`;
+          el.appendChild(i);
+        }
+        pen += adv + tracking;
+      }
+      el.style.width = pen + "px";
+      return el;
+    }
+    function setBmp(id, text, fname, color, tracking = 0) {
+      const el = document.getElementById(id);
+      el.textContent = "";
+      el.appendChild(bmpText(text, fname, color, tracking));
+      return el;
+    }
+
+    // ───────────────────────── Map manifests ─────────────────────────
+    // assets/menu/levels.txt — slug + size for every CMAP in robots.pkg
+    //   (cargo run --example menu_assets, also previews/art/fonts)
+    // assets/menu/maps.txt   — Lang.dat names/descriptions/briefings,
+    //   category + sides (python3 ../tools/lang_dat.py --maps)
+    // assets/<slug>.bundle   — cargo run --example pack_bundle -- <slug>
+    // Two tabs like the original screen (minus «Свои»): the original
+    // game's maps vs everything the HD edition added.
+    const CATS = [
+      ["original", "ОРИГИНАЛЬНЫЕ"],
+      ["addon", "КАРТЫ АДДОНА"],
+      ["other", "ДРУГИЕ"],
+    ];
+    // Side value → faction icon, colors per the FORMLOADROBOT art:
+    // Blazer red, Keller blue, Terron green.
+    const SIDE_ICONS = { Red: "blazer", Blue: "keller", Green: "terron" };
+    const MAPTEXT = {}; // slug → {name, cat, side, ord, desc: []}
+    let LEVELS = [];    // [{slug, size}] — every map from levels.txt
+    let activeCat = "battle";
+    let selected = null; // slug
+
+    function catOf(slug) {
+      const c = MAPTEXT[slug]?.cat;
+      return c === "original" || c === "addon" || c === "other" ? c : null;
+    }
+    function visibleLevels() {
+      // Only maps with a real Lang.dat description are listed; demo /
+      // service / story-PB maps (cat "extra") are hidden entirely.
+      // Учебная leads its tab, like the original quick-launch list.
+      const ord = (l) => (l.slug === "training" ? -1 : MAPTEXT[l.slug].ord);
+      return LEVELS
+        .filter((l) => catOf(l.slug) === activeCat && MAPTEXT[l.slug]?.desc?.length)
+        .sort((a, b) => ord(a) - ord(b));
+    }
+
+    async function loadManifests() {
+      try {
+        const [mapsR, levelsR] = await Promise.all([
+          fetch("assets/menu/maps.txt"),
+          fetch("assets/menu/levels.txt"),
+          loadFont("ranger_6"),
+          loadFont("verdana_09_2_smooth"),
+          loadFont("verdana_10_2_smooth"),
+        ]);
+        if (mapsR.ok) {
+          let cur = null, ord = 0;
+          for (const line of (await mapsR.text()).split("\n")) {
+            const i = line.indexOf("\t");
+            if (i < 0) continue;
+            const tag = line.slice(0, i), val = line.slice(i + 1);
+            if (tag === "map") cur = MAPTEXT[val] = { desc: [], ord: ord++ };
+            else if (!cur) continue;
+            else if (tag === "name") cur.name = val;
+            else if (tag === "cat") cur.cat = val;
+            else if (tag === "side") cur.side = val;
+            else if (tag === "dif") cur.dif = val;
+            else if (tag === "desc") cur.desc.push(val);
+          }
+        }
+        if (levelsR.ok) {
+          LEVELS = (await levelsR.text()).split("\n").flatMap((line) => {
+            const [slug, w, h] = line.split("\t");
+            // Cyrillic "х" — the AFT fonts have no U+00D7 glyph.
+            return slug && h ? [{ slug, size: `${w}х${h}` }] : [];
+          });
+        }
+      } catch {}
+      const curSlug = currentBundle
+        ? currentBundle.split("?")[0].replace(/^.*\//, "").replace(/\.bundle$/, "")
+        : null;
+      selected = LEVELS.some((l) => l.slug === curSlug) ? curSlug
+        : LEVELS.some((l) => l.slug === "training") ? "training"
+        : LEVELS[0]?.slug;
+      activeCat = catOf(selected) || "original";
+      if (!menu.hidden) renderMenu();
+    }
+    loadManifests();
 
     // [id, label, default KeyboardEvent.code, context] — must mirror
     // ACTIONS in src/matrix_game/keybinds.rs. Contexts are independent:
@@ -447,7 +487,6 @@
     const bindsDiv = document.getElementById("binds");
     const bindsNote = document.getElementById("binds-note");
     let capturing = null; // action id while waiting for a keypress
-    let selected = Math.max(0, LEVELS.findIndex(([, b]) => b === currentBundle));
 
     function loadOverrides() {
       const out = {};
@@ -491,9 +530,8 @@
           lastCtx = ctx;
           const h = document.createElement("div");
           h.className = "menu-row";
-          h.style.color = "#6da4c0";
           h.style.marginTop = "6px";
-          h.textContent = ctx === "camera" ? "Камера" : "Игра";
+          h.appendChild(bmpText(ctx === "camera" ? "КАМЕРА" : "ИГРА", "ranger_5", "#6da4c0"));
           bindsDiv.appendChild(h);
         }
         const row = document.createElement("div");
@@ -534,8 +572,8 @@
 
     function renderSound() {
       const on = localStorage.getItem(SOUND_STORAGE) !== "off";
-      document.getElementById("sound-on").classList.toggle("checked", on);
-      document.getElementById("sound-off").classList.toggle("checked", !on);
+      document.getElementById("sound-on")?.classList.toggle("checked", on);
+      document.getElementById("sound-off")?.classList.toggle("checked", !on);
     }
     function setSound(on) {
       const cur = localStorage.getItem(SOUND_STORAGE) !== "off";
@@ -551,54 +589,200 @@
       renderSound();
     }
 
-    function levelName(i) {
-      return MAPTEXT[LEVELS[i][2]]?.name || LEVELS[i][0];
+    function levelName(slug) {
+      return MAPTEXT[slug]?.name || slug;
     }
 
     function esc(s) {
       return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
     }
 
-    function renderSide() {
-      const [, , img, , desc] = LEVELS[selected];
-      document.getElementById("map-preview").src = `assets/menu/maps/${img}.jpg`;
-      const t = MAPTEXT[img];
-      const body = t?.desc?.length ? t.desc.map(esc).join("<br><br>") : esc(desc);
-      document.getElementById("map-desc").innerHTML =
-        `<b>${esc(levelName(selected))}.</b> ${body}`;
+    // Static chrome: title, buttons, sound block. Built once the
+    // fonts are in (called from renderMenu).
+    function renderChrome() {
+      setBmp("title", "БОИ: БЫСТРЫЙ ЗАПУСК", "ranger_6", "#9df0fc").classList.add("glow");
+      setBmp("start-btn", "СТАРТ", "ranger_6", "#06283c", 1);
+      setBmp("cancel-btn", "НАСТРОЙКИ", "ranger_6", "#06283c");
+      setBmp("binds-title", "УПРАВЛЕНИЕ", "ranger_6", "#9df0fc", 1);
+      setBmp("binds-reset", "СБРОСИТЬ", "ranger_6", "#cdeffd");
+      setBmp("binds-back", "НАЗАД", "ranger_6", "#cdeffd");
+      const opts = document.getElementById("opts");
+      opts.textContent = "";
+      const hdr = (t) => {
+        const d = document.createElement("div");
+        d.className = "hdr glow";
+        d.appendChild(bmpText(t, "ranger_6", "#7fd0e8"));
+        return d;
+      };
+      const radio = (id, label) => {
+        const d = document.createElement("div");
+        d.className = "radio";
+        d.id = id;
+        const dot = document.createElement("span");
+        dot.className = "dot";
+        d.append(dot, bmpText(label, "verdana_10_2_smooth", "#cfeefe"));
+        return d;
+      };
+      opts.appendChild(hdr("ЗВУК"));
+      opts.appendChild(radio("sound-on", "Включён"));
+      opts.appendChild(radio("sound-off", "Выключен"));
+      document.getElementById("sound-on").onclick = () => setSound(true);
+      document.getElementById("sound-off").onclick = () => setSound(false);
     }
 
-    function renderLevels() {
+    function renderTabs() {
+      const div = document.getElementById("tabs");
+      div.textContent = "";
+      for (const [cat, label] of CATS) {
+        const el = document.createElement("span");
+        el.className = "tab" + (cat === activeCat ? " active" : "");
+        el.appendChild(bmpText(label, "ranger_6", cat === activeCat ? "#06283c" : "#58c8e8"));
+        el.onclick = () => {
+          if (activeCat === cat) return;
+          activeCat = cat;
+          if (catOf(selected) !== cat) selected = visibleLevels()[0]?.slug;
+          renderMenu();
+        };
+        div.appendChild(el);
+      }
+    }
+
+    function renderSide() {
+      if (!selected) return;
+      document.getElementById("map-preview").src = `assets/menu/maps/${selected}.jpg`;
+      const t = MAPTEXT[selected];
+      const desc = document.getElementById("map-desc");
+      desc.innerHTML = t?.desc?.length
+        ? t.desc.map(esc).join("<br><br>")
+        : "Описание отсутствует.";
+      desc.scrollTop = 0;
+      syncDescSbar();
+    }
+
+    function renderLevels(scrollToSelected = false) {
       const div = document.getElementById("levels");
       div.textContent = "";
-      LEVELS.forEach(([, bundle, , size], i) => {
+      for (const { slug } of visibleLevels()) {
         const el = document.createElement("div");
-        el.className = "level" + (i === selected ? " selected" : "");
-        const left = document.createElement("span");
-        left.textContent = levelName(i);
-        if (bundle === currentBundle) {
-          const cur = document.createElement("span");
-          cur.className = "cur";
-          cur.textContent = "● идёт бой";
-          left.appendChild(cur);
+        el.className = "level" + (slug === selected ? " selected" : "");
+        const sel = slug === selected;
+
+        const name = bmpText(levelName(slug), "verdana_10_2_smooth", sel ? "#ffffff" : "#8ee6fb");
+        name.className += " name";
+        el.appendChild(name);
+
+        if (`assets/${slug}.bundle` === currentBundle) {
+          const cur = bmpText("- идёт бой", "verdana_09_2_smooth", "#7cff9c");
+          cur.className += " name";
+          cur.style.left = parseInt(name.style.width) + 28 + "px";
+          cur.style.top = "13px";
+          el.appendChild(cur);
         }
-        const right = document.createElement("span");
-        right.className = "size";
-        right.textContent = size;
-        el.append(left, right);
+
+        // Faction badges — right-aligned group ending at x≈315,
+        // 30px pitch, like the original rows.
+        const sides = (MAPTEXT[slug]?.side || "").split(",").filter(Boolean);
+        sides.forEach((s, i) => {
+          const icon = SIDE_ICONS[s.trim()];
+          if (!icon) return;
+          const img = document.createElement("img");
+          img.className = "side";
+          img.src = `assets/menu/icon_${icon}.png`;
+          img.style.left = 317 - (sides.length - i) * 30 + "px";
+          el.appendChild(img);
+        });
+
+        // Right column: map "length" label («Малая» … «Большая»), as
+        // in the original (it shows this or the best time there).
+        const dif = MAPTEXT[slug]?.dif;
+        if (dif) {
+          const dv = bmpText(dif, "verdana_09_2_smooth", sel ? "#a5e0f5" : "#5fc6e4");
+          dv.className += " size";
+          dv.style.left = 497 - parseInt(dv.style.width || 40) + "px";
+          el.appendChild(dv);
+        }
+
         el.onclick = () => {
-          selected = i;
+          selected = slug;
           renderLevels();
           renderSide();
         };
         el.ondblclick = () => startLevel();
         div.appendChild(el);
-      });
+        if (scrollToSelected && slug === selected) el.scrollIntoView({ block: "nearest" });
+      }
+      if (!LEVELS.length) {
+        div.textContent = "Список карт пуст — сгенерируйте assets (menu_assets, lang_dat.py, pack_bundle).";
+        div.style.font = "12px Verdana";
+      }
+    }
+
+    // DOM scrollbars (art buttons + proportional thumb). Returns the
+    // sync function; also syncs on native scroll (wheel etc.).
+    function attachSbar(scrollId, sbarId, rowQuant = 0) {
+      const el = document.getElementById(scrollId);
+      const sbar = document.getElementById(sbarId);
+      const track = sbar.querySelector(".sb-track");
+      const thumb = sbar.querySelector(".sb-thumb");
+      function sync() {
+        const need = el.scrollHeight > el.clientHeight + 1;
+        sbar.hidden = !need;
+        if (!need) return;
+        const h = Math.max(24, track.clientHeight * el.clientHeight / el.scrollHeight);
+        thumb.style.height = h + "px";
+        thumb.style.top = (track.clientHeight - h) *
+          el.scrollTop / (el.scrollHeight - el.clientHeight) + "px";
+      }
+      el.addEventListener("scroll", sync);
+      // Fixed steps, applied instantly — the original has no smooth
+      // scrolling; the browser's animated wheel scroll reads as jumpy.
+      // rowQuant > 0 additionally snaps to whole rows (the map list).
+      const step = (dir) => {
+        const next = el.scrollTop + dir * (rowQuant || 42);
+        el.scrollTop = rowQuant ? Math.round(next / rowQuant) * rowQuant : next;
+      };
+      el.addEventListener("wheel", (e) => {
+        e.preventDefault();
+        step(Math.sign(e.deltaY));
+      }, { passive: false });
+      sbar.querySelector(".sb-up").onclick = () => step(-1);
+      sbar.querySelector(".sb-down").onclick = () => step(1);
+      track.onpointerdown = (e) => {
+        if (e.target === thumb) return;
+        el.scrollBy(0, (e.offsetY < thumb.offsetTop ? -1 : 1) * el.clientHeight);
+      };
+      thumb.onpointerdown = (e) => {
+        e.stopPropagation();
+        const startY = e.clientY, startTop = el.scrollTop;
+        // Pointer deltas are in screen px; the stage transform scales
+        // design px, so divide the scale back out.
+        const k = document.getElementById("stage").getBoundingClientRect().width / 973;
+        const ratio = (el.scrollHeight - el.clientHeight) /
+          ((track.clientHeight - thumb.clientHeight) * k || 1);
+        thumb.setPointerCapture(e.pointerId);
+        thumb.onpointermove = (ev) => {
+          el.scrollTop = startTop + (ev.clientY - startY) * ratio;
+        };
+        thumb.onpointerup = () => (thumb.onpointermove = null);
+      };
+      return sync;
+    }
+    const syncSbar = attachSbar("levels", "sbar", 42);
+    const syncDescSbar = attachSbar("map-desc", "sbar-desc");
+
+    function renderMenu() {
+      renderChrome();
+      renderTabs();
+      renderLevels(true); // initial/tab render positions the list once
+      renderSide();
+      renderSound();
+      syncSbar();
     }
 
     function startLevel() {
+      if (!selected) return;
       const p = new URLSearchParams(location.search);
-      p.set("bundle", LEVELS[selected][1]);
+      p.set("bundle", `assets/${selected}.bundle`);
       location.search = p.toString(); // (re)load with the chosen map
     }
 
@@ -622,9 +806,7 @@
     }
     function openMenu() {
       menu.hidden = false;
-      renderLevels();
-      renderSide();
-      renderSound();
+      renderMenu();
       window.addEventListener("keydown", menuKeydown, true);
     }
     function closeMenu() {
@@ -643,13 +825,9 @@
       bindsNote.textContent = "";
     }
     document.getElementById("menu-btn").onclick = () => (menu.hidden ? openMenu() : closeMenu());
-    document.getElementById("menu-close").onclick = closeMenu;
     document.getElementById("start-btn").onclick = startLevel;
-    document.getElementById("cancel-btn").onclick = closeMenu;
-    document.getElementById("binds-open").onclick = openBinds;
+    document.getElementById("cancel-btn").onclick = openBinds; // НАСТРОЙКИ
     document.getElementById("binds-back").onclick = closeBinds;
-    document.getElementById("sound-on").onclick = () => setSound(true);
-    document.getElementById("sound-off").onclick = () => setSound(false);
     document.getElementById("binds-reset").onclick = () => {
       saveOverrides({});
       capturing = null;
@@ -658,14 +836,11 @@
     };
 
     if (inGame) {
-      document.getElementById("menu-close").style.display = "";
-      document.getElementById("cancel-btn").hidden = false;
       await init();
     } else {
       document.getElementById("loading").style.display = "none";
       document.getElementById("sound-btn").style.display = "none";
       document.getElementById("menu-btn").style.display = "none";
-      document.getElementById("menu-close").style.display = "none";
       openMenu();
     }
   </script>
