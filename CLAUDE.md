@@ -48,6 +48,9 @@ cargo run --example pack_bundle
 # Main-menu art for index.html (decodes .GI from mainmenu.pkg + map previews)
 cargo run --example menu_assets
 
+# Map names/descriptions/briefings from Lang.dat (menu + in-game Begin/Win/Loose dialogs)
+python3 ../tools/lang_dat.py ../Data/Lang.dat --maps assets/menu/maps.txt
+
 # Serve locally
 python3 -m http.server 8081
 # open http://localhost:8081

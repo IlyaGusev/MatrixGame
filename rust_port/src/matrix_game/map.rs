@@ -68,6 +68,10 @@ pub fn set_map_name(name: &str) {
     PORTRETS_IN_POS.store(false, PortretOrd::Relaxed);
 }
 
+pub fn map_name() -> String {
+    MAP_NAME.lock().unwrap().clone()
+}
+
 pub fn map_name_is_terron() -> bool {
     MAP_NAME.lock().unwrap().to_lowercase().contains("terron")
 }

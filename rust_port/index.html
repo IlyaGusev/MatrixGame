@@ -331,7 +331,7 @@
   </div>
 
   <script type="module">
-    import init from "./pkg/matrixgame_rs.js?v=369";
+    import init from "./pkg/matrixgame_rs.js?v=370";
 
 
 
@@ -376,6 +376,30 @@
       ["Вирус", "assets/virus.bundle", "virus", "206×192",
        "Заражённые земли: техника здесь долго не живёт. Быстрые рейды эффективнее долгих осад — собирайте дешёвые манёвренные машины и бейте по заводам, пока противник копит тяжёлый кулак."],
     ];
+
+    // Real SR2 names/descriptions from Lang.dat (RobotsMap), generated
+    // by `python3 ../tools/lang_dat.py ../Data/Lang.dat --maps
+    // assets/menu/maps.txt`. Keyed by map stem (= LEVELS img key).
+    // The hardcoded LEVELS texts remain as fallback if the fetch fails.
+    const MAPTEXT = {};
+    async function loadMapTexts() {
+      try {
+        const r = await fetch("assets/menu/maps.txt");
+        if (!r.ok) return;
+        let cur = null;
+        for (const line of (await r.text()).split("\n")) {
+          const i = line.indexOf("\t");
+          if (i < 0) continue;
+          const tag = line.slice(0, i), val = line.slice(i + 1);
+          if (tag === "map") cur = MAPTEXT[val] = { desc: [] };
+          else if (!cur) continue;
+          else if (tag === "name") cur.name = val;
+          else if (tag === "desc") cur.desc.push(val);
+        }
+        if (!menu.hidden) { renderLevels(); renderSide(); }
+      } catch {}
+    }
+    loadMapTexts();
 
     // [id, label, default KeyboardEvent.code, context] — must mirror
     // ACTIONS in src/matrix_game/keybinds.rs. Contexts are independent:
@@ -527,21 +551,31 @@
       renderSound();
     }
 
+    function levelName(i) {
+      return MAPTEXT[LEVELS[i][2]]?.name || LEVELS[i][0];
+    }
+
+    function esc(s) {
+      return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    }
+
     function renderSide() {
       const [, , img, , desc] = LEVELS[selected];
       document.getElementById("map-preview").src = `assets/menu/maps/${img}.jpg`;
+      const t = MAPTEXT[img];
+      const body = t?.desc?.length ? t.desc.map(esc).join("<br><br>") : esc(desc);
       document.getElementById("map-desc").innerHTML =
-        `<b>${LEVELS[selected][0]}.</b> ${desc}`;
+        `<b>${esc(levelName(selected))}.</b> ${body}`;
     }
 
     function renderLevels() {
       const div = document.getElementById("levels");
       div.textContent = "";
-      LEVELS.forEach(([name, bundle, , size], i) => {
+      LEVELS.forEach(([, bundle, , size], i) => {
         const el = document.createElement("div");
         el.className = "level" + (i === selected ? " selected" : "");
         const left = document.createElement("span");
-        left.textContent = name;
+        left.textContent = levelName(i);
         if (bundle === currentBundle) {
           const cur = document.createElement("span");
           cur.className = "cur";
