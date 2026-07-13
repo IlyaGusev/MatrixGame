@@ -45,6 +45,9 @@ wasm-pack build --target web --out-dir pkg
 # Pack assets for WASM (extracts textures from robots.pkg)
 cargo run --example pack_bundle
 
+# Main-menu art for index.html (decodes .GI from mainmenu.pkg + map previews)
+cargo run --example menu_assets
+
 # Serve locally
 python3 -m http.server 8081
 # open http://localhost:8081
