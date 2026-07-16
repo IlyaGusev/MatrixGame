@@ -1720,6 +1720,16 @@ impl ApplicationHandler for App {
                             {
                                 let objs = &state.game.objects;
                                 let rng = &mut state.game.rng;
+                                // Weapon draw reads current_elapsed_ms()
+                                // (plasma muzzle-cone age, volcano flash
+                                // angle) — the logic scope closed above,
+                                // and with the clock at 0 the cone's age
+                                // goes negative, never expires, and sticks
+                                // to the barrel as a permanent glow.
+                                let _scope = crate::matrix_game::map::MapScope::enter(
+                                    &state.map,
+                                    state.game.elapsed_ms,
+                                );
                                 for w in objs.weapons.iter() {
                                     w.draw(&mut state.bb_queue, objs, rng, state.is_paused);
                                 }
@@ -2399,7 +2409,9 @@ fn dispatch_ui_click(state: &mut AppState, click: &crate::matrix_game::interface
             }
             // Pause the game while the constructor is open — port of
             // `g_MatrixMap->Pause(true)` at CConstructor.cpp:975.
+            // Pause(true) also silences everything (MatrixMap.hpp:638).
             state.is_paused = true;
+            state.sounds.stop_all();
             log::debug!("buro: opened robot constructor");
             // Silence "unused import" on paths we only need in other
             // arms of this match.
@@ -5326,7 +5338,11 @@ fn enter_dialog_mode(state: &mut AppState, name: &str) {
     // The C++ releases m_PauseHint here; ours rebuilds per frame and
     // is gated on `dialog.is_none()`, so there's nothing to drop.
     leave_dialog_mode(state);
-    state.is_paused = true; // Pause(true)
+    // Pause(true) → CSound::StopPlayAllSounds (MatrixMap.hpp:634-639) —
+    // kills looped voices (repair hum etc.) that logic won't re-pan
+    // while frozen.
+    state.is_paused = true;
+    state.sounds.stop_all();
 
     if name != "Begin" {
         pl_drop_all_actions(state);
@@ -5604,15 +5620,23 @@ fn dispatch_dialog_action(
 }
 
 /// `OkJustExitHandler` sets GFLAG_EXITLOOP and the host (SR2 / the
-/// standalone EXE shell) tears the session down. The port has no host
-/// to return to: on the web we reload the page for a fresh session,
-/// natively we exit the process.
+/// standalone EXE shell) tears the session down. The port's "host" on
+/// the web is the map-select menu (index.html without `?bundle=`), so
+/// exiting navigates back there; natively we exit the process.
 fn exit_game(exit_state: i32) {
     log::info!("dialog: leaving game loop (g_ExitState={exit_state})");
     #[cfg(target_arch = "wasm32")]
     {
         if let Some(w) = web_sys::window() {
-            let _ = w.location().reload();
+            let loc = w.location();
+            match loc.pathname() {
+                Ok(path) => {
+                    let _ = loc.set_href(&path);
+                }
+                Err(_) => {
+                    let _ = loc.reload();
+                }
+            }
         }
     }
     #[cfg(not(target_arch = "wasm32"))]
@@ -5955,6 +5979,10 @@ fn handle_game_key(state: &mut AppState, code: winit::keyboard::KeyCode) -> bool
         // here since the dialog branch above consumed the key.
         K::Pause => {
             state.is_paused = !state.is_paused;
+            // Pause(true) stops all sounds (MatrixMap.hpp:634-639).
+            if state.is_paused {
+                state.sounds.stop_all();
+            }
             return true;
         }
         _ => {}
