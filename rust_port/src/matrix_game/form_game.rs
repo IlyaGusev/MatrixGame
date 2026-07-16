@@ -1426,6 +1426,9 @@ impl ApplicationHandler for App {
                 // EnterDialogMode(TEMPLATE_DIALOG_WIN/LOOSE) call from
                 // MatrixLogic.cpp:2900-2906 (logic queues, UI executes).
                 if let Some(win) = state.game.pending_win_loose_dialog.take() {
+                    if win {
+                        save_map_record(state.game.elapsed_ms);
+                    }
                     enter_dialog_mode(state, if win { "Win" } else { "Loose" });
                 }
 
@@ -2827,6 +2830,54 @@ fn briefing_stem() -> String {
         }
     }
     out.trim_matches('_').to_string()
+}
+
+/// Persist the best completion time for the current map into
+/// localStorage `matrixgame.records` (`slug=ms;…`) — the quick-launch
+/// menu (index.html) shows it as the «Время:» column + medal.
+#[cfg(target_arch = "wasm32")]
+fn save_map_record(elapsed_ms: i64) {
+    let Some(store) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) else {
+        return;
+    };
+    let slug = briefing_stem();
+    if slug.is_empty() {
+        return;
+    }
+    let raw = store
+        .get_item("matrixgame.records")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    if let Some(s) = merge_record(&raw, &slug, elapsed_ms) {
+        let _ = store.set_item("matrixgame.records", &s);
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn save_map_record(_elapsed_ms: i64) {}
+
+/// Fold a new completion time into the `slug=ms;…` records string;
+/// None when the stored time is already at least as good.
+#[cfg(any(target_arch = "wasm32", test))]
+fn merge_record(raw: &str, slug: &str, elapsed_ms: i64) -> Option<String> {
+    let mut entries: Vec<(String, i64)> = raw
+        .split(';')
+        .filter_map(|p| p.split_once('='))
+        .filter_map(|(k, v)| v.parse().ok().map(|v| (k.to_string(), v)))
+        .collect();
+    match entries.iter_mut().find(|(k, _)| k == slug) {
+        Some(e) if e.1 <= elapsed_ms => return None,
+        Some(e) => e.1 = elapsed_ms,
+        None => entries.push((slug.to_string(), elapsed_ms)),
+    }
+    Some(
+        entries
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(";"),
+    )
 }
 
 /// Parse the `tag\tvalue` lines of maps.txt for one map's entry.
@@ -6247,4 +6298,26 @@ pub fn run() {
         state: Rc::new(RefCell::new(None)),
     };
     event_loop.spawn_app(app);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::merge_record;
+
+    #[test]
+    fn merge_record_updates_only_on_improvement() {
+        assert_eq!(merge_record("", "atoll", 5000), Some("atoll=5000".into()));
+        assert_eq!(
+            merge_record("atoll=5000", "training", 900),
+            Some("atoll=5000;training=900".into())
+        );
+        assert_eq!(
+            merge_record("atoll=5000;training=900", "atoll", 4000),
+            Some("atoll=4000;training=900".into())
+        );
+        assert_eq!(merge_record("atoll=4000;training=900", "atoll", 4000), None);
+        assert_eq!(merge_record("atoll=4000;training=900", "atoll", 9999), None);
+        // garbage entries are dropped rather than crashing
+        assert_eq!(merge_record("bogus;=;x=y", "atoll", 10), Some("atoll=10".into()));
+    }
 }

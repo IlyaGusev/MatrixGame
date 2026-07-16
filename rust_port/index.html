@@ -146,6 +146,9 @@
     .level .name { position: absolute; left: 21px; top: 12px; }
     .level img.side { position: absolute; top: 6px; height: 24px; }
     .level .size { position: absolute; top: 13px; }
+    /* SR2HD completion medal — slightly taller than the row, like the
+       reference; matted out of the HD screenshot (no GI art exists). */
+    .level img.medal { position: absolute; left: 474px; top: 0px; height: 36px; }
 
     #map-preview {
       left: 629px; top: 106px; width: 146px; height: 146px;
@@ -282,7 +285,7 @@
   </div>
 
   <script type="module">
-    import init from "./pkg/matrixgame_rs.js?v=371";
+    import init from "./pkg/matrixgame_rs.js?v=373";
 
     // Render-resolution cap. GPU cost is ~linear in pixel count, so we
     // render at most RENDER_MAX px on the long edge and let CSS upscale the
@@ -476,6 +479,21 @@
     ];
     const KEYS_STORAGE = "matrixgame.keys";
     const SOUND_STORAGE = "matrixgame.sound";
+    const RECORDS_STORAGE = "matrixgame.records"; // slug=best_ms;… (written by the Rust win path)
+
+    function loadRecords() {
+      const out = {};
+      for (const pair of (localStorage.getItem(RECORDS_STORAGE) || "").split(";")) {
+        const i = pair.indexOf("=");
+        if (i > 0) out[pair.slice(0, i)] = +pair.slice(i + 1);
+      }
+      return out;
+    }
+    function fmtTime(ms) {
+      const s = Math.floor(ms / 1000);
+      const p = (n) => String(n).padStart(2, "0");
+      return `${p(Math.floor(s / 3600))}:${p(Math.floor(s / 60) % 60)}:${p(s % 60)}`;
+    }
 
     // No ?bundle= → main-menu mode: the engine is not started at all;
     // pressing СТАРТ reloads with the param set and boots the game.
@@ -661,6 +679,7 @@
 
     function renderLevels(scrollToSelected = false) {
       const div = document.getElementById("levels");
+      const records = loadRecords();
       div.textContent = "";
       for (const { slug } of visibleLevels()) {
         const el = document.createElement("div");
@@ -692,14 +711,26 @@
           el.appendChild(img);
         });
 
-        // Right column: map "length" label («Малая» … «Большая»), as
-        // in the original (it shows this or the best time there).
-        const dif = MAPTEXT[slug]?.dif;
-        if (dif) {
-          const dv = bmpText(dif, "verdana_09_2_smooth", sel ? "#a5e0f5" : "#5fc6e4");
-          dv.className += " size";
-          dv.style.left = 497 - parseInt(dv.style.width || 40) + "px";
-          el.appendChild(dv);
+        // Right column: best time + medal for completed maps, else the
+        // map "length" label («Малая» … «Большая»), like the original.
+        const rec = records[slug];
+        if (rec > 0) {
+          const tv = bmpText("Время: " + fmtTime(rec), "verdana_09_2_smooth", sel ? "#ffffff" : "#8ee6fb");
+          tv.className += " size";
+          tv.style.left = 466 - parseInt(tv.style.width || 80) + "px";
+          el.appendChild(tv);
+          const md = document.createElement("img");
+          md.className = "medal";
+          md.src = "assets/menu/medal.png";
+          el.appendChild(md);
+        } else {
+          const dif = MAPTEXT[slug]?.dif;
+          if (dif) {
+            const dv = bmpText(dif, "verdana_09_2_smooth", sel ? "#a5e0f5" : "#5fc6e4");
+            dv.className += " size";
+            dv.style.left = 497 - parseInt(dv.style.width || 40) + "px";
+            el.appendChild(dv);
+          }
         }
 
         el.onclick = () => {
