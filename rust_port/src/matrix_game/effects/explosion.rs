@@ -497,6 +497,21 @@ impl Explosion {
         (self.props.voronka, self.props.voronka_scale)
     }
 
+    /// `~CMatrixEffectExplosion` parity for the DeleteFirst eviction
+    /// path: the C++ destructor's RemoveDebris kills every ember
+    /// follow-light (MatrixEffectExplosion.cpp:794). Dropping a capped
+    /// explosion without this leaks the lights forever — the
+    /// "10 FPS after 10 minutes" bug.
+    pub fn kill_lights(&self, objs: &mut crate::matrix_game::map_static::Objects) {
+        for deb in &self.debs {
+            if let Deb::Fire { light_key, .. } = deb {
+                objs.pending_light_kill.push(
+                    crate::matrix_game::effects::weapon::WeaponId::synthetic(*light_key),
+                );
+            }
+        }
+    }
+
     /// `Takt` (MatrixEffectExplosion.cpp:625-810). Returns false when
     /// all debris expired.
     pub fn takt(

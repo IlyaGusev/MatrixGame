@@ -295,11 +295,51 @@ fn enforce_limits(effects: &mut Vec<GameEffect>, objs: &mut Objects) {
             _ => false,
         };
         if drop_it {
+            if let GameEffect::Explosion(ex) = &e {
+                ex.kill_lights(objs);
+            }
             if let Some(w) = e.weapon() {
                 objs.weapons.release(w);
             }
         } else {
             effects.push(e);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// MAX_EFFECTS_EXPLOSIONS eviction must queue kills for the evicted
+    /// explosion's ember follow-lights (~CMatrixEffectExplosion parity)
+    /// — leaking them degraded FPS over long battles.
+    #[test]
+    fn explosion_eviction_kills_ember_lights() {
+        let map = GameMap::test_flat(32, 32, 0.0);
+        let mut rng = Rnd::new(1);
+        let mut effects: Vec<GameEffect> = (0..51)
+            .map(|_| {
+                GameEffect::Explosion(explosion::Explosion::new(
+                    glam::Vec3::new(100.0, 100.0, 20.0),
+                    &explosion::EXPLOSION_ROBOT_BOOM,
+                    &map,
+                    &mut rng,
+                    &[],
+                ))
+            })
+            .collect();
+        let expected = {
+            let mut probe = Objects::new();
+            let GameEffect::Explosion(e) = &effects[0] else {
+                unreachable!()
+            };
+            e.kill_lights(&mut probe);
+            probe.pending_light_kill.len()
+        };
+        assert!(expected > 0, "ROBOT_BOOM should carry ember debris");
+        let mut objs = Objects::new();
+        enforce_limits(&mut effects, &mut objs);
+        assert_eq!(objs.pending_light_kill.len(), expected);
     }
 }
